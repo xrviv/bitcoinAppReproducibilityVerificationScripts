@@ -1,0 +1,2 @@
+# bitcoinAppReproducibilityVerificationScripts
+Formerly part of the walletScrutiny Reproducible Build Verfication Scripts
