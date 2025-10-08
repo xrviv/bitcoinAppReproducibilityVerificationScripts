@@ -2,7 +2,7 @@
 #
 # verify_sparrow.sh - Sparrow Desktop Reproducible Build Verifier
 #
-# Version: v0.4.0
+# Version: v0.4.1
 #
 # Description:
 #   Automated reproducible build verification for Sparrow Desktop wallet.
@@ -23,10 +23,10 @@
 # Repository: https://github.com/xrviv/bitcoinAppReproducibilityVerificationScripts
 #
 
-set -euo pipefail 
+set -x
 
 # Script version
-SCRIPT_VERSION="v0.4.0"
+SCRIPT_VERSION="v0.4.1"
 
 # Default values (can be overridden by environment variables)
 DEFAULT_WORK_DIR_BASE="${SPARROW_WORK_DIR:-$HOME/sparrow-verify}"
@@ -253,7 +253,7 @@ KNOWN ACCEPTABLE DIFFERENCES
       Classes: BoundMethodHandle, LambdaForm, Invokers (infrastructure)
 
 VERSION
-    verify_sparrow.sh version v0.3.0
+    verify_sparrow.sh version v0.4.1
 
 AUTHOR
     WalletScrutiny Team
@@ -430,9 +430,10 @@ parse_arguments() {
         die "Invalid BASE_IMAGE tag: $image_tag (only alphanumeric, dots, hyphens allowed)" $EXIT_INVALID_ARGS
     fi
 
-    # Validate CONTAINER_NAME (alphanumeric, hyphens, underscores only)
-    if ! [[ "$CONTAINER_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-        die "Invalid CONTAINER_NAME: $CONTAINER_NAME (only alphanumeric, hyphens, and underscores allowed)" $EXIT_INVALID_ARGS
+    # Validate CONTAINER_NAME (Docker naming: alphanumeric, hyphens, underscores, periods)
+    # Docker container names must match: [a-zA-Z0-9][a-zA-Z0-9_.-]*
+    if ! [[ "$CONTAINER_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
+        die "Invalid CONTAINER_NAME: $CONTAINER_NAME (must start with alphanumeric, then alphanumeric/hyphens/underscores/periods)" $EXIT_INVALID_ARGS
     fi
 
     # Validate GITHUB_TAG format
@@ -624,10 +625,22 @@ DOCKERFILE_END
     log_info "Building Docker image (this may take several minutes)..."
     log_verbose "Docker build command: \"$DOCKER_CMD\" build $cache_flag --build-arg SPARROW_VERSION=$GITHUB_TAG -t sparrow-$VERSION-builder ."
 
-    if ! "$DOCKER_CMD" build $cache_flag --build-arg SPARROW_VERSION="$GITHUB_TAG" -t "sparrow-$VERSION-builder" . > "$WORK_DIR/docker-build.log" 2>&1; then
-        log_error "Docker build failed. Check logs: $WORK_DIR/docker-build.log"
-        tail -20 "$WORK_DIR/docker-build.log"
+    # Always capture output to temp file for error reporting, optionally save permanently
+    local temp_log="$WORK_DIR/docker-build.log"
+    
+    if ! "$DOCKER_CMD" build $cache_flag --build-arg SPARROW_VERSION="$GITHUB_TAG" -t "sparrow-$VERSION-builder" . 2>&1 | tee "$temp_log"; then
+        log_error "Docker build failed. Last 50 lines of output:"
+        echo "------------------------------------------------------"
+        tail -50 "$temp_log"
+        echo "------------------------------------------------------"
+        log_error "Full log saved to: $temp_log"
         exit $EXIT_BUILD_FAILED
+    fi
+    
+    # Remove log file if not saving logs
+    if [[ "$SAVE_LOGS" != true ]]; then
+        log_verbose "Removing build log (use --save-logs to keep it)"
+        rm -f "$temp_log"
     fi
 
     log_success "Docker image built successfully"
