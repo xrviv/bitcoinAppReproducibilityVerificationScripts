@@ -2,7 +2,7 @@
 #
 # verify_sparrow.sh - Sparrow Desktop Reproducible Build Verifier
 #
-# Version: v0.3.0
+# Version: v0.4.0
 #
 # Description:
 #   Automated reproducible build verification for Sparrow Desktop wallet.
@@ -26,11 +26,10 @@
 set -euo pipefail 
 
 # Script version
-SCRIPT_VERSION="v0.3.0"
+SCRIPT_VERSION="v0.4.0"
 
 # Default values (can be overridden by environment variables)
 DEFAULT_WORK_DIR_BASE="${SPARROW_WORK_DIR:-$HOME/sparrow-verify}"
-DEFAULT_REPORT_DIR_BASE="${SPARROW_REPORT_DIR:-$HOME/sparrow-verify/reports}"
 DEFAULT_JDK_VERSION="22.0.2+9"
 DEFAULT_BASE_IMAGE="ubuntu:22.04"
 DOCKER_CMD="${DOCKER_CMD:-docker}"
@@ -38,7 +37,6 @@ DOCKER_CMD="${DOCKER_CMD:-docker}"
 # Global variables
 VERSION=""
 WORK_DIR=""
-REPORT_DIR=""
 JDK_VERSION="$DEFAULT_JDK_VERSION"
 BASE_IMAGE="$DEFAULT_BASE_IMAGE"
 GITHUB_TAG=""
@@ -56,14 +54,9 @@ KEEP_CONTAINER=false
 NO_CACHE=false
 STRICT=false
 IGNORE_LEGAL=false
-NO_REPORT=false
 SAVE_LOGS=false
 VERBOSE=false
 QUIET=false
-
-# Output format
-OUTPUT_FORMAT="markdown"
-REPORT_FILE=""
 
 # Exit codes
 EXIT_SUCCESS=0
@@ -159,7 +152,7 @@ DESCRIPTION
     4. Performs deep modules file inspection via JIMAGE extraction
     5. Verifies application code is byte-for-byte identical
     6. Analyzes JVM-generated classes and legal files
-    7. Generates comprehensive verification report with verdict
+    7. Generates comprehensive verification verdict
 
 ARGUMENTS
     VERSION
@@ -191,10 +184,6 @@ OPTIONS
         --ignore-legal          Don't warn about missing legal files
 
     Output Control:
-        --output-format FORMAT  Report format: markdown|json|text (default: markdown)
-        --report-file FILE      Custom report filename
-        --report-dir DIR        Custom report directory
-        --no-report             Skip report generation
         --save-logs             Save complete build/verification logs
 
     Advanced:
@@ -232,7 +221,6 @@ EXIT CODES
 ENVIRONMENT VARIABLES
     DOCKER_CMD              Docker command to use (default: docker)
     SPARROW_WORK_DIR        Default work directory
-    SPARROW_REPORT_DIR      Default report directory
 
 FILES
     Work Directory Structure:
@@ -241,12 +229,9 @@ FILES
         ├── build-output/Sparrow/        # Built artifacts
         ├── official/Sparrow/             # Official release
         ├── extracted-modules-comparison/ # JIMAGE extraction
-        ├── verification-results.txt      # Terminal output log
-        └── build.log                     # Build log (if --save-logs)
-
-    Report Location:
-        ~/sparrow-verify/reports/VERSION/
-        └── YYYY-MM-DD.HHMM.sparrowdesktop_vVERSION.md
+        ├── modules-diff.txt              # Modules comparison results
+        ├── file-list-diff.txt            # File listing comparison
+        └── docker-build.log              # Build log
 
 REPRODUCIBILITY CRITERIA
     REPRODUCIBLE if:
@@ -313,10 +298,6 @@ parse_arguments() {
                 WORK_DIR="$2"
                 shift 2
                 ;;
-            --report-dir)
-                REPORT_DIR="$2"
-                shift 2
-                ;;
             --skip-build)
                 SKIP_BUILD=true
                 shift
@@ -357,10 +338,6 @@ parse_arguments() {
                 IGNORE_LEGAL=true
                 shift
                 ;;
-            --no-report)
-                NO_REPORT=true
-                shift
-                ;;
             --save-logs)
                 SAVE_LOGS=true
                 shift
@@ -389,14 +366,6 @@ parse_arguments() {
                 BASE_IMAGE="$2"
                 shift 2
                 ;;
-            --output-format)
-                OUTPUT_FORMAT="$2"
-                shift 2
-                ;;
-            --report-file)
-                REPORT_FILE="$2"
-                shift 2
-                ;;
             -*)
                 die "Unknown option: $1" $EXIT_INVALID_ARGS
                 ;;
@@ -416,22 +385,74 @@ parse_arguments() {
         die "VERSION argument required. Use --help for usage information." $EXIT_INVALID_ARGS
     fi
 
+    # Validate VERSION format (should be semantic version like 2.3.0)
+    if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        die "Invalid VERSION format: $VERSION (expected format: X.Y.Z, e.g., 2.3.0)" $EXIT_INVALID_ARGS
+    fi
+
     # Set defaults based on VERSION
     WORK_DIR="${WORK_DIR:-$DEFAULT_WORK_DIR_BASE/$VERSION}"
-    REPORT_DIR="${REPORT_DIR:-$DEFAULT_REPORT_DIR_BASE/$VERSION}"
     GITHUB_TAG="${GITHUB_TAG:-$VERSION}"
     CONTAINER_NAME="${CONTAINER_NAME:-sparrow-$VERSION-container}"
+
+    # Validate WORK_DIR path
+    if [[ "$WORK_DIR" =~ [[:space:]] ]]; then
+        die "Work directory path cannot contain spaces: $WORK_DIR" $EXIT_INVALID_ARGS
+    fi
+
+    # Validate JDK_VERSION format (e.g., 22.0.2+9)
+    if ! [[ "$JDK_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+$ ]]; then
+        die "Invalid JDK_VERSION format: $JDK_VERSION (expected format: X.Y.Z+B, e.g., 22.0.2+9)" $EXIT_INVALID_ARGS
+    fi
+
+    # Validate JDK_VERSION is reasonable (major version between 8 and 99)
+    local jdk_major="${JDK_VERSION%%.*}"
+    if [[ $jdk_major -lt 8 ]] || [[ $jdk_major -gt 99 ]]; then
+        die "Invalid JDK major version: $jdk_major (must be between 8 and 99)" $EXIT_INVALID_ARGS
+    fi
+
+    # Validate BASE_IMAGE format (should contain at least one colon for tag)
+    if ! [[ "$BASE_IMAGE" =~ ^[a-z0-9._/-]+:[a-z0-9._-]+$ ]]; then
+        die "Invalid BASE_IMAGE format: $BASE_IMAGE (expected format: image:tag, e.g., ubuntu:22.04)" $EXIT_INVALID_ARGS
+    fi
+
+    # Validate BASE_IMAGE components
+    local image_name="${BASE_IMAGE%:*}"
+    local image_tag="${BASE_IMAGE##*:}"
+    
+    # Image name should not be empty and should not contain invalid characters
+    if [[ -z "$image_name" ]] || [[ "$image_name" =~ [^a-z0-9._/-] ]]; then
+        die "Invalid BASE_IMAGE name: $image_name (only lowercase alphanumeric, dots, slashes, hyphens allowed)" $EXIT_INVALID_ARGS
+    fi
+    
+    # Tag should not be empty and should not contain invalid characters
+    if [[ -z "$image_tag" ]] || [[ "$image_tag" =~ [^a-z0-9._-] ]]; then
+        die "Invalid BASE_IMAGE tag: $image_tag (only alphanumeric, dots, hyphens allowed)" $EXIT_INVALID_ARGS
+    fi
+
+    # Validate CONTAINER_NAME (alphanumeric, hyphens, underscores only)
+    if ! [[ "$CONTAINER_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        die "Invalid CONTAINER_NAME: $CONTAINER_NAME (only alphanumeric, hyphens, and underscores allowed)" $EXIT_INVALID_ARGS
+    fi
+
+    # Validate GITHUB_TAG format
+    if [[ -n "$GITHUB_TAG" ]] && ! [[ "$GITHUB_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        die "Invalid GITHUB_TAG format: $GITHUB_TAG (expected format: X.Y.Z, e.g., 2.3.0)" $EXIT_INVALID_ARGS
+    fi
+
+    # Validate OFFICIAL_URL if provided
+    if [[ -n "$OFFICIAL_URL" ]] && ! [[ "$OFFICIAL_URL" =~ ^https?:// ]]; then
+        die "Invalid OFFICIAL_URL: must start with http:// or https://" $EXIT_INVALID_ARGS
+    fi
+
+    # Validate DOCKER_CMD is available
+    if ! command -v "$DOCKER_CMD" &> /dev/null; then
+        die "Docker command not found: $DOCKER_CMD (install Docker or use --docker-cmd to specify alternative)" $EXIT_INVALID_ARGS
+    fi
 
     # Set official URL if not provided
     if [[ -z "$OFFICIAL_URL" ]]; then
         OFFICIAL_URL="https://github.com/sparrowwallet/sparrow/releases/download/$VERSION/sparrowwallet-$VERSION-x86_64.tar.gz"
-    fi
-
-    # Set report filename if not provided
-    if [[ -z "$REPORT_FILE" ]] && [[ "$NO_REPORT" != true ]]; then
-        local timestamp
-        timestamp=$(date +"%Y-%m-%d.%H%M")
-        REPORT_FILE="$REPORT_DIR/${timestamp}.sparrowdesktop_v${VERSION}.md"
     fi
 
     # Validate conflicts
@@ -441,6 +462,18 @@ parse_arguments() {
 
     if [[ "$SKIP_BUILD" == true ]] && [[ "$REBUILD" == true ]]; then
         die "Cannot use --skip-build and --rebuild together" $EXIT_INVALID_ARGS
+    fi
+
+    if [[ "$VERIFY_ONLY" == true ]] && [[ "$REBUILD" == true ]]; then
+        die "Cannot use --verify-only and --rebuild together (verify-only skips build)" $EXIT_INVALID_ARGS
+    fi
+
+    if [[ "$SKIP_BUILD" == true ]] && [[ "$NO_CACHE" == true ]]; then
+        die "Cannot use --skip-build and --no-cache together (no-cache only applies to build)" $EXIT_INVALID_ARGS
+    fi
+
+    if [[ "$DEEP_INSPECT_ONLY" == true ]] && [[ "$SKIP_JIMAGE_EXTRACT" == true ]]; then
+        die "Cannot use --deep-inspect-only and --skip-jimage-extract together" $EXIT_INVALID_ARGS
     fi
 }
 
@@ -458,11 +491,6 @@ setup_workspace() {
     mkdir -p "$WORK_DIR/official"
     mkdir -p "$WORK_DIR/extracted-modules-comparison/build"
     mkdir -p "$WORK_DIR/extracted-modules-comparison/official"
-
-    # Create report directory if needed
-    if [[ "$NO_REPORT" != true ]]; then
-        mkdir -p "$REPORT_DIR"
-    fi
 
     # Check required tools
     log_verbose "Checking required tools..."
@@ -504,10 +532,31 @@ build_docker() {
 
     if [[ "$SKIP_BUILD" == true ]]; then
         log_info "Skipping build (--skip-build specified)"
+        
+        # Verify build output exists
         if [[ ! -d "$WORK_DIR/build-output/Sparrow" ]]; then
             log_error "Build output not found at $WORK_DIR/build-output/Sparrow"
+            log_error "Cannot skip build - no existing build artifacts found"
             exit $EXIT_BUILD_FAILED
         fi
+        
+        # Verify critical files exist in build output
+        local missing_files=()
+        for file in "bin/Sparrow" "lib/libapplauncher.so" "lib/runtime/lib/modules"; do
+            if [[ ! -f "$WORK_DIR/build-output/Sparrow/$file" ]]; then
+                missing_files+=("$file")
+            fi
+        done
+        
+        if [[ ${#missing_files[@]} -gt 0 ]]; then
+            log_error "Build output incomplete - missing critical files:"
+            for file in "${missing_files[@]}"; do
+                log_error "  - $file"
+            done
+            exit $EXIT_BUILD_FAILED
+        fi
+        
+        log_success "Build output verified"
         return
     fi
 
@@ -634,11 +683,40 @@ download_official() {
 
     if [[ "$SKIP_DOWNLOAD" == true ]]; then
         log_info "Skipping download (--skip-download specified)"
+        
+        # Check if either tarball or extracted directory exists
         if [[ ! -f "$WORK_DIR/sparrowwallet-$VERSION-x86_64.tar.gz" ]] && [[ ! -d "$WORK_DIR/official/Sparrow" ]]; then
-            log_error "Official release not found at $WORK_DIR/official/Sparrow"
+            log_error "Official release not found"
+            log_error "Neither tarball nor extracted directory exists:"
+            log_error "  Tarball: $WORK_DIR/sparrowwallet-$VERSION-x86_64.tar.gz"
+            log_error "  Directory: $WORK_DIR/official/Sparrow"
             exit $EXIT_DOWNLOAD_FAILED
         fi
-        return
+        
+        # If only tarball exists, we need to extract it
+        if [[ -f "$WORK_DIR/sparrowwallet-$VERSION-x86_64.tar.gz" ]] && [[ ! -d "$WORK_DIR/official/Sparrow" ]]; then
+            log_info "Tarball found but not extracted, extracting now..."
+            # Continue to extraction logic below
+        else
+            # Verify critical files exist in official release
+            local missing_files=()
+            for file in "bin/Sparrow" "lib/libapplauncher.so" "lib/runtime/lib/modules"; do
+                if [[ ! -f "$WORK_DIR/official/Sparrow/$file" ]]; then
+                    missing_files+=("$file")
+                fi
+            done
+            
+            if [[ ${#missing_files[@]} -gt 0 ]]; then
+                log_error "Official release incomplete - missing critical files:"
+                for file in "${missing_files[@]}"; do
+                    log_error "  - $file"
+                done
+                exit $EXIT_DOWNLOAD_FAILED
+            fi
+            
+            log_success "Official release verified"
+            return
+        fi
     fi
 
     cd "$WORK_DIR"
@@ -711,6 +789,18 @@ verify_critical_binaries() {
 
     local build_dir="$WORK_DIR/build-output/Sparrow"
     local official_dir="$WORK_DIR/official/Sparrow"
+    
+    # Verify directories exist
+    if [[ ! -d "$build_dir" ]]; then
+        log_error "Build directory not found: $build_dir"
+        exit $EXIT_BUILD_FAILED
+    fi
+    
+    if [[ ! -d "$official_dir" ]]; then
+        log_error "Official directory not found: $official_dir"
+        exit $EXIT_DOWNLOAD_FAILED
+    fi
+    
     local all_match=true
 
     # Critical files to verify
@@ -773,6 +863,17 @@ analyze_file_counts() {
 
     local build_dir="$WORK_DIR/build-output/Sparrow"
     local official_dir="$WORK_DIR/official/Sparrow"
+    
+    # Verify directories exist
+    if [[ ! -d "$build_dir" ]]; then
+        log_error "Build directory not found: $build_dir"
+        exit $EXIT_BUILD_FAILED
+    fi
+    
+    if [[ ! -d "$official_dir" ]]; then
+        log_error "Official directory not found: $official_dir"
+        exit $EXIT_DOWNLOAD_FAILED
+    fi
 
     # Count files
     local build_count
@@ -890,6 +991,28 @@ inspect_modules_file() {
     local official_dir="$WORK_DIR/official/Sparrow"
     local build_modules="$build_dir/lib/runtime/lib/modules"
     local official_modules="$official_dir/lib/runtime/lib/modules"
+    
+    # Verify directories exist
+    if [[ ! -d "$build_dir" ]]; then
+        log_error "Build directory not found: $build_dir"
+        exit $EXIT_BUILD_FAILED
+    fi
+    
+    if [[ ! -d "$official_dir" ]]; then
+        log_error "Official directory not found: $official_dir"
+        exit $EXIT_DOWNLOAD_FAILED
+    fi
+    
+    # Verify modules files exist
+    if [[ ! -f "$build_modules" ]]; then
+        log_error "Build modules file not found: $build_modules"
+        exit $EXIT_BUILD_FAILED
+    fi
+    
+    if [[ ! -f "$official_modules" ]]; then
+        log_error "Official modules file not found: $official_modules"
+        exit $EXIT_DOWNLOAD_FAILED
+    fi
 
     # Compare file sizes
     local build_size
