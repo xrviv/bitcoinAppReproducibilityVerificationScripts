@@ -2,7 +2,7 @@
 #
 # verify_sparrow.sh - Sparrow Desktop Reproducible Build Verifier
 #
-# Version: v0.0.1
+# Version: v0.3.0
 #
 # Description:
 #   Automated reproducible build verification for Sparrow Desktop wallet.
@@ -20,17 +20,17 @@
 #   verify_sparrow.sh 2.3.0 --skip-build --verify-only
 #
 # Author: WalletScrutiny Team
-# Repository: https://github.com/walletscrutiny/walletScrutinyCom
+# Repository: https://github.com/xrviv/bitcoinAppReproducibilityVerificationScripts
 #
 
-set -x 
+set -euo pipefail 
 
 # Script version
-SCRIPT_VERSION="v0.0.1"
+SCRIPT_VERSION="v0.3.0"
 
-# Default values
-DEFAULT_WORK_DIR_BASE="$HOME/builds/desktop/sparrow"
-DEFAULT_REPORT_DIR_BASE="$HOME/work/0-reports/desktop/sparrow"
+# Default values (can be overridden by environment variables)
+DEFAULT_WORK_DIR_BASE="${SPARROW_WORK_DIR:-$HOME/sparrow-verify}"
+DEFAULT_REPORT_DIR_BASE="${SPARROW_REPORT_DIR:-$HOME/sparrow-verify/reports}"
 DEFAULT_JDK_VERSION="22.0.2+9"
 DEFAULT_BASE_IMAGE="ubuntu:22.04"
 DOCKER_CMD="${DOCKER_CMD:-docker}"
@@ -80,22 +80,26 @@ CRITICAL_BINARIES_MATCH=false
 APP_CODE_IDENTICAL=false
 JVM_CLASSES_ACCEPTABLE=false
 LEGAL_FILES_ACCEPTABLE=false
+MODULES_INSPECTED=false
 VERDICT_EXIT_CODE=$EXIT_SUCCESS
 
-# Colors for output
-if [[ -t 1 ]] && [[ "$QUIET" != true ]]; then
-    COLOR_GREEN='\033[0;32m'
-    COLOR_YELLOW='\033[1;33m'
-    COLOR_RED='\033[0;31m'
-    COLOR_BLUE='\033[0;34m'
-    COLOR_RESET='\033[0m'
-else
-    COLOR_GREEN=''
-    COLOR_YELLOW=''
-    COLOR_RED=''
-    COLOR_BLUE=''
-    COLOR_RESET=''
-fi
+# Colors for output (initialized after argument parsing)
+COLOR_GREEN=''
+COLOR_YELLOW=''
+COLOR_RED=''
+COLOR_BLUE=''
+COLOR_RESET=''
+
+# Function to initialize colors based on terminal and quiet mode
+init_colors() {
+    if [[ -t 1 ]] && [[ "$QUIET" != true ]]; then
+        COLOR_GREEN='\033[0;32m'
+        COLOR_YELLOW='\033[1;33m'
+        COLOR_RED='\033[0;31m'
+        COLOR_BLUE='\033[0;34m'
+        COLOR_RESET='\033[0m'
+    fi
+}
 
 # ============================================================================
 # Helper Functions
@@ -168,7 +172,7 @@ OPTIONS
         --verbose               Enable detailed logging
         --quiet                 Suppress non-essential output
         --work-dir DIR          Custom work directory
-                                (default: ~/builds/desktop/sparrow/VERSION)
+                                (default: ~/sparrow-verify/VERSION)
 
     Build Control:
         --skip-build            Skip Docker build phase
@@ -241,7 +245,7 @@ FILES
         └── build.log                     # Build log (if --save-logs)
 
     Report Location:
-        ~/work/0-reports/desktop/sparrow/VERSION/
+        ~/sparrow-verify/reports/VERSION/
         └── YYYY-MM-DD.HHMM.sparrowdesktop_vVERSION.md
 
 REPRODUCIBILITY CRITERIA
@@ -264,18 +268,18 @@ KNOWN ACCEPTABLE DIFFERENCES
       Classes: BoundMethodHandle, LambdaForm, Invokers (infrastructure)
 
 VERSION
-    verify_sparrow.sh version v0.0.1
+    verify_sparrow.sh version v0.3.0
 
 AUTHOR
     WalletScrutiny Team
 
 REPORTING BUGS
-    https://github.com/walletscrutiny/walletScrutinyCom/issues
+    https://github.com/xrviv/bitcoinAppReproducibilityVerificationScripts/issues
 
 SEE ALSO
-    Build instructions: ~/work/ws-notes/build-notes/desktop/sparrow/
-    Previous verifications: ~/work/0-reports/desktop/sparrow/
+    Sparrow Wallet: https://github.com/sparrowwallet/sparrow
     WalletScrutiny: https://walletscrutiny.com
+    Script repository: https://github.com/xrviv/bitcoinAppReproducibilityVerificationScripts
 EOF
     exit 0
 }
@@ -484,6 +488,10 @@ setup_workspace() {
         missing_tools+=("diff")
     fi
 
+    if ! command -v bc &> /dev/null; then
+        missing_tools+=("bc")
+    fi
+
     if [[ ${#missing_tools[@]} -gt 0 ]]; then
         die "Missing required tools: ${missing_tools[*]}" $EXIT_INVALID_ARGS
     fi
@@ -507,44 +515,51 @@ build_docker() {
 
     # Generate Dockerfile
     log_verbose "Generating Dockerfile..."
-    cat > Dockerfile <<'DOCKERFILE_END'
-FROM ubuntu:22.04
+
+    # Convert JDK_VERSION format for URL (e.g., 22.0.2+9 -> jdk-22.0.2%2B9)
+    local jdk_url_version="${JDK_VERSION//+/%2B}"
+    local jdk_major_version="${JDK_VERSION%%.*}"
+    local jdk_download_url="https://github.com/adoptium/temurin${jdk_major_version}-binaries/releases/download/jdk-${jdk_url_version}/OpenJDK${jdk_major_version}U-jdk_x64_linux_hotspot_${JDK_VERSION//+/_}.tar.gz"
+    local jdk_dir="/opt/jdk-${JDK_VERSION}"
+
+    cat > Dockerfile <<DOCKERFILE_END
+FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install dependencies
-RUN apt-get update && apt-get install -y \
-    wget \
-    git \
+RUN apt-get update && apt-get install -y \\
+    wget \\
+    git \\
     && rm -rf /var/lib/apt/lists/*
 
 # Download and install Eclipse Temurin JDK
-RUN wget -q https://github.com/adoptium/temurin22-binaries/releases/download/jdk-22.0.2%2B9/OpenJDK22U-jdk_x64_linux_hotspot_22.0.2_9.tar.gz \
-    && tar -xzf OpenJDK22U-jdk_x64_linux_hotspot_22.0.2_9.tar.gz -C /opt \
-    && rm OpenJDK22U-jdk_x64_linux_hotspot_22.0.2_9.tar.gz
+RUN wget -q ${jdk_download_url} \\
+    && tar -xzf OpenJDK${jdk_major_version}U-jdk_x64_linux_hotspot_${JDK_VERSION//+/_}.tar.gz -C /opt \\
+    && rm OpenJDK${jdk_major_version}U-jdk_x64_linux_hotspot_${JDK_VERSION//+/_}.tar.gz
 
-ENV JAVA_HOME=/opt/jdk-22.0.2+9
-ENV PATH=$JAVA_HOME/bin:$PATH
+ENV JAVA_HOME=${jdk_dir}
+ENV PATH=\${JAVA_HOME}/bin:\${PATH}
 
 WORKDIR /build
 
-# Clone Sparrow repository
-RUN git clone https://github.com/sparrowwallet/sparrow.git
+# Clone Sparrow repository with submodules
+RUN git clone --recursive https://github.com/sparrowwallet/sparrow.git
 
 WORKDIR /build/sparrow
 
 # Checkout specific tag
 ARG SPARROW_VERSION
-RUN git checkout $SPARROW_VERSION
+RUN git checkout "\${SPARROW_VERSION}"
 
 # Build
 RUN ./gradlew jpackage
 
 # Copy output
-RUN mkdir -p /output && \
-    cp -r build/jpackage/Sparrow /output/ && \
-    find /output -type f -exec chmod 644 {} \; && \
-    find /output -type d -exec chmod 755 {} \;
+RUN mkdir -p /output && \\
+    cp -r build/jpackage/Sparrow /output/ && \\
+    find /output -type f -exec chmod 644 {} \\; && \\
+    find /output -type d -exec chmod 755 {} \\;
 
 CMD ["bash"]
 DOCKERFILE_END
@@ -558,9 +573,9 @@ DOCKERFILE_END
     fi
 
     log_info "Building Docker image (this may take several minutes)..."
-    log_verbose "Docker build command: docker build $cache_flag --build-arg SPARROW_VERSION=$GITHUB_TAG -t sparrow-$VERSION-builder ."
+    log_verbose "Docker build command: \"$DOCKER_CMD\" build $cache_flag --build-arg SPARROW_VERSION=$GITHUB_TAG -t sparrow-$VERSION-builder ."
 
-    if ! docker build $cache_flag --build-arg SPARROW_VERSION="$GITHUB_TAG" -t "sparrow-$VERSION-builder" . > "$WORK_DIR/docker-build.log" 2>&1; then
+    if ! "$DOCKER_CMD" build $cache_flag --build-arg SPARROW_VERSION="$GITHUB_TAG" -t "sparrow-$VERSION-builder" . > "$WORK_DIR/docker-build.log" 2>&1; then
         log_error "Docker build failed. Check logs: $WORK_DIR/docker-build.log"
         tail -20 "$WORK_DIR/docker-build.log"
         exit $EXIT_BUILD_FAILED
@@ -569,10 +584,10 @@ DOCKERFILE_END
     log_success "Docker image built successfully"
 
     # Check if container exists
-    if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+    if "$DOCKER_CMD" ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
         if [[ "$REBUILD" == true ]]; then
             log_info "Removing existing container: $CONTAINER_NAME"
-            docker rm -f "$CONTAINER_NAME" > /dev/null 2>&1
+            "$DOCKER_CMD" rm -f "$CONTAINER_NAME" > /dev/null 2>&1
         else
             log_info "Container $CONTAINER_NAME already exists, using existing build"
             log_verbose "Use --rebuild to force rebuild"
@@ -582,14 +597,14 @@ DOCKERFILE_END
 
     # Create container
     log_info "Creating container to extract build artifacts..."
-    if ! docker create --name "$CONTAINER_NAME" "sparrow-$VERSION-builder" > /dev/null 2>&1; then
+    if ! "$DOCKER_CMD" create --name "$CONTAINER_NAME" "sparrow-$VERSION-builder" > /dev/null 2>&1; then
         log_error "Failed to create container"
         exit $EXIT_BUILD_FAILED
     fi
 
     # Copy build output from container
     log_info "Extracting build artifacts from container..."
-    if ! docker cp "$CONTAINER_NAME:/output/Sparrow" "$WORK_DIR/build-output/" > /dev/null 2>&1; then
+    if ! "$DOCKER_CMD" cp "$CONTAINER_NAME:/output/Sparrow" "$WORK_DIR/build-output/" > /dev/null 2>&1; then
         log_error "Failed to copy build artifacts from container"
         exit $EXIT_BUILD_FAILED
     fi
@@ -603,9 +618,10 @@ DOCKERFILE_END
     # Cleanup container if not keeping
     if [[ "$KEEP_CONTAINER" != true ]]; then
         log_verbose "Removing container $CONTAINER_NAME"
-        docker rm "$CONTAINER_NAME" > /dev/null 2>&1
+        "$DOCKER_CMD" rm "$CONTAINER_NAME" > /dev/null 2>&1
     else
-        log_info "Container preserved: $CONTAINER_NAME (use --keep-container to preserve)"
+        log_info "Container preserved: $CONTAINER_NAME"
+        log_verbose "Remove with: \"$DOCKER_CMD\" rm $CONTAINER_NAME"
     fi
 }
 
@@ -805,6 +821,13 @@ analyze_file_counts() {
 analyze_legal_files() {
     log_info "[6/8] Analyzing legal files..."
 
+    # Skip if --ignore-legal specified
+    if [[ "$IGNORE_LEGAL" == true ]]; then
+        log_info "Skipping legal files analysis (--ignore-legal specified)"
+        LEGAL_FILES_ACCEPTABLE=true
+        return
+    fi
+
     local build_dir="$WORK_DIR/build-output/Sparrow"
     local official_dir="$WORK_DIR/official/Sparrow"
 
@@ -820,6 +843,14 @@ analyze_legal_files() {
     local missing_legal=$((official_legal - build_legal))
 
     if [[ $missing_legal -gt 0 ]]; then
+        if [[ "$STRICT" == true ]]; then
+            log_error "$missing_legal legal/documentation files missing in build"
+            log_error "Strict mode: failing on legal file differences"
+            VERDICT_EXIT_CODE=$EXIT_MANUAL_REVIEW_REQUIRED
+            LEGAL_FILES_ACCEPTABLE=false
+            return
+        fi
+
         log_warning "$missing_legal legal/documentation files missing in build"
 
         # Check if all missing files are legal files
@@ -829,12 +860,19 @@ analyze_legal_files() {
         if [[ $non_legal_missing -gt 0 ]]; then
             log_error "$non_legal_missing non-legal files are missing (investigation required)"
             VERDICT_EXIT_CODE=$EXIT_MANUAL_REVIEW_REQUIRED
+            LEGAL_FILES_ACCEPTABLE=false
         else
             log_success "All missing files are legal documentation (acceptable)"
             LEGAL_FILES_ACCEPTABLE=true
         fi
     elif [[ $missing_legal -lt 0 ]]; then
         log_warning "Build has $((-missing_legal)) more legal files than official"
+        if [[ "$STRICT" == true ]]; then
+            VERDICT_EXIT_CODE=$EXIT_MANUAL_REVIEW_REQUIRED
+            LEGAL_FILES_ACCEPTABLE=false
+        else
+            LEGAL_FILES_ACCEPTABLE=true
+        fi
     else
         log_success "Legal file counts match"
         LEGAL_FILES_ACCEPTABLE=true
@@ -878,6 +916,7 @@ inspect_modules_file() {
         log_success "Modules file is byte-for-byte identical"
         JVM_CLASSES_ACCEPTABLE=true
         APP_CODE_IDENTICAL=true
+        MODULES_INSPECTED=true
         return
     fi
 
@@ -889,6 +928,11 @@ inspect_modules_file() {
     if [[ "$SKIP_JIMAGE_EXTRACT" == true ]]; then
         log_warning "Skipping JIMAGE extraction (--skip-jimage-extract specified)"
         log_warning "Cannot verify application code identity without extraction"
+        log_warning "Marking for manual review"
+        MODULES_INSPECTED=false
+        APP_CODE_IDENTICAL=false
+        JVM_CLASSES_ACCEPTABLE=false
+        VERDICT_EXIT_CODE=$EXIT_MANUAL_REVIEW_REQUIRED
         return
     fi
 
@@ -896,6 +940,10 @@ inspect_modules_file() {
     if ! command -v jimage &> /dev/null; then
         log_error "jimage command not found (requires JDK installation)"
         log_error "Cannot perform deep modules inspection"
+        log_warning "Marking for manual review - install JDK to enable full verification"
+        MODULES_INSPECTED=false
+        APP_CODE_IDENTICAL=false
+        JVM_CLASSES_ACCEPTABLE=false
         VERDICT_EXIT_CODE=$EXIT_MANUAL_REVIEW_REQUIRED
         return
     fi
@@ -909,6 +957,9 @@ inspect_modules_file() {
     log_verbose "Extracting built modules..."
     if ! jimage extract --dir "$extract_dir/build" "$build_modules" > /dev/null 2>&1; then
         log_error "Failed to extract built modules file"
+        MODULES_INSPECTED=false
+        APP_CODE_IDENTICAL=false
+        JVM_CLASSES_ACCEPTABLE=false
         VERDICT_EXIT_CODE=$EXIT_MANUAL_REVIEW_REQUIRED
         return
     fi
@@ -916,6 +967,9 @@ inspect_modules_file() {
     log_verbose "Extracting official modules..."
     if ! jimage extract --dir "$extract_dir/official" "$official_modules" > /dev/null 2>&1; then
         log_error "Failed to extract official modules file"
+        MODULES_INSPECTED=false
+        APP_CODE_IDENTICAL=false
+        JVM_CLASSES_ACCEPTABLE=false
         VERDICT_EXIT_CODE=$EXIT_MANUAL_REVIEW_REQUIRED
         return
     fi
@@ -933,6 +987,7 @@ inspect_modules_file() {
 
     if [[ $total_diffs -eq 0 ]]; then
         log_success "Extracted modules contents are identical"
+        MODULES_INSPECTED=true
         JVM_CLASSES_ACCEPTABLE=true
         APP_CODE_IDENTICAL=true
         return
@@ -946,9 +1001,11 @@ inspect_modules_file() {
     if diff -qr "$extract_dir/build/com.sparrowwallet.sparrow" \
                "$extract_dir/official/com.sparrowwallet.sparrow" > /dev/null 2>&1; then
         log_success "✓ Sparrow application code is 100% IDENTICAL"
+        MODULES_INSPECTED=true
         APP_CODE_IDENTICAL=true
     else
         log_error "✗ Sparrow application code differs (CRITICAL)"
+        MODULES_INSPECTED=true
         APP_CODE_IDENTICAL=false
         VERDICT_EXIT_CODE=$EXIT_APP_CODE_DIFFERS
         exit $EXIT_APP_CODE_DIFFERS
@@ -964,18 +1021,107 @@ inspect_modules_file() {
     if [[ $jvm_diffs -eq $total_diffs ]]; then
         log_success "All differences are JVM-generated classes (acceptable)"
         log_info "Classes: LambdaForm, MethodHandle, BoundMethodHandle (invokedynamic infrastructure)"
+        MODULES_INSPECTED=true
         JVM_CLASSES_ACCEPTABLE=true
     elif [[ $jvm_diffs -gt 0 ]]; then
         log_warning "$jvm_diffs JVM infrastructure differences (acceptable)"
         local other_diffs=$((total_diffs - jvm_diffs))
         log_warning "$other_diffs other differences (requires review)"
+        MODULES_INSPECTED=true
         JVM_CLASSES_ACCEPTABLE=false
         VERDICT_EXIT_CODE=$EXIT_MANUAL_REVIEW_REQUIRED
     else
         log_error "Differences are not in expected JVM infrastructure"
+        MODULES_INSPECTED=true
         JVM_CLASSES_ACCEPTABLE=false
         VERDICT_EXIT_CODE=$EXIT_MANUAL_REVIEW_REQUIRED
     fi
+}
+
+# ============================================================================
+# Phase 8: Final Verdict Generation
+# ============================================================================
+
+generate_verdict() {
+    log_info "[8/8] Generating final verdict..."
+
+    echo ""
+    echo "======================================================"
+    echo "VERIFICATION RESULTS"
+    echo "======================================================"
+
+    # Summary of verification results
+    echo ""
+    echo "Critical Components:"
+    if [[ "$CRITICAL_BINARIES_MATCH" == true ]]; then
+        echo "  ✓ Critical binaries: IDENTICAL"
+    else
+        echo "  ✗ Critical binaries: DIFFER"
+    fi
+
+    if [[ "$APP_CODE_IDENTICAL" == true ]]; then
+        echo "  ✓ Application code: IDENTICAL"
+    else
+        echo "  ✗ Application code: DIFFER"
+    fi
+
+    echo ""
+    echo "Acceptable Differences:"
+    if [[ "$JVM_CLASSES_ACCEPTABLE" == true ]]; then
+        echo "  ✓ JVM infrastructure: Expected differences only"
+    else
+        echo "  ⚠ JVM infrastructure: Unexpected differences"
+    fi
+
+    if [[ "$LEGAL_FILES_ACCEPTABLE" == true ]]; then
+        echo "  ✓ Legal files: Acceptable (documentation only)"
+    else
+        echo "  ⚠ Legal files: Requires review"
+    fi
+
+    echo ""
+    echo "======================================================"
+
+    # Determine final verdict
+    if [[ "$CRITICAL_BINARIES_MATCH" == true ]] && [[ "$APP_CODE_IDENTICAL" == true ]]; then
+        echo "VERDICT: ✅ REPRODUCIBLE"
+        echo "======================================================"
+        echo ""
+        echo "The build is reproducible. All functional binaries and"
+        echo "application code are byte-for-byte identical. Differences"
+        echo "are limited to JVM infrastructure and documentation files."
+        VERDICT_EXIT_CODE=$EXIT_SUCCESS
+    elif [[ "$CRITICAL_BINARIES_MATCH" == false ]]; then
+        echo "VERDICT: ❌ NOT REPRODUCIBLE (Critical binaries differ)"
+        echo "======================================================"
+        VERDICT_EXIT_CODE=$EXIT_CRITICAL_BINARIES_DIFFER
+    elif [[ "$APP_CODE_IDENTICAL" == false ]]; then
+        echo "VERDICT: ❌ NOT REPRODUCIBLE (Application code differs)"
+        echo "======================================================"
+        VERDICT_EXIT_CODE=$EXIT_APP_CODE_DIFFERS
+    else
+        echo "VERDICT: ⚠️ MANUAL REVIEW REQUIRED"
+        echo "======================================================"
+        echo ""
+        echo "Verification complete but requires manual review of"
+        echo "unexpected differences found during analysis."
+        VERDICT_EXIT_CODE=$EXIT_MANUAL_REVIEW_REQUIRED
+    fi
+
+    echo ""
+    echo "Work directory: $WORK_DIR"
+    echo "Build artifacts: $WORK_DIR/build-output/Sparrow/"
+    echo "Official release: $WORK_DIR/official/Sparrow/"
+
+    if [[ -f "$WORK_DIR/modules-diff.txt" ]]; then
+        echo "Modules diff: $WORK_DIR/modules-diff.txt"
+    fi
+
+    if [[ -f "$WORK_DIR/file-list-diff.txt" ]]; then
+        echo "File list diff: $WORK_DIR/file-list-diff.txt"
+    fi
+
+    echo ""
 }
 
 # ============================================================================
@@ -985,6 +1131,9 @@ inspect_modules_file() {
 main() {
     # Parse command line arguments
     parse_arguments "$@"
+
+    # Initialize colors after parsing (depends on QUIET flag)
+    init_colors
 
     # Print header
     if [[ "$QUIET" != true ]]; then
@@ -997,8 +1146,23 @@ main() {
         echo ""
     fi
 
+    # Handle --deep-inspect-only mode
+    if [[ "$DEEP_INSPECT_ONLY" == true ]]; then
+        log_info "Deep inspect only mode - skipping to Phase 7"
+        inspect_modules_file
+        generate_verdict
+        exit $VERDICT_EXIT_CODE
+    fi
+
     # Phase 1: Setup
     setup_workspace
+
+    # Handle --verify-only mode
+    if [[ "$VERIFY_ONLY" == true ]]; then
+        SKIP_BUILD=true
+        SKIP_DOWNLOAD=true
+        log_info "Verify-only mode - skipping build and download"
+    fi
 
     # Phase 2: Docker Build
     build_docker
@@ -1015,10 +1179,13 @@ main() {
     # Phase 6: Legal Files Analysis
     analyze_legal_files
 
-    # More phases will be implemented next
-    log_info "Phases 7-8 coming next..."
+    # Phase 7: Modules File Inspection
+    inspect_modules_file
 
-    exit $EXIT_SUCCESS
+    # Phase 8: Final Verdict Generation
+    generate_verdict
+
+    exit $VERDICT_EXIT_CODE
 }
 
 # Run main function
