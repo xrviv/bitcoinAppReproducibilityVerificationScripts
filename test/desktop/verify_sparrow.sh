@@ -2,7 +2,7 @@
 #
 # verify_sparrow.sh - Sparrow Desktop Reproducible Build Verifier
 #
-# Version: v0.4.1
+# Version: v0.5.0
 #
 # Description:
 #   Automated reproducible build verification for Sparrow Desktop wallet.
@@ -23,10 +23,10 @@
 # Repository: https://github.com/xrviv/bitcoinAppReproducibilityVerificationScripts
 #
 
-set -x
+set -euo pipefail
 
 # Script version
-SCRIPT_VERSION="v0.4.1"
+SCRIPT_VERSION="v0.5.0"
 
 # Default values (can be overridden by environment variables)
 DEFAULT_WORK_DIR_BASE="${SPARROW_WORK_DIR:-$HOME/sparrow-verify}"
@@ -98,31 +98,8 @@ init_colors() {
 # Helper Functions
 # ============================================================================
 
-log_info() {
-    [[ "$QUIET" == true ]] && return
-    echo -e "${COLOR_BLUE}[INFO]${COLOR_RESET} $*"
-}
-
-log_success() {
-    [[ "$QUIET" == true ]] && return
-    echo -e "${COLOR_GREEN}[✓]${COLOR_RESET} $*"
-}
-
-log_warning() {
-    [[ "$QUIET" == true ]] && return
-    echo -e "${COLOR_YELLOW}[⚠]${COLOR_RESET} $*" >&2
-}
-
-log_error() {
-    echo -e "${COLOR_RED}[✗]${COLOR_RESET} $*" >&2
-}
-
-log_verbose() {
-    [[ "$VERBOSE" == true ]] && echo -e "    $*"
-}
-
 die() {
-    log_error "$1"
+    echo "ERROR: $1" >&2
     exit "${2:-1}"
 }
 
@@ -253,7 +230,7 @@ KNOWN ACCEPTABLE DIFFERENCES
       Classes: BoundMethodHandle, LambdaForm, Invokers (infrastructure)
 
 VERSION
-    verify_sparrow.sh version v0.4.1
+    verify_sparrow.sh version v0.5.0
 
 AUTHOR
     WalletScrutiny Team
@@ -483,64 +460,39 @@ parse_arguments() {
 # ============================================================================
 
 setup_workspace() {
-    log_info "[1/8] Setting up workspace..."
-
     # Create work directory structure
-    log_verbose "Creating directory structure in: $WORK_DIR"
-    mkdir -p "$WORK_DIR"
-    mkdir -p "$WORK_DIR/build-output"
-    mkdir -p "$WORK_DIR/official"
-    mkdir -p "$WORK_DIR/extracted-modules-comparison/build"
-    mkdir -p "$WORK_DIR/extracted-modules-comparison/official"
+    mkdir -p "$WORK_DIR" || die "Failed to create work directory: $WORK_DIR" $EXIT_INVALID_ARGS
+    mkdir -p "$WORK_DIR/build-output" || die "Failed to create build-output directory" $EXIT_INVALID_ARGS
+    mkdir -p "$WORK_DIR/official" || die "Failed to create official directory" $EXIT_INVALID_ARGS
+    mkdir -p "$WORK_DIR/extracted-modules-comparison/build" || die "Failed to create extraction directory" $EXIT_INVALID_ARGS
+    mkdir -p "$WORK_DIR/extracted-modules-comparison/official" || die "Failed to create extraction directory" $EXIT_INVALID_ARGS
 
     # Check required tools
-    log_verbose "Checking required tools..."
     local missing_tools=()
 
-    if ! command -v "$DOCKER_CMD" &> /dev/null; then
-        missing_tools+=("$DOCKER_CMD")
-    fi
+    command -v "$DOCKER_CMD" &> /dev/null || missing_tools+=("$DOCKER_CMD")
 
     if ! command -v wget &> /dev/null && ! command -v curl &> /dev/null; then
         missing_tools+=("wget or curl")
     fi
 
-    if ! command -v tar &> /dev/null; then
-        missing_tools+=("tar")
-    fi
-
-    if ! command -v sha256sum &> /dev/null; then
-        missing_tools+=("sha256sum")
-    fi
-
-    if ! command -v diff &> /dev/null; then
-        missing_tools+=("diff")
-    fi
-
-    if ! command -v bc &> /dev/null; then
-        missing_tools+=("bc")
-    fi
+    command -v tar &> /dev/null || missing_tools+=("tar")
+    command -v sha256sum &> /dev/null || missing_tools+=("sha256sum")
+    command -v diff &> /dev/null || missing_tools+=("diff")
+    command -v bc &> /dev/null || missing_tools+=("bc")
 
     if [[ ${#missing_tools[@]} -gt 0 ]]; then
         die "Missing required tools: ${missing_tools[*]}" $EXIT_INVALID_ARGS
     fi
-
-    log_success "Workspace setup complete"
 }
 
 build_docker() {
-    log_info "[2/8] Building Sparrow Desktop from source..."
-
     if [[ "$SKIP_BUILD" == true ]]; then
-        log_info "Skipping build (--skip-build specified)"
-        
         # Verify build output exists
         if [[ ! -d "$WORK_DIR/build-output/Sparrow" ]]; then
-            log_error "Build output not found at $WORK_DIR/build-output/Sparrow"
-            log_error "Cannot skip build - no existing build artifacts found"
-            exit $EXIT_BUILD_FAILED
+            die "Build output not found at $WORK_DIR/build-output/Sparrow" $EXIT_BUILD_FAILED
         fi
-        
+
         # Verify critical files exist in build output
         local missing_files=()
         for file in "bin/Sparrow" "lib/libapplauncher.so" "lib/runtime/lib/modules"; do
@@ -548,23 +500,19 @@ build_docker() {
                 missing_files+=("$file")
             fi
         done
-        
+
         if [[ ${#missing_files[@]} -gt 0 ]]; then
-            log_error "Build output incomplete - missing critical files:"
+            echo "ERROR: Build output incomplete - missing critical files:" >&2
             for file in "${missing_files[@]}"; do
-                log_error "  - $file"
+                echo "  - $file" >&2
             done
             exit $EXIT_BUILD_FAILED
         fi
-        
-        log_success "Build output verified"
+
         return
     fi
 
     cd "$WORK_DIR"
-
-    # Generate Dockerfile
-    log_verbose "Generating Dockerfile..."
 
     # Convert JDK_VERSION format for URL (e.g., 22.0.2+9 -> jdk-22.0.2%2B9)
     local jdk_url_version="${JDK_VERSION//+/%2B}"
@@ -580,7 +528,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Install dependencies
 RUN apt-get update && apt-get install -y \\
     wget \\
+    rpm \\
+    fakeroot \\
+    binutils \\
     git \\
+    unzip \\
     && rm -rf /var/lib/apt/lists/*
 
 # Download and install Eclipse Temurin JDK
@@ -614,76 +566,51 @@ RUN mkdir -p /output && \\
 CMD ["bash"]
 DOCKERFILE_END
 
-    log_success "Dockerfile generated"
-
     # Build Docker image
     local cache_flag=""
     if [[ "$NO_CACHE" == true ]]; then
         cache_flag="--no-cache"
     fi
 
-    log_info "Building Docker image (this may take several minutes)..."
-    log_verbose "Docker build command: \"$DOCKER_CMD\" build $cache_flag --build-arg SPARROW_VERSION=$GITHUB_TAG -t sparrow-$VERSION-builder ."
-
     # Always capture output to temp file for error reporting, optionally save permanently
     local temp_log="$WORK_DIR/docker-build.log"
-    
+
     if ! "$DOCKER_CMD" build $cache_flag --build-arg SPARROW_VERSION="$GITHUB_TAG" -t "sparrow-$VERSION-builder" . 2>&1 | tee "$temp_log"; then
-        log_error "Docker build failed. Last 50 lines of output:"
-        echo "------------------------------------------------------"
-        tail -50 "$temp_log"
-        echo "------------------------------------------------------"
-        log_error "Full log saved to: $temp_log"
+        echo "ERROR: Docker build failed. Last 50 lines of output:" >&2
+        echo "------------------------------------------------------" >&2
+        tail -50 "$temp_log" >&2
+        echo "------------------------------------------------------" >&2
+        echo "ERROR: Full log saved to: $temp_log" >&2
         exit $EXIT_BUILD_FAILED
     fi
-    
+
     # Remove log file if not saving logs
     if [[ "$SAVE_LOGS" != true ]]; then
-        log_verbose "Removing build log (use --save-logs to keep it)"
         rm -f "$temp_log"
     fi
-
-    log_success "Docker image built successfully"
 
     # Check if container exists
     if "$DOCKER_CMD" ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
         if [[ "$REBUILD" == true ]]; then
-            log_info "Removing existing container: $CONTAINER_NAME"
             "$DOCKER_CMD" rm -f "$CONTAINER_NAME" > /dev/null 2>&1
         else
-            log_info "Container $CONTAINER_NAME already exists, using existing build"
-            log_verbose "Use --rebuild to force rebuild"
             return
         fi
     fi
 
     # Create container
-    log_info "Creating container to extract build artifacts..."
     if ! "$DOCKER_CMD" create --name "$CONTAINER_NAME" "sparrow-$VERSION-builder" > /dev/null 2>&1; then
-        log_error "Failed to create container"
-        exit $EXIT_BUILD_FAILED
+        die "Failed to create container" $EXIT_BUILD_FAILED
     fi
 
     # Copy build output from container
-    log_info "Extracting build artifacts from container..."
     if ! "$DOCKER_CMD" cp "$CONTAINER_NAME:/output/Sparrow" "$WORK_DIR/build-output/" > /dev/null 2>&1; then
-        log_error "Failed to copy build artifacts from container"
-        exit $EXIT_BUILD_FAILED
+        die "Failed to copy build artifacts from container" $EXIT_BUILD_FAILED
     fi
-
-    log_success "Build artifacts extracted to: $WORK_DIR/build-output/Sparrow"
-
-    # Show build summary
-    local file_count=$(find "$WORK_DIR/build-output/Sparrow" -type f | wc -l)
-    log_info "Built artifact contains $file_count files"
 
     # Cleanup container if not keeping
     if [[ "$KEEP_CONTAINER" != true ]]; then
-        log_verbose "Removing container $CONTAINER_NAME"
         "$DOCKER_CMD" rm "$CONTAINER_NAME" > /dev/null 2>&1
-    else
-        log_info "Container preserved: $CONTAINER_NAME"
-        log_verbose "Remove with: \"$DOCKER_CMD\" rm $CONTAINER_NAME"
     fi
 }
 
@@ -692,24 +619,20 @@ DOCKERFILE_END
 # ============================================================================
 
 download_official() {
-    log_info "[3/8] Downloading official release..."
-
     if [[ "$SKIP_DOWNLOAD" == true ]]; then
-        log_info "Skipping download (--skip-download specified)"
-        
         # Check if either tarball or extracted directory exists
         if [[ ! -f "$WORK_DIR/sparrowwallet-$VERSION-x86_64.tar.gz" ]] && [[ ! -d "$WORK_DIR/official/Sparrow" ]]; then
-            log_error "Official release not found"
-            log_error "Neither tarball nor extracted directory exists:"
-            log_error "  Tarball: $WORK_DIR/sparrowwallet-$VERSION-x86_64.tar.gz"
-            log_error "  Directory: $WORK_DIR/official/Sparrow"
+            echo "ERROR: Official release not found" >&2
+            echo "ERROR: Neither tarball nor extracted directory exists:" >&2
+            echo "  Tarball: $WORK_DIR/sparrowwallet-$VERSION-x86_64.tar.gz" >&2
+            echo "  Directory: $WORK_DIR/official/Sparrow" >&2
             exit $EXIT_DOWNLOAD_FAILED
         fi
-        
+
         # If only tarball exists, we need to extract it
         if [[ -f "$WORK_DIR/sparrowwallet-$VERSION-x86_64.tar.gz" ]] && [[ ! -d "$WORK_DIR/official/Sparrow" ]]; then
-            log_info "Tarball found but not extracted, extracting now..."
             # Continue to extraction logic below
+            :
         else
             # Verify critical files exist in official release
             local missing_files=()
@@ -718,79 +641,60 @@ download_official() {
                     missing_files+=("$file")
                 fi
             done
-            
+
             if [[ ${#missing_files[@]} -gt 0 ]]; then
-                log_error "Official release incomplete - missing critical files:"
+                echo "ERROR: Official release incomplete - missing critical files:" >&2
                 for file in "${missing_files[@]}"; do
-                    log_error "  - $file"
+                    echo "  - $file" >&2
                 done
                 exit $EXIT_DOWNLOAD_FAILED
             fi
-            
-            log_success "Official release verified"
+
             return
         fi
     fi
 
     cd "$WORK_DIR"
 
-    # Check if tarball already exists
-    if [[ -f "sparrowwallet-$VERSION-x86_64.tar.gz" ]]; then
-        log_info "Tarball already exists, skipping download"
-    else
-        log_verbose "Downloading from: $OFFICIAL_URL"
-
+    # Download if tarball doesn't exist
+    if [[ ! -f "sparrowwallet-$VERSION-x86_64.tar.gz" ]]; then
         # Download with wget or curl
         if command -v wget &> /dev/null; then
             if ! wget -q --show-progress "$OFFICIAL_URL" -O "sparrowwallet-$VERSION-x86_64.tar.gz" 2>&1; then
-                log_error "Download failed from $OFFICIAL_URL"
-                log_error "Verify version exists at: https://github.com/sparrowwallet/sparrow/releases"
+                echo "ERROR: Download failed from $OFFICIAL_URL" >&2
+                echo "ERROR: Verify version exists at: https://github.com/sparrowwallet/sparrow/releases" >&2
                 exit $EXIT_DOWNLOAD_FAILED
             fi
         elif command -v curl &> /dev/null; then
             if ! curl -L -o "sparrowwallet-$VERSION-x86_64.tar.gz" "$OFFICIAL_URL" 2>&1; then
-                log_error "Download failed from $OFFICIAL_URL"
-                log_error "Verify version exists at: https://github.com/sparrowwallet/sparrow/releases"
+                echo "ERROR: Download failed from $OFFICIAL_URL" >&2
+                echo "ERROR: Verify version exists at: https://github.com/sparrowwallet/sparrow/releases" >&2
                 exit $EXIT_DOWNLOAD_FAILED
             fi
         else
             die "Neither wget nor curl available" $EXIT_DOWNLOAD_FAILED
         fi
-
-        log_success "Download complete"
     fi
 
     # Calculate SHA256 of tarball
-    log_verbose "Calculating SHA256 of tarball..."
     local tarball_hash
     tarball_hash=$(sha256sum "sparrowwallet-$VERSION-x86_64.tar.gz" | cut -d' ' -f1)
-    log_info "Tarball SHA256: $tarball_hash"
+    echo "$tarball_hash  sparrowwallet-$VERSION-x86_64.tar.gz"
 
     # Extract tarball
-    if [[ -d "official/Sparrow" ]]; then
-        log_info "Official release already extracted, skipping extraction"
-    else
-        log_info "Extracting tarball..."
+    if [[ ! -d "official/Sparrow" ]]; then
         mkdir -p official
 
         if ! tar -xzf "sparrowwallet-$VERSION-x86_64.tar.gz" -C official/ 2>&1; then
-            log_error "Failed to extract tarball"
-            log_error "Tarball may be corrupted"
+            echo "ERROR: Failed to extract tarball" >&2
+            echo "ERROR: Tarball may be corrupted" >&2
             exit $EXIT_DOWNLOAD_FAILED
         fi
 
         if [[ ! -d "official/Sparrow" ]]; then
-            log_error "Expected directory 'Sparrow' not found in tarball"
-            exit $EXIT_DOWNLOAD_FAILED
+            die "Expected directory 'Sparrow' not found in tarball" $EXIT_DOWNLOAD_FAILED
         fi
-
-        log_success "Extraction complete"
     fi
-
-    # Show file count
-    local official_count
-    official_count=$(find official/Sparrow -type f | wc -l)
-    log_info "Official artifact contains $official_count files"
 }
 
 # ============================================================================
@@ -798,22 +702,20 @@ download_official() {
 # ============================================================================
 
 verify_critical_binaries() {
-    log_info "[4/8] Verifying critical binaries..."
-
     local build_dir="$WORK_DIR/build-output/Sparrow"
     local official_dir="$WORK_DIR/official/Sparrow"
-    
+
     # Verify directories exist
     if [[ ! -d "$build_dir" ]]; then
-        log_error "Build directory not found: $build_dir"
+        echo "ERROR: Build directory not found: $build_dir"
         exit $EXIT_BUILD_FAILED
     fi
-    
+
     if [[ ! -d "$official_dir" ]]; then
-        log_error "Official directory not found: $official_dir"
+        echo "ERROR: Official directory not found: $official_dir"
         exit $EXIT_DOWNLOAD_FAILED
     fi
-    
+
     local all_match=true
 
     # Critical files to verify
@@ -825,43 +727,37 @@ verify_critical_binaries() {
     )
 
     for file in "${critical_files[@]}"; do
-        log_verbose "Comparing: $file"
-
         # Check if files exist
         if [[ ! -f "$build_dir/$file" ]]; then
-            log_error "Built file missing: $file"
+            echo "ERROR: Built file missing: $file"
             exit $EXIT_BUILD_FAILED
         fi
 
         if [[ ! -f "$official_dir/$file" ]]; then
-            log_error "Official file missing: $file"
+            echo "ERROR: Official file missing: $file"
             exit $EXIT_DOWNLOAD_FAILED
         fi
 
-        # Calculate hashes
+        # Calculate and compare hashes
         local build_hash
         local official_hash
         build_hash=$(sha256sum "$build_dir/$file" | cut -d' ' -f1)
         official_hash=$(sha256sum "$official_dir/$file" | cut -d' ' -f1)
 
-        # Compare
         if [[ "$build_hash" == "$official_hash" ]]; then
-            log_success "✓ $file: MATCH"
-            log_verbose "  SHA256: $build_hash"
+            echo "$build_hash  $file"
         else
-            log_error "✗ $file: MISMATCH"
-            log_error "  Built:    $build_hash"
-            log_error "  Official: $official_hash"
+            echo "ERROR: $file: MISMATCH" >&2
+            echo "ERROR:   Built:    $build_hash" >&2
+            echo "ERROR:   Official: $official_hash" >&2
             all_match=false
         fi
     done
 
     if [[ "$all_match" == true ]]; then
         CRITICAL_BINARIES_MATCH=true
-        log_success "All critical binaries identical (4/4 match)"
     else
         CRITICAL_BINARIES_MATCH=false
-        log_error "Critical binaries differ - build is NOT reproducible"
         VERDICT_EXIT_CODE=$EXIT_CRITICAL_BINARIES_DIFFER
         exit $EXIT_CRITICAL_BINARIES_DIFFER
     fi
@@ -872,60 +768,24 @@ verify_critical_binaries() {
 # ============================================================================
 
 analyze_file_counts() {
-    log_info "[5/8] Analyzing file differences..."
-
     local build_dir="$WORK_DIR/build-output/Sparrow"
     local official_dir="$WORK_DIR/official/Sparrow"
-    
+
     # Verify directories exist
     if [[ ! -d "$build_dir" ]]; then
-        log_error "Build directory not found: $build_dir"
+        echo "ERROR: Build directory not found: $build_dir"
         exit $EXIT_BUILD_FAILED
     fi
-    
+
     if [[ ! -d "$official_dir" ]]; then
-        log_error "Official directory not found: $official_dir"
+        echo "ERROR: Official directory not found: $official_dir"
         exit $EXIT_DOWNLOAD_FAILED
     fi
 
-    # Count files
-    local build_count
-    local official_count
-    build_count=$(find "$build_dir" -type f | wc -l)
-    official_count=$(find "$official_dir" -type f | wc -l)
-
-    log_info "Built artifact: $build_count files"
-    log_info "Official release: $official_count files"
-
-    local diff_count=$((official_count - build_count))
-
-    if [[ $diff_count -gt 0 ]]; then
-        log_warning "Official has $diff_count more files than build"
-    elif [[ $diff_count -lt 0 ]]; then
-        log_warning "Build has $((-diff_count)) more files than official"
-    else
-        log_success "File counts match exactly"
-    fi
-
-    # Generate file list diff
-    log_verbose "Generating file list comparison..."
+    # Count and generate diff
     diff <(cd "$build_dir" && find . -type f | sort) \
          <(cd "$official_dir" && find . -type f | sort) \
          > "$WORK_DIR/file-list-diff.txt" 2>&1 || true
-
-    # Analyze missing/extra files
-    local files_only_official
-    local files_only_build
-    files_only_official=$(grep -c "^>" "$WORK_DIR/file-list-diff.txt" 2>/dev/null || echo 0)
-    files_only_build=$(grep -c "^<" "$WORK_DIR/file-list-diff.txt" 2>/dev/null || echo 0)
-
-    if [[ $files_only_official -gt 0 ]]; then
-        log_verbose "$files_only_official files only in official release"
-    fi
-
-    if [[ $files_only_build -gt 0 ]]; then
-        log_warning "$files_only_build files only in build output"
-    fi
 }
 
 # ============================================================================
@@ -933,11 +793,8 @@ analyze_file_counts() {
 # ============================================================================
 
 analyze_legal_files() {
-    log_info "[6/8] Analyzing legal files..."
-
     # Skip if --ignore-legal specified
     if [[ "$IGNORE_LEGAL" == true ]]; then
-        log_info "Skipping legal files analysis (--ignore-legal specified)"
         LEGAL_FILES_ACCEPTABLE=true
         return
     fi
@@ -948,39 +805,32 @@ analyze_legal_files() {
     # Count legal files
     local build_legal
     local official_legal
-    build_legal=$(find "$build_dir/lib/runtime/legal/" -type f 2>/dev/null | wc -l || echo 0)
-    official_legal=$(find "$official_dir/lib/runtime/legal/" -type f 2>/dev/null | wc -l || echo 0)
-
-    log_verbose "Legal files in build: $build_legal"
-    log_verbose "Legal files in official: $official_legal"
+    build_legal=$(find "$build_dir/lib/runtime/legal/" -type f 2>/dev/null | wc -l | tr -d ' ' || echo 0)
+    official_legal=$(find "$official_dir/lib/runtime/legal/" -type f 2>/dev/null | wc -l | tr -d ' ' || echo 0)
 
     local missing_legal=$((official_legal - build_legal))
 
     if [[ $missing_legal -gt 0 ]]; then
         if [[ "$STRICT" == true ]]; then
-            log_error "$missing_legal legal/documentation files missing in build"
-            log_error "Strict mode: failing on legal file differences"
+            echo "ERROR: $missing_legal legal/documentation files missing in build" >&2
+            echo "ERROR: Strict mode: failing on legal file differences" >&2
             VERDICT_EXIT_CODE=$EXIT_MANUAL_REVIEW_REQUIRED
             LEGAL_FILES_ACCEPTABLE=false
             return
         fi
 
-        log_warning "$missing_legal legal/documentation files missing in build"
-
         # Check if all missing files are legal files
         local non_legal_missing
-        non_legal_missing=$(grep "^>" "$WORK_DIR/file-list-diff.txt" 2>/dev/null | grep -v "lib/runtime/legal" | wc -l || echo 0)
+        non_legal_missing=$(grep "^>" "$WORK_DIR/file-list-diff.txt" 2>/dev/null | grep -v "lib/runtime/legal" | wc -l | tr -d ' ' || echo 0)
 
         if [[ $non_legal_missing -gt 0 ]]; then
-            log_error "$non_legal_missing non-legal files are missing (investigation required)"
+            echo "ERROR: $non_legal_missing non-legal files are missing (investigation required)" >&2
             VERDICT_EXIT_CODE=$EXIT_MANUAL_REVIEW_REQUIRED
             LEGAL_FILES_ACCEPTABLE=false
         else
-            log_success "All missing files are legal documentation (acceptable)"
             LEGAL_FILES_ACCEPTABLE=true
         fi
     elif [[ $missing_legal -lt 0 ]]; then
-        log_warning "Build has $((-missing_legal)) more legal files than official"
         if [[ "$STRICT" == true ]]; then
             VERDICT_EXIT_CODE=$EXIT_MANUAL_REVIEW_REQUIRED
             LEGAL_FILES_ACCEPTABLE=false
@@ -988,7 +838,6 @@ analyze_legal_files() {
             LEGAL_FILES_ACCEPTABLE=true
         fi
     else
-        log_success "Legal file counts match"
         LEGAL_FILES_ACCEPTABLE=true
     fi
 }
@@ -998,49 +847,32 @@ analyze_legal_files() {
 # ============================================================================
 
 inspect_modules_file() {
-    log_info "[7/8] Inspecting modules file..."
-
     local build_dir="$WORK_DIR/build-output/Sparrow"
     local official_dir="$WORK_DIR/official/Sparrow"
     local build_modules="$build_dir/lib/runtime/lib/modules"
     local official_modules="$official_dir/lib/runtime/lib/modules"
-    
+
     # Verify directories exist
     if [[ ! -d "$build_dir" ]]; then
-        log_error "Build directory not found: $build_dir"
+        echo "ERROR: Build directory not found: $build_dir" >&2
         exit $EXIT_BUILD_FAILED
     fi
-    
+
     if [[ ! -d "$official_dir" ]]; then
-        log_error "Official directory not found: $official_dir"
+        echo "ERROR: Official directory not found: $official_dir" >&2
         exit $EXIT_DOWNLOAD_FAILED
     fi
-    
+
     # Verify modules files exist
     if [[ ! -f "$build_modules" ]]; then
-        log_error "Build modules file not found: $build_modules"
+        echo "ERROR: Build modules file not found: $build_modules" >&2
         exit $EXIT_BUILD_FAILED
     fi
-    
+
     if [[ ! -f "$official_modules" ]]; then
-        log_error "Official modules file not found: $official_modules"
+        echo "ERROR: Official modules file not found: $official_modules" >&2
         exit $EXIT_DOWNLOAD_FAILED
     fi
-
-    # Compare file sizes
-    local build_size
-    local official_size
-    build_size=$(stat -c%s "$build_modules" 2>/dev/null || stat -f%z "$build_modules" 2>/dev/null)
-    official_size=$(stat -c%s "$official_modules" 2>/dev/null || stat -f%z "$official_modules" 2>/dev/null)
-
-    local size_diff=$((official_size - build_size))
-    local percent_diff
-    percent_diff=$(echo "scale=6; ($size_diff * 100.0) / $official_size" | bc 2>/dev/null || echo "0")
-
-    log_info "Modules file size:"
-    log_info "  Built:    $build_size bytes"
-    log_info "  Official: $official_size bytes"
-    log_info "  Diff:     $size_diff bytes ($percent_diff%)"
 
     # Compare hashes
     local build_hash
@@ -1049,22 +881,15 @@ inspect_modules_file() {
     official_hash=$(sha256sum "$official_modules" | cut -d' ' -f1)
 
     if [[ "$build_hash" == "$official_hash" ]]; then
-        log_success "Modules file is byte-for-byte identical"
         JVM_CLASSES_ACCEPTABLE=true
         APP_CODE_IDENTICAL=true
         MODULES_INSPECTED=true
         return
     fi
 
-    log_warning "Modules file hashes differ (expected - may be compression variance)"
-    log_verbose "  Built:    $build_hash"
-    log_verbose "  Official: $official_hash"
-
     # Skip JIMAGE extraction if requested
     if [[ "$SKIP_JIMAGE_EXTRACT" == true ]]; then
-        log_warning "Skipping JIMAGE extraction (--skip-jimage-extract specified)"
-        log_warning "Cannot verify application code identity without extraction"
-        log_warning "Marking for manual review"
+        echo "ERROR: Skipping JIMAGE extraction - cannot verify application code" >&2
         MODULES_INSPECTED=false
         APP_CODE_IDENTICAL=false
         JVM_CLASSES_ACCEPTABLE=false
@@ -1074,9 +899,7 @@ inspect_modules_file() {
 
     # Check if jimage command exists
     if ! command -v jimage &> /dev/null; then
-        log_error "jimage command not found (requires JDK installation)"
-        log_error "Cannot perform deep modules inspection"
-        log_warning "Marking for manual review - install JDK to enable full verification"
+        echo "ERROR: jimage command not found (requires JDK installation)" >&2
         MODULES_INSPECTED=false
         APP_CODE_IDENTICAL=false
         JVM_CLASSES_ACCEPTABLE=false
@@ -1085,14 +908,12 @@ inspect_modules_file() {
     fi
 
     # Extract modules contents
-    log_info "Extracting modules contents (this may take a minute)..."
     local extract_dir="$WORK_DIR/extracted-modules-comparison"
 
     mkdir -p "$extract_dir/build" "$extract_dir/official"
 
-    log_verbose "Extracting built modules..."
     if ! jimage extract --dir "$extract_dir/build" "$build_modules" > /dev/null 2>&1; then
-        log_error "Failed to extract built modules file"
+        echo "ERROR: Failed to extract built modules file" >&2
         MODULES_INSPECTED=false
         APP_CODE_IDENTICAL=false
         JVM_CLASSES_ACCEPTABLE=false
@@ -1100,47 +921,36 @@ inspect_modules_file() {
         return
     fi
 
-    log_verbose "Extracting official modules..."
     if ! jimage extract --dir "$extract_dir/official" "$official_modules" > /dev/null 2>&1; then
-        log_error "Failed to extract official modules file"
+        echo "ERROR: Failed to extract official modules file" >&2
         MODULES_INSPECTED=false
         APP_CODE_IDENTICAL=false
         JVM_CLASSES_ACCEPTABLE=false
         VERDICT_EXIT_CODE=$EXIT_MANUAL_REVIEW_REQUIRED
         return
     fi
-
-    log_success "Modules extracted successfully"
 
     # Compare extracted contents
-    log_info "Comparing extracted modules contents..."
-
     diff -qr "$extract_dir/build" "$extract_dir/official" > "$WORK_DIR/modules-diff.txt" 2>&1 || true
 
     # Count total differences
     local total_diffs
-    total_diffs=$(grep -c "^Files" "$WORK_DIR/modules-diff.txt" 2>/dev/null || echo 0)
+    total_diffs=$(grep -c "^Files" "$WORK_DIR/modules-diff.txt" 2>/dev/null | tr -d ' ' || echo 0)
 
     if [[ $total_diffs -eq 0 ]]; then
-        log_success "Extracted modules contents are identical"
         MODULES_INSPECTED=true
         JVM_CLASSES_ACCEPTABLE=true
         APP_CODE_IDENTICAL=true
         return
     fi
 
-    log_info "Found $total_diffs differing files in modules"
-
     # Check Sparrow application code
-    log_info "Verifying Sparrow application code..."
-
     if diff -qr "$extract_dir/build/com.sparrowwallet.sparrow" \
                "$extract_dir/official/com.sparrowwallet.sparrow" > /dev/null 2>&1; then
-        log_success "✓ Sparrow application code is 100% IDENTICAL"
         MODULES_INSPECTED=true
         APP_CODE_IDENTICAL=true
     else
-        log_error "✗ Sparrow application code differs (CRITICAL)"
+        echo "ERROR: Sparrow application code differs (CRITICAL)" >&2
         MODULES_INSPECTED=true
         APP_CODE_IDENTICAL=false
         VERDICT_EXIT_CODE=$EXIT_APP_CODE_DIFFERS
@@ -1149,25 +959,17 @@ inspect_modules_file() {
 
     # Check if differences are only in JVM infrastructure
     local jvm_diffs
-    jvm_diffs=$(grep "java.base/java/lang/invoke" "$WORK_DIR/modules-diff.txt" 2>/dev/null | wc -l || echo 0)
-
-    log_verbose "Differences in JVM infrastructure: $jvm_diffs"
-    log_verbose "Total differences: $total_diffs"
+    jvm_diffs=$(grep "java.base/java/lang/invoke" "$WORK_DIR/modules-diff.txt" 2>/dev/null | wc -l | tr -d ' ' || echo 0)
 
     if [[ $jvm_diffs -eq $total_diffs ]]; then
-        log_success "All differences are JVM-generated classes (acceptable)"
-        log_info "Classes: LambdaForm, MethodHandle, BoundMethodHandle (invokedynamic infrastructure)"
         MODULES_INSPECTED=true
         JVM_CLASSES_ACCEPTABLE=true
     elif [[ $jvm_diffs -gt 0 ]]; then
-        log_warning "$jvm_diffs JVM infrastructure differences (acceptable)"
-        local other_diffs=$((total_diffs - jvm_diffs))
-        log_warning "$other_diffs other differences (requires review)"
         MODULES_INSPECTED=true
         JVM_CLASSES_ACCEPTABLE=false
         VERDICT_EXIT_CODE=$EXIT_MANUAL_REVIEW_REQUIRED
     else
-        log_error "Differences are not in expected JVM infrastructure"
+        echo "ERROR: Differences are not in expected JVM infrastructure" >&2
         MODULES_INSPECTED=true
         JVM_CLASSES_ACCEPTABLE=false
         VERDICT_EXIT_CODE=$EXIT_MANUAL_REVIEW_REQUIRED
@@ -1179,8 +981,6 @@ inspect_modules_file() {
 # ============================================================================
 
 generate_verdict() {
-    log_info "[8/8] Generating final verdict..."
-
     echo ""
     echo "======================================================"
     echo "VERIFICATION RESULTS"
@@ -1271,20 +1071,8 @@ main() {
     # Initialize colors after parsing (depends on QUIET flag)
     init_colors
 
-    # Print header
-    if [[ "$QUIET" != true ]]; then
-        echo "======================================================"
-        echo "Sparrow Desktop Reproducible Build Verification"
-        echo "======================================================"
-        echo "Version: $VERSION"
-        echo "Platform: $(uname -s) $(uname -m)"
-        echo "Date: $(date -u '+%Y-%m-%d %H:%M UTC')"
-        echo ""
-    fi
-
     # Handle --deep-inspect-only mode
     if [[ "$DEEP_INSPECT_ONLY" == true ]]; then
-        log_info "Deep inspect only mode - skipping to Phase 7"
         inspect_modules_file
         generate_verdict
         exit $VERDICT_EXIT_CODE
@@ -1297,7 +1085,6 @@ main() {
     if [[ "$VERIFY_ONLY" == true ]]; then
         SKIP_BUILD=true
         SKIP_DOWNLOAD=true
-        log_info "Verify-only mode - skipping build and download"
     fi
 
     # Phase 2: Docker Build
