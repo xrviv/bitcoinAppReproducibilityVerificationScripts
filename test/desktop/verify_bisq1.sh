@@ -2,10 +2,11 @@
 
 # Bisq Reproducible Build Verification Tool
 #
-# Version: 3.4.0
+# Version: 3.4.1
 # Last Updated: 2025-10-10
 #
 # Changelog:
+# v3.4.1 - Force Java 17 for generateInstallers, add --rerun-tasks flag (2025-10-10)
 # v3.4.0 - Removed docker system prune, infinite loops; script now exits cleanly (2025-10-10)
 # v3.3.0 - Added Java 17 for jpackage support, improved fallback logic (2025-10-10)
 # v3.2.0 - Accept version with or without 'v' prefix (1.9.21 or v1.9.21) (2025-10-10)
@@ -21,7 +22,7 @@
 set -euo pipefail # Enhanced error handling
 # set -x     # Debug mode - show all commands as they execute
 
-VERSION="3.4.0"
+VERSION="3.4.1"
 
 # Cleanup function for interruptions
 cleanup_on_exit() {
@@ -315,14 +316,24 @@ if [[ "$MODE" == "build" ]]; then
   echo "Building (20+ min)..."
   cd bisq
   ./gradlew clean build -x test
-  
+
   echo "Creating package..."
-  ./gradlew desktop:generateInstallers
+  echo "Forcing Java 17 for jpackage task..."
+  # Use Java 17 for packaging since jpackage requires Java 16+
+  export JAVA_HOME=$JAVA_17_HOME
+  export PATH=$JAVA_17_HOME/bin:$PATH
+
+  # Run with --rerun-tasks to avoid stale cache
+  ./gradlew desktop:generateInstallers --rerun-tasks
   echo "Build complete"
-  
+
   echo ""
   echo "Checking build output..."
-  find desktop/build -name "*.deb" -o -name "*.rpm" -o -name "*.dmg" -o -name "*.exe" -o -name "*bisq*" | head -10
+  echo "Looking for desktop.jar..."
+  find desktop/build -name "desktop.jar" -type f
+  echo ""
+  echo "Looking for package files..."
+  { find desktop/build -name "*.deb" -o -name "*.rpm" -o -name "*.dmg" -o -name "*.exe" -o -name "*bisq*" | head -10; } || true
   
   LOCAL_DEB=$(find desktop/build/packaging/jpackage/packages -name "bisq_*-1_amd64.deb" | head -1)
   if [[ -n "$LOCAL_DEB" ]]; then
@@ -333,7 +344,7 @@ if [[ "$MODE" == "build" ]]; then
   if [[ -z "$LOCAL_DEB" ]]; then
    echo "Gradle task did not create .deb file, trying manual jpackage..."
    echo "Available build artifacts:"
-   find desktop/build -type f | grep -E "\.(deb|rpm|jar)$" | head -10
+   { find desktop/build -type f | grep -E "\.(deb|rpm|jar)$" | head -10; } || true
 
    # Try multiple jpackage locations in order of preference
    JPACKAGE_PATH=""
