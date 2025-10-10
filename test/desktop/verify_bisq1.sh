@@ -2,10 +2,12 @@
 
 # Bisq Reproducible Build Verification Tool
 #
-# Version: 3.0.1
+# Version: 3.2.0
 # Last Updated: 2025-10-10
 #
 # Changelog:
+# v3.2.0 - Accept version with or without 'v' prefix (1.9.21 or v1.9.21) (2025-10-10)
+# v3.1.0 - Changed default mode to 'build' for correct workflow (2025-10-10)
 # v3.0.1 - Removed emojis and verbose output for cleaner terminal display (2025-10-10)
 # v3.0.0 - Added --build-path parameter for portable path configuration (2025-10-10)
 # v2.0.1 - Renamed from verify_bisqdesktop.sh to verify_bisq1.sh (2025-10-10)
@@ -15,9 +17,9 @@
 # v1.1 - Added RPM support (2025-08-27)
 
 set -euo pipefail # Enhanced error handling
-set -x     # Debug mode - show all commands as they execute
+# set -x     # Debug mode - show all commands as they execute
 
-VERSION="3.0.1"
+VERSION="3.2.0"
 
 # Cleanup function for interruptions
 cleanup_on_exit() {
@@ -48,7 +50,7 @@ NC='\033[0m' # No Color
 BUILD_PATH=""
 DEFAULT_BUILD_PATH="$HOME/builds/desktop/bisq1-build"
 BISQ_VERSION=""
-MODE=${MODE:-verify} # 'build', 'verify', or 'shell'
+MODE=${MODE:-build} # 'build' or 'verify' - default is build then verify
 
 show_help() {
   cat << EOF
@@ -63,28 +65,28 @@ OPTIONS:
   -h, --help    Show this help message
 
 MODES:
-  verify - Verification only using existing .deb files (default, ~2 min)
-  build - Full build + verification (~30 min)
+  build - Full build + verification (default, ~30 min)
+  verify - Verification only using existing .deb files (~2 min)
 
 EXAMPLES:
   ./verify_bisq1.sh
-   # Verify v1.9.21 using default build path
-
-  ./verify_bisq1.sh --build-path ~/my-builds/bisq
-   # Verify using custom build path
+   # Build and verify v1.9.21 (default)
 
   ./verify_bisq1.sh v1.9.20
-   # Verify v1.9.20 using default build path
+   # Build and verify v1.9.20
 
-  ./verify_bisq1.sh --build-path /custom/path v1.9.21 build
-   # Full build of v1.9.21 using custom path
+  ./verify_bisq1.sh --build-path ~/my-builds/bisq
+   # Build and verify using custom build path
 
-  MODE=build ./verify_bisq1.sh --build-path ~/bisq-builds
-   # Full build using custom path (environment variable)
+  ./verify_bisq1.sh v1.9.21 verify
+   # Verify only (requires existing .deb files)
+
+  ./verify_bisq1.sh --build-path /custom/path v1.9.21
+   # Build and verify v1.9.21 using custom path
 
 ENVIRONMENT:
   BISQ_VERSION - Version to verify (default: v1.9.21)
-  MODE   - Operation mode: 'verify' or 'build' (default: verify)
+  MODE   - Operation mode: 'build' or 'verify' (default: build)
 
 BUILD PATH STRUCTURE:
   If --build-path is not specified, the script will create and use:
@@ -127,6 +129,11 @@ while [[ $# -gt 0 ]]; do
     BISQ_VERSION="$1"
     shift
     ;;
+   [0-9]*.[0-9]*.[0-9]*)
+    # Version without 'v' prefix - add it
+    BISQ_VERSION="v$1"
+    shift
+    ;;
    *)
     echo "Unknown argument: $1"
     show_help
@@ -147,6 +154,11 @@ fi
 # Set default version if not specified
 if [[ -z "$BISQ_VERSION" ]]; then
   BISQ_VERSION="v1.9.21"
+fi
+
+# Ensure version has 'v' prefix
+if [[ ! "$BISQ_VERSION" =~ ^v ]]; then
+  BISQ_VERSION="v$BISQ_VERSION"
 fi
 
 # Validate build path
@@ -267,12 +279,12 @@ exec 2> >(stdbuf -oL cat >&2) # Line buffer stderr
 
 echo "=== Bisq Container Verification ==="
 echo "Version: ${BISQ_VERSION:-v1.9.21}"
-echo "Mode: ${MODE:-verify}" 
+echo "Mode: ${MODE:-build}" 
 echo "Java: $(java -version 2>&1 | head -1)"
 echo ""
 
 BISQ_VERSION=${BISQ_VERSION:-v1.9.21}
-MODE=${MODE:-verify}
+MODE=${MODE:-build}
 WORK_DIR="/home/bisq/work"
 RESULTS_DIR="/home/bisq/build-results"
 
