@@ -21,19 +21,21 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-# Preflight check: Install and verify all prerequisites
+# Preflight check: Verify all prerequisites
 preflight_check() {
   echo -e "${CYAN}=== Preflight Check: Verifying Prerequisites ===${NC}"
   
   local missing_deps=()
   local needs_docker_install=false
   local needs_docker_group=false
+  local docker_not_running=false
   
   # Check system tools
   echo -e "${CYAN}Checking system tools...${NC}"
   for cmd in git wget python3 xxd sha256sum; do
     if ! command -v "$cmd" &> /dev/null; then
       missing_deps+=("$cmd")
+      echo -e "${RED}✗${NC} $cmd not found"
     else
       echo -e "${GREEN}✓${NC} $cmd found"
     fi
@@ -42,14 +44,15 @@ preflight_check() {
   # Check Docker
   echo -e "${CYAN}Checking Docker...${NC}"
   if ! command -v docker &> /dev/null; then
-    echo -e "${YELLOW}✗${NC} docker not found"
+    echo -e "${RED}✗${NC} docker not found"
     needs_docker_install=true
   else
     echo -e "${GREEN}✓${NC} docker found"
     
     # Check if Docker daemon is running
-    if ! docker info &> /dev/null; then
+    if ! docker info &> /dev/null 2>&1; then
       echo -e "${YELLOW}⚠${NC} Docker daemon not running or permission denied"
+      docker_not_running=true
       
       # Check if user is in docker group
       if ! groups | grep -q docker; then
@@ -62,119 +65,75 @@ preflight_check() {
   fi
   
   # If everything is OK, return early
-  if [[ ${#missing_deps[@]} -eq 0 && "$needs_docker_install" == false && "$needs_docker_group" == false ]]; then
+  if [[ ${#missing_deps[@]} -eq 0 && "$needs_docker_install" == false && "$needs_docker_group" == false && "$docker_not_running" == false ]]; then
     echo -e "${GREEN}=== All prerequisites satisfied ===${NC}"
+    echo ""
     return 0
   fi
   
-  # Otherwise, offer to install missing dependencies
+  # Display installation instructions
   echo ""
-  echo -e "${YELLOW}=== Missing Prerequisites Detected ===${NC}"
-  
-  if [[ ${#missing_deps[@]} -gt 0 ]]; then
-    echo -e "${YELLOW}Missing tools:${NC} ${missing_deps[*]}"
-  fi
-  
-  if [[ "$needs_docker_install" == true ]]; then
-    echo -e "${YELLOW}Docker needs to be installed${NC}"
-  fi
-  
-  if [[ "$needs_docker_group" == true ]]; then
-    echo -e "${YELLOW}User needs to be added to docker group${NC}"
-  fi
-  
+  echo -e "${RED}=== Missing Prerequisites ===${NC}"
   echo ""
-  read -p "Install missing prerequisites? (y/N): " -n 1 -r
-  echo
   
-  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo -e "${RED}Aborting. Please install prerequisites manually.${NC}"
-    exit 1
-  fi
-  
-  # Install missing dependencies
-  echo -e "${CYAN}Installing prerequisites...${NC}"
-  
-  # Determine package names based on missing commands
-  local packages=()
-  
-  for dep in "${missing_deps[@]}"; do
-    case "$dep" in
-      xxd)
-        packages+=("vim-common")
-        ;;
-      sha256sum)
-        packages+=("coreutils")
-        ;;
-      *)
-        packages+=("$dep")
-        ;;
-    esac
-  done
-  
-  # Install Docker if needed
-  if [[ "$needs_docker_install" == true ]]; then
-    packages+=("docker.io" "docker-buildx-plugin" "docker-compose-plugin")
-    packages+=("build-essential" "dkms" "linux-headers-$(uname -r)")
-  fi
-  
-  if [[ ${#packages[@]} -gt 0 ]]; then
-    echo -e "${CYAN}Installing packages: ${packages[*]}${NC}"
-    sudo apt-get update
-    sudo apt-get install -y "${packages[@]}"
-  fi
-  
-  # Start and enable Docker if it was just installed
-  if [[ "$needs_docker_install" == true ]]; then
-    echo -e "${CYAN}Starting Docker service...${NC}"
-    sudo systemctl start docker
-    sudo systemctl enable docker
-    needs_docker_group=true  # Always add to group after fresh install
-  fi
-  
-  # Add user to docker group if needed
-  if [[ "$needs_docker_group" == true ]]; then
-    echo -e "${CYAN}Adding user to docker group...${NC}"
-    sudo usermod -aG docker "$USER"
-    echo -e "${YELLOW}⚠ You need to log out and log back in for docker group changes to take effect.${NC}"
-    echo -e "${YELLOW}⚠ Alternatively, run: newgrp docker${NC}"
+  if [[ ${#missing_deps[@]} -gt 0 || "$needs_docker_install" == true ]]; then
+    echo -e "${YELLOW}Required packages are missing. Install them with:${NC}"
     echo ""
-    read -p "Continue anyway? (y/N): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-      echo -e "${YELLOW}Please log out and log back in, then re-run this script.${NC}"
-      exit 0
+    
+    # Build package list
+    local packages=()
+    
+    for dep in "${missing_deps[@]}"; do
+      case "$dep" in
+        xxd)
+          packages+=("vim-common")
+          ;;
+        sha256sum)
+          packages+=("coreutils")
+          ;;
+        *)
+          packages+=("$dep")
+          ;;
+      esac
+    done
+    
+    if [[ "$needs_docker_install" == true ]]; then
+      packages+=("docker.io" "docker-buildx-plugin" "docker-compose-plugin")
+      packages+=("build-essential" "dkms" "linux-headers-\$(uname -r)")
     fi
+    
+    echo -e "${CYAN}  sudo apt-get update && sudo apt-get install -y ${packages[*]}${NC}"
+    echo ""
   fi
   
-  # Final verification
-  echo -e "${CYAN}Verifying installation...${NC}"
-  local verification_failed=false
-  
-  for cmd in git wget python3 xxd sha256sum docker; do
-    if ! command -v "$cmd" &> /dev/null; then
-      echo -e "${RED}✗${NC} $cmd still not found"
-      verification_failed=true
-    else
-      echo -e "${GREEN}✓${NC} $cmd verified"
-    fi
-  done
-  
-  # Test Docker access
-  if ! docker info &> /dev/null; then
-    echo -e "${YELLOW}⚠${NC} Docker daemon still not accessible (may need re-login)"
-    echo -e "${YELLOW}  Try running: newgrp docker${NC}"
-  else
-    echo -e "${GREEN}✓${NC} Docker daemon accessible"
+  if [[ "$needs_docker_install" == true ]]; then
+    echo -e "${YELLOW}After installing Docker, start and enable the service:${NC}"
+    echo ""
+    echo -e "${CYAN}  sudo systemctl start docker${NC}"
+    echo -e "${CYAN}  sudo systemctl enable docker${NC}"
+    echo ""
   fi
   
-  if [[ "$verification_failed" == true ]]; then
-    echo -e "${RED}Some prerequisites failed to install. Please check errors above.${NC}"
-    exit 1
+  if [[ "$needs_docker_group" == true || "$needs_docker_install" == true ]]; then
+    echo -e "${YELLOW}Add your user to the docker group:${NC}"
+    echo ""
+    echo -e "${CYAN}  sudo usermod -aG docker \$USER${NC}"
+    echo ""
+    echo -e "${YELLOW}Then log out and log back in, or run:${NC}"
+    echo ""
+    echo -e "${CYAN}  newgrp docker${NC}"
+    echo ""
   fi
   
-  echo -e "${GREEN}=== Preflight check complete ===${NC}"
-  echo ""
+  if [[ "$docker_not_running" == true && "$needs_docker_group" == false ]]; then
+    echo -e "${YELLOW}Docker daemon is not running. Start it with:${NC}"
+    echo ""
+    echo -e "${CYAN}  sudo systemctl start docker${NC}"
+    echo ""
+  fi
+  
+  echo -e "${RED}Please install the missing prerequisites and re-run this script.${NC}"
+  exit 1
 }
 
 usage() {
