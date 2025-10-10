@@ -179,10 +179,10 @@ paddingBytesCount=$(( maxFirmwareSize - firmwareBytesCount ))
 dd if=/dev/zero ibs=1 count=$paddingBytesCount 2>/dev/null | tr "\000" "\377" > p_padding.bin
 downloadFirmwareHash=$( cat p_version.bin "p_${EDITION_FILENAME}.bin" p_padding.bin | sha256sum | cut -c1-64 | xxd -r -p | sha256sum | cut -c1-64 )
 
-echo "Hashes of
-signed download             $signedHash
-signed download minus sig.  $downloadStrippedSigHash
-built binary                $builtHash
-firmware as shown in device $downloadFirmwareHash
-                           (The latter is a double sha256 over version,
-                            firmware and padding)"
+echo "Hashes of"
+echo "signed download             $signedHash"
+echo "signed download minus sig.  $downloadStrippedSigHash"
+echo "built binary                $builtHash"
+echo "firmware as shown in device $downloadFirmwareHash"
+echo "                           (The latter is a double sha256 over version,"
+echo "                            firmware and padding)"
