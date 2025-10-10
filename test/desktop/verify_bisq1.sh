@@ -2,10 +2,12 @@
 
 # Bisq Reproducible Build Verification Tool
 #
-# Version: 3.2.0
+# Version: 3.4.0
 # Last Updated: 2025-10-10
 #
 # Changelog:
+# v3.4.0 - Removed docker system prune, infinite loops; script now exits cleanly (2025-10-10)
+# v3.3.0 - Added Java 17 for jpackage support, improved fallback logic (2025-10-10)
 # v3.2.0 - Accept version with or without 'v' prefix (1.9.21 or v1.9.21) (2025-10-10)
 # v3.1.0 - Changed default mode to 'build' for correct workflow (2025-10-10)
 # v3.0.1 - Removed emojis and verbose output for cleaner terminal display (2025-10-10)
@@ -19,7 +21,7 @@
 set -euo pipefail # Enhanced error handling
 # set -x     # Debug mode - show all commands as they execute
 
-VERSION="3.2.0"
+VERSION="3.4.0"
 
 # Cleanup function for interruptions
 cleanup_on_exit() {
@@ -201,11 +203,10 @@ echo "Cleaning Docker..."
 docker ps -q --filter ancestor="$IMAGE_NAME" | xargs -r docker stop 2>/dev/null || true
 docker ps -aq --filter ancestor="$IMAGE_NAME" | xargs -r docker rm 2>/dev/null || true
 
-# Remove Docker image and prune system
+# Remove old Docker image
 if docker images -q "$IMAGE_NAME" >/dev/null 2>&1; then
   docker rmi "$IMAGE_NAME" >/dev/null 2>&1 || true
 fi
-docker system prune -f >/dev/null 2>&1 || true
 
 # Clean previous results to avoid contamination
 echo "Cleaning results..."
@@ -243,7 +244,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y \
   git wget curl unzip tar xz-utils zstd binutils \
-  openjdk-11-jdk ca-certificates ca-certificates-java fakeroot dpkg-dev \
+  openjdk-11-jdk openjdk-17-jdk \
+  ca-certificates ca-certificates-java fakeroot dpkg-dev \
   build-essential debhelper rpm \
   libx11-6 libxext6 libxrender1 libxtst6 libxi6 libxrandr2 libxcb1 libxau6 \
   xvfb x11-apps \
@@ -252,6 +254,7 @@ RUN apt-get update && apt-get install -y \
   && useradd -m -s /bin/bash bisq
 
 ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+ENV JAVA_17_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 ENV PATH=$JAVA_HOME/bin:$PATH
 ENV GRADLE_OPTS="-Xmx4g -Dorg.gradle.daemon=false"
 
@@ -328,20 +331,36 @@ if [[ "$MODE" == "build" ]]; then
   OFFICIAL_DEB="$WORK_DIR/Bisq-64bit-${BISQ_VERSION#v}.deb"
   
   if [[ -z "$LOCAL_DEB" ]]; then
-   echo " Gradle task failed to create .deb file, trying manual jpackage..."
+   echo "Gradle task did not create .deb file, trying manual jpackage..."
    echo "Available build artifacts:"
    find desktop/build -type f | grep -E "\.(deb|rpm|jar)$" | head -10
-   
-   # Get Java 17 toolchain path for jpackage
-   JPACKAGE_PATH=$(find /home/bisq/.gradle/jdks -name "jpackage" -path "*/azul*17*/bin/jpackage" | head -1)
-   if [[ -z "$JPACKAGE_PATH" ]]; then
-    echo " ERROR: Could not find jpackage in Java 17 toolchain"
+
+   # Try multiple jpackage locations in order of preference
+   JPACKAGE_PATH=""
+
+   # 1. Try Java 17 from system
+   if [[ -x "$JAVA_17_HOME/bin/jpackage" ]]; then
+    JPACKAGE_PATH="$JAVA_17_HOME/bin/jpackage"
+    echo "Using system Java 17 jpackage"
+   # 2. Try Gradle toolchain (Java 17)
+   elif [[ -n "$(find /home/bisq/.gradle/jdks -name "jpackage" -path "*17*/bin/jpackage" 2>/dev/null | head -1)" ]]; then
+    JPACKAGE_PATH=$(find /home/bisq/.gradle/jdks -name "jpackage" -path "*17*/bin/jpackage" | head -1)
+    echo "Using Gradle toolchain jpackage: $JPACKAGE_PATH"
+   # 3. Try Gradle toolchain (Java 16)
+   elif [[ -n "$(find /home/bisq/.gradle/jdks -name "jpackage" -path "*16*/bin/jpackage" 2>/dev/null | head -1)" ]]; then
+    JPACKAGE_PATH=$(find /home/bisq/.gradle/jdks -name "jpackage" -path "*16*/bin/jpackage" | head -1)
+    echo "Using Gradle toolchain jpackage: $JPACKAGE_PATH"
+   else
+    echo "ERROR: Could not find jpackage (requires Java 16+)"
+    echo "Checked:"
+    echo " - $JAVA_17_HOME/bin/jpackage"
+    echo " - /home/bisq/.gradle/jdks/*/bin/jpackage"
     exit 1
    fi
-   
+
    echo "Running manual jpackage..."
-   echo "Using jpackage: $JPACKAGE_PATH"
-   
+   mkdir -p desktop/build/packaging/jpackage/packages
+
    # Run manual jpackage command
    "$JPACKAGE_PATH" \
     --dest desktop/build/packaging/jpackage/packages \
@@ -599,14 +618,9 @@ echo ""
 echo "Results: $RESULTS_DIR"
 echo "Complete"
 echo ""
-echo " Container ready for analysis. Use 'docker exec -it \$(docker ps -l -q) bash' to access."
-echo ""
-echo ""
 
-# Keep container running for analysis
-while true; do
-  sleep 60
-done
+# Exit cleanly - no infinite loop
+exit 0
 CONTAINER_SCRIPT
 
 echo "Building image..."
@@ -631,27 +645,9 @@ docker run -it \
   "$IMAGE_NAME"
 
 CONTAINER_EXIT_CODE=$?
-echo "Container execution completed with exit code: $CONTAINER_EXIT_CODE"
 
-# Get the last container ID for inspection instructions
-CONTAINER_ID=$(docker ps -l -q --filter ancestor=bisq-verify)
-if [[ -n "$CONTAINER_ID" ]]; then
-  echo ""
-  echo "CONTAINER INSTRUCTIONS:"
-  echo ""
-  echo "Container available:"
-  echo ""
-  echo " Enter container: docker exec -it $CONTAINER_ID bash"
-  echo " View logs again: docker logs $CONTAINER_ID"
-  echo " Copy files out: docker cp $CONTAINER_ID:/path/to/file ."
-  echo ""
-  echo "Cleanup:"
-  echo " Stop container: docker stop $CONTAINER_ID"
-  echo " Remove container: docker rm $CONTAINER_ID"
-  echo " Remove image:  docker rmi bisq-verify"
-  echo " Cleanup system: docker system prune -f"
-  echo ""
-fi
+# Get the last container ID
+CONTAINER_ID=$(docker ps -l -q)
 
 # Check results to determine exit code
 if [[ -f "$RESULTS_DIR/verification-report.txt" ]] && grep -q "Reproducible: YES" "$RESULTS_DIR/verification-report.txt"; then
@@ -660,14 +656,14 @@ else
   CONTAINER_EXIT_CODE=1
 fi
 
-# Cleanup temp files but keep container
+# Cleanup temp files
 rm -f "$SCRIPT_DIR/.dockerfile-temp" "$SCRIPT_DIR/verify-container.sh"
 
 echo ""
-echo ""
+echo "---"
 if [[ $CONTAINER_EXIT_CODE -eq 0 ]]; then
   echo "VERIFICATION PASSED"
-  [[ -f "$RESULTS_DIR/verification-report.txt" ]] && grep -q "Reproducible: YES" "$RESULTS_DIR/verification-report.txt" && echo "REPRODUCIBLE"
+  [[ -f "$RESULTS_DIR/verification-report.txt" ]] && grep -q "Reproducible: YES" "$RESULTS_DIR/verification-report.txt" && echo "BUILD IS REPRODUCIBLE"
 else
   echo "VERIFICATION FAILED"
 fi
@@ -676,29 +672,17 @@ echo ""
 echo "Results: $RESULTS_DIR"
 [[ -f "$RESULTS_DIR/verification-report.txt" ]] && echo "Report: verification-report.txt"
 
-# Yellow text for cleanup instructions
+# Bright yellow text for container cleanup instructions
+echo ""
 echo -e "\033[1;33m"
-echo "CONTAINER INSTRUCTIONS:"
+echo "Container created: $CONTAINER_ID"
 echo ""
-echo "Container running:"
+echo "To delete the container:"
+echo "  docker rm $CONTAINER_ID"
 echo ""
-echo " Enter container: docker exec -it $CONTAINER_ID bash"
-echo " View logs again: docker logs $CONTAINER_ID"
-echo " Copy files out: docker cp $CONTAINER_ID:/path/to/file ."
-echo ""
-echo "Cleanup:"
-echo " Stop container: docker stop $CONTAINER_ID"
-echo " Remove container: docker rm $CONTAINER_ID"
-echo " Remove image:  docker rmi $IMAGE_NAME"
-echo " Cleanup system: docker system prune -f"
+echo "To delete the image:"
+echo "  docker rmi $IMAGE_NAME"
 echo -e "\033[0m"
 
-echo ""
-echo "Container ID: $CONTAINER_ID"
-echo "Press Ctrl+C to exit"
-echo ""
-
-# Wait indefinitely - user can Ctrl+C when done
-while true; do
-  sleep 1
-done
+# Exit cleanly with appropriate code
+exit $CONTAINER_EXIT_CODE
