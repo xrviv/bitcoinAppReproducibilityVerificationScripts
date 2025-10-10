@@ -1,12 +1,17 @@
 #!/bin/bash
 # BitBox02 Firmware Reproducible Build Helper
-# Version 0.2.1
+# Version 0.3.0
+# Author: Daniel Andrei ("xrviv") R. Garcia
+# Organization: WalletScrutiny.com
+# Last Updated: 2025-10-10
 # Automates download, build, and comparison for BitBox02 firmware editions (btc or multi).
+# Use at your own risk; hardware flashing and firmware verification can brick devices if misused.
+# Provided under the Apache 2.0 license without warranties or implied guarantees of fitness.
 
 set -euo pipefail
 
 SCRIPT_NAME=$(basename "$0")
-SCRIPT_VERSION="0.2.1"
+SCRIPT_VERSION="0.3.0"
 SCRIPT_DESCRIPTION="Automates download, container build, and hash comparison for BitBox02 firmware releases."
 
 CYAN='\033[1;36m'
@@ -72,7 +77,7 @@ fi
 
 echo -e "${CYAN}Attempting to build BitBox02 firmware version ${version} (${edition} edition)...${NC}"
 ARCHIVE=/tmp
-WORKSPACE="$HOME/wsTest"
+WORKSPACE="$HOME/builds/hardware/bitbox2-build"
 
 if [ -d "$WORKSPACE" ]; then
     echo -e "${RED}Error:${NC} Workspace $WORKSPACE already exists. Remove it manually before rerunning." >&2
