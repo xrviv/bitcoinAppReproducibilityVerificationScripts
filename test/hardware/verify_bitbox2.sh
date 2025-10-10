@@ -309,7 +309,8 @@ if [[ ! -s "p_${EDITION_FILENAME}.bin" ]]; then
 fi
 
 downloadStrippedSigHash=$(sha256sum "p_${EDITION_FILENAME}.bin")
-cat p_head.bin | tail -c +$(( 8 + 6 * 64 + 1 )) | head -c 4 > p_version.bin
+version_offset=$(( 8 + 6 * 64 + 1 ))
+cat p_head.bin | tail -c +"${version_offset}" | head -c 4 > p_version.bin
 firmwareBytesCount=$(wc -c "p_${EDITION_FILENAME}.bin" | sed 's/ .*//g')
 maxFirmwareSize=884736
 paddingBytesCount=$(( maxFirmwareSize - firmwareBytesCount ))
