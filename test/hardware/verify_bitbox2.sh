@@ -225,21 +225,26 @@ done
 cd bitbox02-firmware || exit 1
 
 # Harden upstream build script so the Go toolchain download follows redirects.
+# The Dockerfile needs to be patched directly since it's generated during the build process.
 python3 - <<'PY'
 from pathlib import Path
+import re
+
 build_sh = Path("releases/build.sh")
 text = build_sh.read_text()
-needle_plain = "curl https://dl.google.com/go/go1.19.3.linux-${TARGETARCH}.tar.gz | tar -xz -C /opt/go_dist"
-needle_patched = "curl -fsSL https://dl.google.com/go/go1.19.3.linux-${TARGETARCH}.tar.gz | tar -xz -C /opt/go_dist"
-if needle_plain in text and needle_patched not in text:
-    patch = (
-        "cd temp;\n\n"
-        "# Ensure Go toolchain download follows redirects so the archive extracts correctly.\n"
-        "sed -i 's|curl https://dl.google.com/go/go1.19.3.linux-${TARGETARCH}.tar.gz | tar -xz -C /opt/go_dist|"
-        "curl -fsSL https://dl.google.com/go/go1.19.3.linux-${TARGETARCH}.tar.gz | tar -xz -C /opt/go_dist|' Dockerfile\n\n"
-    )
-    text = text.replace("cd temp;\n\n", patch, 1)
+
+# Find the section where the Dockerfile is created and patch the curl command
+# Look for the pattern where curl is used without -L flag
+old_curl = r'curl https://dl\.google\.com/go/go1\.19\.3\.linux-\$\{TARGETARCH\}\.tar\.gz'
+new_curl = r'curl -fsSL https://dl.google.com/go/go1.19.3.linux-${TARGETARCH}.tar.gz'
+
+# Replace in the build script
+if old_curl in text:
+    text = re.sub(old_curl, new_curl, text)
     build_sh.write_text(text)
+    print("Patched build.sh to use curl -fsSL for Go download")
+else:
+    print("Warning: Could not find curl pattern to patch in build.sh")
 PY
 
 if [ "$edition" = "multi" ]; then
