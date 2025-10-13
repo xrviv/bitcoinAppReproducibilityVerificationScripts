@@ -4,11 +4,11 @@ Tooling used by [WalletScrutiny.com](https://walletscrutiny.com) to examine whet
 
 ## What Are Reproducible Builds?
 
-A build is *reproducible* when independent parties can compile the same source revision and obtain identical binaries. Reproducibility matters because it allows end users to verify that the binaries they install match the audited source, reducing the risk of supply-chain attacks or unreviewed changes.
+A build is *reproducible* when independent parties can compile the same source revision and obtain identical binaries. Reproducibility matters because it allows end users to verify that the binaries they install match the audited source, reducing the risk of supply-chain attacks or unreviewed changes. For more information, visit [reproducible-builds.org](https://reproducible-builds.org/)
 
 ## About WalletScrutiny
 
-WalletScrutiny documents the security posture of Bitcoin and Lightning wallets. Part of that review involves checking reproducibility claims—if a wallet project publishes source code, WalletScrutiny attempts to rebuild it and compare the resulting artifacts against what is distributed on app stores or vendor websites. These scripts encapsulate repeatable workflows for that verification.
+[WalletScrutiny](https://walletscrutiny.com) documents the security posture of Bitcoin and Lightning wallets. Part of that review involves checking reproducibility claims—if a wallet project publishes source code, WalletScrutiny attempts to rebuild it and compare the resulting artifacts against what is distributed on app stores or vendor websites. These scripts encapsulate repeatable workflows for that verification.
 
 ## Repository Layout
 
@@ -62,4 +62,4 @@ Review the disclaimers printed at startup, then follow the prompts. The script d
 3. Document any non-reproducible differences and the rationale for accepting them.
 4. Submit changes under the MIT license (see `LICENSE`).
 
-For background on WalletScrutiny’s verification process, visit the site or reach out at [contact@walletscrutiny.com](mailto:contact@walletscrutiny.com).
+For background on WalletScrutiny’s verification process, please visit [walletscrutiny.com](https://walletscrutiny.com)
