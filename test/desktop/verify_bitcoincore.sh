@@ -289,7 +289,7 @@ RUN apk --no-cache --update add \
       make \
       shadow
 
-ARG guix_download_path=https://ftp.gnu.org/gnu/guix/
+ARG guix_download_path=https://ftpmirror.gnu.org/gnu/guix/
 ARG guix_version=1.4.0
 ARG guix_checksum_aarch64=72d807392889919940b7ec9632c45a259555e6b0942ea7bfd131101e08ebfcf4
 ARG guix_checksum_x86_64=236ca7c9c5958b1f396c2924fcc5bc9d6fdebcb1b4cf3c7c6d46d4bf660ed9c9
@@ -302,9 +302,7 @@ ENV LC_ALL=en_US.UTF-8
 RUN guix_file_name=guix-binary-${guix_version}.$(uname -m)-linux.tar.xz    && \
     eval "guix_checksum=\${guix_checksum_$(uname -m)}"                     && \
     cd /tmp                                                                && \
-    (wget -q -O "$guix_file_name" "${guix_download_path}/${guix_file_name}" || \
-     wget -q -O "$guix_file_name" "https://ftpmirror.gnu.org/gnu/guix/${guix_file_name}" || \
-     wget -q -O "$guix_file_name" "https://mirror.clarkson.edu/gnu/guix/${guix_file_name}") && \
+    wget -q -O "$guix_file_name" "${guix_download_path}/${guix_file_name}" && \
     echo "${guix_checksum}  ${guix_file_name}" | sha256sum -c              && \
     tar xJf "$guix_file_name"                                              && \
     mv var/guix /var/                                                      && \
