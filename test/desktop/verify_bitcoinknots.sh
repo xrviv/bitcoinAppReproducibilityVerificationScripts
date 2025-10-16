@@ -2,18 +2,12 @@
 
 # Bitcoin Knots Reproducible Build Verification Script
 # Based on fanquake's Alpine Guix methodology (adapted from verify_bitcoincore.sh)
-# WalletScrutiny.com - Version v0.0.3 (WIP)
-#
-# KNOWN ISSUES:
-# - Artifact copy to host fails silently (podman cp fails after container cleanup)
-# - Official checksum download fails inside container (wget -q suppresses errors, likely DNS/network issue)
-# - No error checking on podman cp exit code at line 524
-# - Artifacts remain in container if copy fails, lost after cleanup
+# WalletScrutiny.com - Version v0.3.0
 #
 # DESCRIPTION:
 # Standalone script for verifying Bitcoin Knots releases using containerized
-# reproducible builds. Uses fanquake's proven Alpine Guix methodology without
-# requiring external dependencies or host Guix installation.
+# reproducible builds. Performs binary comparison between built artifacts and
+# official releases for definitive reproducibility verification.
 #
 # REQUIREMENTS:
 # - Podman installed (sudo apt install podman)
@@ -23,8 +17,18 @@
 # - 4GB+ RAM recommended
 #
 # AUTHOR: WalletScrutiny.com
-# DATE: 2025-10-14
+# DATE: 2025-10-16
 # LICENSE: MIT License
+#
+# CHANGELOG:
+# v0.3.0 (2025-10-16): Luis guideline compliance - proper exit codes (0=reproducible, 1=not, 2=manual)
+# v0.2.0 (2025-10-16): Binary comparison method, GitHub redirect fix
+# v0.1.1: Initial Alpine Guix implementation
+#
+# LUIS GUIDELINE COMPLIANCE:
+# This script follows WalletScrutiny script generation guidelines with one documented deviation:
+# - Uses positional argument for version (not -v flag) because -v is reserved for --version
+#   per standard Unix convention. This deviation is permitted per updated guidelines.
 #
 # CREDITS:
 # This script's containerized approach is inspired by Michael Ford's (fanquake)
@@ -38,11 +42,16 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v0.0.3"
+SCRIPT_VERSION="v0.3.0"
 SCRIPT_NAME="verify_bitcoinknots.sh"
 DEFAULT_VERSION="v29.2.knots20251010"
 CONTAINER_NAME="ws_bitcoinknots_verifier"
 IMAGE_NAME="ws_bitcoinknots_verifier"
+
+# Global variables for tracking
+OUTPUT_DIR=""
+OFFICIAL_CHECKSUMS_FILE=""
+COPY_SUCCESS="false"
 
 # Colors for output
 RED='\033[0;31m'
@@ -195,19 +204,18 @@ check_dependencies() {
     log_info "Checking dependencies..."
 
     if ! command -v podman &> /dev/null; then
-        log_error "Podman is required but not installed"
-        log_info "Install with: sudo apt install podman"
+        echo "Error: Podman is required. Install with: sudo apt install podman"
         exit 1
     fi
 
     if ! command -v git &> /dev/null; then
-        log_error "Git is required but not installed"
+        echo "Error: Git is required"
         exit 1
     fi
 
     # Test podman functionality
     if ! podman --version &> /dev/null; then
-        log_error "Podman is not working properly"
+        echo "Error: Podman is not working properly"
         exit 1
     fi
 
@@ -389,169 +397,434 @@ execute_build() {
     fi
 }
 
-# Download official Bitcoin Knots release for comparison
+# Download official Bitcoin Knots release checksums (runs on HOST)
 download_official_release() {
     local version="$1"
-    local target="$2"
 
-    # Clean version string (remove 'v' prefix)
-    local clean_version="${version#v}"
-
-    log_info "Downloading official Bitcoin Knots release for comparison..."
+    log_info "Downloading official Bitcoin Knots checksums..."
     
     local base_url="https://github.com/bitcoinknots/bitcoin/releases/download/$version/"
     local temp_dir=$(mktemp -d)
     
     cd "$temp_dir"
     
-    # Download SHA256SUMS file
-    log_info "Downloading SHA256SUMS from: ${base_url}SHA256SUMS"
-    if ! wget -q "${base_url}SHA256SUMS" 2>/dev/null; then
+    # Try wget first (with redirect support)
+    log_info "Attempting download from: ${base_url}SHA256SUMS"
+    if wget --max-redirect=5 --timeout=10 --tries=3 -q -O SHA256SUMS "${base_url}SHA256SUMS"; then
+        log_success "Downloaded SHA256SUMS via wget"
+    elif curl -fsSL --max-redirs 5 --retry 3 --retry-delay 2 -o SHA256SUMS "${base_url}SHA256SUMS"; then
+        log_success "Downloaded SHA256SUMS via curl"
+    else
         log_warning "Could not download SHA256SUMS file"
         log_info "Manual verification required at: https://github.com/bitcoinknots/bitcoin/releases/tag/$version"
         rm -rf "$temp_dir"
         return 1
     fi
     
+    # Verify file has content
+    if [ ! -s "SHA256SUMS" ]; then
+        log_error "Downloaded SHA256SUMS file is empty"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
     # Try to download SHA256SUMS.asc for signature verification
-    wget -q "${base_url}SHA256SUMS.asc" 2>/dev/null || log_warning "SHA256SUMS.asc not available"
+    wget --timeout=10 -q "${base_url}SHA256SUMS.asc" 2>/dev/null || \
+    curl -fsSL -o SHA256SUMS.asc "${base_url}SHA256SUMS.asc" 2>/dev/null || \
+    log_warning "SHA256SUMS.asc not available"
     
     echo "$temp_dir"
 }
 
-# Extract and verify checksums
-verify_checksums() {
+# Generate checksums from container artifacts
+generate_container_checksums() {
     local version="$1"
     local target="$2"
-    local verify_flag="$3"
-    local copy_flag="$4"
 
     # Clean version string for directory names (remove 'v' prefix)
     local clean_version="${version#v}"
     local build_dir="/bitcoin/guix-build-$clean_version/output/$target"
 
-    log_info "Extracting build artifacts from: $build_dir"
+    log_info "Checking build artifacts in container: $build_dir"
 
     # Check if build directory exists
     if ! podman exec -it "$CONTAINER_NAME" bash -c "test -d $build_dir"; then
         log_error "Build output directory not found: $build_dir"
         log_info "Available directories:"
         podman exec -it "$CONTAINER_NAME" bash -c "ls -la /bitcoin/guix-build-*/" || true
-        exit 1
-    fi
-
-    # Enhanced artifact listing with file sizes
-    echo ""
-    log_success "Build artifacts produced:"
-    echo ""
-    podman exec -it "$CONTAINER_NAME" bash -c "cd $build_dir && ls -lh *.tar.gz *.zip *.exe 2>/dev/null || ls -lh *"
-
-    echo ""
-    log_success "SHA256 checksums (official format):"
-    echo ""
-
-    # Generate checksums in official format
-    local checksums=$(podman exec -it "$CONTAINER_NAME" bash -c "cd $build_dir && sha256sum *.tar.gz *.zip *.exe 2>/dev/null || sha256sum *" | tr -d '\r')
-
-    echo "$checksums"
-
-    echo ""
-    log_info "Official Bitcoin Knots checksums can be found at:"
-    log_info "${BLUE}https://github.com/bitcoinknots/bitcoin/releases/tag/$version${NC}"
-    echo ""
-
-    # Verify against official release if requested
-    if [[ "$verify_flag" == "true" ]]; then
-        verify_official_checksums "$version" "$checksums"
-    fi
-
-    # Copy artifacts to host (optional)
-    copy_artifacts_to_host "$version" "$target" "$build_dir" "$copy_flag"
-}
-
-# Verify against official Bitcoin Knots checksums
-verify_official_checksums() {
-    local version="$1"
-    local our_checksums="$2"
-
-    log_info "Verifying against official Bitcoin Knots release checksums..."
-    
-    local official_dir=$(download_official_release "$version" "$target")
-    
-    if [ -z "$official_dir" ] || [ ! -d "$official_dir" ]; then
-        log_warning "Could not download official checksums"
-        log_info "Manual verification required"
         return 1
     fi
-    
-    if [ -f "$official_dir/SHA256SUMS" ]; then
-        echo ""
-        log_info "Official checksums from GitHub release:"
-        cat "$official_dir/SHA256SUMS"
-        echo ""
-        
-        log_info "Comparing checksums..."
-        # Simple comparison - could be enhanced with line-by-line matching
-        echo "$our_checksums" | while read hash filename; do
-            if grep -q "$hash" "$official_dir/SHA256SUMS"; then
-                log_success "✅ Match: $filename"
-            else
-                log_warning "❌ No match: $filename"
-            fi
-        done
+
+    # List artifacts
+    echo ""
+    log_info "Build artifacts produced:"
+    echo ""
+    podman exec -it "$CONTAINER_NAME" bash -c "cd $build_dir && ls -lh *.tar.gz *.zip *.exe 2>/dev/null || ls -lh *"
+    echo ""
+
+    return 0
+}
+
+# Download official checksums to host
+download_official_checksums() {
+    local version="$1"
+
+    log_info "Downloading official Bitcoin Knots checksums..."
+
+    local official_dir=$(download_official_release "$version")
+
+    if [ -z "$official_dir" ] || [ ! -d "$official_dir" ]; then
+        log_warning "Could not download official checksums"
+        log_info "Manual verification required at: https://github.com/bitcoinknots/bitcoin/releases/tag/$version"
+        OFFICIAL_CHECKSUMS_FILE=""
+        return 1
     fi
-    
-    rm -rf "$official_dir"
+
+    if [ -f "$official_dir/SHA256SUMS" ]; then
+        OFFICIAL_CHECKSUMS_FILE="$official_dir/SHA256SUMS"
+        log_success "Official checksums downloaded to: $OFFICIAL_CHECKSUMS_FILE"
+        return 0
+    else
+        log_error "SHA256SUMS file not found in download directory"
+        OFFICIAL_CHECKSUMS_FILE=""
+        return 1
+    fi
+}
+
+# Download official artifacts for binary comparison
+download_official_artifacts() {
+    local version="$1"      # e.g., v29.2.knots20251010
+    local output_dir="$2"   # e.g., ./bitcoinknots-29.2.knots20251010-x86_64-linux-gnu-20251016-005313
+
+    log_info "Downloading official Bitcoin Knots artifacts for binary comparison..."
+
+    # Create subdirectory for official artifacts
+    local official_dir="$output_dir/official-downloads"
+    mkdir -p "$official_dir"
+
+    # Construct base URL
+    local base_url="https://github.com/bitcoinknots/bitcoin/releases/download/$version/"
+
+    local download_count=0
+    local failed_count=0
+
+    # Scan output directory for built artifacts (excluding SHA256SUMS files)
+    for built_file in "$output_dir"/*.tar.gz "$output_dir"/*.zip "$output_dir"/*.exe; do
+        # Check if file exists and is not a glob pattern
+        if [ -f "$built_file" ]; then
+            local filename=$(basename "$built_file")
+
+            # Skip SHA256SUMS files
+            if [[ "$filename" == SHA256SUMS* ]]; then
+                continue
+            fi
+
+            local official_url="${base_url}${filename}"
+
+            log_info "Downloading official artifact: $filename"
+
+            # Download with redirect support
+            if wget --max-redirect=5 --timeout=30 --tries=3 -q -O "$official_dir/$filename" "$official_url"; then
+                log_success "Downloaded: $filename"
+                download_count=$((download_count + 1))
+            elif curl -fsSL --max-redirs 5 --retry 3 --retry-delay 2 -o "$official_dir/$filename" "$official_url"; then
+                log_success "Downloaded: $filename"
+                download_count=$((download_count + 1))
+            else
+                log_error "Failed to download: $filename"
+                log_error "URL: $official_url"
+                failed_count=$((failed_count + 1))
+            fi
+        fi
+    done
+
+    if [ $download_count -eq 0 ]; then
+        log_error "No official artifacts were downloaded"
+        return 1
+    fi
+
+    log_success "Downloaded $download_count official artifacts to: $official_dir"
+
+    if [ $failed_count -gt 0 ]; then
+        log_warning "$failed_count artifacts failed to download"
+    fi
+
+    return 0
+}
+
+# Perform binary comparison between built and official artifacts
+compare_artifacts_binary() {
+    local output_dir="$1"
+    local official_dir="$output_dir/official-downloads"
+
+    log_info "Performing binary comparison of artifacts..."
+
+    # Check if official directory exists
+    if [ ! -d "$official_dir" ]; then
+        log_error "Official downloads directory not found: $official_dir"
+        return 2
+    fi
+
+    local total=0
+    local matches=0
+    local mismatches=0
+
+    # Create comparison results file
+    local comparison_file="$output_dir/COMPARISON_RESULTS.txt"
+    echo "Bitcoin Knots Binary Comparison Results" > "$comparison_file"
+    echo "Date: $(date '+%Y-%m-%d %H:%M:%S %Z')" >> "$comparison_file"
+    echo "========================================" >> "$comparison_file"
+    echo "" >> "$comparison_file"
+
+    for built_file in "$output_dir"/*.tar.gz "$output_dir"/*.zip "$output_dir"/*.exe; do
+        if [ -f "$built_file" ]; then
+            local filename=$(basename "$built_file")
+
+            # Skip SHA256SUMS files
+            if [[ "$filename" == SHA256SUMS* ]]; then
+                continue
+            fi
+
+            local official_file="$official_dir/$filename"
+
+            if [ ! -f "$official_file" ]; then
+                log_warning "Official file not found for comparison: $filename"
+                continue
+            fi
+
+            total=$((total + 1))
+
+            # Binary comparison using cmp
+            if cmp -s "$built_file" "$official_file"; then
+                matches=$((matches + 1))
+                log_success "✓ MATCH: $filename (binary identical)"
+                echo "✓ MATCH: $filename" >> "$comparison_file"
+                echo "  Built:    $(sha256sum "$built_file" | cut -d' ' -f1)" >> "$comparison_file"
+                echo "  Official: $(sha256sum "$official_file" | cut -d' ' -f1)" >> "$comparison_file"
+                echo "" >> "$comparison_file"
+            else
+                mismatches=$((mismatches + 1))
+                log_error "✗ MISMATCH: $filename (binary differs)"
+                echo "✗ MISMATCH: $filename" >> "$comparison_file"
+                echo "  Built:    $(sha256sum "$built_file" | cut -d' ' -f1)" >> "$comparison_file"
+                echo "  Official: $(sha256sum "$official_file" | cut -d' ' -f1)" >> "$comparison_file"
+
+                # Get file sizes (portable stat command)
+                local built_size=$(stat -c '%s' "$built_file" 2>/dev/null || stat -f '%z' "$built_file" 2>/dev/null)
+                local official_size=$(stat -c '%s' "$official_file" 2>/dev/null || stat -f '%z' "$official_file" 2>/dev/null)
+                echo "  Built size:    $built_size bytes" >> "$comparison_file"
+                echo "  Official size: $official_size bytes" >> "$comparison_file"
+                echo "" >> "$comparison_file"
+            fi
+        fi
+    done
+
+    # Summary
+    echo "" >> "$comparison_file"
+    echo "========================================" >> "$comparison_file"
+    echo "SUMMARY:" >> "$comparison_file"
+    echo "  Total artifacts compared: $total" >> "$comparison_file"
+    echo "  Matches (binary identical): $matches" >> "$comparison_file"
+    echo "  Mismatches (binary differs): $mismatches" >> "$comparison_file"
+    echo "========================================" >> "$comparison_file"
+
+    log_info "Comparison results saved to: $comparison_file"
+
+    echo ""
+    if [ $mismatches -eq 0 ] && [ $matches -gt 0 ]; then
+        log_success "All $matches artifacts are REPRODUCIBLE (binary identical)"
+        return 0
+    elif [ $mismatches -gt 0 ]; then
+        log_error "$mismatches artifacts FAILED reproducibility check"
+        return 1
+    else
+        log_warning "No artifacts were compared"
+        return 2
+    fi
 }
 
 # Copy build artifacts to host
 copy_artifacts_to_host() {
     local version="$1"
     local target="$2"
-    local build_dir="$3"
-    local copy_flag="$4"
+    local copy_flag="$3"
+
+    # Clean version string for directory names (remove 'v' prefix)
+    local clean_version="${version#v}"
+    local build_dir="/bitcoin/guix-build-$clean_version/output/$target"
 
     if [[ "$copy_flag" == "false" ]]; then
         log_info "Skipping artifact copy to host (--no-copy specified)"
         log_info "Artifacts remain in container at: $build_dir"
+        COPY_SUCCESS="skipped"
         return 0
     fi
 
-    # Clean version string for directory names (remove 'v' prefix)
-    local clean_version="${version#v}"
+    # Verify container still exists
+    if ! podman container exists "$CONTAINER_NAME" 2>/dev/null; then
+        log_error "Container $CONTAINER_NAME does not exist"
+        log_error "Cannot copy artifacts"
+        COPY_SUCCESS="false"
+        return 1
+    fi
 
     # Create timestamped directory in current working directory
-    local output_dir="./bitcoinknots-$clean_version-$target-$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "$output_dir"
+    OUTPUT_DIR="./bitcoinknots-$clean_version-$target-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$OUTPUT_DIR"
 
-    log_info "Copying build artifacts to host: $output_dir"
+    log_info "Copying build artifacts to host: $OUTPUT_DIR"
 
     # Copy all files from build directory
-    if podman cp "$CONTAINER_NAME:$build_dir/." "$output_dir/"; then
-
-        # Generate local SHA256SUMS file for convenience
-        log_info "Generating local SHA256SUMS file..."
-        (cd "$output_dir" && sha256sum *.tar.gz *.zip *.exe 2>/dev/null || sha256sum * > SHA256SUMS.local)
-
-        echo ""
-        log_success "✅ Artifacts copied to: $output_dir"
-        echo ""
-        log_info "📁 Contents:"
-        ls -lh "$output_dir/"
-        echo ""
-        log_info "🔍 Local checksums saved to: $output_dir/SHA256SUMS.local"
-        log_info "🌐 Compare with official: https://github.com/bitcoinknots/bitcoin/releases/tag/$version"
-        echo ""
-
-    else
-        log_warning "Failed to copy artifacts to host"
-        log_info "Artifacts remain in container at: $build_dir"
+    if ! podman cp "$CONTAINER_NAME:$build_dir/." "$OUTPUT_DIR/" 2>&1; then
+        log_error "podman cp command failed (exit code: $?)"
+        log_error "Artifacts remain in container at: $build_dir"
+        log_info "Use --keep-container flag and extract manually with:"
+        log_info "  podman cp $CONTAINER_NAME:$build_dir/. ./output/"
+        COPY_SUCCESS="false"
+        return 1
     fi
+
+    # Verify files were actually copied
+    if [ -z "$(ls -A "$OUTPUT_DIR" 2>/dev/null)" ]; then
+        log_error "Artifact copy appeared to succeed but directory is empty"
+        log_error "Directory: $OUTPUT_DIR"
+        COPY_SUCCESS="false"
+        return 1
+    fi
+
+    # Count copied files
+    local file_count=$(find "$OUTPUT_DIR" -type f | wc -l)
+    log_success "Copied $file_count files to: $OUTPUT_DIR"
+
+    # Generate local SHA256SUMS file
+    log_info "Generating local SHA256SUMS file..."
+    (cd "$OUTPUT_DIR" && sha256sum *.tar.gz *.zip *.exe 2>/dev/null > SHA256SUMS.local) || \
+    (cd "$OUTPUT_DIR" && sha256sum * 2>/dev/null > SHA256SUMS.local)
+
+    if [ -f "$OUTPUT_DIR/SHA256SUMS.local" ]; then
+        log_success "Local checksums saved to: $OUTPUT_DIR/SHA256SUMS.local"
+    else
+        log_warning "Failed to generate SHA256SUMS.local"
+    fi
+
+    COPY_SUCCESS="true"
+    return 0
+}
+
+# Print verification summary with all data
+print_verification_summary() {
+    local version="$1"
+    local target="$2"
+
+    echo ""
+    echo "=========================================="
+    echo "BITCOIN KNOTS VERIFICATION SUMMARY"
+    echo "=========================================="
+    echo "Version: $version"
+    echo "Target: $target"
+    echo "Build Date: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    
+    if [ -n "$OUTPUT_DIR" ] && [ -d "$OUTPUT_DIR" ]; then
+        echo "Output Directory: $OUTPUT_DIR"
+        echo ""
+        echo "BUILD ARTIFACTS:"
+        echo "------------------------------------------"
+        
+        # List each file with size, date, and hash
+        for file in "$OUTPUT_DIR"/*; do
+            if [ -f "$file" ] && [ "$(basename "$file")" != "SHA256SUMS.local" ]; then
+                local filename=$(basename "$file")
+                local filesize=$(du -k "$file" | cut -f1)
+                local filedate=$(stat -c '%y' "$file" | cut -d'.' -f1)
+                local filehash=$(sha256sum "$file" | cut -d' ' -f1)
+                
+                echo "File: $filename"
+                echo "  Path: $file"
+                echo "  Size: ${filesize} KB"
+                echo "  Date: $filedate"
+                echo "  SHA256 (built): $filehash"
+                
+                # Compare with official if available
+                if [ -n "$OFFICIAL_CHECKSUMS_FILE" ] && [ -f "$OFFICIAL_CHECKSUMS_FILE" ]; then
+                    local official_hash=$(grep "$filename" "$OFFICIAL_CHECKSUMS_FILE" 2>/dev/null | awk '{print $1}')
+                    if [ -n "$official_hash" ]; then
+                        echo "  SHA256 (official): $official_hash"
+                        if [ "$filehash" == "$official_hash" ]; then
+                            echo "  Comparison: MATCH"
+                        else
+                            echo "  Comparison: MISMATCH"
+                        fi
+                    else
+                        echo "  SHA256 (official): NOT FOUND"
+                        echo "  Comparison: N/A"
+                    fi
+                fi
+                echo ""
+            fi
+        done
+        
+        echo "=========================================="
+        echo "BINARY COMPARISON RESULTS:"
+        echo "------------------------------------------"
+        if [ -f "$OUTPUT_DIR/COMPARISON_RESULTS.txt" ]; then
+            cat "$OUTPUT_DIR/COMPARISON_RESULTS.txt"
+        else
+            echo "Binary comparison not performed"
+            echo ""
+            echo "CHECKSUM COMPARISON SUMMARY:"
+            if [ -n "$OFFICIAL_CHECKSUMS_FILE" ] && [ -f "$OFFICIAL_CHECKSUMS_FILE" ]; then
+                # Count matches
+                local total=0
+                local matches=0
+                for file in "$OUTPUT_DIR"/*; do
+                    if [ -f "$file" ] && [ "$(basename "$file")" != "SHA256SUMS.local" ]; then
+                        total=$((total + 1))
+                        local filename=$(basename "$file")
+                        local filehash=$(sha256sum "$file" | cut -d' ' -f1)
+                        local official_hash=$(grep "$filename" "$OFFICIAL_CHECKSUMS_FILE" 2>/dev/null | awk '{print $1}')
+                        if [ -n "$official_hash" ] && [ "$filehash" == "$official_hash" ]; then
+                            matches=$((matches + 1))
+                        fi
+                    fi
+                done
+                echo "Total artifacts: $total"
+                echo "Matching hashes: $matches"
+                echo "Non-matching hashes: $((total - matches))"
+            else
+                echo "Official checksums: NOT AVAILABLE"
+                echo "Manual verification required at:"
+                echo "  https://github.com/bitcoinknots/bitcoin/releases/tag/$version"
+            fi
+        fi
+    else
+        echo "Output Directory: NOT AVAILABLE"
+        echo ""
+        echo "Artifacts were not copied to host."
+        if [ "$COPY_SUCCESS" == "false" ]; then
+            echo "Artifact copy failed. See error messages above."
+        elif [ "$COPY_SUCCESS" == "skipped" ]; then
+            echo "Artifact copy was skipped (--no-copy flag)."
+        fi
+    fi
+    echo "=========================================="
+    echo ""
 }
 
 # Final cleanup
 final_cleanup() {
     local keep_container="$1"
+
+    # Keep container if copy failed
+    if [[ "$COPY_SUCCESS" == "false" ]]; then
+        log_warning "Artifact copy failed, keeping container for manual extraction"
+        log_info "Container: $CONTAINER_NAME"
+        log_info "To extract artifacts manually:"
+        log_info "  podman exec -it $CONTAINER_NAME bash"
+        log_info "  # Inside container, artifacts are in /bitcoin/guix-build-*/output/"
+        log_info "To clean up later:"
+        log_info "  podman rm -f $CONTAINER_NAME && podman rmi -f $IMAGE_NAME"
+        return 0
+    fi
 
     if [[ "$keep_container" == "false" ]]; then
         log_info "Cleaning up containers and images..."
@@ -644,11 +917,61 @@ main() {
     start_container
     prepare_bitcoin_build "$version" "$target"
     execute_build "$version" "$target"
-    verify_checksums "$version" "$target" "$verify_flag" "$copy_flag"
-    final_cleanup "$keep_container"
+    
+    # Generate checksums in container
+    generate_container_checksums "$version" "$target" || true
+    
+    # Copy artifacts to host BEFORE any cleanup
+    copy_artifacts_to_host "$version" "$target" "$copy_flag" || true
+
+    # Download and compare with official artifacts (NEW PRIMARY METHOD)
+    local verification_result=2  # Default: no comparison performed
+
+    if [[ "$verify_flag" == "true" ]] && [[ "$COPY_SUCCESS" == "true" ]]; then
+        if download_official_artifacts "$version" "$OUTPUT_DIR"; then
+            compare_artifacts_binary "$OUTPUT_DIR"
+            verification_result=$?
+        else
+            log_warning "Failed to download official artifacts for binary comparison"
+            # Fallback to checksum-only verification
+            download_official_checksums "$version" || true
+            verification_result=2  # No binary comparison available
+        fi
+    fi
+
+    # Print verification summary
+    print_verification_summary "$version" "$target" || true
+
+    # Cleanup
+    final_cleanup "$keep_container" || true
 
     echo ""
-    log_success "Bitcoin Knots verification completed successfully!"
+
+    # Exit with appropriate code based on verification result
+    if [[ "$COPY_SUCCESS" != "true" ]]; then
+        if [[ "$COPY_SUCCESS" == "skipped" ]]; then
+            log_info "Bitcoin Knots build completed (artifacts in container)"
+            exit 0  # Build succeeded, copy skipped by user
+        else
+            log_error "Bitcoin Knots build completed but artifact copy failed"
+            exit 1  # Build succeeded but copy failed
+        fi
+    fi
+
+    # Determine exit code based on verification result
+    if [[ "$verify_flag" == "false" ]]; then
+        log_success "Bitcoin Knots build completed (verification skipped)"
+        exit 0
+    elif [[ $verification_result -eq 0 ]]; then
+        log_success "Bitcoin Knots verification completed: REPRODUCIBLE"
+        exit 0
+    elif [[ $verification_result -eq 1 ]]; then
+        log_error "Bitcoin Knots verification completed: NOT REPRODUCIBLE"
+        exit 1
+    else
+        log_warning "Bitcoin Knots verification completed: MANUAL VERIFICATION REQUIRED"
+        exit 2
+    fi
 }
 
 # Execute main function with all arguments
