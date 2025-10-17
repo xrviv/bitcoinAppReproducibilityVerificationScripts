@@ -21,9 +21,10 @@ git checkout master
 git fetch origin master
 git pull
 git checkout includeNostrBackuptoSearchVerifications
-node scripts/nostr/backupNostrVerificationEvents.mjs
+node scripts/nostr/backupNostrVerificationEvents.mjs -d 365
 ./refresh.sh -g "$GAP"
 node scripts/nostr/wsVerify.mjs --needs-verification | tee ~/needs-verification-$(date +%Y-%m-%d).txt
+git restore .
+git clean -f
 git checkout master
-git clean -f 
 git reset --hard HEAD
