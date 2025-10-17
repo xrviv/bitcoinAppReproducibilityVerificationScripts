@@ -2,13 +2,18 @@
 # ==============================================================================
 # verify_nunchukandroid.sh - Nunchuk Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.0
+# Version:       v0.3.0
 # Author:        Daniel Garcia (dannybuntu)
 # Organization:  WalletScrutiny.com
 # Last Modified: 2025-10-17 (Philippine Time)
 # Project:       https://github.com/nunchuk-io/nunchuk-android
 # ==============================================================================
 # LICENSE: MIT License
+#
+# Changes in v0.3.0:
+# - Uses repository's own Dockerfile from reproducible-builds directory (removed embedded Dockerfile)
+# - Fixed Java version issue by using official build environment
+# - Always shows Docker build output in real-time with tee
 #
 # Changes in v0.2.0:
 # - Integrated APK extraction from Android device (from apkextractor_sync.sh)
@@ -19,8 +24,7 @@
 # - Added adb dependency check for device extraction
 #
 # Changes in v0.1.0:
-# - Initial standalone script combining testAAB.sh, io.nunchuk.android.sh, and Dockerfile
-# - Embedded Dockerfile for reproducible build environment
+# - Initial standalone script combining testAAB.sh and io.nunchuk.android.sh
 # - Automatic device-spec.json generation from official APKs
 # - Complete AAB build and split APK generation workflow
 # - Hash comparison and diff analysis
@@ -41,10 +45,11 @@
 # By using this script, you acknowledge these disclaimers and accept full responsibility.
 #
 # SCRIPT SUMMARY:
+# - Extracts APKs from Android device OR uses existing APK directory
 # - Extracts metadata from official Nunchuk split APKs
 # - Generates device-spec.json for bundletool based on official APK characteristics
 # - Clones Nunchuk source repository and checks out the correct release tag
-# - Builds Docker container with Android SDK and NDK for reproducible builds
+# - Builds Docker container using repository's own Dockerfile
 # - Performs containerized AAB build using disorderfs for filesystem ordering
 # - Converts AAB to split APKs using bundletool with matching device configuration
 # - Compares official vs built APKs using hash comparison and binary diff analysis
@@ -71,7 +76,7 @@ echo -e "\033[0m"
 sleep 3
 
 # Global Variables
-SCRIPT_VERSION="v0.2.0"
+SCRIPT_VERSION="v0.3.0"
 BUNDLETOOL_VERSION="1.18.0"
 wsContainer="docker.io/walletscrutiny/android:5"
 
@@ -535,80 +540,20 @@ commit=$(git rev-parse HEAD)
 echo -e "${GREEN}Checked out commit: $commit${NC}"
 
 # Step 5: Build Docker image
-echo -e "\n${CYAN}Step 5: Building Docker image...${NC}"
+echo -e "\n${CYAN}Step 5: Building Docker image from repository...${NC}"
 
-dockerfileContent=$(cat <<'DOCKERFILE_END'
-FROM docker.io/debian:stable-20240722-slim
-
-RUN set -ex; \
-    apt-get update; \
-    DEBIAN_FRONTEND=noninteractive apt-get install --yes -o APT::Install-Suggests=false --no-install-recommends \
-        bzip2 make automake ninja-build g++-multilib libtool binutils-gold \
-        bsdmainutils pkg-config python3 patch bison curl unzip git openjdk-17-jdk sudo nano; \
-    rm -rf /var/lib/apt/lists/*; \
-    useradd -ms /bin/bash appuser; \
-    usermod -aG sudo appuser; \
-    echo "appuser ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
-
-USER appuser
-WORKDIR /home/appuser
-RUN mkdir -p /home/appuser/app
-ENV ANDROID_SDK_ROOT=/home/appuser/app/sdk
-ENV ANDROID_SDK=/home/appuser/app/sdk
-ENV ANDROID_HOME=/home/appuser/app/sdk
-ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
-WORKDIR /home/appuser/app/nunchuk
-
-ENV ANDROID_SDK_URL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-ENV ANDROID_BUILD_TOOLS_VERSION 34.0.0
-ENV ANDROID_VERSION 34
-ENV ANDROID_NDK_VERSION 25.1.8937393
-ENV ANDROID_CMAKE_VERSION 3.18.1
-ENV ANDROID_NDK_HOME ${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}/
-ENV PATH ${PATH}:${ANDROID_HOME}/tools:${ANDROID_HOME}/platform-tools
-
-RUN set -ex; \
-    mkdir -p "$ANDROID_HOME/cmdline-tools" && \
-    cd "$ANDROID_HOME/cmdline-tools" && \
-    curl -o sdk.zip $ANDROID_SDK_URL && \
-    unzip sdk.zip && \
-    mv cmdline-tools latest && \
-    rm sdk.zip
-
-RUN chmod +x ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager
-
-RUN ls -l ${ANDROID_HOME}/cmdline-tools/latest/bin/
-
-RUN yes | ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --sdk_root=$ANDROID_HOME --licenses
-RUN ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --sdk_root=$ANDROID_HOME --update
-
-RUN $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --sdk_root=$ANDROID_HOME \
-    "build-tools;${ANDROID_BUILD_TOOLS_VERSION}" \
-    "platforms;android-${ANDROID_VERSION}" \
-    "cmake;$ANDROID_CMAKE_VERSION" \
-    "platform-tools" \
-    "ndk;$ANDROID_NDK_VERSION"
-
-ENV PATH ${ANDROID_NDK_HOME}:$PATH
-ENV PATH ${ANDROID_NDK_HOME}/prebuilt/linux-x86_64/bin/:$PATH
-
-ENV GRADLE_USER_HOME=/home/appuser/app/nunchuk/.gradle-home
-DOCKERFILE_END
-)
-
-echo "$dockerfileContent" > "$workDir/Dockerfile.nunchuk"
-
-cd "$workDir"
-echo -e "${YELLOW}Building Docker image (this may take 10-15 minutes)...${NC}"
-if [ "$verbose" = true ]; then
-    podman build --platform linux/amd64 -t nunchuk-android -f Dockerfile.nunchuk .
-else
-    podman build --platform linux/amd64 -t nunchuk-android -f Dockerfile.nunchuk . > "$workDir/docker-build.log" 2>&1
+cd "$repoDir/reproducible-builds"
+if [ ! -f "Dockerfile" ]; then
+    echo -e "${RED}Error: Dockerfile not found in reproducible-builds directory${NC}"
+    exit 1
 fi
 
-if [ $? -ne 0 ]; then
+echo -e "${YELLOW}Building Docker image (this may take 10-15 minutes)...${NC}"
+podman build --platform linux/amd64 -t nunchuk-android . 2>&1 | tee "$workDir/docker-build.log"
+
+if [ ${PIPESTATUS[0]} -ne 0 ]; then
     echo -e "${RED}Error: Docker image build failed${NC}"
-    [ "$verbose" = false ] && echo "Check $workDir/docker-build.log for details"
+    echo "Check $workDir/docker-build.log for details"
     exit 1
 fi
 
