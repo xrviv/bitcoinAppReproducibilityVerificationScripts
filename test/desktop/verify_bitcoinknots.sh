@@ -44,7 +44,7 @@ set -euo pipefail
 # Script metadata
 SCRIPT_VERSION="v0.3.0"
 SCRIPT_NAME="verify_bitcoinknots.sh"
-DEFAULT_VERSION="v29.2.knots20251010"
+DEFAULT_VERSION="29.2.knots20251010"
 CONTAINER_NAME="ws_bitcoinknots_verifier"
 IMAGE_NAME="ws_bitcoinknots_verifier"
 
@@ -59,6 +59,17 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
+
+# Version normalization function
+normalize_version() {
+    local ver="$1"
+    # Add 'v' prefix if not present
+    if [[ ! "$ver" =~ ^v ]]; then
+        echo "v${ver}"
+    else
+        echo "$ver"
+    fi
+}
 
 # Logging functions
 log_info() {
@@ -94,7 +105,8 @@ OPTIONS:
     -h, --help          Show this help message
     -v, --version       Show script version
     -c, --clean         Clean up containers and images before build
-    -t, --target HOST   Build target (default: x86_64-linux-gnu)
+    -t, --target HOST   Build target (default: all Linux + Windows targets)
+                       Specify single target or space-separated list
     --no-verify         Skip checksum verification against official release
     --keep-container    Keep container running after build
     --list-targets      Show available build targets
@@ -102,13 +114,15 @@ OPTIONS:
 
 ARGUMENTS:
     VERSION             Bitcoin Knots version to verify (default: $DEFAULT_VERSION)
-                       Examples: v29.2.knots20251010, v29.1.knots20250903
+                       Examples: 29.2.knots20251010, 29.1.knots20250903
+                       Note: 'v' prefix optional (handled automatically)
 
 EXAMPLES:
-    $SCRIPT_NAME                                    # Verify default version
-    $SCRIPT_NAME v29.2.knots20251010                # Verify specific version
-    $SCRIPT_NAME --clean v29.1.knots20250903        # Clean up and verify
-    $SCRIPT_NAME --target x86_64-w64-mingw32 v29.2.knots20251010  # Windows build
+    $SCRIPT_NAME                                    # Build all Linux + Windows targets
+    $SCRIPT_NAME 29.2.knots20251010                 # Build all targets for specific version
+    $SCRIPT_NAME --clean 29.1.knots20250903         # Clean up and build all targets
+    $SCRIPT_NAME --target x86_64-linux-gnu 29.2.knots20251010     # Single Linux target
+    $SCRIPT_NAME --target x86_64-w64-mingw32 29.2.knots20251010   # Single Windows target
     $SCRIPT_NAME --list-targets                     # Show all available build targets
 
 REQUIREMENTS:
@@ -144,7 +158,7 @@ Bitcoin Knots supports building for multiple platforms. Each target produces
 different output files based on the platform and architecture.
 
 LINUX TARGETS:
-    x86_64-linux-gnu        Standard 64-bit Linux (glibc) - DEFAULT
+    x86_64-linux-gnu        Standard 64-bit Linux (glibc)
     aarch64-linux-gnu       64-bit ARM Linux (e.g., Raspberry Pi 4)
     arm-linux-gnueabihf     32-bit ARM Linux (e.g., Raspberry Pi 3)
     powerpc64-linux-gnu     64-bit PowerPC Linux
@@ -153,6 +167,17 @@ LINUX TARGETS:
 
 WINDOWS TARGETS:
     x86_64-w64-mingw32      64-bit Windows
+
+DEFAULT BEHAVIOR:
+    By default (when --target is not specified), all Linux targets and
+    Windows target are built in a single run:
+    - x86_64-linux-gnu
+    - aarch64-linux-gnu
+    - arm-linux-gnueabihf
+    - powerpc64-linux-gnu
+    - powerpc64le-linux-gnu
+    - riscv64-linux-gnu
+    - x86_64-w64-mingw32
 
 MACOS TARGETS:
     x86_64-apple-darwin     64-bit macOS (Intel)
@@ -177,13 +202,22 @@ FOR MACOS TARGETS:
     bitcoin-VERSION-TARGET-unsigned.tar.gz  # Unsigned binaries
     bitcoin-VERSION-TARGET-unsigned.zip     # Unsigned app bundle
 
-MULTI-TARGET BUILD:
-To build all default targets at once, omit the --target flag:
-    $SCRIPT_NAME v29.2.knots20251010
+SINGLE VS MULTI-TARGET BUILDS:
+To build all default targets (all Linux + Windows), omit the --target flag:
+    $SCRIPT_NAME 29.2.knots20251010
+
+To build a single specific target, use --target:
+    $SCRIPT_NAME --target x86_64-linux-gnu 29.2.knots20251010
+    $SCRIPT_NAME --target x86_64-w64-mingw32 29.2.knots20251010
+
+To build custom target list (space-separated):
+    $SCRIPT_NAME --target "x86_64-linux-gnu x86_64-w64-mingw32" 29.2.knots20251010
+
+Note: Version can be specified with or without 'v' prefix (both work)
 
 BUILD TIME ESTIMATES:
-    Single target:    20-40 minutes
-    All targets:      60-120 minutes (depending on hardware)
+    Single target:        20-40 minutes
+    All default targets:  90-180 minutes (depending on hardware)
 
 VERIFICATION:
 All output files can be verified against official Bitcoin Knots releases
@@ -840,7 +874,7 @@ final_cleanup() {
 # Main execution function
 main() {
     local version="$DEFAULT_VERSION"
-    local target="x86_64-linux-gnu"
+    local target="x86_64-linux-gnu aarch64-linux-gnu arm-linux-gnueabihf powerpc64-linux-gnu powerpc64le-linux-gnu riscv64-linux-gnu x86_64-w64-mingw32"
     local clean_flag="false"
     local verify_flag="true"
     local keep_container="false"
@@ -892,6 +926,9 @@ main() {
                 ;;
         esac
     done
+
+    # Normalize version (add 'v' prefix if missing)
+    version=$(normalize_version "$version")
 
     # Display configuration
     echo ""
