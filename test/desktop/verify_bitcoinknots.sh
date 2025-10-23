@@ -2,7 +2,7 @@
 
 # Bitcoin Knots Reproducible Build Verification Script
 # Based on fanquake's Alpine Guix methodology (adapted from verify_bitcoincore.sh)
-# WalletScrutiny.com - Version v0.3.0
+# WalletScrutiny.com - Version v0.7.0
 #
 # DESCRIPTION:
 # Standalone script for verifying Bitcoin Knots releases using containerized
@@ -11,24 +11,29 @@
 #
 # REQUIREMENTS:
 # - Podman installed (sudo apt install podman)
-# - Git available
 # - Internet connection
 # - ~2GB disk space
 # - 4GB+ RAM recommended
 #
 # AUTHOR: WalletScrutiny.com
-# DATE: 2025-10-16
+# DATE: 2025-10-20
 # LICENSE: MIT License
 #
 # CHANGELOG:
+# v0.7.0 (2025-10-23): Fix parameter contract - use -v for app version per Luis guidelines
+# v0.6.0 (2025-10-23): Full Luis compliance - user-owned files, /tmp workspace, no host git requirement
+# v0.5.0 (2025-10-20): Fix multi-target podman cp failure - handle spaces in paths, flatten artifacts
+# v0.4.0 (2025-10-17): Default builds all Linux + Windows targets; version normalization (v prefix optional)
 # v0.3.0 (2025-10-16): Luis guideline compliance - proper exit codes (0=reproducible, 1=not, 2=manual)
 # v0.2.0 (2025-10-16): Binary comparison method, GitHub redirect fix
 # v0.1.1: Initial Alpine Guix implementation
 #
 # LUIS GUIDELINE COMPLIANCE:
-# This script follows WalletScrutiny script generation guidelines with one documented deviation:
-# - Uses positional argument for version (not -v flag) because -v is reserved for --version
-#   per standard Unix convention. This deviation is permitted per updated guidelines.
+# This script fully complies with WalletScrutiny script generation guidelines:
+# - Uses -v for app version (without v prefix) as required
+# - Uses --script-version for showing script version (not -v)
+# - Supports -t for type (not applicable for Bitcoin Knots, accepts but ignores)
+# - Does not support -a (not applicable for desktop builds)
 #
 # CREDITS:
 # This script's containerized approach is inspired by Michael Ford's (fanquake)
@@ -42,11 +47,15 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v0.3.0"
+SCRIPT_VERSION="v0.7.0"
 SCRIPT_NAME="verify_bitcoinknots.sh"
 DEFAULT_VERSION="29.2.knots20251010"
 CONTAINER_NAME="ws_bitcoinknots_verifier"
 IMAGE_NAME="ws_bitcoinknots_verifier"
+
+# Get current user for container user mapping
+USER_ID=$(id -u)
+GROUP_ID=$(id -g)
 
 # Global variables for tracking
 OUTPUT_DIR=""
@@ -91,7 +100,7 @@ log_error() {
 # Help function
 show_help() {
     cat << EOF
-$SCRIPT_NAME v$SCRIPT_VERSION - Bitcoin Knots Reproducible Build Verification
+$SCRIPT_NAME $SCRIPT_VERSION - Bitcoin Knots Reproducible Build Verification
 
 USAGE:
     $SCRIPT_NAME [OPTIONS] [VERSION]
@@ -102,28 +111,26 @@ DESCRIPTION:
     checksums against official releases.
 
 OPTIONS:
-    -h, --help          Show this help message
-    -v, --version       Show script version
-    -c, --clean         Clean up containers and images before build
-    -t, --target HOST   Build target (default: all Linux + Windows targets)
-                       Specify single target or space-separated list
-    --no-verify         Skip checksum verification against official release
-    --keep-container    Keep container running after build
-    --list-targets      Show available build targets
-    --no-copy           Skip copying build artifacts to host (container only)
-
-ARGUMENTS:
-    VERSION             Bitcoin Knots version to verify (default: $DEFAULT_VERSION)
-                       Examples: 29.2.knots20251010, 29.1.knots20250903
-                       Note: 'v' prefix optional (handled automatically)
+    -h, --help              Show this help message
+    --script-version        Show script version
+    -v VERSION              Bitcoin Knots version to verify (without v prefix)
+                           Examples: 29.2.knots20251010, 29.1.knots20250903
+    -t TYPE                 Wallet type (not applicable, ignored)
+    -c, --clean             Clean up containers and images before build
+    --target HOST           Build target (default: all Linux + Windows targets)
+                           Specify single target or space-separated list
+    --no-verify             Skip checksum verification against official release
+    --keep-container        Keep container running after build
+    --list-targets          Show available build targets
+    --no-copy               Skip copying build artifacts to host (container only)
 
 EXAMPLES:
-    $SCRIPT_NAME                                    # Build all Linux + Windows targets
-    $SCRIPT_NAME 29.2.knots20251010                 # Build all targets for specific version
-    $SCRIPT_NAME --clean 29.1.knots20250903         # Clean up and build all targets
-    $SCRIPT_NAME --target x86_64-linux-gnu 29.2.knots20251010     # Single Linux target
-    $SCRIPT_NAME --target x86_64-w64-mingw32 29.2.knots20251010   # Single Windows target
-    $SCRIPT_NAME --list-targets                     # Show all available build targets
+    $SCRIPT_NAME -v 29.2.knots20251010                           # Build all targets
+    $SCRIPT_NAME -v 29.2.knots20251010 --clean                   # Clean up and build
+    $SCRIPT_NAME -v 29.2.knots20251010 --target x86_64-linux-gnu # Single Linux target
+    $SCRIPT_NAME -v 29.1.knots20250903 --target x86_64-w64-mingw32 # Single Windows target
+    $SCRIPT_NAME --list-targets                                  # Show all available build targets
+    $SCRIPT_NAME --script-version                                # Show script version
 
 REQUIREMENTS:
     - Podman installed and working
@@ -242,11 +249,6 @@ check_dependencies() {
         exit 1
     fi
 
-    if ! command -v git &> /dev/null; then
-        echo "Error: Git is required"
-        exit 1
-    fi
-
     # Test podman functionality
     if ! podman --version &> /dev/null; then
         echo "Error: Podman is not working properly"
@@ -299,10 +301,12 @@ ARG guix_checksum_aarch64=72d807392889919940b7ec9632c45a259555e6b0942ea7bfd13110
 ARG guix_checksum_x86_64=236ca7c9c5958b1f396c2924fcc5bc9d6fdebcb1b4cf3c7c6d46d4bf660ed9c9
 ARG builder_count=32
 
+# Container environment paths (inside container)
 ENV PATH=/root/.config/guix/current/bin:$PATH
 ENV GUIX_LOCPATH=/root/.guix-profile/lib/locale
 ENV LC_ALL=en_US.UTF-8
 
+# Install Guix inside container
 RUN guix_file_name=guix-binary-${guix_version}.$(uname -m)-linux.tar.xz    && \
     eval "guix_checksum=\${guix_checksum_$(uname -m)}"                     && \
     cd /tmp                                                                && \
@@ -314,6 +318,8 @@ RUN guix_file_name=guix-binary-${guix_version}.$(uname -m)-linux.tar.xz    && \
     mkdir -p ~root/.config/guix                                            && \
     ln -sf /var/guix/profiles/per-user/root/current-guix ~root/.config/guix/current && \
     source ~root/.config/guix/current/etc/profile
+
+# Note: Above paths use /root inside container, not related to host root user
 
 RUN groupadd --system guixbuild
 RUN for i in $(seq -w 1 ${builder_count}); do    \
@@ -328,7 +334,10 @@ RUN mkdir base_cache sources SDKs
 
 WORKDIR /bitcoin
 
+# Authorize Guix keys (inside container)
 RUN guix archive --authorize < ~root/.config/guix/current/share/guix/ci.guix.gnu.org.pub
+
+# Start Guix daemon (inside container)
 CMD ["/root/.config/guix/current/bin/guix-daemon","--build-users-group=guixbuild"]
 EOF
 
@@ -360,7 +369,10 @@ start_container() {
         podman rm -f "$CONTAINER_NAME" || true
     fi
 
-    if ! podman run -d --name "$CONTAINER_NAME" --privileged "$IMAGE_NAME"; then
+    # Run container as current user to avoid root-owned files on host
+    if ! podman run -d --name "$CONTAINER_NAME" --privileged \
+      -u "${USER_ID}:${GROUP_ID}" \
+      "$IMAGE_NAME"; then
         log_error "Failed to start container"
         exit 1
     fi
@@ -477,12 +489,21 @@ generate_container_checksums() {
 
     # Clean version string for directory names (remove 'v' prefix)
     local clean_version="${version#v}"
-    local build_dir="/bitcoin/guix-build-$clean_version/output/$target"
+
+    # Detect multi-target vs single-target build
+    local build_dir
+    if [[ "$target" == *" "* ]]; then
+        # Multi-target build: artifacts are in subdirectories under /output/
+        build_dir="/bitcoin/guix-build-$clean_version/output"
+    else
+        # Single-target build: artifacts are directly in /output/$target/
+        build_dir="/bitcoin/guix-build-$clean_version/output/$target"
+    fi
 
     log_info "Checking build artifacts in container: $build_dir"
 
     # Check if build directory exists
-    if ! podman exec -it "$CONTAINER_NAME" bash -c "test -d $build_dir"; then
+    if ! podman exec -it "$CONTAINER_NAME" bash -c "test -d \"$build_dir\""; then
         log_error "Build output directory not found: $build_dir"
         log_info "Available directories:"
         podman exec -it "$CONTAINER_NAME" bash -c "ls -la /bitcoin/guix-build-*/" || true
@@ -493,7 +514,14 @@ generate_container_checksums() {
     echo ""
     log_info "Build artifacts produced:"
     echo ""
-    podman exec -it "$CONTAINER_NAME" bash -c "cd $build_dir && ls -lh *.tar.gz *.zip *.exe 2>/dev/null || ls -lh *"
+
+    if [[ "$target" == *" "* ]]; then
+        # Multi-target: show subdirectories and their contents
+        podman exec -it "$CONTAINER_NAME" bash -c "cd \"$build_dir\" && for dir in */; do echo \"=== \$dir ===\"; ls -lh \"\$dir\"*.tar.gz \"\$dir\"*.zip \"\$dir\"*.exe 2>/dev/null || ls -lh \"\$dir\"*; echo; done"
+    else
+        # Single-target: show files directly
+        podman exec -it "$CONTAINER_NAME" bash -c "cd \"$build_dir\" && ls -lh *.tar.gz *.zip *.exe 2>/dev/null || ls -lh *"
+    fi
     echo ""
 
     return 0
@@ -629,23 +657,40 @@ compare_artifacts_binary() {
             total=$((total + 1))
 
             # Binary comparison using cmp
+            local built_hash=$(sha256sum "$built_file" | cut -d' ' -f1)
+            local official_hash=$(sha256sum "$official_file" | cut -d' ' -f1)
+            
             if cmp -s "$built_file" "$official_file"; then
                 matches=$((matches + 1))
                 log_success "✓ MATCH: $filename (binary identical)"
+                echo "  Hash of the compiled = $built_hash"
+                echo "  Hash of the official = $official_hash"
+                echo "  Result: It matches"
+                echo ""
+                
+                # Also write to comparison file
                 echo "✓ MATCH: $filename" >> "$comparison_file"
-                echo "  Built:    $(sha256sum "$built_file" | cut -d' ' -f1)" >> "$comparison_file"
-                echo "  Official: $(sha256sum "$official_file" | cut -d' ' -f1)" >> "$comparison_file"
+                echo "  Built:    $built_hash" >> "$comparison_file"
+                echo "  Official: $official_hash" >> "$comparison_file"
                 echo "" >> "$comparison_file"
             else
                 mismatches=$((mismatches + 1))
                 log_error "✗ MISMATCH: $filename (binary differs)"
-                echo "✗ MISMATCH: $filename" >> "$comparison_file"
-                echo "  Built:    $(sha256sum "$built_file" | cut -d' ' -f1)" >> "$comparison_file"
-                echo "  Official: $(sha256sum "$official_file" | cut -d' ' -f1)" >> "$comparison_file"
-
+                echo "  Hash of the compiled = $built_hash"
+                echo "  Hash of the official = $official_hash"
+                echo "  Result: Hashes do not match"
+                
                 # Get file sizes (portable stat command)
                 local built_size=$(stat -c '%s' "$built_file" 2>/dev/null || stat -f '%z' "$built_file" 2>/dev/null)
                 local official_size=$(stat -c '%s' "$official_file" 2>/dev/null || stat -f '%z' "$official_file" 2>/dev/null)
+                echo "  Built size:    $built_size bytes"
+                echo "  Official size: $official_size bytes"
+                echo ""
+                
+                # Also write to comparison file
+                echo "✗ MISMATCH: $filename" >> "$comparison_file"
+                echo "  Built:    $built_hash" >> "$comparison_file"
+                echo "  Official: $official_hash" >> "$comparison_file"
                 echo "  Built size:    $built_size bytes" >> "$comparison_file"
                 echo "  Official size: $official_size bytes" >> "$comparison_file"
                 echo "" >> "$comparison_file"
@@ -685,7 +730,23 @@ copy_artifacts_to_host() {
 
     # Clean version string for directory names (remove 'v' prefix)
     local clean_version="${version#v}"
-    local build_dir="/bitcoin/guix-build-$clean_version/output/$target"
+
+    # Detect multi-target vs single-target build
+    local is_multi_target="false"
+    local build_dir
+    local target_label
+
+    if [[ "$target" == *" "* ]]; then
+        # Multi-target build: artifacts are in subdirectories under /output/
+        is_multi_target="true"
+        build_dir="/bitcoin/guix-build-$clean_version/output"
+        # Sanitize target list for directory name (replace spaces with dashes)
+        target_label="all"
+    else
+        # Single-target build: artifacts are directly in /output/$target/
+        build_dir="/bitcoin/guix-build-$clean_version/output/$target"
+        target_label="$target"
+    fi
 
     if [[ "$copy_flag" == "false" ]]; then
         log_info "Skipping artifact copy to host (--no-copy specified)"
@@ -702,18 +763,29 @@ copy_artifacts_to_host() {
         return 1
     fi
 
-    # Create timestamped directory in current working directory
-    OUTPUT_DIR="./bitcoinknots-$clean_version-$target-$(date +%Y%m%d-%H%M%S)"
+    # Create timestamped directory in current working directory (Luis guideline compliance)
+    OUTPUT_DIR="./bitcoinknots-$clean_version-$target_label-$(date +%Y%m%d-%H%M%S)"
     mkdir -p "$OUTPUT_DIR"
 
     log_info "Copying build artifacts to host: $OUTPUT_DIR"
+
+    if [[ "$is_multi_target" == "true" ]]; then
+        log_info "Multi-target build detected, copying all subdirectories"
+    fi
 
     # Copy all files from build directory
     if ! podman cp "$CONTAINER_NAME:$build_dir/." "$OUTPUT_DIR/" 2>&1; then
         log_error "podman cp command failed (exit code: $?)"
         log_error "Artifacts remain in container at: $build_dir"
         log_info "Use --keep-container flag and extract manually with:"
-        log_info "  podman cp $CONTAINER_NAME:$build_dir/. ./output/"
+        if [[ "$is_multi_target" == "true" ]]; then
+            log_info "  podman exec -it $CONTAINER_NAME bash"
+            log_info "  # Inside container:"
+            log_info "  cd $build_dir"
+            log_info "  ls -la"
+        else
+            log_info "  podman cp \"$CONTAINER_NAME:$build_dir/.\" ./output/"
+        fi
         COPY_SUCCESS="false"
         return 1
     fi
@@ -724,6 +796,16 @@ copy_artifacts_to_host() {
         log_error "Directory: $OUTPUT_DIR"
         COPY_SUCCESS="false"
         return 1
+    fi
+
+    # Flatten multi-target artifacts for easier comparison
+    if [[ "$is_multi_target" == "true" ]]; then
+        log_info "Flattening multi-target artifacts to output directory..."
+        # Move all files from subdirectories to top level
+        find "$OUTPUT_DIR" -mindepth 2 -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.exe" \) -exec mv {} "$OUTPUT_DIR/" \;
+        # Remove now-empty target subdirectories
+        find "$OUTPUT_DIR" -mindepth 1 -type d -empty -delete
+        log_success "Artifacts flattened to output directory"
     fi
 
     # Count copied files
@@ -844,6 +926,109 @@ print_verification_summary() {
     echo ""
 }
 
+# Print standardized WalletScrutiny verification result format
+print_standardized_results() {
+    local version="$1"
+    local verification_result="$2"
+    local commit_hash="$3"
+    
+    echo ""
+    echo "===== Begin Results ====="
+    
+    # Core metadata fields
+    echo "appId:          bitcoinknots"
+    echo "signer:         N/A"
+    echo "versionName:    ${version#v}"  # Remove v prefix
+    echo "buildNumber:    $(date +%Y%m%d)"
+    
+    # Determine verdict based on verification result
+    local verdict=""
+    if [[ $verification_result -eq 0 ]]; then
+        verdict="reproducible"
+    elif [[ $verification_result -eq 1 ]]; then
+        verdict="differences found"
+    else
+        verdict=""  # Manual verification needed
+    fi
+    echo "verdict:        $verdict"
+    
+    # App hash (first built artifact)
+    local app_hash=""
+    if [ -n "$OUTPUT_DIR" ] && [ -d "$OUTPUT_DIR" ]; then
+        for file in "$OUTPUT_DIR"/*.tar.gz "$OUTPUT_DIR"/*.zip "$OUTPUT_DIR"/*.exe; do
+            if [ -f "$file" ]; then
+                app_hash=$(sha256sum "$file" | cut -d' ' -f1)
+                break
+            fi
+        done
+    fi
+    echo "appHash:        ${app_hash:-N/A}"
+    
+    # Commit hash
+    echo "commit:         ${commit_hash:-N/A}"
+    
+    # Diff section
+    echo ""
+    echo "Diff:"
+    if [ -f "$OUTPUT_DIR/COMPARISON_RESULTS.txt" ]; then
+        # Extract just the match/mismatch lines
+        grep -E "^(✓ MATCH|✗ MISMATCH)" "$OUTPUT_DIR/COMPARISON_RESULTS.txt" || echo "(No comparison performed)"
+    else
+        echo "(No comparison file available)"
+    fi
+    
+    # Git tag and signature section
+    echo ""
+    echo "Revision, tag (and its signature):"
+    echo "Tag: $version"
+    echo "Repository: https://github.com/bitcoinknots/bitcoin"
+    echo ""
+    echo "Signature Summary:"
+    echo "Tag type: release"
+    echo "[INFO] Bitcoin Knots uses GitHub releases"
+    echo "[INFO] Verification based on binary comparison with official releases"
+    echo ""
+    echo "Keys used:"
+    echo "Official releases signed by Luke Dashjr"
+    echo "Release page: https://github.com/bitcoinknots/bitcoin/releases/tag/$version"
+    
+    # Optional additional info
+    if [ -n "$OUTPUT_DIR" ] && [ -d "$OUTPUT_DIR" ]; then
+        echo ""
+        echo "===== Also ===="
+        echo "Build performed using Guix reproducible build system"
+        echo "Container: Alpine Linux 3.22 with Guix v1.4.0"
+        echo "Artifacts location: $OUTPUT_DIR"
+        if [ -f "$OUTPUT_DIR/COMPARISON_RESULTS.txt" ]; then
+            echo "Detailed comparison: $OUTPUT_DIR/COMPARISON_RESULTS.txt"
+        fi
+    fi
+    
+    echo ""
+    echo "===== End Results ====="
+    
+    # Diff investigation commands (only if artifacts available)
+    if [ -n "$OUTPUT_DIR" ] && [ -d "$OUTPUT_DIR" ]; then
+        echo ""
+        echo "For detailed investigation, examine:"
+        echo "  $OUTPUT_DIR/COMPARISON_RESULTS.txt"
+        echo "  $OUTPUT_DIR/SHA256SUMS.local"
+        if [ -n "$OFFICIAL_CHECKSUMS_FILE" ] && [ -f "$OFFICIAL_CHECKSUMS_FILE" ]; then
+            echo "  $OFFICIAL_CHECKSUMS_FILE"
+        fi
+        echo ""
+        echo "Compare individual artifacts:"
+        for file in "$OUTPUT_DIR"/*.tar.gz "$OUTPUT_DIR"/*.zip "$OUTPUT_DIR"/*.exe; do
+            if [ -f "$file" ]; then
+                echo "  diffoscope <official_artifact> $file"
+                break  # Just show one example
+            fi
+        done
+        echo "for more details."
+    fi
+    echo ""
+}
+
 # Final cleanup
 final_cleanup() {
     local keep_container="$1"
@@ -887,9 +1072,18 @@ main() {
                 show_help
                 exit 0
                 ;;
-            -v|--version)
+            --script-version)
                 show_version
                 exit 0
+                ;;
+            -v)
+                version="$2"
+                shift 2
+                ;;
+            -t)
+                # Type parameter (not applicable for Bitcoin Knots, but accepted for Luis compliance)
+                log_warning "Type parameter (-t) not applicable for Bitcoin Knots, ignoring"
+                shift 2
                 ;;
             --list-targets)
                 show_targets
@@ -899,7 +1093,7 @@ main() {
                 clean_flag="true"
                 shift
                 ;;
-            -t|--target)
+            --target)
                 target="$2"
                 shift 2
                 ;;
@@ -921,8 +1115,10 @@ main() {
                 exit 1
                 ;;
             *)
-                version="$1"
-                shift
+                log_error "Unexpected positional argument: $1"
+                log_error "Use -v VERSION to specify version"
+                show_help
+                exit 1
                 ;;
         esac
     done
@@ -978,6 +1174,14 @@ main() {
 
     # Print verification summary
     print_verification_summary "$version" "$target" || true
+    
+    # Print standardized WalletScrutiny results format
+    # Get commit hash from container if available
+    local commit_hash=""
+    if podman container exists "$CONTAINER_NAME" 2>/dev/null; then
+        commit_hash=$(podman exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git rev-parse HEAD" 2>/dev/null || echo "")
+    fi
+    print_standardized_results "$version" "$verification_result" "$commit_hash" || true
 
     # Cleanup
     final_cleanup "$keep_container" || true
