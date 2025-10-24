@@ -2,12 +2,22 @@
 # ==============================================================================
 # verify_bullbitcoinandroid.sh - Bull Bitcoin Mobile Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.3.4
+# Version:       v0.3.6
 # Author:        Daniel Garcia (dannybuntu)
 # Organization:  WalletScrutiny.com
-# Last Modified: 2025-10-22 (Philippine Time - OOM fix)
+# Last Modified: 2025-10-24 (Philippine Time - git safe.directory fix)
 # Project:       https://github.com/SatoshiPortal/bullbitcoin-mobile
 # ==============================================================================
+# Changes in v0.3.6:
+# - Configure git safe.directory=/app inside container before signature checks
+# - Prevents git from aborting when container runs as root with /app owned by docker user
+#
+# Changes in v0.3.5:
+# - Align verification summary with Luis + standard result format
+# - Populate GitHub download metadata (hash, signer, version code)
+# - Emit full diff output instead of truncated previews
+# - Sync --version reporting with header metadata
+#
 # Changes in v0.3.4:
 # - CRITICAL FIX: Added memory limit (4GB) to container build to prevent OOM crashes
 # - Added pre-build memory check with user warning if < 4GB available
@@ -140,6 +150,7 @@ trap 'on_error $LINENO' ERR
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 shouldCleanup=false
+additionalInfo=""
 
 # Color constants
 YELLOW='\033[1;33m'
@@ -176,6 +187,17 @@ check_command() {
   else
     echo -e "$1 - ${RED}${ERROR_ICON} not installed${NC}"
     MISSING_DEPENDENCIES=true
+  fi
+}
+
+# Append message to the "Also" section of the summary
+append_additional_info() {
+  local message="$1"
+  local current="${additionalInfo:-}"
+  if [[ -z "$current" ]]; then
+    additionalInfo="$message"
+  else
+    additionalInfo="$current"$'\n'"$message"
   fi
 }
 
@@ -453,6 +475,7 @@ if [[ "$verificationMode" == "device" ]]; then
     echo -e "${YELLOW}  Official APK: v$officialVersion${NC}"
     echo -e "${YELLOW}  This may result in expected differences.${NC}"
     echo ""
+    append_additional_info "Requested build: v$appVersion. Device APK reports v$officialVersion."
   fi
 
   echo -e "${CYAN}Now comparing v${appVersion} (to be built) to v${officialVersion} (official APKs)${NC}"
@@ -910,6 +933,8 @@ build_and_verify() {
       --volume "$apkDir":/official-apks:rw \
       bullbitcoin-verifier:v6.1.0 \
       bash -c "
+        git config --global --add safe.directory /app
+
         # Run extraction and comparison script (github mode)
         /app/extract_and_compare.sh \
           github \
@@ -957,6 +982,8 @@ build_and_verify() {
       --volume "$apkDir":/official-apks:ro \
       bullbitcoin-verifier:v6.1.0 \
       bash -c "
+        git config --global --add safe.directory /app
+
         # Run extraction and comparison script (device mode)
         /app/extract_and_compare.sh \
           device \
@@ -1018,6 +1045,50 @@ build_and_verify() {
 # Note: extract_splits_from_aab() and compare_split_apks() functions removed in v0.2.0
 # All extraction and comparison now happens inside container via extract_and_compare.sh
 
+finalize_github_metadata() {
+  local githubApk="$apkDir/github.apk"
+
+  if [[ ! -f "$githubApk" ]]; then
+    echo -e "${RED}Error: Expected GitHub APK at $githubApk but it was not found.${NC}"
+    exit 1
+  fi
+
+  appHash=$(sha256sum "$githubApk" | awk '{print $1;}')
+  signer=$(getSigner "$githubApk")
+
+  local tempExtractDir
+  tempExtractDir=$(mktemp -d /tmp/github_meta_XXXXXX)
+
+  if ! containerApktool "$tempExtractDir" "$githubApk"; then
+    echo -e "${RED}Error: Failed to decode GitHub APK for metadata extraction.${NC}"
+    rm -rf "$tempExtractDir"
+    exit 1
+  fi
+
+  if [[ -f "$tempExtractDir/apktool.yml" ]]; then
+    officialVersion=$(grep 'versionName' "$tempExtractDir/apktool.yml" | awk '{print $2}' | tr -d "'" | head -n1)
+    versionCode=$(grep 'versionCode' "$tempExtractDir/apktool.yml" | awk '{print $2}' | tr -d "'" | head -n1)
+  fi
+
+  if [[ -f "$tempExtractDir/AndroidManifest.xml" ]]; then
+    appId=$(grep 'package=' "$tempExtractDir/AndroidManifest.xml" | sed 's/.*package="//; s/".*//')
+  fi
+
+  rm -rf "$tempExtractDir"
+
+  if [[ -z "$officialVersion" ]]; then
+    officialVersion="$appVersion"
+  fi
+
+  if [[ -z "$versionCode" ]]; then
+    versionCode="unknown"
+  fi
+
+  if [[ "$appVersion" != "$officialVersion" ]]; then
+    append_additional_info "Requested build: v$appVersion. GitHub APK reports v$officialVersion."
+  fi
+}
+
 # Generate verification summary
 # ==============================
 
@@ -1029,56 +1100,39 @@ result() {
   fi
 
   # Read aggregated diffs from results directory (created by container)
-  local aggregated_diffs=""
+  local diff_output=""
   local split_mismatch=false
 
-  for diff_file in "$workDir/results"/diff_*.txt; do
+  shopt -s nullglob
+  for diff_file in "$workDir/results"/diff_*.txt "$workDir/results"/diff_extra_*.txt; do
     [ -f "$diff_file" ] || continue
-    local split_name content total_lines preview
-    split_name=$(basename "$diff_file" | sed 's/^diff_//; s/\.txt$//')
+    local base content split_name
+    base=$(basename "$diff_file")
+    if [[ "$base" == diff_extra_* ]]; then
+      split_name=${base#diff_extra_}
+    else
+      split_name=${base#diff_}
+    fi
+    split_name=${split_name%.txt}
     content=$(cat "$diff_file")
+
     if [[ "$content" == "missing_in_built" ]]; then
       split_mismatch=true
-      aggregated_diffs+="=== ${split_name} ==="$'\n'
-      aggregated_diffs+="Split ${split_name} exists in the official APK set but is missing from the rebuilt output."$'\n\n'
-    elif [[ -n "$content" && "$content" != "extra_in_built" ]]; then
-      # Truncate diff output to first 3 lines
-      total_lines=$(echo "$content" | wc -l)
-      preview=$(echo "$content" | head -n 3)
-      aggregated_diffs+="=== ${split_name} ==="$'\n'
-      aggregated_diffs+="$preview"$'\n'
-      if [[ $total_lines -gt 3 ]]; then
-        local remaining=$((total_lines - 3))
-        aggregated_diffs+="... $remaining more lines"$'\n'
-        aggregated_diffs+="Full diff saved: $diff_file"$'\n'
-      fi
-      aggregated_diffs+=$'\n'
+      diff_output+="Split ${split_name} exists only in the official APK set."$'\n'
+      continue
     fi
-  done
 
-  for diff_file in "$workDir/results"/diff_extra_*.txt; do
-    [ -f "$diff_file" ] || continue
-    local split_name content total_lines preview
-    split_name=$(basename "$diff_file" | sed 's/^diff_extra_//; s/\.txt$//')
-    content=$(cat "$diff_file")
     if [[ "$content" == "extra_in_built" ]]; then
       split_mismatch=true
-      aggregated_diffs+="=== ${split_name} ==="$'\n'
-      aggregated_diffs+="Split ${split_name} exists in the rebuilt output but not in the official APK set."$'\n\n'
-    elif [[ -n "$content" ]]; then
-      # Truncate diff output to first 3 lines
-      total_lines=$(echo "$content" | wc -l)
-      preview=$(echo "$content" | head -n 3)
-      aggregated_diffs+="=== ${split_name} ==="$'\n'
-      aggregated_diffs+="$preview"$'\n'
-      if [[ $total_lines -gt 3 ]]; then
-        local remaining=$((total_lines - 3))
-        aggregated_diffs+="... $remaining more lines"$'\n'
-        aggregated_diffs+="Full diff saved: $diff_file"$'\n'
-      fi
-      aggregated_diffs+=$'\n'
+      diff_output+="Split ${split_name} exists only in the rebuilt APK set."$'\n'
+      continue
+    fi
+
+    if [[ -n "$content" ]]; then
+      diff_output+="$content"$'\n'
     fi
   done
+  shopt -u nullglob
 
   # Set global verdict for exit code (v0.3.0)
   verdict=""
@@ -1090,7 +1144,7 @@ result() {
 
   local diffGuide="
 Detailed diff files available at:
-$workDir/results/diff_*.txt
+$workDir/results/
 
 To investigate further, you can re-run the container:
 podman run -it --rm \\
@@ -1106,22 +1160,21 @@ for more details."
   fi
 
   local infoBlock=""
-  if [[ -n "$additionalInfo" ]]; then
-    infoBlock="===== Also ====$newline$additionalInfo$newline"
+  if [[ -n "${additionalInfo:-}" ]]; then
+    infoBlock="===== Also =====\n${additionalInfo}\n"
   fi
 
   echo "===== Begin Results ====="
   echo "appId:          $appId"
   echo "signer:         $signer"
-  echo "builtVersion:   $appVersion"
-  echo "officialVersion: $officialVersion"
+  echo "apkVersionName: $officialVersion"
   echo "apkVersionCode: $versionCode"
   echo "verdict:        $verdict"
   echo "appHash:        $appHash"
   echo "commit:         $commit"
   echo
   echo "Diff:"
-  echo "$aggregated_diffs"
+  printf '%s\n' "$diff_output"
   echo
   echo "Revision, tag (and its signature):"
 
@@ -1154,6 +1207,9 @@ cleanup() {
 
 echo "=== Starting Verification Process ==="
 build_and_verify
+if [[ "$verificationMode" == "github" ]]; then
+  finalize_github_metadata
+fi
 result
 echo "=== Verification Complete ==="
 echo "Session End: $(date -Iseconds)"
