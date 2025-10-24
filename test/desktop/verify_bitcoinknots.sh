@@ -2,7 +2,7 @@
 
 # Bitcoin Knots Reproducible Build Verification Script
 # Based on fanquake's Alpine Guix methodology (adapted from verify_bitcoincore.sh)
-# WalletScrutiny.com - Version v0.8.0
+# WalletScrutiny.com - Version v0.9.0
 #
 # DESCRIPTION:
 # Standalone script for verifying Bitcoin Knots releases using containerized
@@ -20,6 +20,7 @@
 # LICENSE: MIT License
 #
 # CHANGELOG:
+# v0.9.0 (2025-10-24): Release-only verification by default, optional debug flag, machine-readable summary
 # v0.8.1 (2025-10-24): Use POSIX '.' in embedded Dockerfile for BusyBox compatibility
 # v0.8.0 (2025-10-23): Stream official downloads + build artifacts via container; force wget for Guix deps
 # v0.7.0 (2025-10-23): Fix parameter contract - use -v for app version per Luis guidelines
@@ -49,7 +50,7 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v0.8.1"
+SCRIPT_VERSION="v0.9.0"
 SCRIPT_NAME="verify_bitcoinknots.sh"
 DEFAULT_VERSION="29.2.knots20251010"
 CONTAINER_NAME="ws_bitcoinknots_verifier"
@@ -59,6 +60,9 @@ IMAGE_NAME="ws_bitcoinknots_verifier"
 OUTPUT_DIR=""
 OFFICIAL_CHECKSUMS_FILE=""
 COPY_SUCCESS="false"
+INCLUDE_DEBUG_ARTIFACTS="false"
+declare -a SELECTED_ARTIFACTS=()
+declare -a SKIPPED_OPTIONAL_ARTIFACTS=()
 
 # Colors for output
 RED='\033[0;31m'
@@ -95,6 +99,105 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+is_optional_artifact() {
+    local filename="$1"
+
+    if [[ "$filename" == *-debug.* ]]; then
+        return 0
+    fi
+    if [[ "$filename" == *-codesigning.* ]]; then
+        return 0
+    fi
+    if [[ "$filename" == *-unsigned.* ]]; then
+        return 0
+    fi
+    if [[ "$filename" == codesignatures-* ]]; then
+        return 0
+    fi
+    if [[ "$filename" == *.desc.html ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+select_artifacts_for_verification() {
+    local output_dir="$1"
+    local include_debug="$2"
+
+    SELECTED_ARTIFACTS=()
+    SKIPPED_OPTIONAL_ARTIFACTS=()
+
+    if [[ ! -d "$output_dir" ]]; then
+        log_warning "Output directory not found for artifact selection: $output_dir"
+        return 1
+    fi
+
+    shopt -s nullglob
+    for file in "$output_dir"/*; do
+        [[ -f "$file" ]] || continue
+        local filename
+        filename=$(basename "$file")
+
+        case "$filename" in
+            COMPARISON_RESULTS.txt|SHA256SUMS|SHA256SUMS.local)
+                continue
+                ;;
+        esac
+
+        if [[ "$include_debug" != "true" ]] && is_optional_artifact "$filename"; then
+            SKIPPED_OPTIONAL_ARTIFACTS+=("$filename")
+            continue
+        fi
+
+        SELECTED_ARTIFACTS+=("$filename")
+    done
+    shopt -u nullglob
+
+    if [[ ${#SELECTED_ARTIFACTS[@]} -eq 0 ]]; then
+        log_warning "No artifacts selected for verification"
+    else
+        log_info "Selected ${#SELECTED_ARTIFACTS[@]} artifacts for verification"
+        for artifact in "${SELECTED_ARTIFACTS[@]}"; do
+            log_info "  - $artifact"
+        done
+    fi
+
+    if [[ "$include_debug" != "true" ]] && [[ ${#SKIPPED_OPTIONAL_ARTIFACTS[@]} -gt 0 ]]; then
+        log_info "Skipped ${#SKIPPED_OPTIONAL_ARTIFACTS[@]} optional artifacts (use --with-debug to include):"
+        for skipped in "${SKIPPED_OPTIONAL_ARTIFACTS[@]}"; do
+            log_info "  - $skipped"
+        done
+    fi
+
+    return 0
+}
+
+derive_target_label() {
+    local filename="$1"
+    local version="$2"
+
+    local clean_version="${version#v}"
+    local remainder="${filename#bitcoin-${clean_version}-}"
+
+    if [[ "$remainder" == "$filename" ]]; then
+        remainder="${filename#bitcoin-${clean_version}}"
+        remainder="${remainder#-}"
+    fi
+
+    remainder="${remainder%.tar.gz}"
+    remainder="${remainder%.tar.xz}"
+    remainder="${remainder%.zip}"
+    remainder="${remainder%.exe}"
+    remainder="${remainder%.dmg}"
+
+    if [[ -z "$remainder" ]]; then
+        remainder="source"
+    fi
+
+    echo "$remainder"
+}
+
 # Help function
 show_help() {
     cat << EOF
@@ -121,6 +224,7 @@ OPTIONS:
     --keep-container        Keep container running after build
     --list-targets          Show available build targets
     --no-copy               Skip copying build artifacts to host (container only)
+    --with-debug            Include debug/codesigning/unsigned artifacts in verification
 
 EXAMPLES:
     $SCRIPT_NAME -v 29.2.knots20251010                           # Build all targets
@@ -404,24 +508,24 @@ prepare_bitcoin_build() {
 
     # Clean previous build artifacts
     log_info "Cleaning previous build artifacts..."
-    podman exec -it "$CONTAINER_NAME" bash -c "cd /bitcoin && rm -rf depends/work/ guix-build-*/ base_cache/*" || true
-    podman exec -it "$CONTAINER_NAME" bash -c "cd /bitcoin && make -C depends clean-all" || true
+    podman exec "$CONTAINER_NAME" bash -c "cd /bitcoin && rm -rf depends/work/ guix-build-*/ base_cache/*" || true
+    podman exec "$CONTAINER_NAME" bash -c "cd /bitcoin && make -C depends clean-all" || true
 
     # Update repository and checkout version
     log_info "Fetching latest Bitcoin Knots repository..."
-    podman exec -it "$CONTAINER_NAME" bash -c "cd /bitcoin && git fetch --all --tags"
+    podman exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git fetch --all --tags"
 
     log_info "Checking out version: $version"
-    if ! podman exec -it "$CONTAINER_NAME" bash -c "cd /bitcoin && git checkout $version"; then
+    if ! podman exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git checkout $version"; then
         log_error "Failed to checkout version: $version"
         log_error "Available tags:"
-        podman exec -it "$CONTAINER_NAME" bash -c "cd /bitcoin && git tag | grep -E 'knots' | tail -10"
+        podman exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git tag | grep -E 'knots' | tail -10"
         exit 1
     fi
 
     # Verify GPG signature
     log_info "Verifying GPG signature for $version..."
-    if podman exec -it "$CONTAINER_NAME" bash -c "cd /bitcoin && git verify-tag $version 2>/dev/null"; then
+    if podman exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git verify-tag $version 2>/dev/null"; then
         log_success "GPG signature verified for $version"
     else
         log_warning "GPG signature verification failed for $version"
@@ -445,7 +549,7 @@ execute_build() {
     # Execute the build
     local build_cmd="cd /bitcoin && time FORCE_USE_WGET=1 BASE_CACHE='/base_cache' SOURCE_PATH='/sources' SDK_PATH='/SDKs' HOSTS='$target' ./contrib/guix/guix-build"
 
-    if podman exec -it "$CONTAINER_NAME" bash -c "$build_cmd"; then
+    if podman exec "$CONTAINER_NAME" bash -c "$build_cmd"; then
         local end_time=$(date +%s)
         local duration=$((end_time - start_time))
         log_success "Build completed successfully in $duration seconds"
@@ -476,10 +580,10 @@ generate_container_checksums() {
     log_info "Checking build artifacts in container: $build_dir"
 
     # Check if build directory exists
-    if ! podman exec -it "$CONTAINER_NAME" bash -c "test -d \"$build_dir\""; then
+    if ! podman exec "$CONTAINER_NAME" bash -c "test -d \"$build_dir\""; then
         log_error "Build output directory not found: $build_dir"
         log_info "Available directories:"
-        podman exec -it "$CONTAINER_NAME" bash -c "ls -la /bitcoin/guix-build-*/" || true
+        podman exec "$CONTAINER_NAME" bash -c "ls -la /bitcoin/guix-build-*/" || true
         return 1
     fi
 
@@ -490,10 +594,10 @@ generate_container_checksums() {
 
     if [[ "$target" == *" "* ]]; then
         # Multi-target: show subdirectories and their contents
-        podman exec -it "$CONTAINER_NAME" bash -c "cd \"$build_dir\" && for dir in */; do echo \"=== \$dir ===\"; ls -lh \"\$dir\"*.tar.gz \"\$dir\"*.zip \"\$dir\"*.exe 2>/dev/null || ls -lh \"\$dir\"*; echo; done"
+        podman exec "$CONTAINER_NAME" bash -c "cd \"$build_dir\" && for dir in */; do echo \"=== \$dir ===\"; ls -lh \"\$dir\"*.tar.gz \"\$dir\"*.zip \"\$dir\"*.exe 2>/dev/null || ls -lh \"\$dir\"*; echo; done"
     else
         # Single-target: show files directly
-        podman exec -it "$CONTAINER_NAME" bash -c "cd \"$build_dir\" && ls -lh *.tar.gz *.zip *.exe 2>/dev/null || ls -lh *"
+        podman exec "$CONTAINER_NAME" bash -c "cd \"$build_dir\" && ls -lh *.tar.gz *.zip *.exe 2>/dev/null || ls -lh *"
     fi
     echo ""
 
@@ -580,31 +684,34 @@ download_official_artifacts() {
     OFFICIAL_CHECKSUMS_FILE="$official_dir/SHA256SUMS"
     log_success "Official SHA256SUMS downloaded to: $OFFICIAL_CHECKSUMS_FILE"
 
-    local -a official_files=()
+    declare -A official_hashes=()
     while IFS=' ' read -r hash filename; do
         [[ -z "$hash" || -z "$filename" ]] && continue
         filename="${filename#\*}"
-        official_files+=("$filename")
+        official_hashes["$filename"]="$hash"
     done < "$OFFICIAL_CHECKSUMS_FILE"
 
     local download_count=0
     local failed_count=0
 
-    shopt -s nullglob
-    for built_file in "$output_dir"/*.tar.gz "$output_dir"/*.zip "$output_dir"/*.exe; do
-        [[ -f "$built_file" ]] || continue
-        local filename=$(basename "$built_file")
+    if [[ ${#SELECTED_ARTIFACTS[@]} -eq 0 ]]; then
+        log_warning "No artifacts selected for official download"
+        podman exec "$CONTAINER_NAME" rm -rf "$container_temp_dir" >/dev/null 2>&1 || true
+        return 1
+    fi
 
-        local found="false"
-        for official in "${official_files[@]}"; do
-            if [[ "$official" == "$filename" ]]; then
-                found="true"
-                break
-            fi
-        done
+    for filename in "${SELECTED_ARTIFACTS[@]}"; do
+        local built_file="$output_dir/$filename"
 
-        if [[ "$found" != "true" ]]; then
+        if [[ ! -f "$built_file" ]]; then
+            log_warning "Selected artifact not found on host: $filename"
+            failed_count=$((failed_count + 1))
+            continue
+        fi
+
+        if [[ -z "${official_hashes[$filename]:-}" ]]; then
             log_warning "Official SHA256SUMS does not list artifact: $filename"
+            failed_count=$((failed_count + 1))
             continue
         fi
 
@@ -625,7 +732,6 @@ download_official_artifacts() {
         download_count=$((download_count + 1))
         log_success "Downloaded official artifact: $filename"
     done
-    shopt -u nullglob
 
     podman exec "$CONTAINER_NAME" rm -rf "$container_temp_dir" >/dev/null 2>&1 || true
 
@@ -644,6 +750,7 @@ download_official_artifacts() {
 # Perform binary comparison between built and official artifacts
 compare_artifacts_binary() {
     local output_dir="$1"
+    local version="$2"
     local official_dir="$output_dir/official-downloads"
 
     log_info "Performing binary comparison of artifacts..."
@@ -658,81 +765,62 @@ compare_artifacts_binary() {
     local matches=0
     local mismatches=0
 
-    # Create comparison results file
+    if [[ ${#SELECTED_ARTIFACTS[@]} -eq 0 ]]; then
+        log_warning "No artifacts selected for comparison"
+        return 2
+    fi
+
     local comparison_file="$output_dir/COMPARISON_RESULTS.txt"
-    echo "Bitcoin Knots Binary Comparison Results" > "$comparison_file"
+    echo "BUILDS MATCH BINARIES" > "$comparison_file"
     echo "Date: $(date '+%Y-%m-%d %H:%M:%S %Z')" >> "$comparison_file"
-    echo "========================================" >> "$comparison_file"
     echo "" >> "$comparison_file"
 
-    for built_file in "$output_dir"/*.tar.gz "$output_dir"/*.zip "$output_dir"/*.exe; do
-        if [ -f "$built_file" ]; then
-            local filename=$(basename "$built_file")
+    for filename in "${SELECTED_ARTIFACTS[@]}"; do
+        local built_file="$output_dir/$filename"
+        local official_file="$official_dir/$filename"
 
-            # Skip SHA256SUMS files
-            if [[ "$filename" == SHA256SUMS* ]]; then
-                continue
-            fi
+        if [[ ! -f "$built_file" ]]; then
+            log_warning "Built artifact missing on host: $filename"
+            mismatches=$((mismatches + 1))
+            echo "$filename - missing-on-host - N/A - 0 (MISSING BUILT ARTIFACT)" >> "$comparison_file"
+            continue
+        fi
 
-            local official_file="$official_dir/$filename"
+        if [[ ! -f "$official_file" ]]; then
+            log_warning "Official artifact missing for comparison: $filename"
+            mismatches=$((mismatches + 1))
+            local target_label
+            target_label=$(derive_target_label "$filename" "$version")
+            local built_hash
+            built_hash=$(sha256sum "$built_file" | cut -d' ' -f1)
+            echo "$filename - $target_label - $built_hash - 0 (OFFICIAL MISSING)" >> "$comparison_file"
+            continue
+        fi
 
-            if [ ! -f "$official_file" ]; then
-                log_warning "Official file not found for comparison: $filename"
-                continue
-            fi
+        total=$((total + 1))
+        local target_label
+        target_label=$(derive_target_label "$filename" "$version")
+        local built_hash
+        built_hash=$(sha256sum "$built_file" | cut -d' ' -f1)
+        local official_hash
+        official_hash=$(sha256sum "$official_file" | cut -d' ' -f1)
 
-            total=$((total + 1))
-
-            # Binary comparison using cmp
-            local built_hash=$(sha256sum "$built_file" | cut -d' ' -f1)
-            local official_hash=$(sha256sum "$official_file" | cut -d' ' -f1)
-            
-            if cmp -s "$built_file" "$official_file"; then
-                matches=$((matches + 1))
-                log_success "✓ MATCH: $filename (binary identical)"
-                echo "  Hash of the compiled = $built_hash"
-                echo "  Hash of the official = $official_hash"
-                echo "  Result: It matches"
-                echo ""
-                
-                # Also write to comparison file
-                echo "✓ MATCH: $filename" >> "$comparison_file"
-                echo "  Built:    $built_hash" >> "$comparison_file"
-                echo "  Official: $official_hash" >> "$comparison_file"
-                echo "" >> "$comparison_file"
-            else
-                mismatches=$((mismatches + 1))
-                log_error "✗ MISMATCH: $filename (binary differs)"
-                echo "  Hash of the compiled = $built_hash"
-                echo "  Hash of the official = $official_hash"
-                echo "  Result: Hashes do not match"
-                
-                # Get file sizes (portable stat command)
-                local built_size=$(stat -c '%s' "$built_file" 2>/dev/null || stat -f '%z' "$built_file" 2>/dev/null)
-                local official_size=$(stat -c '%s' "$official_file" 2>/dev/null || stat -f '%z' "$official_file" 2>/dev/null)
-                echo "  Built size:    $built_size bytes"
-                echo "  Official size: $official_size bytes"
-                echo ""
-                
-                # Also write to comparison file
-                echo "✗ MISMATCH: $filename" >> "$comparison_file"
-                echo "  Built:    $built_hash" >> "$comparison_file"
-                echo "  Official: $official_hash" >> "$comparison_file"
-                echo "  Built size:    $built_size bytes" >> "$comparison_file"
-                echo "  Official size: $official_size bytes" >> "$comparison_file"
-                echo "" >> "$comparison_file"
-            fi
+        if cmp -s "$built_file" "$official_file"; then
+            matches=$((matches + 1))
+            log_success "MATCH: $filename"
+            echo "$filename - $target_label - $built_hash - 1 (MATCHES)" >> "$comparison_file"
+        else
+            mismatches=$((mismatches + 1))
+            log_error "MISMATCH: $filename"
+            echo "$filename - $target_label - $built_hash - 0 (DOESN'T MATCH)" >> "$comparison_file"
         fi
     done
 
-    # Summary
     echo "" >> "$comparison_file"
-    echo "========================================" >> "$comparison_file"
-    echo "SUMMARY:" >> "$comparison_file"
-    echo "  Total artifacts compared: $total" >> "$comparison_file"
-    echo "  Matches (binary identical): $matches" >> "$comparison_file"
-    echo "  Mismatches (binary differs): $mismatches" >> "$comparison_file"
-    echo "========================================" >> "$comparison_file"
+    echo "SUMMARY" >> "$comparison_file"
+    echo "total: $total" >> "$comparison_file"
+    echo "matches: $matches" >> "$comparison_file"
+    echo "mismatches: $mismatches" >> "$comparison_file"
 
     log_info "Comparison results saved to: $comparison_file"
 
@@ -863,40 +951,44 @@ print_verification_summary() {
         echo ""
         echo "BUILD ARTIFACTS:"
         echo "------------------------------------------"
-        
-        # List each file with size, date, and hash
-        for file in "$OUTPUT_DIR"/*; do
-            if [ -f "$file" ] && [ "$(basename "$file")" != "SHA256SUMS.local" ]; then
-                local filename=$(basename "$file")
-                local filesize=$(du -k "$file" | cut -f1)
-                local filedate=$(stat -c '%y' "$file" | cut -d'.' -f1)
-                local filehash=$(sha256sum "$file" | cut -d' ' -f1)
-                
-                echo "File: $filename"
-                echo "  Path: $file"
-                echo "  Size: ${filesize} KB"
-                echo "  Date: $filedate"
-                echo "  SHA256 (built): $filehash"
-                
-                # Compare with official if available
-                if [ -n "$OFFICIAL_CHECKSUMS_FILE" ] && [ -f "$OFFICIAL_CHECKSUMS_FILE" ]; then
-                    local official_hash=$(grep "$filename" "$OFFICIAL_CHECKSUMS_FILE" 2>/dev/null | awk '{print $1}')
-                    if [ -n "$official_hash" ]; then
-                        echo "  SHA256 (official): $official_hash"
-                        if [ "$filehash" == "$official_hash" ]; then
-                            echo "  Comparison: MATCH"
+
+        if [[ ${#SELECTED_ARTIFACTS[@]} -eq 0 ]]; then
+            echo "No artifacts selected for verification"
+        else
+            for filename in "${SELECTED_ARTIFACTS[@]}"; do
+                local file="$OUTPUT_DIR/$filename"
+                if [ -f "$file" ]; then
+                    local filesize=$(du -k "$file" | cut -f1)
+                    local filedate=$(stat -c '%y' "$file" | cut -d'.' -f1)
+                    local filehash=$(sha256sum "$file" | cut -d' ' -f1)
+
+                    echo "File: $filename"
+                    echo "  Path: $file"
+                    echo "  Size: ${filesize} KB"
+                    echo "  Date: $filedate"
+                    echo "  SHA256 (built): $filehash"
+
+                    if [ -n "$OFFICIAL_CHECKSUMS_FILE" ] && [ -f "$OFFICIAL_CHECKSUMS_FILE" ]; then
+                        local official_hash=$(grep -F "  $filename" "$OFFICIAL_CHECKSUMS_FILE" 2>/dev/null | awk '{print $1}')
+                        if [ -n "$official_hash" ]; then
+                            echo "  SHA256 (official): $official_hash"
                         else
-                            echo "  Comparison: MISMATCH"
+                            echo "  SHA256 (official): NOT FOUND"
                         fi
-                    else
-                        echo "  SHA256 (official): NOT FOUND"
-                        echo "  Comparison: N/A"
                     fi
+                    echo ""
                 fi
-                echo ""
-            fi
-        done
-        
+            done
+        fi
+
+        if [[ ${#SKIPPED_OPTIONAL_ARTIFACTS[@]} -gt 0 ]]; then
+            echo "Optional artifacts skipped (use --with-debug to include):"
+            for skipped in "${SKIPPED_OPTIONAL_ARTIFACTS[@]}"; do
+                echo "  - $skipped"
+            done
+            echo ""
+        fi
+
         echo "=========================================="
         echo "BINARY COMPARISON RESULTS:"
         echo "------------------------------------------"
@@ -907,15 +999,14 @@ print_verification_summary() {
             echo ""
             echo "CHECKSUM COMPARISON SUMMARY:"
             if [ -n "$OFFICIAL_CHECKSUMS_FILE" ] && [ -f "$OFFICIAL_CHECKSUMS_FILE" ]; then
-                # Count matches
                 local total=0
                 local matches=0
-                for file in "$OUTPUT_DIR"/*; do
-                    if [ -f "$file" ] && [ "$(basename "$file")" != "SHA256SUMS.local" ]; then
+                for filename in "${SELECTED_ARTIFACTS[@]}"; do
+                    local file="$OUTPUT_DIR/$filename"
+                    if [ -f "$file" ]; then
                         total=$((total + 1))
-                        local filename=$(basename "$file")
                         local filehash=$(sha256sum "$file" | cut -d' ' -f1)
-                        local official_hash=$(grep "$filename" "$OFFICIAL_CHECKSUMS_FILE" 2>/dev/null | awk '{print $1}')
+                        local official_hash=$(grep -F "  $filename" "$OFFICIAL_CHECKSUMS_FILE" 2>/dev/null | awk '{print $1}')
                         if [ -n "$official_hash" ] && [ "$filehash" == "$official_hash" ]; then
                             matches=$((matches + 1))
                         fi
@@ -972,13 +1063,12 @@ print_standardized_results() {
     
     # App hash (first built artifact)
     local app_hash=""
-    if [ -n "$OUTPUT_DIR" ] && [ -d "$OUTPUT_DIR" ]; then
-        for file in "$OUTPUT_DIR"/*.tar.gz "$OUTPUT_DIR"/*.zip "$OUTPUT_DIR"/*.exe; do
-            if [ -f "$file" ]; then
-                app_hash=$(sha256sum "$file" | cut -d' ' -f1)
-                break
-            fi
-        done
+    if [ -n "$OUTPUT_DIR" ] && [ -d "$OUTPUT_DIR" ] && [[ ${#SELECTED_ARTIFACTS[@]} -gt 0 ]]; then
+        local first_selected="${SELECTED_ARTIFACTS[0]}"
+        local first_file="$OUTPUT_DIR/$first_selected"
+        if [ -f "$first_file" ]; then
+            app_hash=$(sha256sum "$first_file" | cut -d' ' -f1)
+        fi
     fi
     echo "appHash:        ${app_hash:-N/A}"
     
@@ -989,8 +1079,7 @@ print_standardized_results() {
     echo ""
     echo "Diff:"
     if [ -f "$OUTPUT_DIR/COMPARISON_RESULTS.txt" ]; then
-        # Extract just the match/mismatch lines
-        grep -E "^(✓ MATCH|✗ MISMATCH)" "$OUTPUT_DIR/COMPARISON_RESULTS.txt" || echo "(No comparison performed)"
+        grep -E " - (0|1) " "$OUTPUT_DIR/COMPARISON_RESULTS.txt" || echo "(No comparison performed)"
     else
         echo "(No comparison file available)"
     fi
@@ -1036,12 +1125,13 @@ print_standardized_results() {
         fi
         echo ""
         echo "Compare individual artifacts:"
-        for file in "$OUTPUT_DIR"/*.tar.gz "$OUTPUT_DIR"/*.zip "$OUTPUT_DIR"/*.exe; do
-            if [ -f "$file" ]; then
-                echo "  diffoscope <official_artifact> $file"
-                break  # Just show one example
+        if [[ ${#SELECTED_ARTIFACTS[@]} -gt 0 ]]; then
+            local first_selected="${SELECTED_ARTIFACTS[0]}"
+            local first_file="$OUTPUT_DIR/$first_selected"
+            if [ -f "$first_file" ]; then
+                echo "  diffoscope <official_artifact> $first_file"
             fi
-        done
+        fi
         echo "for more details."
     fi
     echo ""
@@ -1056,7 +1146,7 @@ final_cleanup() {
         log_warning "Artifact copy failed, keeping container for manual extraction"
         log_info "Container: $CONTAINER_NAME"
         log_info "To extract artifacts manually:"
-        log_info "  podman exec -it $CONTAINER_NAME bash"
+        log_info "  podman exec $CONTAINER_NAME bash"
         log_info "  # Inside container, artifacts are in /bitcoin/guix-build-*/output/"
         log_info "To clean up later:"
         log_info "  podman rm -f $CONTAINER_NAME && podman rmi -f $IMAGE_NAME"
@@ -1069,7 +1159,7 @@ final_cleanup() {
         log_success "Cleanup completed"
     else
         log_info "Container kept running as requested: $CONTAINER_NAME"
-        log_info "To connect: podman exec -it $CONTAINER_NAME bash"
+        log_info "To connect: podman exec $CONTAINER_NAME bash"
         log_info "To clean up later: podman rm -f $CONTAINER_NAME && podman rmi -f $IMAGE_NAME"
     fi
 }
@@ -1082,6 +1172,7 @@ main() {
     local verify_flag="true"
     local keep_container="false"
     local copy_flag="true"
+    local include_debug="false"
 
     # Parse command line arguments
     while [[ $# -gt 0 ]]; do
@@ -1125,6 +1216,11 @@ main() {
                 ;;
             --no-copy)
                 copy_flag="false"
+                shift
+                ;;
+            --with-debug)
+                include_debug="true"
+                INCLUDE_DEBUG_ARTIFACTS="true"
                 shift
                 ;;
             -*)
@@ -1175,12 +1271,19 @@ main() {
     # Copy artifacts to host BEFORE any cleanup
     copy_artifacts_to_host "$version" "$target" "$copy_flag" || true
 
+    if [[ "$COPY_SUCCESS" == "true" ]]; then
+        select_artifacts_for_verification "$OUTPUT_DIR" "$include_debug" || true
+    else
+        SELECTED_ARTIFACTS=()
+        SKIPPED_OPTIONAL_ARTIFACTS=()
+    fi
+
     # Download and compare with official artifacts (NEW PRIMARY METHOD)
     local verification_result=2  # Default: no comparison performed
 
     if [[ "$verify_flag" == "true" ]] && [[ "$COPY_SUCCESS" == "true" ]]; then
         if download_official_artifacts "$version" "$OUTPUT_DIR"; then
-            compare_artifacts_binary "$OUTPUT_DIR"
+            compare_artifacts_binary "$OUTPUT_DIR" "$version"
             verification_result=$?
         else
             log_warning "Failed to download official artifacts for binary comparison"
