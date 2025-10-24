@@ -20,6 +20,7 @@
 # LICENSE: MIT License
 #
 # CHANGELOG:
+# v0.8.1 (2025-10-24): Use POSIX '.' in embedded Dockerfile for BusyBox compatibility
 # v0.8.0 (2025-10-23): Stream official downloads + build artifacts via container; force wget for Guix deps
 # v0.7.0 (2025-10-23): Fix parameter contract - use -v for app version per Luis guidelines
 # v0.6.0 (2025-10-23): Full Luis compliance - user-owned files, /tmp workspace, no host git requirement
@@ -48,7 +49,7 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v0.8.0"
+SCRIPT_VERSION="v0.8.1"
 SCRIPT_NAME="verify_bitcoinknots.sh"
 DEFAULT_VERSION="29.2.knots20251010"
 CONTAINER_NAME="ws_bitcoinknots_verifier"
@@ -155,7 +156,7 @@ EOF
 # Show available build targets
 show_targets() {
     cat << EOF
-$SCRIPT_NAME v$SCRIPT_VERSION - Available Build Targets
+$SCRIPT_NAME $SCRIPT_VERSION - Available Build Targets
 
 SUPPORTED BUILD TARGETS:
 Bitcoin Knots supports building for multiple platforms. Each target produces
@@ -328,7 +329,7 @@ RUN set -e                                                              && \
     mv gnu /                                                               && \
     mkdir -p ~root/.config/guix                                            && \
     ln -sf /var/guix/profiles/per-user/root/current-guix ~root/.config/guix/current && \
-    source ~root/.config/guix/current/etc/profile
+    . /root/.config/guix/current/etc/profile
 
 # Note: Above paths use /root inside container, not related to host root user
 
