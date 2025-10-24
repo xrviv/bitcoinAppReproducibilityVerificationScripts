@@ -2,19 +2,84 @@
 # ==============================================================================
 # verify_bullbitcoinandroid.sh - Bull Bitcoin Mobile Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.1.0
+# Version:       v0.3.4
 # Author:        Daniel Garcia (dannybuntu)
 # Organization:  WalletScrutiny.com
-# Last Modified: 2025-10-21 (Philippine Time)
+# Last Modified: 2025-10-22 (Philippine Time - OOM fix)
 # Project:       https://github.com/SatoshiPortal/bullbitcoin-mobile
 # ==============================================================================
+# Changes in v0.3.4:
+# - CRITICAL FIX: Added memory limit (4GB) to container build to prevent OOM crashes
+# - Added pre-build memory check with user warning if < 4GB available
+# - Updated REQUIREMENTS: Minimum 8GB RAM (12GB+ recommended)
+# - Documented OOM incident: systemd-oomd killed terminal at 3.2GB usage
+# - Container now limited to 4GB to ensure system stability
+# - Interactive prompt allows user to cancel build on low memory
+#
+# Changes in v0.3.3:
+# - Moved GitHub APK download inside container (~95% containerization!)
+# - Removed curl dependency from host (only docker/podman needed now)
+# - Container downloads APK directly using wget (already installed)
+# - Pass app version to container via environment variable
+# - True Luis compliance: absolutely minimal host dependencies
+#
+# Changes in v0.3.2:
+# - Made -a parameter optional (full Luis Guidelines compliance)
+# - Added Path 1: GitHub APK verification (no -a, downloads universal APK from GitHub)
+# - Added Path 2: Device split APK verification (with -a, uses provided splits)
+# - Automatic path selection based on -a presence
+# - Universal APK extraction from AAB using bundletool --mode=universal
+# - Two comparison modes: universal APK vs APK, or split-by-split
+# - Build server can now run without pre-extracted device APKs
+#
+# Changes in v0.3.1:
+# - Changed -v flag to specify app version (not script version)
+# - Added --version flag for script version (Unix convention)
+# - Script now compares user-specified version against official APK version
+# - Added comparison summary: "Comparing v{built} to v{official}"
+# - Added version mismatch warning if versions differ
+# - Full Luis compliance: -v specifies app version to build
+#
+# Changes in v0.3.0:
+# - BREAKING: Removed git dependency from host (full Luis compliance)
+# - Git clone now happens inside Dockerfile using build arg
+# - Git verification moved to container, outputs to git_verification.txt
+# - Fixed exit code: returns 0 if reproducible, 1 if differences found
+# - Removed prepare() and resolve_tag() functions (no longer needed on host)
+# - Updated REQUIREMENTS: only docker/podman needed on host
+#
+# Changes in v0.2.3:
+# - Improved diff output readability - now shows only first 3 lines per split
+# - Added summary line showing total lines and diff file path
+# - Prevents terminal flooding with massive smali diffs
+# - Full diffs still saved to workspace for detailed analysis
+#
+# Changes in v0.2.2:
+# - Fixed runtime permission error when writing to mounted /workspace volume
+# - Removed host-side mkdir for results directory (line 739 deleted)
+# - Added --user root to container run command for volume write access
+# - Container script now creates results directory with correct permissions
+#
+# Changes in v0.2.1:
+# - Fixed Podman user namespace permission error in Dockerfile
+# - Removed redundant chmod on extract_and_compare.sh (already executable from host)
+# - COPY instruction preserves executable permission set on line 580
+#
+# Changes in v0.2.0:
+# - BREAKING: Full containerization - only docker/podman required on host
+# - Moved bundletool execution inside container (removes Java host dependency)
+# - Moved APK extraction/comparison inside container (removes unzip dependency)
+# - Single container run for build + extract + compare (was multi-step)
+# - Embedded extraction/comparison script runs inside container
+# - Host script only orchestrates and displays results
+# - 100% compliant with Luis and standalone script guidelines
+#
 # Changes in v0.1.0:
 # - Initial release: Standalone AAB verification script for Bull Bitcoin Mobile
 # - Supports split APKs verification (Play Store AAB distribution)
 # - Auto-generates device-spec.json from official APK metadata
 # - Embedded Dockerfile for reproducible Flutter AAB build
 # - Split-by-split comparison with aggregated diff output
-# - Compliant with Luis guidelines and verification-result-summary-format.md
 # ==============================================================================
 #
 # TECHNICAL DISCLAIMER:
@@ -31,13 +96,19 @@
 # By using this script, you acknowledge these disclaimers and accept full responsibility.
 #
 # SCRIPT SUMMARY:
-# - Extracts official Bull Bitcoin Mobile split APKs from device or provided directory
+# - Reads official Bull Bitcoin Mobile split APKs from provided directory
 # - Auto-generates device-spec.json from APK metadata (architectures, SDK, locales, density)
-# - Clones source code repository and checks out the exact release tag
-# - Performs containerized reproducible AAB build using Flutter/Android SDK
-# - Extracts split APKs from built AAB using bundletool and device-spec.json
-# - Compares built split APKs against official releases (split-by-split diff analysis)
-# - Documents differences and generates detailed reproducibility assessment report
+# - Builds container image with Flutter/Android SDK + bundletool + apktool
+# - Runs single container that:
+#   * Clones source code and checks out exact release tag
+#   * Builds AAB using Flutter (reproducible build)
+#   * Extracts split APKs from AAB using bundletool
+#   * Decodes both official and built APKs using apktool
+#   * Compares split-by-split and generates diff reports
+# - Reads verification results from container output
+# - Displays reproducibility assessment summary
+#
+# HOST DEPENDENCIES: Only docker or podman required (no Java, unzip, or build tools)
 
 set -euo pipefail
 
@@ -108,6 +179,45 @@ check_command() {
   fi
 }
 
+# Check available system memory before starting build
+check_memory() {
+  local available_mem_gb=$(free -g | awk '/^Mem:/ {print $7}')
+  local total_mem_gb=$(free -g | awk '/^Mem:/ {print $2}')
+
+  echo "System Memory Status:"
+  echo "  Total: ${total_mem_gb}GB"
+  echo "  Available: ${available_mem_gb}GB"
+  echo ""
+
+  if [[ $available_mem_gb -lt 4 ]]; then
+    echo -e "${RED}${WARNING_ICON} Low Available Memory Detected${NC}"
+    echo -e "${YELLOW}  Available: ${available_mem_gb}GB (Recommended: 6GB+)${NC}"
+    echo -e "${YELLOW}  This build requires significant memory resources.${NC}"
+    echo -e "${YELLOW}  System may become unstable or build may fail.${NC}"
+    echo ""
+    echo -e "${YELLOW}Recommendations:${NC}"
+    echo -e "${YELLOW}  - Close unnecessary applications${NC}"
+    echo -e "${YELLOW}  - Stop memory-intensive processes${NC}"
+    echo -e "${YELLOW}  - Consider upgrading RAM if builds fail frequently${NC}"
+    echo ""
+
+    if [[ $total_mem_gb -lt 8 ]]; then
+      echo -e "${RED}${WARNING_ICON} Total RAM: ${total_mem_gb}GB (Minimum: 8GB recommended)${NC}"
+      echo ""
+    fi
+
+    read -p "Continue anyway? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+      echo "Build cancelled by user"
+      exit 1
+    fi
+  else
+    echo -e "${GREEN}${SUCCESS_ICON} Sufficient memory available for build${NC}"
+    echo ""
+  fi
+}
+
 # Run apktool in container to decode APK
 containerApktool() {
   targetFolder=$1
@@ -160,8 +270,8 @@ NAME
        verify_bullbitcoinandroid.sh - Bull Bitcoin Mobile reproducible build verification
 
 SYNOPSIS
-       verify_bullbitcoinandroid.sh -a <apk_dir> [OPTIONS]
-       verify_bullbitcoinandroid.sh -v | -h
+       verify_bullbitcoinandroid.sh -v <version> -a <apk_dir> [OPTIONS]
+       verify_bullbitcoinandroid.sh --version | -h
 
 DESCRIPTION
        Performs containerized reproducible AAB build verification for Bull Bitcoin Mobile.
@@ -170,10 +280,13 @@ DESCRIPTION
        Workspace: /tmp/test_com.bullbitcoin.mobile_<version>/
 
 OPTIONS
-       -v, --version           Show script version and exit
+       --version               Show script version and exit
        -h, --help              Show this help and exit
 
-       -a, --apk-dir <dir>     Directory containing official split APKs (required)
+       -v <version>            App version to build (required, e.g., 6.1.0 without 'v' prefix)
+       -a, --apk-dir <dir>     Directory containing official split APKs (optional)
+                               If provided: Split APK verification (device extracted)
+                               If omitted: Downloads universal APK from GitHub releases
                                Expected files: base.apk, split_config.*.apk
 
        -t, --type <type>       App type (optional, for Luis guidelines compliance)
@@ -181,8 +294,17 @@ OPTIONS
        -c, --cleanup           Remove temporary files after completion
 
 REQUIREMENTS
-       docker OR podman, git, unzip, sha256sum, grep, awk, sed, aapt
-       Optional: java (for bundletool), diffoscope, meld
+       docker OR podman (required - that's it!)
+       aapt (optional - falls back to container if missing)
+
+       Minimum 8GB RAM (12GB+ recommended for stability)
+       - Build requires 4GB+ for container
+       - Additional 2-4GB for system operations
+       - Low memory may cause system instability or OOM crashes
+
+       Standard tools (typically pre-installed): sha256sum, grep, awk, sed
+
+       Note: APK downloads happen inside container, no curl/wget needed on host
 
 EXIT CODES
        0    Verification completed (check verdict in output for reproducibility status)
@@ -190,8 +312,12 @@ EXIT CODES
        2    Unsupported appId (not com.bullbitcoin.mobile)
 
 EXAMPLES
-       verify_bullbitcoinandroid.sh -a /var/shared/apk/com.bullbitcoin.mobile/6.1.0/splits/
-       verify_bullbitcoinandroid.sh -a ~/bullbitcoin-splits/ -c
+       # Path 1: GitHub universal APK verification (no device needed)
+       verify_bullbitcoinandroid.sh -v 6.1.0
+
+       # Path 2: Device split APK verification (requires extracted splits)
+       verify_bullbitcoinandroid.sh -v 6.1.0 -a /var/shared/apk/com.bullbitcoin.mobile/6.1.0/splits/
+       verify_bullbitcoinandroid.sh -v 6.1.0 -a ~/bullbitcoin-splits/ -c
 
 For detailed documentation, see: https://walletscrutiny.com
 
@@ -202,13 +328,15 @@ EOF
 # ===============================
 
 apkDir=""
+appVersion=""
 revisionOverride=""
 appType=""
-showVersion=false
+showScriptVersion=false
 
 while [[ "$#" -gt 0 ]]; do
   case $1 in
-    -v|--version) showVersion=true ;;
+    --version) showScriptVersion=true ;;
+    -v) appVersion="$2"; shift ;;
     -a|--apk-dir) apkDir="$2"; shift ;;
     -t|--type) appType="$2"; shift ;;
     -r|--revision) revisionOverride="$2"; shift ;;
@@ -220,89 +348,136 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 # Show script version and exit if requested
-if [ "$showVersion" = true ]; then
-  echo "verify_bullbitcoinandroid.sh v0.1.0"
+if [ "$showScriptVersion" = true ]; then
+  echo "verify_bullbitcoinandroid.sh v0.3.5"
   exit 0
 fi
 
 # Validate required arguments
-if [[ -z "$apkDir" ]]; then
-  echo -e "${RED}Error: APK directory not specified. Use -a to provide directory with split APKs.${NC}"
+if [[ -z "$appVersion" ]]; then
+  echo -e "${RED}Error: App version not specified. Use -v to specify version (e.g., -v 6.1.0).${NC}"
   usage
   exit 1
 fi
 
-# Make path absolute
-if ! [[ $apkDir =~ ^/.* ]]; then
-  apkDir="$PWD/$apkDir"
-fi
+# Determine verification path based on -a parameter
+verificationMode=""
+if [[ -z "$apkDir" ]]; then
+  verificationMode="github"
+  echo "=== Verification Mode: GitHub Universal APK ==="
+  echo "No -a parameter provided. Container will download universal APK from GitHub releases."
+  echo ""
 
-if [ ! -d "$apkDir" ]; then
-  echo -e "${RED}Error: APK directory $apkDir not found!${NC}"
-  exit 1
-fi
+  # Create placeholder directory (container will populate it)
+  apkDir=$(mktemp -d /tmp/github_apk_XXXXXX)
+else
+  verificationMode="device"
+  echo "=== Verification Mode: Device Split APKs ==="
 
-# Check for base.apk
-if [ ! -f "$apkDir/base.apk" ]; then
-  echo -e "${RED}Error: base.apk not found in $apkDir${NC}"
-  exit 1
+  # Make path absolute
+  if ! [[ $apkDir =~ ^/.* ]]; then
+    apkDir="$PWD/$apkDir"
+  fi
+
+  if [ ! -d "$apkDir" ]; then
+    echo -e "${RED}Error: APK directory $apkDir not found!${NC}"
+    exit 1
+  fi
+
+  # Check for base.apk
+  if [ ! -f "$apkDir/base.apk" ]; then
+    echo -e "${RED}Error: base.apk not found in $apkDir${NC}"
+    exit 1
+  fi
+
+  echo "Using split APKs from: $apkDir"
+  echo ""
 fi
 
 echo "=== Bull Bitcoin Mobile Verification Session Start ==="
 echo "Timestamp: $(date -Iseconds)"
-echo "APK Directory: $apkDir"
+echo "APK Source: $verificationMode"
+if [[ "$verificationMode" == "device" ]]; then
+  echo "APK Directory: $apkDir"
+fi
 echo "=============================================="
 
-# Extract metadata from base.apk
-# ===============================
+# Extract metadata from APK (device mode only)
+# =============================================
 
-echo "Extracting metadata from base.apk..."
-tempExtractDir=$(mktemp -d /tmp/extract_base_XXXXXX)
-containerApktool "$tempExtractDir" "$apkDir/base.apk"
+if [[ "$verificationMode" == "device" ]]; then
+  echo "Extracting metadata from base.apk..."
+  tempExtractDir=$(mktemp -d /tmp/extract_base_XXXXXX)
+  containerApktool "$tempExtractDir" "$apkDir/base.apk"
 
-if [ $? -ne 0 ]; then
-  echo -e "${RED}Failed to extract base.apk${NC}"
-  exit 1
+  if [ $? -ne 0 ]; then
+    echo -e "${RED}Failed to extract base.apk${NC}"
+    exit 1
+  fi
+
+  appId=$(grep 'package=' "$tempExtractDir"/AndroidManifest.xml | sed 's/.*package=\"//g' | sed 's/\".*//g')
+  officialVersion=$(grep 'versionName' "$tempExtractDir"/apktool.yml | awk '{print $2}' | tr -d "'")
+  versionCode=$(grep 'versionCode' "$tempExtractDir"/apktool.yml | awk '{print $2}' | tr -d "'")
+
+  rm -rf "$tempExtractDir"
+
+  if [ -z "$appId" ]; then
+    echo "appId could not be determined from base.apk"
+    exit 1
+  fi
+
+  if [ -z "$officialVersion" ]; then
+    echo "officialVersion could not be determined from base.apk"
+    exit 1
+  fi
+
+  if [ -z "$versionCode" ]; then
+    echo "versionCode could not be determined from base.apk"
+    exit 1
+  fi
+
+  if [[ "$appId" != "com.bullbitcoin.mobile" ]]; then
+    echo "Unsupported appId $appId (expected com.bullbitcoin.mobile)"
+    exit 2
+  fi
+
+  echo "App ID: $appId"
+  echo "Official APK Version: $officialVersion ($versionCode)"
+  echo "Building Version: $appVersion"
+  echo ""
+
+  # Version comparison and warning
+  if [[ "$appVersion" != "$officialVersion" ]]; then
+    echo -e "${YELLOW}${WARNING_ICON} Version Mismatch Detected${NC}"
+    echo -e "${YELLOW}  Building: v$appVersion${NC}"
+    echo -e "${YELLOW}  Official APK: v$officialVersion${NC}"
+    echo -e "${YELLOW}  This may result in expected differences.${NC}"
+    echo ""
+  fi
+
+  echo -e "${CYAN}Now comparing v${appVersion} (to be built) to v${officialVersion} (official APKs)${NC}"
+  echo ""
+
+  # Extract signer and hash from APK
+  appHash=$(sha256sum "$apkDir/base.apk" | awk '{print $1;}')
+  signer=$( getSigner "$apkDir/base.apk" )
+
+  echo "Base APK Hash: $appHash"
+  echo "Signer: $signer"
+else
+  # GitHub mode: metadata will be extracted in container
+  echo "GitHub mode: Metadata will be extracted from downloaded APK in container"
+  appId="com.bullbitcoin.mobile"
+  officialVersion="$appVersion"  # Assume versions match
+  versionCode="TBD"
+  appHash="TBD"
+  signer="TBD"
+  echo -e "${CYAN}Will compare v${appVersion} (to be built) to v${appVersion} (GitHub APK)${NC}"
+  echo ""
 fi
 
-appId=$(grep 'package=' "$tempExtractDir"/AndroidManifest.xml | sed 's/.*package=\"//g' | sed 's/\".*//g')
-versionName=$(grep 'versionName' "$tempExtractDir"/apktool.yml | awk '{print $2}' | tr -d "'")
-versionCode=$(grep 'versionCode' "$tempExtractDir"/apktool.yml | awk '{print $2}' | tr -d "'")
-
-rm -rf "$tempExtractDir"
-
-if [ -z "$appId" ]; then
-  echo "appId could not be determined from base.apk"
-  exit 1
-fi
-
-if [ -z "$versionName" ]; then
-  echo "versionName could not be determined from base.apk"
-  exit 1
-fi
-
-if [ -z "$versionCode" ]; then
-  echo "versionCode could not be determined from base.apk"
-  exit 1
-fi
-
-if [[ "$appId" != "com.bullbitcoin.mobile" ]]; then
-  echo "Unsupported appId $appId (expected com.bullbitcoin.mobile)"
-  exit 2
-fi
-
-echo "App ID: $appId"
-echo "Version: $versionName ($versionCode)"
-
-# Extract signer and hash from base.apk
-appHash=$(sha256sum "$apkDir/base.apk" | awk '{print $1;}')
-signer=$( getSigner "$apkDir/base.apk" )
-
-echo "Base APK Hash: $appHash"
-echo "Signer: $signer"
-
-# Define workspace
-workDir="/tmp/test_${appId}_${versionName}"
+# Define workspace (use appVersion from -v flag)
+workDir="/tmp/test_${appId}_${appVersion}"
 repo="https://github.com/SatoshiPortal/bullbitcoin-mobile"
 container_name="bullbitcoin_verifier_$$"
 additionalInfo=""
@@ -323,61 +498,62 @@ if [[ -d "$workDir" ]]; then
   exit 1
 fi
 
-# Generate device-spec.json
-# =========================
-
-echo "Generating device-spec.json from official APKs..."
-
-# Determine architectures from base.apk
-if command -v aapt >/dev/null 2>&1; then
-  abiOutput=$(aapt dump badging "$apkDir/base.apk" 2>/dev/null | grep "native-code" || true)
-else
-  # Use container to run aapt
-  apkDirName=$(dirname "$apkDir/base.apk")
-  apkBaseName=$(basename "$apkDir/base.apk")
-  abiOutput=$($CONTAINER_CMD run --rm --volume "$apkDirName":/apk:ro docker.io/walletscrutiny/android:5 \
-    sh -c "aapt dump badging /apk/$apkBaseName" 2>/dev/null | grep "native-code" || true)
-fi
-
-# Parse ABIs
-supportedAbis='["armeabi-v7a"]'  # Default
-if [[ -n "$abiOutput" ]]; then
-  abisRaw=$(echo "$abiOutput" | sed "s/.*native-code: '//g" | sed "s/'.*//g")
-  IFS=' ' read -r -a abisArray <<< "$abisRaw"
-  jsonAbis="["
-  for abi in "${abisArray[@]}"; do
-     jsonAbis+="\"$abi\", "
-  done
-  jsonAbis=$(echo "$jsonAbis" | sed 's/, $//')
-  jsonAbis+="]"
-  supportedAbis="$jsonAbis"
-fi
-
-# Determine SDK version from base.apk
-if command -v aapt >/dev/null 2>&1; then
-  sdkVersion=$(aapt dump badging "$apkDir/base.apk" 2>/dev/null | grep "sdkVersion" | head -n1 | sed "s/.*sdkVersion:'\([0-9]*\)'.*/\1/" || echo "31")
-else
-  sdkVersion=$($CONTAINER_CMD run --rm --volume "$apkDirName":/apk:ro docker.io/walletscrutiny/android:5 \
-    sh -c "aapt dump badging /apk/$apkBaseName" 2>/dev/null | grep "sdkVersion" | head -n1 | sed "s/.*sdkVersion:'\([0-9]*\)'.*/\1/" || echo "31")
-fi
-
-# Set defaults for supportedLocales and screenDensity
-supportedLocales='["en"]'
-screenDensity=320
-
-echo -e "${GREEN}Generated device-spec.json with these values:${NC}"
-echo "{"
-echo "  \"supportedAbis\": $supportedAbis,"
-echo "  \"supportedLocales\": $supportedLocales,"
-echo "  \"screenDensity\": $screenDensity,"
-echo "  \"sdkVersion\": $sdkVersion"
-echo "}"
-echo
-
-# Create workspace and device-spec.json
+# Create workspace
 mkdir -p "$workDir"
 
-cat > "$workDir/device-spec.json" <<EOF
+# Generate device-spec.json (only for device mode)
+# =================================================
+
+if [[ "$verificationMode" == "device" ]]; then
+  echo "Generating device-spec.json from official APKs..."
+
+  # Determine architectures from base.apk
+  if command -v aapt >/dev/null 2>&1; then
+    abiOutput=$(aapt dump badging "$apkDir/base.apk" 2>/dev/null | grep "native-code" || true)
+  else
+    # Use container to run aapt
+    apkDirName=$(dirname "$apkDir/base.apk")
+    apkBaseName=$(basename "$apkDir/base.apk")
+    abiOutput=$($CONTAINER_CMD run --rm --volume "$apkDirName":/apk:ro docker.io/walletscrutiny/android:5 \
+      sh -c "aapt dump badging /apk/$apkBaseName" 2>/dev/null | grep "native-code" || true)
+  fi
+
+  # Parse ABIs
+  supportedAbis='["armeabi-v7a"]'  # Default
+  if [[ -n "$abiOutput" ]]; then
+    abisRaw=$(echo "$abiOutput" | sed "s/.*native-code: '//g" | sed "s/'.*//g")
+    IFS=' ' read -r -a abisArray <<< "$abisRaw"
+    jsonAbis="["
+    for abi in "${abisArray[@]}"; do
+       jsonAbis+="\"$abi\", "
+    done
+    jsonAbis=$(echo "$jsonAbis" | sed 's/, $//')
+    jsonAbis+="]"
+    supportedAbis="$jsonAbis"
+  fi
+
+  # Determine SDK version from base.apk
+  if command -v aapt >/dev/null 2>&1; then
+    sdkVersion=$(aapt dump badging "$apkDir/base.apk" 2>/dev/null | grep "sdkVersion" | head -n1 | sed "s/.*sdkVersion:'\([0-9]*\)'.*/\1/" || echo "31")
+  else
+    sdkVersion=$($CONTAINER_CMD run --rm --volume "$apkDirName":/apk:ro docker.io/walletscrutiny/android:5 \
+      sh -c "aapt dump badging /apk/$apkBaseName" 2>/dev/null | grep "sdkVersion" | head -n1 | sed "s/.*sdkVersion:'\([0-9]*\)'.*/\1/" || echo "31")
+  fi
+
+  # Set defaults for supportedLocales and screenDensity
+  supportedLocales='["en"]'
+  screenDensity=320
+
+  echo -e "${GREEN}Generated device-spec.json with these values:${NC}"
+  echo "{"
+  echo "  \"supportedAbis\": $supportedAbis,"
+  echo "  \"supportedLocales\": $supportedLocales,"
+  echo "  \"screenDensity\": $screenDensity,"
+  echo "  \"sdkVersion\": $sdkVersion"
+  echo "}"
+  echo
+
+  cat > "$workDir/device-spec.json" <<EOF
 {
   "supportedAbis": $supportedAbis,
   "supportedLocales": $supportedLocales,
@@ -386,115 +562,181 @@ cat > "$workDir/device-spec.json" <<EOF
 }
 EOF
 
-if [ ! -s "$workDir/device-spec.json" ]; then
-  echo -e "${RED}Error: Failed to create device-spec.json${NC}"
-  exit 1
+  if [ ! -s "$workDir/device-spec.json" ]; then
+    echo -e "${RED}Error: Failed to create device-spec.json${NC}"
+    exit 1
+  fi
+
+  echo "device-spec.json saved to: $workDir/device-spec.json"
+  echo ""
 fi
 
-echo "device-spec.json saved to: $workDir/device-spec.json"
+echo "Verification mode: $verificationMode"
+if [[ "$verificationMode" == "device" ]]; then
+  echo "Official split APKs will be mounted from: $apkDir"
+else
+  echo "GitHub APK will be mounted from: $apkDir"
+fi
+echo "(Extraction and comparison will happen inside container)"
+echo ""
 
-# Extract official split APKs
-# ===========================
+# Create extraction and comparison script (runs inside container)
+# =================================================================
 
-echo "Extracting official split APKs..."
+create_extraction_script() {
+  cat > "$workDir/extract_and_compare.sh" <<EXTRACT_EOF
+#!/bin/bash
+set -euo pipefail
 
-mkdir -p "$workDir/official-split-apks"
-mkdir -p "$workDir/official-unzipped"
+MODE="\$1"
+OFFICIAL_DIR="\$2"
+OUTPUT_DIR="\$3"
+APP_VERSION="\${4:-}"
+DEVICE_SPEC="\${5:-}"
 
-# Copy all split APKs to workspace
-cp -r "$apkDir"/*.apk "$workDir/official-split-apks/" 2>/dev/null || true
+echo "[Container] Starting extraction and comparison (mode: \$MODE)..."
+mkdir -p "\$OUTPUT_DIR"
 
-# Unzip each split APK
-for apk_file in "$workDir/official-split-apks"/*.apk; do
-  [ -e "$apk_file" ] || continue
-  apk_name=$(basename "$apk_file")
+if [[ "\$MODE" == "github" ]]; then
+  # Path 1: GitHub universal APK comparison
+  echo "[Container] Downloading APK from GitHub releases..."
 
-  # Normalize name: base.apk → base, split_config.arm64_v8a.apk → arm64_v8a
-  if [[ "$apk_name" == "base.apk" ]]; then
-    normalized_name="base"
+  # Get release page to find actual APK filename
+  releaseJson=\$(curl -sL "https://api.github.com/repos/SatoshiPortal/bullbitcoin-mobile/releases/tags/v\${APP_VERSION}")
+  apkUrl=\$(echo "\$releaseJson" | grep -o "https://github.com/SatoshiPortal/bullbitcoin-mobile/releases/download/v\${APP_VERSION}/[^\"]*\\.apk" | head -n1)
+
+  if [[ -z "\$apkUrl" ]]; then
+    echo "[Container ERROR] Could not find APK in GitHub releases for v\${APP_VERSION}"
+    echo "[Container ERROR] Check https://github.com/SatoshiPortal/bullbitcoin-mobile/releases/tag/v\${APP_VERSION}"
+    exit 1
+  fi
+
+  echo "[Container] Downloading: \$apkUrl"
+  wget -q "\$apkUrl" -O "\$OFFICIAL_DIR/github.apk"
+
+  if [ ! -f "\$OFFICIAL_DIR/github.apk" ]; then
+    echo "[Container ERROR] Failed to download APK from GitHub"
+    exit 1
+  fi
+
+  echo "[Container] Downloaded GitHub APK: \${OFFICIAL_DIR}/github.apk"
+
+  echo "[Container] Extracting universal APK from AAB..."
+  java -jar /tmp/bundletool.jar build-apks \\
+    --bundle=/app/build/app/outputs/bundle/release/app-release.aab \\
+    --output=/tmp/built-universal.apks \\
+    --mode=universal
+
+  echo "[Container] Unzipping universal APK..."
+  mkdir -p /tmp/built-decoded /tmp/official-decoded
+  unzip -qq /tmp/built-universal.apks 'universal.apk' -d /tmp/
+
+  echo "[Container] Decoding built universal APK..."
+  apktool d -f -o /tmp/built-decoded /tmp/universal.apk 2>/dev/null || true
+
+  echo "[Container] Decoding official GitHub APK..."
+  apktool d -f -o /tmp/official-decoded "\$OFFICIAL_DIR/github.apk" 2>/dev/null || true
+
+  echo "[Container] Comparing universal APKs..."
+  diff_output=\$(diff -r /tmp/official-decoded /tmp/built-decoded 2>/dev/null || true)
+
+  if [[ -n "\$diff_output" ]]; then
+    echo "\$diff_output" > "\$OUTPUT_DIR/diff_universal.txt"
+    non_meta=\$(echo "\$diff_output" | grep -vcE "(META-INF|^$)" || echo "0")
+    echo "    Differences: \$non_meta (non-META-INF)"
   else
-    normalized_name=$(echo "$apk_name" | sed 's/^split_config\.//; s/\.apk$//')
+    touch "\$OUTPUT_DIR/diff_universal.txt"
+    echo "    No differences found"
+    non_meta=0
   fi
 
-  mkdir -p "$workDir/official-unzipped/$normalized_name"
-  unzip -qq "$apk_file" -d "$workDir/official-unzipped/$normalized_name"
+  echo "\$non_meta" > "\$OUTPUT_DIR/total_diffs.txt"
+  echo "[Container] Total non-META-INF differences: \$non_meta"
 
-  echo "  Extracted: $apk_name → official-unzipped/$normalized_name/"
-done
+else
+  # Path 2: Device split APK comparison
+  echo "[Container] Extracting split APKs from AAB using bundletool..."
+  java -jar /tmp/bundletool.jar build-apks \\
+    --bundle=/app/build/app/outputs/bundle/release/app-release.aab \\
+    --output=/tmp/built-split-apks.apks \\
+    --device-spec="\$DEVICE_SPEC" \\
+    --mode=default
 
-echo "Official split APKs extracted to: $workDir/official-unzipped/"
+  echo "[Container] Unzipping split APKs..."
+  mkdir -p /tmp/built-raw /tmp/built-decoded /tmp/official-decoded
+  unzip -qq /tmp/built-split-apks.apks -d /tmp/built-raw/
 
-# Resolve git tag
-# ===============
-
-resolve_tag() {
-  local version="${versionName:-}"
-  if [[ -z "$version" ]]; then
-    return 1
-  fi
-
-  declare -A seen=()
-  local ordered=()
-
-  add_candidate() {
-    local candidate="$1"
-    if [[ -n "$candidate" && -z "${seen[$candidate]:-}" ]]; then
-      ordered+=("$candidate")
-      seen[$candidate]=1
+  echo "[Container] Decoding built split APKs..."
+  for apk in /tmp/built-raw/splits/*.apk; do
+    [ -e "\$apk" ] || continue
+    name=\$(basename "\$apk" .apk)
+    if [[ "\$name" == "base-master" ]]; then
+      normalized="base"
+    else
+      normalized=\$(echo "\$name" | sed 's/^base-//')
     fi
-  }
+    echo "  Decoding: \$name -> \$normalized"
+    apktool d -f -o "/tmp/built-decoded/\$normalized" "\$apk" 2>/dev/null || true
+  done
 
-  add_candidate "$version"
-  add_candidate "v${version}"
+  echo "[Container] Decoding official split APKs..."
+  for apk in "\$OFFICIAL_DIR"/*.apk; do
+    [ -e "\$apk" ] || continue
+    name=\$(basename "\$apk" .apk)
+    if [[ "\$name" == "base" ]]; then
+      normalized="base"
+    else
+      normalized=\$(echo "\$name" | sed 's/^split_config\\.//')
+    fi
+    echo "  Decoding: \$name -> \$normalized"
+    apktool d -f -o "/tmp/official-decoded/\$normalized" "\$apk" 2>/dev/null || true
+  done
 
-  local candidate
-  for candidate in "${ordered[@]}"; do
-    if git rev-parse --verify "refs/tags/${candidate}" >/dev/null 2>&1; then
-      echo "$candidate"
-      return 0
+  echo "[Container] Comparing split APKs..."
+  total_diffs=0
+
+  for official in /tmp/official-decoded/*; do
+    [ -d "\$official" ] || continue
+    split_name=\$(basename "\$official")
+    built="/tmp/built-decoded/\$split_name"
+    if [[ ! -d "\$built" ]]; then
+      echo "  [WARNING] Split \$split_name exists in official but not in built"
+      echo "missing_in_built" > "\$OUTPUT_DIR/diff_\$split_name.txt"
+      continue
+    fi
+    echo "  Comparing split: \$split_name..."
+    diff_output=\$(diff -r "\$official" "\$built" 2>/dev/null || true)
+    if [[ -n "\$diff_output" ]]; then
+      echo "\$diff_output" > "\$OUTPUT_DIR/diff_\$split_name.txt"
+      non_meta=\$(echo "\$diff_output" | grep -vcE "(META-INF|^$)" || echo "0")
+      total_diffs=\$((total_diffs + non_meta))
+      echo "    Differences: \$non_meta (non-META-INF)"
+    else
+      touch "\$OUTPUT_DIR/diff_\$split_name.txt"
+      echo "    No differences found"
     fi
   done
 
-  return 1
-}
-
-# Prepare source repository
-# =========================
-
-prepare() {
-  echo "Preparing Bull Bitcoin Mobile source repository..."
-
-  cd "$workDir"
-  git clone --quiet "$repo" app
-  cd app
-  git fetch --quiet --tags
-
-  if [[ -n "$revisionOverride" ]]; then
-    git checkout --quiet "$revisionOverride"
-    tag=""
-    commit=$(git rev-parse HEAD)
-    echo "Checked out revision: $commit (manual override)"
-  else
-    tag=$(resolve_tag)
-    if [[ -z "$tag" ]]; then
-      echo -e "${YELLOW}${WARNING_ICON} No matching tag found for version $versionName${NC}"
-      echo "Searching for commit matching version..."
-      # Try to find commit from version code in git log
-      commit=$(git log --all --grep="$versionName" --format="%H" -n 1 || echo "")
-      if [[ -z "$commit" ]]; then
-        echo -e "${RED}Cannot find tag or commit for version $versionName${NC}"
-        exit 1
-      fi
-      git checkout --quiet "$commit"
-      additionalInfo="No upstream tag matched version $versionName; using commit $commit."
-    else
-      git checkout --quiet "$tag"
-      commit=$(git rev-parse HEAD)
-      echo "Checked out tag: $tag (commit: $commit)"
+  for built in /tmp/built-decoded/*; do
+    [ -d "\$built" ] || continue
+    split_name=\$(basename "\$built")
+    official="/tmp/official-decoded/\$split_name"
+    if [[ ! -d "\$official" ]]; then
+      echo "  [WARNING] Split \$split_name exists in built but not in official"
+      echo "extra_in_built" > "\$OUTPUT_DIR/diff_extra_\$split_name.txt"
     fi
-  fi
+  done
 
-  cd "$workDir"
+  echo "\$total_diffs" > "\$OUTPUT_DIR/total_diffs.txt"
+  echo "[Container] Total non-META-INF differences: \$total_diffs"
+fi
+
+echo "[Container] Comparison complete"
+exit 0
+EXTRACT_EOF
+
+  chmod +x "$workDir/extract_and_compare.sh"
+  echo "Extraction script created at: $workDir/extract_and_compare.sh"
 }
 
 # Create Dockerfile
@@ -503,8 +745,12 @@ prepare() {
 create_dockerfile() {
   cat > "$workDir/Dockerfile" <<'DOCKERFILE_EOF'
 # Bull Bitcoin Mobile Reproducible Build Dockerfile
-# Modified from upstream v6.1.0 Dockerfile for verification purposes
+# Modified from upstream Dockerfile for verification purposes
+# v0.3.0: Repository cloned inside container using build arg
 FROM --platform=linux/amd64 ubuntu:24.04
+
+# Build argument for app version (from -v flag)
+ARG VERSION=APPVERSION_PLACEHOLDER
 
 # Avoid prompts from apt
 ENV DEBIAN_FRONTEND=noninteractive
@@ -577,8 +823,9 @@ RUN sudo mkdir /app
 
 RUN sudo chown -R $USER /app
 
-# Clone the Bull Bitcoin mobile repository at v6.1.0 tag
-RUN git clone --branch v6.1.0 https://github.com/SatoshiPortal/bullbitcoin-mobile /app
+# Clone the Bull Bitcoin mobile repository at specified version tag
+# Uses build arg VERSION (e.g., 6.1.0) -> clones v6.1.0
+RUN git clone --branch v${VERSION} https://github.com/SatoshiPortal/bullbitcoin-mobile /app
 
 WORKDIR /app
 
@@ -602,200 +849,255 @@ RUN echo "storePassword=android" > /app/android/key.properties && \
 
 # Build AAB (Android App Bundle) instead of APK
 RUN flutter build appbundle --release
+
+# Install bundletool for APK extraction (v0.2.0: moved from host to container)
+RUN wget -q https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar -O /tmp/bundletool.jar
+
+# Install apktool for APK decoding (v0.2.0: moved from host to container)
+RUN sudo wget -q https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool -O /usr/local/bin/apktool && \
+    sudo wget -q https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar -O /usr/local/bin/apktool.jar && \
+    sudo chmod +x /usr/local/bin/apktool
+
+# Copy extraction and comparison script (created by host, already executable)
+COPY extract_and_compare.sh /app/extract_and_compare.sh
 DOCKERFILE_EOF
+
+  # Substitute app version placeholder with actual version
+  sed -i "s/APPVERSION_PLACEHOLDER/${appVersion}/" "$workDir/Dockerfile"
 
   echo "Dockerfile created at: $workDir/Dockerfile"
 }
 
-# Build AAB in container
-# ======================
+# Build and verify in single container (v0.2.0: fully containerized)
+# =====================================================================
 
-build_aab() {
-  echo "Building AAB in container..."
+build_and_verify() {
+  echo "Building and verifying in container..."
   echo "This may take 30-60 minutes depending on system resources..."
+  echo ""
 
+  # Check system memory before starting resource-intensive build
+  check_memory
+
+  # Create both scripts
+  create_extraction_script
   create_dockerfile
 
   cd "$workDir"
 
-  # Build container image with increased file descriptor limit
-  echo "Building container image..."
-  $CONTAINER_CMD build --no-cache --ulimit nofile=65536:65536 -t bullbitcoin-mobile:v6.1.0 .
+  # Build container image with memory limit to prevent OOM crashes
+  echo "Building container image with Flutter + bundletool + apktool..."
+  $CONTAINER_CMD build --memory=4g --no-cache --ulimit nofile=65536:65536 -t bullbitcoin-verifier:v6.1.0 .
 
   if [ $? -ne 0 ]; then
     echo -e "${RED}Container build failed${NC}"
     exit 1
   fi
 
-  # Create container to copy artifacts
-  echo "Creating container to extract AAB..."
-  $CONTAINER_CMD create --name "$container_name" bullbitcoin-mobile:v6.1.0
+  echo ""
+  echo "Container image built successfully"
+  echo ""
 
-  # Copy AAB from container to host
-  mkdir -p "$workDir/built-aab"
-  $CONTAINER_CMD cp "$container_name":/app/build/app/outputs/bundle/release/app-release.aab "$workDir/built-aab/"
+  # Run container with all verification steps
+  echo "Running verification inside container..."
 
-  if [ ! -f "$workDir/built-aab/app-release.aab" ]; then
-    echo -e "${RED}Failed to copy AAB from container${NC}"
+  if [[ "$verificationMode" == "github" ]]; then
+    # GitHub mode: container downloads APK
+    $CONTAINER_CMD run --rm \
+      --name "$container_name" \
+      --user root \
+      --volume "$workDir":/workspace:rw \
+      --volume "$apkDir":/official-apks:rw \
+      bullbitcoin-verifier:v6.1.0 \
+      bash -c "
+        # Run extraction and comparison script (github mode)
+        /app/extract_and_compare.sh \
+          github \
+          /official-apks \
+          /workspace/results \
+          $appVersion
+
+        # Copy AAB to workspace for host access
+        cp /app/build/app/outputs/bundle/release/app-release.aab /workspace/
+
+        # Git verification (v0.3.0: moved from host to container)
+        cd /app
+        echo \"===== Git Verification =====\" > /workspace/git_verification.txt
+        echo \"Commit: \$(git rev-parse HEAD)\" >> /workspace/git_verification.txt
+        echo \"\" >> /workspace/git_verification.txt
+
+        # Check if tag exists
+        if git describe --exact-match --tags HEAD >/dev/null 2>&1; then
+          TAG=\$(git describe --exact-match --tags HEAD)
+          echo \"Tag: \$TAG\" >> /workspace/git_verification.txt
+
+          # Check tag type
+          if [ \"\$(git cat-file -t refs/tags/\$TAG)\" = \"tag\" ]; then
+            echo \"Tag type: annotated\" >> /workspace/git_verification.txt
+            echo \"\" >> /workspace/git_verification.txt
+            git tag -v \"\$TAG\" >> /workspace/git_verification.txt 2>&1 || echo \"\\[INFO\\] Tag signature check failed or not signed\" >> /workspace/git_verification.txt
+          else
+            echo \"Tag type: lightweight \\(no signature possible\\)\" >> /workspace/git_verification.txt
+          fi
+        else
+          echo \"Tag: \\(none\\)\" >> /workspace/git_verification.txt
+        fi
+
+        # Check commit signature
+        echo \"\" >> /workspace/git_verification.txt
+        echo \"Commit signature:\" >> /workspace/git_verification.txt
+        git verify-commit HEAD >> /workspace/git_verification.txt 2>&1 || echo \"[INFO] Commit signature check failed or not signed\" >> /workspace/git_verification.txt
+      "
+  else
+    # Device mode: needs device-spec.json
+    $CONTAINER_CMD run --rm \
+      --name "$container_name" \
+      --user root \
+      --volume "$workDir":/workspace:rw \
+      --volume "$apkDir":/official-apks:ro \
+      bullbitcoin-verifier:v6.1.0 \
+      bash -c "
+        # Run extraction and comparison script (device mode)
+        /app/extract_and_compare.sh \
+          device \
+          /official-apks \
+          /workspace/results \
+          '' \
+          /workspace/device-spec.json
+
+        # Copy AAB to workspace for host access
+        cp /app/build/app/outputs/bundle/release/app-release.aab /workspace/
+
+        # Git verification (v0.3.0: moved from host to container)
+        cd /app
+        echo \"===== Git Verification =====\" > /workspace/git_verification.txt
+        echo \"Commit: \$(git rev-parse HEAD)\" >> /workspace/git_verification.txt
+        echo \"\" >> /workspace/git_verification.txt
+
+        # Check if tag exists
+        if git describe --exact-match --tags HEAD >/dev/null 2>&1; then
+          TAG=\$(git describe --exact-match --tags HEAD)
+          echo \"Tag: \$TAG\" >> /workspace/git_verification.txt
+
+          # Check tag type
+          if [ \"\$(git cat-file -t refs/tags/\$TAG)\" = \"tag\" ]; then
+            echo \"Tag type: annotated\" >> /workspace/git_verification.txt
+            echo \"\" >> /workspace/git_verification.txt
+            git tag -v \"\$TAG\" >> /workspace/git_verification.txt 2>&1 || echo \"\\[INFO\\] Tag signature check failed or not signed\" >> /workspace/git_verification.txt
+          else
+            echo \"Tag type: lightweight \\(no signature possible\\)\" >> /workspace/git_verification.txt
+          fi
+        else
+          echo \"Tag: \\(none\\)\" >> /workspace/git_verification.txt
+        fi
+
+        # Check commit signature
+        echo \"\" >> /workspace/git_verification.txt
+        echo \"Commit signature:\" >> /workspace/git_verification.txt
+        git verify-commit HEAD >> /workspace/git_verification.txt 2>&1 || echo \"[INFO] Commit signature check failed or not signed\" >> /workspace/git_verification.txt
+      "
+  fi
+
+  if [ $? -ne 0 ]; then
+    echo -e "${RED}Verification failed${NC}"
     exit 1
   fi
 
-  echo "AAB built successfully: $workDir/built-aab/app-release.aab"
-
-  # Clean up container
-  $CONTAINER_CMD rm "$container_name"
+  # Read results
+  total_non_meta_diffs=$(cat "$workDir/results/total_diffs.txt" 2>/dev/null || echo "0")
+  
+  echo ""
+  echo "Verification complete"
+  echo "AAB artifact: $workDir/app-release.aab"
+  echo "Diff files: $workDir/results/diff_*.txt"
+  echo ""
 
   cd "$workDir"
 }
 
-# Extract split APKs from built AAB using bundletool
-# ===================================================
-
-extract_splits_from_aab() {
-  echo "Extracting split APKs from built AAB using bundletool..."
-
-  # Check if bundletool is available, if not download it
-  if [ ! -f "$workDir/bundletool.jar" ]; then
-    echo "Downloading bundletool..."
-    wget -q https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar -O "$workDir/bundletool.jar"
-
-    if [ ! -f "$workDir/bundletool.jar" ]; then
-      echo -e "${RED}Failed to download bundletool${NC}"
-      exit 1
-    fi
-  fi
-
-  # Extract split APKs using bundletool
-  echo "Running bundletool to generate split APKs..."
-  java -jar "$workDir/bundletool.jar" build-apks \
-    --bundle="$workDir/built-aab/app-release.aab" \
-    --output="$workDir/built-split-apks.apks" \
-    --device-spec="$workDir/device-spec.json" \
-    --mode=default
-
-  if [ ! -f "$workDir/built-split-apks.apks" ]; then
-    echo -e "${RED}Failed to generate split APKs from AAB${NC}"
-    exit 1
-  fi
-
-  # Unzip the .apks file (it's a ZIP archive containing split APKs)
-  mkdir -p "$workDir/built-split-apks-raw"
-  unzip -qq "$workDir/built-split-apks.apks" -d "$workDir/built-split-apks-raw/"
-
-  # Copy and normalize split APKs
-  mkdir -p "$workDir/built-split-apks"
-  mkdir -p "$workDir/built-unzipped"
-
-  # Bundletool puts APKs in a splits/ subdirectory
-  for apk_file in "$workDir/built-split-apks-raw/splits"/*.apk; do
-    [ -e "$apk_file" ] || continue
-    apk_name=$(basename "$apk_file")
-
-    # Normalize filename: base-master.apk → base.apk, base-*.apk → split_config.*.apk
-    if [[ "$apk_name" == "base-master.apk" ]] || [[ "$apk_name" == "base.apk" ]]; then
-      cp "$apk_file" "$workDir/built-split-apks/base.apk"
-      normalized_name="base"
-    else
-      # Handle base-en.apk → split_config.en.apk, base-armeabi_v7a.apk → split_config.armeabi_v7a.apk
-      config_name=$(echo "$apk_name" | sed 's/^base-//; s/\.apk$//')
-      cp "$apk_file" "$workDir/built-split-apks/split_config.${config_name}.apk"
-      normalized_name="$config_name"
-    fi
-
-    # Unzip to corresponding directory
-    mkdir -p "$workDir/built-unzipped/$normalized_name"
-    unzip -qq "$apk_file" -d "$workDir/built-unzipped/$normalized_name"
-
-    echo "  Extracted: $apk_name → built-unzipped/$normalized_name/"
-  done
-
-  echo "Built split APKs extracted to: $workDir/built-unzipped/"
-}
-
-# Compare split APKs
-# ==================
-
-compare_split_apks() {
-  echo ""
-  echo "Comparing split APKs (official vs built)..."
-  echo ""
-
-  local all_diffs=""
-  local total_non_meta_diffs=0
-
-  # Compare each split
-  for official_split_dir in "$workDir/official-unzipped"/*; do
-    split_name=$(basename "$official_split_dir")
-    built_split_dir="$workDir/built-unzipped/$split_name"
-
-    if [[ ! -d "$built_split_dir" ]]; then
-      echo -e "${YELLOW}${WARNING_ICON} Split $split_name exists in official but not in built${NC}"
-      additionalInfo+="Missing split: $split_name in built artifacts. "
-      continue
-    fi
-
-    echo "Comparing split: $split_name..."
-    diff_output=$(diff --brief --recursive "$official_split_dir" "$built_split_dir" 2>/dev/null || true)
-
-    if [[ -n "$diff_output" ]]; then
-      # Save to file
-      echo "$diff_output" > "$workDir/diff_${split_name}.txt"
-
-      # Count non-META-INF diffs
-      non_meta_count=$(grep -vcE "(META-INF|^$)" <<<"$diff_output" 2>/dev/null || echo "0")
-      total_non_meta_diffs=$((total_non_meta_diffs + non_meta_count))
-
-      # Aggregate for summary with split identifier
-      all_diffs+="=== ${split_name} ==="$'\n'
-      all_diffs+="$diff_output"$'\n'
-      all_diffs+=""$'\n'
-
-      echo "  Differences found: $(echo "$diff_output" | wc -l) files differ (non-META-INF: $non_meta_count)"
-    else
-      echo "  No differences found"
-      touch "$workDir/diff_${split_name}.txt"
-    fi
-  done
-
-  # Check for extra splits in built that don't exist in official
-  for built_split_dir in "$workDir/built-unzipped"/*; do
-    split_name=$(basename "$built_split_dir")
-    official_split_dir="$workDir/official-unzipped/$split_name"
-
-    if [[ ! -d "$official_split_dir" ]]; then
-      echo -e "${YELLOW}${WARNING_ICON} Split $split_name exists in built but not in official${NC}"
-      additionalInfo+="Extra split: $split_name in built artifacts. "
-    fi
-  done
-
-  # Export for result function
-  export aggregated_diffs="$all_diffs"
-  export total_non_meta_diffs
-
-  echo ""
-  echo "Total non-META-INF differences across all splits: $total_non_meta_diffs"
-}
+# Note: extract_splits_from_aab() and compare_split_apks() functions removed in v0.2.0
+# All extraction and comparison now happens inside container via extract_and_compare.sh
 
 # Generate verification summary
 # ==============================
 
 result() {
-  local verdict=""
-  if [[ $total_non_meta_diffs -eq 0 ]]; then
+  # Read commit hash from git verification file (v0.3.0: generated in container)
+  local commit=""
+  if [ -f "$workDir/git_verification.txt" ]; then
+    commit=$(grep "^Commit:" "$workDir/git_verification.txt" | awk '{print $2}')
+  fi
+
+  # Read aggregated diffs from results directory (created by container)
+  local aggregated_diffs=""
+  local split_mismatch=false
+
+  for diff_file in "$workDir/results"/diff_*.txt; do
+    [ -f "$diff_file" ] || continue
+    local split_name content total_lines preview
+    split_name=$(basename "$diff_file" | sed 's/^diff_//; s/\.txt$//')
+    content=$(cat "$diff_file")
+    if [[ "$content" == "missing_in_built" ]]; then
+      split_mismatch=true
+      aggregated_diffs+="=== ${split_name} ==="$'\n'
+      aggregated_diffs+="Split ${split_name} exists in the official APK set but is missing from the rebuilt output."$'\n\n'
+    elif [[ -n "$content" && "$content" != "extra_in_built" ]]; then
+      # Truncate diff output to first 3 lines
+      total_lines=$(echo "$content" | wc -l)
+      preview=$(echo "$content" | head -n 3)
+      aggregated_diffs+="=== ${split_name} ==="$'\n'
+      aggregated_diffs+="$preview"$'\n'
+      if [[ $total_lines -gt 3 ]]; then
+        local remaining=$((total_lines - 3))
+        aggregated_diffs+="... $remaining more lines"$'\n'
+        aggregated_diffs+="Full diff saved: $diff_file"$'\n'
+      fi
+      aggregated_diffs+=$'\n'
+    fi
+  done
+
+  for diff_file in "$workDir/results"/diff_extra_*.txt; do
+    [ -f "$diff_file" ] || continue
+    local split_name content total_lines preview
+    split_name=$(basename "$diff_file" | sed 's/^diff_extra_//; s/\.txt$//')
+    content=$(cat "$diff_file")
+    if [[ "$content" == "extra_in_built" ]]; then
+      split_mismatch=true
+      aggregated_diffs+="=== ${split_name} ==="$'\n'
+      aggregated_diffs+="Split ${split_name} exists in the rebuilt output but not in the official APK set."$'\n\n'
+    elif [[ -n "$content" ]]; then
+      # Truncate diff output to first 3 lines
+      total_lines=$(echo "$content" | wc -l)
+      preview=$(echo "$content" | head -n 3)
+      aggregated_diffs+="=== ${split_name} ==="$'\n'
+      aggregated_diffs+="$preview"$'\n'
+      if [[ $total_lines -gt 3 ]]; then
+        local remaining=$((total_lines - 3))
+        aggregated_diffs+="... $remaining more lines"$'\n'
+        aggregated_diffs+="Full diff saved: $diff_file"$'\n'
+      fi
+      aggregated_diffs+=$'\n'
+    fi
+  done
+
+  # Set global verdict for exit code (v0.3.0)
+  verdict=""
+  if [[ $total_non_meta_diffs -eq 0 && "$split_mismatch" == false ]]; then
     verdict="reproducible"
   else
     verdict="differences found"
   fi
 
   local diffGuide="
-Run a full diff on individual splits:
-diff --recursive $workDir/official-unzipped/base $workDir/built-unzipped/base
+Detailed diff files available at:
+$workDir/results/diff_*.txt
 
-Or use meld for visual comparison:
-meld $workDir/official-unzipped $workDir/built-unzipped
-
-Or use diffoscope on individual split APKs:
-diffoscope $workDir/official-split-apks/base.apk $workDir/built-split-apks/base.apk
+To investigate further, you can re-run the container:
+podman run -it --rm \\
+  --volume $workDir:/workspace:rw \\
+  --volume $apkDir:/official-apks:ro \\
+  bullbitcoin-verifier:v6.1.0 \\
+  bash
 
 for more details."
 
@@ -811,7 +1113,8 @@ for more details."
   echo "===== Begin Results ====="
   echo "appId:          $appId"
   echo "signer:         $signer"
-  echo "apkVersionName: $versionName"
+  echo "builtVersion:   $appVersion"
+  echo "officialVersion: $officialVersion"
   echo "apkVersionCode: $versionCode"
   echo "verdict:        $verdict"
   echo "appHash:        $appHash"
@@ -822,25 +1125,12 @@ for more details."
   echo
   echo "Revision, tag (and its signature):"
 
-  cd "$workDir/app"
-
-  # Check tag type
-  if [[ -n "$tag" ]] && git rev-parse --verify "refs/tags/$tag" >/dev/null 2>&1; then
-    if [[ $(git cat-file -t "refs/tags/$tag") == "tag" ]]; then
-      echo "Tag: $tag (annotated)"
-      git tag -v "$tag" 2>&1 || echo "[INFO] Tag signature check failed or not signed"
-    else
-      echo "Tag: $tag (lightweight, no signature possible)"
-    fi
+  # Read git verification from file (v0.3.0: generated in container)
+  if [ -f "$workDir/git_verification.txt" ]; then
+    cat "$workDir/git_verification.txt"
   else
-    echo "No tag (build from commit $commit)"
+    echo "[WARNING] git_verification.txt not found"
   fi
-
-  # Check commit signature
-  echo ""
-  git verify-commit "$commit" 2>&1 || echo "[INFO] Commit signature check failed or not signed"
-
-  cd "$workDir"
 
   echo -e "\n${infoBlock}===== End Results ====="
   echo "$diffGuide"
@@ -863,12 +1153,16 @@ cleanup() {
 # ==============
 
 echo "=== Starting Verification Process ==="
-prepare
-build_aab
-extract_splits_from_aab
-compare_split_apks
+build_and_verify
 result
 echo "=== Verification Complete ==="
 echo "Session End: $(date -Iseconds)"
 
-cleanup
+# Determine exit code based on verdict (v0.3.0: Luis compliance)
+if [[ "$verdict" == "reproducible" ]]; then
+  cleanup
+  exit 0
+else
+  cleanup
+  exit 1
+fi
