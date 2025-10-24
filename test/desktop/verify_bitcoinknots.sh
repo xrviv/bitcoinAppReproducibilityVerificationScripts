@@ -140,7 +140,7 @@ select_artifacts_for_verification() {
         filename=$(basename "$file")
 
         case "$filename" in
-            COMPARISON_RESULTS.txt|SHA256SUMS|SHA256SUMS.local)
+            COMPARISON_RESULTS.txt|SHA256SUMS|SHA256SUMS.local|SHA256SUMS.*)
                 continue
                 ;;
         esac
