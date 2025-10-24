@@ -2,7 +2,7 @@
 
 # Bitcoin Knots Reproducible Build Verification Script
 # Based on fanquake's Alpine Guix methodology (adapted from verify_bitcoincore.sh)
-# WalletScrutiny.com - Version v0.7.0
+# WalletScrutiny.com - Version v0.8.0
 #
 # DESCRIPTION:
 # Standalone script for verifying Bitcoin Knots releases using containerized
@@ -20,6 +20,8 @@
 # LICENSE: MIT License
 #
 # CHANGELOG:
+# v0.8.1 (2025-10-24): Use POSIX '.' in embedded Dockerfile for BusyBox compatibility
+# v0.8.0 (2025-10-23): Stream official downloads + build artifacts via container; force wget for Guix deps
 # v0.7.0 (2025-10-23): Fix parameter contract - use -v for app version per Luis guidelines
 # v0.6.0 (2025-10-23): Full Luis compliance - user-owned files, /tmp workspace, no host git requirement
 # v0.5.0 (2025-10-20): Fix multi-target podman cp failure - handle spaces in paths, flatten artifacts
@@ -47,15 +49,11 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v0.7.0"
+SCRIPT_VERSION="v0.8.1"
 SCRIPT_NAME="verify_bitcoinknots.sh"
 DEFAULT_VERSION="29.2.knots20251010"
 CONTAINER_NAME="ws_bitcoinknots_verifier"
 IMAGE_NAME="ws_bitcoinknots_verifier"
-
-# Get current user for container user mapping
-USER_ID=$(id -u)
-GROUP_ID=$(id -g)
 
 # Global variables for tracking
 OUTPUT_DIR=""
@@ -158,7 +156,7 @@ EOF
 # Show available build targets
 show_targets() {
     cat << EOF
-$SCRIPT_NAME v$SCRIPT_VERSION - Available Build Targets
+$SCRIPT_NAME $SCRIPT_VERSION - Available Build Targets
 
 SUPPORTED BUILD TARGETS:
 Bitcoin Knots supports building for multiple platforms. Each target produces
@@ -296,6 +294,7 @@ RUN apk --no-cache --update add \
       shadow
 
 ARG guix_download_path=https://ftpmirror.gnu.org/gnu/guix/
+ARG guix_alt_download_path=https://ftp.gnu.org/gnu/guix/
 ARG guix_version=1.4.0
 ARG guix_checksum_aarch64=72d807392889919940b7ec9632c45a259555e6b0942ea7bfd131101e08ebfcf4
 ARG guix_checksum_x86_64=236ca7c9c5958b1f396c2924fcc5bc9d6fdebcb1b4cf3c7c6d46d4bf660ed9c9
@@ -307,17 +306,30 @@ ENV GUIX_LOCPATH=/root/.guix-profile/lib/locale
 ENV LC_ALL=en_US.UTF-8
 
 # Install Guix inside container
-RUN guix_file_name=guix-binary-${guix_version}.$(uname -m)-linux.tar.xz    && \
-    eval "guix_checksum=\${guix_checksum_$(uname -m)}"                     && \
-    cd /tmp                                                                && \
-    wget -q -O "$guix_file_name" "${guix_download_path}/${guix_file_name}" && \
-    echo "${guix_checksum}  ${guix_file_name}" | sha256sum -c              && \
-    tar xJf "$guix_file_name"                                              && \
+RUN set -e                                                              && \
+    guix_file_name=guix-binary-${guix_version}.$(uname -m)-linux.tar.xz && \
+    eval "guix_checksum=\${guix_checksum_$(uname -m)}"                  && \
+    cd /tmp                                                             && \
+    for mirror in "${guix_download_path}" "${guix_alt_download_path}"; do \
+      echo "Attempting download from ${mirror}/${guix_file_name}" >&2;     \
+      if wget --tries=3 --timeout=60 -q -O "$guix_file_name" "${mirror}/${guix_file_name}"; then \
+        break;                                                             \
+      else                                                                 \
+        echo "Download failed from $mirror" >&2;                           \
+        rm -f "$guix_file_name";                                           \
+      fi;                                                                  \
+    done                                                                && \
+    if [ ! -s "$guix_file_name" ]; then                                 \
+      echo "ERROR: Unable to download Guix binary from any mirror" >&2; \
+      exit 1;                                                           \
+    fi                                                                  && \
+    echo "${guix_checksum}  ${guix_file_name}" | sha256sum -c           && \
+    tar xJf "$guix_file_name"                                           && \
     mv var/guix /var/                                                      && \
     mv gnu /                                                               && \
     mkdir -p ~root/.config/guix                                            && \
     ln -sf /var/guix/profiles/per-user/root/current-guix ~root/.config/guix/current && \
-    source ~root/.config/guix/current/etc/profile
+    . /root/.config/guix/current/etc/profile
 
 # Note: Above paths use /root inside container, not related to host root user
 
@@ -369,9 +381,9 @@ start_container() {
         podman rm -f "$CONTAINER_NAME" || true
     fi
 
-    # Run container as current user to avoid root-owned files on host
+    # Run container as root (required for guix-daemon and mounts)
+    # Files will be owned by root, we'll handle ownership in copy function
     if ! podman run -d --name "$CONTAINER_NAME" --privileged \
-      -u "${USER_ID}:${GROUP_ID}" \
       "$IMAGE_NAME"; then
         log_error "Failed to start container"
         exit 1
@@ -431,7 +443,7 @@ execute_build() {
     local start_time=$(date +%s)
 
     # Execute the build
-    local build_cmd="cd /bitcoin && time BASE_CACHE='/base_cache' SOURCE_PATH='/sources' SDK_PATH='/SDKs' HOSTS='$target' ./contrib/guix/guix-build"
+    local build_cmd="cd /bitcoin && time FORCE_USE_WGET=1 BASE_CACHE='/base_cache' SOURCE_PATH='/sources' SDK_PATH='/SDKs' HOSTS='$target' ./contrib/guix/guix-build"
 
     if podman exec -it "$CONTAINER_NAME" bash -c "$build_cmd"; then
         local end_time=$(date +%s)
@@ -441,45 +453,6 @@ execute_build() {
         log_error "Build failed"
         exit 1
     fi
-}
-
-# Download official Bitcoin Knots release checksums (runs on HOST)
-download_official_release() {
-    local version="$1"
-
-    log_info "Downloading official Bitcoin Knots checksums..."
-    
-    local base_url="https://github.com/bitcoinknots/bitcoin/releases/download/$version/"
-    local temp_dir=$(mktemp -d)
-    
-    cd "$temp_dir"
-    
-    # Try wget first (with redirect support)
-    log_info "Attempting download from: ${base_url}SHA256SUMS"
-    if wget --max-redirect=5 --timeout=10 --tries=3 -q -O SHA256SUMS "${base_url}SHA256SUMS"; then
-        log_success "Downloaded SHA256SUMS via wget"
-    elif curl -fsSL --max-redirs 5 --retry 3 --retry-delay 2 -o SHA256SUMS "${base_url}SHA256SUMS"; then
-        log_success "Downloaded SHA256SUMS via curl"
-    else
-        log_warning "Could not download SHA256SUMS file"
-        log_info "Manual verification required at: https://github.com/bitcoinknots/bitcoin/releases/tag/$version"
-        rm -rf "$temp_dir"
-        return 1
-    fi
-    
-    # Verify file has content
-    if [ ! -s "SHA256SUMS" ]; then
-        log_error "Downloaded SHA256SUMS file is empty"
-        rm -rf "$temp_dir"
-        return 1
-    fi
-    
-    # Try to download SHA256SUMS.asc for signature verification
-    wget --timeout=10 -q "${base_url}SHA256SUMS.asc" 2>/dev/null || \
-    curl -fsSL -o SHA256SUMS.asc "${base_url}SHA256SUMS.asc" 2>/dev/null || \
-    log_warning "SHA256SUMS.asc not available"
-    
-    echo "$temp_dir"
 }
 
 # Generate checksums from container artifacts
@@ -531,26 +504,47 @@ generate_container_checksums() {
 download_official_checksums() {
     local version="$1"
 
+    if [[ -n "$OFFICIAL_CHECKSUMS_FILE" ]] && [[ -f "$OFFICIAL_CHECKSUMS_FILE" ]]; then
+        log_info "Official checksums already available: $OFFICIAL_CHECKSUMS_FILE"
+        return 0
+    fi
+
     log_info "Downloading official Bitcoin Knots checksums..."
 
-    local official_dir=$(download_official_release "$version")
+    local base_url="https://github.com/bitcoinknots/bitcoin/releases/download/$version"
+    local temp_dir
+    local container_temp_dir
 
-    if [ -z "$official_dir" ] || [ ! -d "$official_dir" ]; then
-        log_warning "Could not download official checksums"
+    temp_dir=$(mktemp -d)
+
+    if ! container_temp_dir=$(podman exec "$CONTAINER_NAME" mktemp -d /tmp/ws_official_sha.XXXXXX 2>/dev/null); then
+        log_error "Failed to create temporary directory inside container for checksums"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+
+    if ! podman exec "$CONTAINER_NAME" bash -lc "set -euo pipefail; cd '$container_temp_dir'; wget --tries=3 --timeout=60 -q -O SHA256SUMS '$base_url/SHA256SUMS' || curl -fL --retry 3 --retry-delay 2 -o SHA256SUMS '$base_url/SHA256SUMS'"; then
+        log_warning "Could not download SHA256SUMS file"
         log_info "Manual verification required at: https://github.com/bitcoinknots/bitcoin/releases/tag/$version"
+        podman exec "$CONTAINER_NAME" rm -rf "$container_temp_dir" >/dev/null 2>&1 || true
+        rm -rf "$temp_dir"
         OFFICIAL_CHECKSUMS_FILE=""
         return 1
     fi
 
-    if [ -f "$official_dir/SHA256SUMS" ]; then
-        OFFICIAL_CHECKSUMS_FILE="$official_dir/SHA256SUMS"
-        log_success "Official checksums downloaded to: $OFFICIAL_CHECKSUMS_FILE"
-        return 0
-    else
-        log_error "SHA256SUMS file not found in download directory"
+    if ! podman exec "$CONTAINER_NAME" bash -lc "cat '$container_temp_dir/SHA256SUMS'" > "$temp_dir/SHA256SUMS"; then
+        log_error "Failed to copy SHA256SUMS from container"
+        podman exec "$CONTAINER_NAME" rm -rf "$container_temp_dir" >/dev/null 2>&1 || true
+        rm -rf "$temp_dir"
         OFFICIAL_CHECKSUMS_FILE=""
         return 1
     fi
+
+    podman exec "$CONTAINER_NAME" rm -rf "$container_temp_dir" >/dev/null 2>&1 || true
+
+    OFFICIAL_CHECKSUMS_FILE="$temp_dir/SHA256SUMS"
+    log_success "Official checksums downloaded to: $OFFICIAL_CHECKSUMS_FILE"
+    return 0
 }
 
 # Download official artifacts for binary comparison
@@ -558,57 +552,90 @@ download_official_artifacts() {
     local version="$1"      # e.g., v29.2.knots20251010
     local output_dir="$2"   # e.g., ./bitcoinknots-29.2.knots20251010-x86_64-linux-gnu-20251016-005313
 
-    log_info "Downloading official Bitcoin Knots artifacts for binary comparison..."
+    log_info "Downloading official Bitcoin Knots artifacts for binary comparison (inside container)..."
 
-    # Create subdirectory for official artifacts
     local official_dir="$output_dir/official-downloads"
     mkdir -p "$official_dir"
 
-    # Construct base URL
-    local base_url="https://github.com/bitcoinknots/bitcoin/releases/download/$version/"
+    local base_url="https://github.com/bitcoinknots/bitcoin/releases/download/$version"
+    local container_temp_dir
+
+    if ! container_temp_dir=$(podman exec "$CONTAINER_NAME" mktemp -d /tmp/ws_official_artifacts.XXXXXX 2>/dev/null); then
+        log_error "Failed to create temporary directory inside container for official artifacts"
+        return 1
+    fi
+
+    if ! podman exec "$CONTAINER_NAME" bash -lc "set -euo pipefail; cd '$container_temp_dir'; wget --tries=3 --timeout=60 -q -O SHA256SUMS '$base_url/SHA256SUMS' || curl -fL --retry 3 --retry-delay 2 -o SHA256SUMS '$base_url/SHA256SUMS'"; then
+        log_error "Failed to download SHA256SUMS inside container"
+        podman exec "$CONTAINER_NAME" rm -rf "$container_temp_dir" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    if ! podman exec "$CONTAINER_NAME" bash -lc "cat '$container_temp_dir/SHA256SUMS'" > "$official_dir/SHA256SUMS"; then
+        log_error "Failed to copy SHA256SUMS from container"
+        podman exec "$CONTAINER_NAME" rm -rf "$container_temp_dir" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    OFFICIAL_CHECKSUMS_FILE="$official_dir/SHA256SUMS"
+    log_success "Official SHA256SUMS downloaded to: $OFFICIAL_CHECKSUMS_FILE"
+
+    local -a official_files=()
+    while IFS=' ' read -r hash filename; do
+        [[ -z "$hash" || -z "$filename" ]] && continue
+        filename="${filename#\*}"
+        official_files+=("$filename")
+    done < "$OFFICIAL_CHECKSUMS_FILE"
 
     local download_count=0
     local failed_count=0
 
-    # Scan output directory for built artifacts (excluding SHA256SUMS files)
+    shopt -s nullglob
     for built_file in "$output_dir"/*.tar.gz "$output_dir"/*.zip "$output_dir"/*.exe; do
-        # Check if file exists and is not a glob pattern
-        if [ -f "$built_file" ]; then
-            local filename=$(basename "$built_file")
+        [[ -f "$built_file" ]] || continue
+        local filename=$(basename "$built_file")
 
-            # Skip SHA256SUMS files
-            if [[ "$filename" == SHA256SUMS* ]]; then
-                continue
+        local found="false"
+        for official in "${official_files[@]}"; do
+            if [[ "$official" == "$filename" ]]; then
+                found="true"
+                break
             fi
+        done
 
-            local official_url="${base_url}${filename}"
-
-            log_info "Downloading official artifact: $filename"
-
-            # Download with redirect support
-            if wget --max-redirect=5 --timeout=30 --tries=3 -q -O "$official_dir/$filename" "$official_url"; then
-                log_success "Downloaded: $filename"
-                download_count=$((download_count + 1))
-            elif curl -fsSL --max-redirs 5 --retry 3 --retry-delay 2 -o "$official_dir/$filename" "$official_url"; then
-                log_success "Downloaded: $filename"
-                download_count=$((download_count + 1))
-            else
-                log_error "Failed to download: $filename"
-                log_error "URL: $official_url"
-                failed_count=$((failed_count + 1))
-            fi
+        if [[ "$found" != "true" ]]; then
+            log_warning "Official SHA256SUMS does not list artifact: $filename"
+            continue
         fi
+
+        log_info "Downloading official artifact inside container: $filename"
+        if ! podman exec "$CONTAINER_NAME" bash -lc "set -euo pipefail; cd '$container_temp_dir'; if [ ! -f '$filename' ]; then wget --tries=3 --timeout=120 -q '$base_url/$filename' || curl -fL --retry 3 --retry-delay 2 -o '$filename' '$base_url/$filename'; fi"; then
+            log_error "Failed to download: $filename"
+            log_error "URL: $base_url/$filename"
+            failed_count=$((failed_count + 1))
+            continue
+        fi
+
+        if ! podman exec "$CONTAINER_NAME" bash -lc "cat '$container_temp_dir/$filename'" > "$official_dir/$filename"; then
+            log_error "Failed to copy $filename from container"
+            failed_count=$((failed_count + 1))
+            continue
+        fi
+
+        download_count=$((download_count + 1))
+        log_success "Downloaded official artifact: $filename"
     done
+    shopt -u nullglob
+
+    podman exec "$CONTAINER_NAME" rm -rf "$container_temp_dir" >/dev/null 2>&1 || true
 
     if [ $download_count -eq 0 ]; then
         log_error "No official artifacts were downloaded"
         return 1
     fi
 
-    log_success "Downloaded $download_count official artifacts to: $official_dir"
-
     if [ $failed_count -gt 0 ]; then
-        log_warning "$failed_count artifacts failed to download"
+        log_warning "$failed_count official artifacts failed to download"
     fi
 
     return 0
@@ -773,19 +800,10 @@ copy_artifacts_to_host() {
         log_info "Multi-target build detected, copying all subdirectories"
     fi
 
-    # Copy all files from build directory
-    if ! podman cp "$CONTAINER_NAME:$build_dir/." "$OUTPUT_DIR/" 2>&1; then
-        log_error "podman cp command failed (exit code: $?)"
+    # Copy artifacts via tar stream to preserve user ownership on host
+    if ! ( set -o pipefail; podman exec "$CONTAINER_NAME" bash -lc "set -euo pipefail; cd '$build_dir' && tar -cf - ." | tar -C "$OUTPUT_DIR" --no-same-owner -xf - ); then
+        log_error "Failed to stream artifacts from container (tar copy failed)"
         log_error "Artifacts remain in container at: $build_dir"
-        log_info "Use --keep-container flag and extract manually with:"
-        if [[ "$is_multi_target" == "true" ]]; then
-            log_info "  podman exec -it $CONTAINER_NAME bash"
-            log_info "  # Inside container:"
-            log_info "  cd $build_dir"
-            log_info "  ls -la"
-        else
-            log_info "  podman cp \"$CONTAINER_NAME:$build_dir/.\" ./output/"
-        fi
         COPY_SUCCESS="false"
         return 1
     fi
@@ -797,7 +815,7 @@ copy_artifacts_to_host() {
         COPY_SUCCESS="false"
         return 1
     fi
-
+    
     # Flatten multi-target artifacts for easier comparison
     if [[ "$is_multi_target" == "true" ]]; then
         log_info "Flattening multi-target artifacts to output directory..."
