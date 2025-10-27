@@ -2,12 +2,19 @@
 # ==============================================================================
 # verify_bullbitcoinandroid.sh - Bull Bitcoin Mobile Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.3.8
+# Version:       v0.3.9
 # Author:        Daniel Garcia (dannybuntu)
 # Organization:  WalletScrutiny.com
-# Last Modified: 2025-10-27 (Philippine Time - diff output truncation)
+# Last Modified: 2025-10-27 (Philippine Time - memory-efficient diff handling)
 # Project:       https://github.com/SatoshiPortal/bullbitcoin-mobile
 # ==============================================================================
+# Changes in v0.3.9:
+# - CRITICAL: Fixed memory exhaustion when reading large diff files (12MB+)
+# - Read diff files efficiently: use head/wc without loading entire file into RAM
+# - Prevents hang/crash when diff has 466K+ lines (Bull Bitcoin v6.1.0 case)
+# - Check file size with -s before reading content
+# - Read only first line to check for special markers
+#
 # Changes in v0.3.8:
 # - Truncate large diff output: show only first 3 lines if diff > 3 lines
 # - Add "Full diff saved to: <path>" message for truncated diffs
@@ -381,7 +388,7 @@ done
 
 # Show script version and exit if requested
 if [ "$showScriptVersion" = true ]; then
-  echo "verify_bullbitcoinandroid.sh v0.3.8"
+  echo "verify_bullbitcoinandroid.sh v0.3.9"
   exit 0
 fi
 
@@ -1058,6 +1065,8 @@ build_and_verify() {
 # All extraction and comparison now happens inside container via extract_and_compare.sh
 
 finalize_github_metadata() {
+  echo ""
+  echo "Extracting metadata from downloaded GitHub APK..."
   local githubApk="$apkDir/github.apk"
 
   if [[ ! -f "$githubApk" ]]; then
@@ -1099,12 +1108,17 @@ finalize_github_metadata() {
   if [[ "$appVersion" != "$officialVersion" ]]; then
     append_additional_info "Requested build: v$appVersion. GitHub APK reports v$officialVersion."
   fi
+
+  echo "Metadata extraction complete."
+  echo ""
 }
 
 # Generate verification summary
 # ==============================
 
 result() {
+  echo "Generating verification summary..."
+  echo ""
   # Read commit hash from git verification file (v0.3.0: generated in container)
   local commit=""
   if [ -f "$workDir/git_verification.txt" ]; then
@@ -1118,7 +1132,7 @@ result() {
   shopt -s nullglob
   for diff_file in "$workDir/results"/diff_*.txt "$workDir/results"/diff_extra_*.txt; do
     [ -f "$diff_file" ] || continue
-    local base content split_name line_count
+    local base split_name line_count first_line
     base=$(basename "$diff_file")
     if [[ "$base" == diff_extra_* ]]; then
       split_name=${base#diff_extra_}
@@ -1126,36 +1140,40 @@ result() {
       split_name=${base#diff_}
     fi
     split_name=${split_name%.txt}
-    content=$(cat "$diff_file")
 
-    if [[ "$content" == "missing_in_built" ]]; then
+    # Check for special marker files without reading entire content
+    first_line=$(head -1 "$diff_file" 2>/dev/null)
+
+    if [[ "$first_line" == "missing_in_built" ]]; then
       split_mismatch=true
       diff_output+="Split ${split_name} exists only in the official APK set."$'\n'
       continue
     fi
 
-    if [[ "$content" == "extra_in_built" ]]; then
+    if [[ "$first_line" == "extra_in_built" ]]; then
       split_mismatch=true
       diff_output+="Split ${split_name} exists only in the rebuilt APK set."$'\n'
       continue
     fi
 
-    if [[ -n "$content" ]]; then
+    # Check if file is non-empty
+    if [[ -s "$diff_file" ]]; then
       # Add split label for device mode (multiple splits)
       if [[ "$verificationMode" == "device" ]]; then
         diff_output+="=== Split: ${split_name} ==="$'\n'
       fi
 
-      # Count lines in diff
-      line_count=$(echo "$content" | wc -l)
+      # Count lines efficiently without loading entire file into memory
+      line_count=$(wc -l < "$diff_file")
 
       # If diff has more than 3 lines, truncate and show reference
       if [[ $line_count -gt 3 ]]; then
-        diff_output+=$(echo "$content" | head -3)$'\n'
+        diff_output+=$(head -3 "$diff_file")$'\n'
         diff_output+="... (${line_count} total lines)"$'\n'
         diff_output+="Full diff saved to: $workDir/results/${base}"$'\n'
       else
-        diff_output+="$content"$'\n'
+        # Small file, safe to read entirely
+        diff_output+=$(cat "$diff_file")$'\n'
       fi
     fi
   done
