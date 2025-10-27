@@ -2,12 +2,20 @@
 # ==============================================================================
 # verify_bullbitcoinandroid.sh - Bull Bitcoin Mobile Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.3.9
+# Version:       v0.4.0
 # Author:        Daniel Garcia (dannybuntu)
 # Organization:  WalletScrutiny.com
-# Last Modified: 2025-10-27 (Philippine Time - memory-efficient diff handling)
+# Last Modified: 2025-10-27 (Philippine Time - Rust FFI support + execution dir)
 # Project:       https://github.com/SatoshiPortal/bullbitcoin-mobile
 # ==============================================================================
+# Changes in v0.4.0:
+# - CRITICAL: Added Rust Android cross-compilation targets (aarch64, armv7, x86_64, i686)
+# - CRITICAL: Set NDK environment variables (ANDROID_NDK_HOME, NDK_HOME) for Rust FFI
+# - CRITICAL: Explicitly install NDK via sdkmanager (ndk;27.0.12077973)
+# - Changed workspace from /tmp to execution directory (Luis guideline compliance)
+# - GitHub APK directory now in execution dir instead of /tmp
+# - Fixes missing native libraries: libbdk_flutter, libark_wallet, libboltz, lwk, payjoin_flutter, libtor
+#
 # Changes in v0.3.9:
 # - CRITICAL: Fixed memory exhaustion when reading large diff files (12MB+)
 # - Read diff files efficiently: use head/wc without loading entire file into RAM
@@ -388,7 +396,7 @@ done
 
 # Show script version and exit if requested
 if [ "$showScriptVersion" = true ]; then
-  echo "verify_bullbitcoinandroid.sh v0.3.9"
+  echo "verify_bullbitcoinandroid.sh v0.4.0"
   exit 0
 fi
 
@@ -407,8 +415,10 @@ if [[ -z "$apkDir" ]]; then
   echo "No -a parameter provided. Container will download universal APK from GitHub releases."
   echo ""
 
-  # Create placeholder directory (container will populate it)
-  apkDir=$(mktemp -d /tmp/github_apk_XXXXXX)
+  # Create placeholder directory in execution directory (container will populate it)
+  apkDir="./bullbitcoin_${appVersion}_github_apk"
+  mkdir -p "$apkDir"
+  apkDir=$(cd "$apkDir" && pwd)  # Get absolute path
 else
   verificationMode="device"
   echo "=== Verification Mode: Device Split APKs ==="
@@ -517,7 +527,8 @@ else
 fi
 
 # Define workspace (use appVersion from -v flag)
-workDir="/tmp/test_${appId}_${appVersion}"
+# Use execution directory as workspace (Luis guideline #2: use directory where script is executed)
+workDir="./bullbitcoin_${appVersion}_verification"
 repo="https://github.com/SatoshiPortal/bullbitcoin-mobile"
 container_name="bullbitcoin_verifier_$$"
 additionalInfo=""
@@ -831,6 +842,12 @@ ENV PATH="/home/$USER/.cargo/bin:${PATH}"
 # Verify Rust installation
 RUN rustc --version && cargo --version
 
+# Install Android Rust targets for cross-compilation
+RUN rustup target add aarch64-linux-android
+RUN rustup target add armv7-linux-androideabi
+RUN rustup target add x86_64-linux-android
+RUN rustup target add i686-linux-android
+
 # Set environment variables
 ENV FLUTTER_HOME=/opt/flutter
 ENV ANDROID_HOME=/opt/android-sdk
@@ -854,7 +871,11 @@ RUN flutter config --android-sdk=/opt/android-sdk
 
 # Accept licenses and install necessary Android SDK components
 RUN yes | sdkmanager --licenses
-RUN sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+RUN sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.0.12077973"
+
+# Set NDK environment variables for Rust cross-compilation
+ENV ANDROID_NDK_HOME=/opt/android-sdk/ndk/27.0.12077973
+ENV NDK_HOME=/opt/android-sdk/ndk/27.0.12077973
 
 # Clean up existing app directory
 RUN sudo rm -rf /app
