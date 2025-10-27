@@ -2,12 +2,22 @@
 # ==============================================================================
 # verify_bullbitcoinandroid.sh - Bull Bitcoin Mobile Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.3.6
+# Version:       v0.3.8
 # Author:        Daniel Garcia (dannybuntu)
 # Organization:  WalletScrutiny.com
-# Last Modified: 2025-10-24 (Philippine Time - git safe.directory fix)
+# Last Modified: 2025-10-27 (Philippine Time - diff output truncation)
 # Project:       https://github.com/SatoshiPortal/bullbitcoin-mobile
 # ==============================================================================
+# Changes in v0.3.8:
+# - Truncate large diff output: show only first 3 lines if diff > 3 lines
+# - Add "Full diff saved to: <path>" message for truncated diffs
+# - Add split labels in device mode for better readability
+# - Prevents terminal flooding with massive smali diffs (10K+ lines)
+#
+# Changes in v0.3.7:
+# - Added 6GB memory limit to podman run containers to avoid user-slice OOM kills
+# - Keeps Flutter build from taking down GNOME even on 16GB systems
+#
 # Changes in v0.3.6:
 # - Configure git safe.directory=/app inside container before signature checks
 # - Prevents git from aborting when container runs as root with /app owned by docker user
@@ -371,7 +381,7 @@ done
 
 # Show script version and exit if requested
 if [ "$showScriptVersion" = true ]; then
-  echo "verify_bullbitcoinandroid.sh v0.3.5"
+  echo "verify_bullbitcoinandroid.sh v0.3.8"
   exit 0
 fi
 
@@ -929,6 +939,7 @@ build_and_verify() {
     $CONTAINER_CMD run --rm \
       --name "$container_name" \
       --user root \
+      --memory=6g \
       --volume "$workDir":/workspace:rw \
       --volume "$apkDir":/official-apks:rw \
       bullbitcoin-verifier:v6.1.0 \
@@ -978,6 +989,7 @@ build_and_verify() {
     $CONTAINER_CMD run --rm \
       --name "$container_name" \
       --user root \
+      --memory=6g \
       --volume "$workDir":/workspace:rw \
       --volume "$apkDir":/official-apks:ro \
       bullbitcoin-verifier:v6.1.0 \
@@ -1106,7 +1118,7 @@ result() {
   shopt -s nullglob
   for diff_file in "$workDir/results"/diff_*.txt "$workDir/results"/diff_extra_*.txt; do
     [ -f "$diff_file" ] || continue
-    local base content split_name
+    local base content split_name line_count
     base=$(basename "$diff_file")
     if [[ "$base" == diff_extra_* ]]; then
       split_name=${base#diff_extra_}
@@ -1129,7 +1141,22 @@ result() {
     fi
 
     if [[ -n "$content" ]]; then
-      diff_output+="$content"$'\n'
+      # Add split label for device mode (multiple splits)
+      if [[ "$verificationMode" == "device" ]]; then
+        diff_output+="=== Split: ${split_name} ==="$'\n'
+      fi
+
+      # Count lines in diff
+      line_count=$(echo "$content" | wc -l)
+
+      # If diff has more than 3 lines, truncate and show reference
+      if [[ $line_count -gt 3 ]]; then
+        diff_output+=$(echo "$content" | head -3)$'\n'
+        diff_output+="... (${line_count} total lines)"$'\n'
+        diff_output+="Full diff saved to: $workDir/results/${base}"$'\n'
+      else
+        diff_output+="$content"$'\n'
+      fi
     fi
   done
   shopt -u nullglob
