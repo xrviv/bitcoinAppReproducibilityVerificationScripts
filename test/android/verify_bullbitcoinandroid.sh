@@ -2,12 +2,37 @@
 # ==============================================================================
 # verify_bullbitcoinandroid.sh - Bull Bitcoin Mobile Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.3.6
+# Version:       v0.4.0
 # Author:        Daniel Garcia (dannybuntu)
 # Organization:  WalletScrutiny.com
-# Last Modified: 2025-10-24 (Philippine Time - git safe.directory fix)
+# Last Modified: 2025-10-27 (Philippine Time - Rust FFI support + execution dir)
 # Project:       https://github.com/SatoshiPortal/bullbitcoin-mobile
 # ==============================================================================
+# Changes in v0.4.0:
+# - CRITICAL: Added Rust Android cross-compilation targets (aarch64, armv7, x86_64, i686)
+# - CRITICAL: Set NDK environment variables (ANDROID_NDK_HOME, NDK_HOME) for Rust FFI
+# - CRITICAL: Explicitly install NDK via sdkmanager (ndk;27.0.12077973)
+# - Changed workspace from /tmp to execution directory (Luis guideline compliance)
+# - GitHub APK directory now in execution dir instead of /tmp
+# - Fixes missing native libraries: libbdk_flutter, libark_wallet, libboltz, lwk, payjoin_flutter, libtor
+#
+# Changes in v0.3.9:
+# - CRITICAL: Fixed memory exhaustion when reading large diff files (12MB+)
+# - Read diff files efficiently: use head/wc without loading entire file into RAM
+# - Prevents hang/crash when diff has 466K+ lines (Bull Bitcoin v6.1.0 case)
+# - Check file size with -s before reading content
+# - Read only first line to check for special markers
+#
+# Changes in v0.3.8:
+# - Truncate large diff output: show only first 3 lines if diff > 3 lines
+# - Add "Full diff saved to: <path>" message for truncated diffs
+# - Add split labels in device mode for better readability
+# - Prevents terminal flooding with massive smali diffs (10K+ lines)
+#
+# Changes in v0.3.7:
+# - Added 6GB memory limit to podman run containers to avoid user-slice OOM kills
+# - Keeps Flutter build from taking down GNOME even on 16GB systems
+#
 # Changes in v0.3.6:
 # - Configure git safe.directory=/app inside container before signature checks
 # - Prevents git from aborting when container runs as root with /app owned by docker user
@@ -371,7 +396,7 @@ done
 
 # Show script version and exit if requested
 if [ "$showScriptVersion" = true ]; then
-  echo "verify_bullbitcoinandroid.sh v0.3.5"
+  echo "verify_bullbitcoinandroid.sh v0.4.0"
   exit 0
 fi
 
@@ -390,8 +415,10 @@ if [[ -z "$apkDir" ]]; then
   echo "No -a parameter provided. Container will download universal APK from GitHub releases."
   echo ""
 
-  # Create placeholder directory (container will populate it)
-  apkDir=$(mktemp -d /tmp/github_apk_XXXXXX)
+  # Create placeholder directory in execution directory (container will populate it)
+  apkDir="./bullbitcoin_${appVersion}_github_apk"
+  mkdir -p "$apkDir"
+  apkDir=$(cd "$apkDir" && pwd)  # Get absolute path
 else
   verificationMode="device"
   echo "=== Verification Mode: Device Split APKs ==="
@@ -500,7 +527,8 @@ else
 fi
 
 # Define workspace (use appVersion from -v flag)
-workDir="/tmp/test_${appId}_${appVersion}"
+# Use execution directory as workspace (Luis guideline #2: use directory where script is executed)
+workDir="./bullbitcoin_${appVersion}_verification"
 repo="https://github.com/SatoshiPortal/bullbitcoin-mobile"
 container_name="bullbitcoin_verifier_$$"
 additionalInfo=""
@@ -814,6 +842,12 @@ ENV PATH="/home/$USER/.cargo/bin:${PATH}"
 # Verify Rust installation
 RUN rustc --version && cargo --version
 
+# Install Android Rust targets for cross-compilation
+RUN rustup target add aarch64-linux-android
+RUN rustup target add armv7-linux-androideabi
+RUN rustup target add x86_64-linux-android
+RUN rustup target add i686-linux-android
+
 # Set environment variables
 ENV FLUTTER_HOME=/opt/flutter
 ENV ANDROID_HOME=/opt/android-sdk
@@ -837,7 +871,11 @@ RUN flutter config --android-sdk=/opt/android-sdk
 
 # Accept licenses and install necessary Android SDK components
 RUN yes | sdkmanager --licenses
-RUN sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+RUN sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.0.12077973"
+
+# Set NDK environment variables for Rust cross-compilation
+ENV ANDROID_NDK_HOME=/opt/android-sdk/ndk/27.0.12077973
+ENV NDK_HOME=/opt/android-sdk/ndk/27.0.12077973
 
 # Clean up existing app directory
 RUN sudo rm -rf /app
@@ -929,6 +967,7 @@ build_and_verify() {
     $CONTAINER_CMD run --rm \
       --name "$container_name" \
       --user root \
+      --memory=6g \
       --volume "$workDir":/workspace:rw \
       --volume "$apkDir":/official-apks:rw \
       bullbitcoin-verifier:v6.1.0 \
@@ -978,6 +1017,7 @@ build_and_verify() {
     $CONTAINER_CMD run --rm \
       --name "$container_name" \
       --user root \
+      --memory=6g \
       --volume "$workDir":/workspace:rw \
       --volume "$apkDir":/official-apks:ro \
       bullbitcoin-verifier:v6.1.0 \
@@ -1046,6 +1086,8 @@ build_and_verify() {
 # All extraction and comparison now happens inside container via extract_and_compare.sh
 
 finalize_github_metadata() {
+  echo ""
+  echo "Extracting metadata from downloaded GitHub APK..."
   local githubApk="$apkDir/github.apk"
 
   if [[ ! -f "$githubApk" ]]; then
@@ -1087,12 +1129,17 @@ finalize_github_metadata() {
   if [[ "$appVersion" != "$officialVersion" ]]; then
     append_additional_info "Requested build: v$appVersion. GitHub APK reports v$officialVersion."
   fi
+
+  echo "Metadata extraction complete."
+  echo ""
 }
 
 # Generate verification summary
 # ==============================
 
 result() {
+  echo "Generating verification summary..."
+  echo ""
   # Read commit hash from git verification file (v0.3.0: generated in container)
   local commit=""
   if [ -f "$workDir/git_verification.txt" ]; then
@@ -1106,7 +1153,7 @@ result() {
   shopt -s nullglob
   for diff_file in "$workDir/results"/diff_*.txt "$workDir/results"/diff_extra_*.txt; do
     [ -f "$diff_file" ] || continue
-    local base content split_name
+    local base split_name line_count first_line
     base=$(basename "$diff_file")
     if [[ "$base" == diff_extra_* ]]; then
       split_name=${base#diff_extra_}
@@ -1114,22 +1161,41 @@ result() {
       split_name=${base#diff_}
     fi
     split_name=${split_name%.txt}
-    content=$(cat "$diff_file")
 
-    if [[ "$content" == "missing_in_built" ]]; then
+    # Check for special marker files without reading entire content
+    first_line=$(head -1 "$diff_file" 2>/dev/null)
+
+    if [[ "$first_line" == "missing_in_built" ]]; then
       split_mismatch=true
       diff_output+="Split ${split_name} exists only in the official APK set."$'\n'
       continue
     fi
 
-    if [[ "$content" == "extra_in_built" ]]; then
+    if [[ "$first_line" == "extra_in_built" ]]; then
       split_mismatch=true
       diff_output+="Split ${split_name} exists only in the rebuilt APK set."$'\n'
       continue
     fi
 
-    if [[ -n "$content" ]]; then
-      diff_output+="$content"$'\n'
+    # Check if file is non-empty
+    if [[ -s "$diff_file" ]]; then
+      # Add split label for device mode (multiple splits)
+      if [[ "$verificationMode" == "device" ]]; then
+        diff_output+="=== Split: ${split_name} ==="$'\n'
+      fi
+
+      # Count lines efficiently without loading entire file into memory
+      line_count=$(wc -l < "$diff_file")
+
+      # If diff has more than 3 lines, truncate and show reference
+      if [[ $line_count -gt 3 ]]; then
+        diff_output+=$(head -3 "$diff_file")$'\n'
+        diff_output+="... (${line_count} total lines)"$'\n'
+        diff_output+="Full diff saved to: $workDir/results/${base}"$'\n'
+      else
+        # Small file, safe to read entirely
+        diff_output+=$(cat "$diff_file")$'\n'
+      fi
     fi
   done
   shopt -u nullglob
