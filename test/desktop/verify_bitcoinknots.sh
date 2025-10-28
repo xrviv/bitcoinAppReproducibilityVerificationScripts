@@ -61,6 +61,7 @@ OUTPUT_DIR=""
 OFFICIAL_CHECKSUMS_FILE=""
 COPY_SUCCESS="false"
 INCLUDE_DEBUG_ARTIFACTS="false"
+OUTPUT_TARGET_LABEL=""
 declare -a SELECTED_ARTIFACTS=()
 declare -a SKIPPED_OPTIONAL_ARTIFACTS=()
 
@@ -196,6 +197,67 @@ derive_target_label() {
     fi
 
     echo "$remainder"
+}
+
+sanitize_target_name() {
+    local target="$1"
+
+    if [[ -z "$target" ]]; then
+        echo "all-targets"
+        return
+    fi
+
+    local sanitized="${target// /-}"
+    sanitized="${sanitized//\//-}"
+    sanitized="${sanitized//[^A-Za-z0-9._-]/-}"
+    sanitized="${sanitized//--/-}"
+    sanitized="${sanitized##-}"
+    sanitized="${sanitized%%-}"
+
+    echo "${sanitized:-target}"
+}
+
+write_summary_file() {
+    local version="$1"
+    local requested_target="$2"
+    local verification_result="$3"
+
+    if [[ -z "$OUTPUT_DIR" || ! -d "$OUTPUT_DIR" ]]; then
+        return 0
+    fi
+
+    local effective_target="${OUTPUT_TARGET_LABEL:-$requested_target}"
+    if [[ -z "$effective_target" ]]; then
+        effective_target="all-targets"
+    fi
+
+    local safe_target
+    safe_target=$(sanitize_target_name "$effective_target")
+    local clean_version="${version#v}"
+    local summary_file="$OUTPUT_DIR/bitcoinknots-${safe_target}-${clean_version}-verification-summary.txt"
+
+    {
+        echo "Bitcoin Knots Verification Summary"
+        echo "Generated: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        echo "Version: $version"
+        echo "Target: $effective_target"
+        echo "Artifacts Directory: $OUTPUT_DIR"
+        case "$verification_result" in
+            0) echo "Verification Result: reproducible" ;;
+            1) echo "Verification Result: differences found" ;;
+            2) echo "Verification Result: manual verification required" ;;
+            *) echo "Verification Result: unknown" ;;
+        esac
+        echo ""
+        if [ -f "$OUTPUT_DIR/COMPARISON_RESULTS.txt" ]; then
+            echo "Comparison Results:"
+            cat "$OUTPUT_DIR/COMPARISON_RESULTS.txt"
+        else
+            echo "Comparison Results: not available"
+        fi
+    } > "$summary_file"
+
+    log_success "Verification summary saved to: $summary_file"
 }
 
 # Help function
@@ -928,8 +990,8 @@ copy_artifacts_to_host() {
     else
         log_warning "Failed to generate SHA256SUMS.local"
     fi
-
     COPY_SUCCESS="true"
+    OUTPUT_TARGET_LABEL="$target_label"
     return 0
 }
 
@@ -1295,6 +1357,10 @@ main() {
 
     # Print verification summary
     print_verification_summary "$version" "$target" || true
+
+    if [[ "$COPY_SUCCESS" == "true" ]]; then
+        write_summary_file "$version" "$target" "$verification_result" || true
+    fi
     
     # Print standardized WalletScrutiny results format
     # Get commit hash from container if available
