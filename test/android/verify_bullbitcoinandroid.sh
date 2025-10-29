@@ -2,12 +2,39 @@
 # ==============================================================================
 # verify_bullbitcoinandroid.sh - Bull Bitcoin Mobile Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.4.0
+# Version:       v0.5.1
 # Author:        Daniel Garcia (dannybuntu)
 # Organization:  WalletScrutiny.com
-# Last Modified: 2025-10-27 (Philippine Time - Rust FFI support + execution dir)
+# Last Modified: 2025-10-29 (Philippine Time - exit code visibility)
 # Project:       https://github.com/SatoshiPortal/bullbitcoin-mobile
 # ==============================================================================
+# Changes in v0.5.1:
+# - Added exit code echo at end of script for visibility
+# - Script now prints "Exit code: 0" or "Exit code: 1" before exiting
+#
+# Changes in v0.5.0:
+# - BREAKING: Updated to new Luis script guidelines (2025-10-29)
+# - Changed short flags to long flags: -v → --version, -a → --apk, -t → --type
+# - Added --arch parameter (optional, for future multi-architecture support)
+# - Kept --revision as custom flag (not in guidelines but useful)
+# - --apk now accepts both file (single APK) or directory (split APKs)
+# - All examples updated to use new long-form parameters
+#
+# Changes in v0.4.3:
+# - Added --preserve flag to save both official and built split APKs to workspace
+# - Split APKs preserved in workspace/official-splits/ and workspace/built-splits/
+# - Allows post-verification analysis of actual APK binaries (not just diffs)
+#
+# Changes in v0.4.2:
+# - CRITICAL: Force cargokit to build Rust libraries from source instead of using precompiled binaries
+# - Sets use_precompiled_binaries: false in cargokit_options.yaml for reproducibility
+# - Ensures native .so files (libbdk_flutter, libark_wallet, etc.) are compiled from source
+# - Root cause: v0.4.0/v0.4.1 had Rust targets + NDK but cargokit downloaded precompiled binaries
+#
+# Changes in v0.4.1:
+# - Fixed: Convert workDir to absolute path after creation for podman mounting
+# - Prevents "lstat: no such file or directory" error with relative paths
+#
 # Changes in v0.4.0:
 # - CRITICAL: Added Rust Android cross-compilation targets (aarch64, armv7, x86_64, i686)
 # - CRITICAL: Set NDK environment variables (ANDROID_NDK_HOME, NDK_HOME) for Rust FFI
@@ -317,28 +344,31 @@ NAME
        verify_bullbitcoinandroid.sh - Bull Bitcoin Mobile reproducible build verification
 
 SYNOPSIS
-       verify_bullbitcoinandroid.sh -v <version> -a <apk_dir> [OPTIONS]
-       verify_bullbitcoinandroid.sh --version | -h
+       verify_bullbitcoinandroid.sh --version <version> [--apk <path>] [OPTIONS]
+       verify_bullbitcoinandroid.sh --script-version | --help
 
 DESCRIPTION
        Performs containerized reproducible AAB build verification for Bull Bitcoin Mobile.
        Extracts split APKs from device, builds AAB from source in Docker/Podman, extracts
        split APKs from built AAB using bundletool, and compares against official release.
-       Workspace: /tmp/test_com.bullbitcoin.mobile_<version>/
+       Workspace: ./bullbitcoin_<version>_verification/
 
 OPTIONS
-       --version               Show script version and exit
-       -h, --help              Show this help and exit
+       --script-version        Show script version and exit
+       --help                  Show this help and exit
 
-       -v <version>            App version to build (required, e.g., 6.1.0 without 'v' prefix)
-       -a, --apk-dir <dir>     Directory containing official split APKs (optional)
-                               If provided: Split APK verification (device extracted)
+       --version <version>     App version to build (required, e.g., 6.1.0 without 'v' prefix)
+       --apk <path>            APK file or directory containing split APKs (optional)
+                               If file: Single universal APK
+                               If directory: Split APKs (expects base.apk, split_config.*.apk)
                                If omitted: Downloads universal APK from GitHub releases
-                               Expected files: base.apk, split_config.*.apk
 
-       -t, --type <type>       App type (optional, for Luis guidelines compliance)
-       -r, --revision <hash>   Override git tag, checkout specific commit
-       -c, --cleanup           Remove temporary files after completion
+       --type <type>           App type (optional, e.g., bitcoin, multi)
+       --arch <architecture>   Target architecture (optional, e.g., x86_64-linux-gnu)
+       --revision <hash>       Override git tag, checkout specific commit (custom flag)
+       --cleanup               Remove temporary files after completion
+       --preserve              Preserve both official and built split APKs in workspace
+                               Creates: workspace/official-splits/ and workspace/built-splits/
 
 REQUIREMENTS
        docker OR podman (required - that's it!)
@@ -354,17 +384,23 @@ REQUIREMENTS
        Note: APK downloads happen inside container, no curl/wget needed on host
 
 EXIT CODES
-       0    Verification completed (check verdict in output for reproducibility status)
-       1    Build failed, dependency missing, or runtime error
+       0    Verification reproducible
+       1    Verification not reproducible or error occurred
        2    Unsupported appId (not com.bullbitcoin.mobile)
 
 EXAMPLES
        # Path 1: GitHub universal APK verification (no device needed)
-       verify_bullbitcoinandroid.sh -v 6.1.0
+       verify_bullbitcoinandroid.sh --version 6.1.0
 
        # Path 2: Device split APK verification (requires extracted splits)
-       verify_bullbitcoinandroid.sh -v 6.1.0 -a /var/shared/apk/com.bullbitcoin.mobile/6.1.0/splits/
-       verify_bullbitcoinandroid.sh -v 6.1.0 -a ~/bullbitcoin-splits/ -c
+       verify_bullbitcoinandroid.sh --version 6.1.0 --apk /var/shared/apk/com.bullbitcoin.mobile/6.1.0/
+       verify_bullbitcoinandroid.sh --version 6.1.0 --apk ~/bullbitcoin-splits/ --cleanup
+
+       # Preserve split APKs for further analysis
+       verify_bullbitcoinandroid.sh --version 6.1.0 --apk ~/bullbitcoin-splits/ --preserve
+
+       # Specify app type for automated builds
+       verify_bullbitcoinandroid.sh --version 6.1.0 --type bitcoin
 
 For detailed documentation, see: https://walletscrutiny.com
 
@@ -374,21 +410,25 @@ EOF
 # Read script arguments and flags
 # ===============================
 
-apkDir=""
+apkPath=""
 appVersion=""
 revisionOverride=""
 appType=""
+appArch=""
 showScriptVersion=false
+preserveSplits=false
 
 while [[ "$#" -gt 0 ]]; do
   case $1 in
-    --version) showScriptVersion=true ;;
-    -v) appVersion="$2"; shift ;;
-    -a|--apk-dir) apkDir="$2"; shift ;;
-    -t|--type) appType="$2"; shift ;;
-    -r|--revision) revisionOverride="$2"; shift ;;
-    -c|--cleanup) shouldCleanup=true ;;
-    --help|-h) usage; exit 0 ;;
+    --script-version) showScriptVersion=true ;;
+    --version) appVersion="$2"; shift ;;
+    --apk) apkPath="$2"; shift ;;
+    --type) appType="$2"; shift ;;
+    --arch) appArch="$2"; shift ;;
+    --revision) revisionOverride="$2"; shift ;;
+    --cleanup) shouldCleanup=true ;;
+    --preserve) preserveSplits=true ;;
+    --help) usage; exit 0 ;;
     *) echo "Unknown argument: $1"; usage; exit 1 ;;
   esac
   shift
@@ -396,23 +436,26 @@ done
 
 # Show script version and exit if requested
 if [ "$showScriptVersion" = true ]; then
-  echo "verify_bullbitcoinandroid.sh v0.4.0"
+  echo "verify_bullbitcoinandroid.sh v0.5.1"
   exit 0
 fi
 
 # Validate required arguments
 if [[ -z "$appVersion" ]]; then
-  echo -e "${RED}Error: App version not specified. Use -v to specify version (e.g., -v 6.1.0).${NC}"
+  echo -e "${RED}Error: App version not specified. Use --version to specify version (e.g., --version 6.1.0).${NC}"
   usage
   exit 1
 fi
 
-# Determine verification path based on -a parameter
+# Determine verification path based on --apk parameter
 verificationMode=""
-if [[ -z "$apkDir" ]]; then
+apkDir=""  # Will store the directory path (either provided or created)
+
+if [[ -z "$apkPath" ]]; then
+  # No --apk provided: GitHub mode
   verificationMode="github"
   echo "=== Verification Mode: GitHub Universal APK ==="
-  echo "No -a parameter provided. Container will download universal APK from GitHub releases."
+  echo "No --apk parameter provided. Container will download universal APK from GitHub releases."
   echo ""
 
   # Create placeholder directory in execution directory (container will populate it)
@@ -420,27 +463,42 @@ if [[ -z "$apkDir" ]]; then
   mkdir -p "$apkDir"
   apkDir=$(cd "$apkDir" && pwd)  # Get absolute path
 else
-  verificationMode="device"
-  echo "=== Verification Mode: Device Split APKs ==="
-
+  # --apk provided: check if it's a file or directory
   # Make path absolute
-  if ! [[ $apkDir =~ ^/.* ]]; then
-    apkDir="$PWD/$apkDir"
+  if ! [[ $apkPath =~ ^/.* ]]; then
+    apkPath="$PWD/$apkPath"
   fi
 
-  if [ ! -d "$apkDir" ]; then
-    echo -e "${RED}Error: APK directory $apkDir not found!${NC}"
+  if [ -f "$apkPath" ]; then
+    # Single APK file provided
+    verificationMode="device"
+    echo "=== Verification Mode: Single APK File ==="
+    echo "Using APK file: $apkPath"
+
+    # Create directory and copy file
+    apkDir="./bullbitcoin_${appVersion}_apk"
+    mkdir -p "$apkDir"
+    cp "$apkPath" "$apkDir/base.apk"
+    apkDir=$(cd "$apkDir" && pwd)  # Get absolute path
+    echo ""
+  elif [ -d "$apkPath" ]; then
+    # Directory with split APKs provided
+    verificationMode="device"
+    echo "=== Verification Mode: Device Split APKs ==="
+    apkDir="$apkPath"
+
+    # Check for base.apk
+    if [ ! -f "$apkDir/base.apk" ]; then
+      echo -e "${RED}Error: base.apk not found in $apkDir${NC}"
+      exit 1
+    fi
+
+    echo "Using split APKs from: $apkDir"
+    echo ""
+  else
+    echo -e "${RED}Error: APK path $apkPath not found (not a file or directory)!${NC}"
     exit 1
   fi
-
-  # Check for base.apk
-  if [ ! -f "$apkDir/base.apk" ]; then
-    echo -e "${RED}Error: base.apk not found in $apkDir${NC}"
-    exit 1
-  fi
-
-  echo "Using split APKs from: $apkDir"
-  echo ""
 fi
 
 echo "=== Bull Bitcoin Mobile Verification Session Start ==="
@@ -551,6 +609,11 @@ fi
 
 # Create workspace
 mkdir -p "$workDir"
+# Convert to absolute path for container mounting
+workDir=$(cd "$workDir" && pwd)
+
+echo "Absolute workspace path: $workDir"
+echo ""
 
 # Generate device-spec.json (only for device mode)
 # =================================================
@@ -644,6 +707,7 @@ OFFICIAL_DIR="\$2"
 OUTPUT_DIR="\$3"
 APP_VERSION="\${4:-}"
 DEVICE_SPEC="\${5:-}"
+PRESERVE="\${6:-false}"
 
 echo "[Container] Starting extraction and comparison (mode: \$MODE)..."
 mkdir -p "\$OUTPUT_DIR"
@@ -703,6 +767,21 @@ if [[ "\$MODE" == "github" ]]; then
 
   echo "\$non_meta" > "\$OUTPUT_DIR/total_diffs.txt"
   echo "[Container] Total non-META-INF differences: \$non_meta"
+
+  # Preserve universal APKs if requested
+  if [[ "\$PRESERVE" == "true" ]]; then
+    echo "[Container] Preserving universal APKs to workspace..."
+    mkdir -p "\$OUTPUT_DIR/official-apk"
+    mkdir -p "\$OUTPUT_DIR/built-apk"
+
+    echo "  Copying official universal APK..."
+    cp "\$OFFICIAL_DIR/github.apk" "\$OUTPUT_DIR/official-apk/" 2>/dev/null || true
+    cp /tmp/universal.apk "\$OUTPUT_DIR/built-apk/universal.apk" 2>/dev/null || true
+
+    echo "[Container] Universal APKs preserved:"
+    echo "  Official: \$OUTPUT_DIR/official-apk/"
+    echo "  Built: \$OUTPUT_DIR/built-apk/"
+  fi
 
 else
   # Path 2: Device split APK comparison
@@ -780,6 +859,23 @@ else
 
   echo "\$total_diffs" > "\$OUTPUT_DIR/total_diffs.txt"
   echo "[Container] Total non-META-INF differences: \$total_diffs"
+
+  # Preserve split APKs if requested
+  if [[ "\$PRESERVE" == "true" ]]; then
+    echo "[Container] Preserving split APKs to workspace..."
+    mkdir -p "\$OUTPUT_DIR/official-splits"
+    mkdir -p "\$OUTPUT_DIR/built-splits"
+
+    echo "  Copying official split APKs..."
+    cp "\$OFFICIAL_DIR"/*.apk "\$OUTPUT_DIR/official-splits/" 2>/dev/null || true
+
+    echo "  Copying built split APKs..."
+    cp /tmp/built-raw/splits/*.apk "\$OUTPUT_DIR/built-splits/" 2>/dev/null || true
+
+    echo "[Container] Split APKs preserved:"
+    echo "  Official: \$OUTPUT_DIR/official-splits/"
+    echo "  Built: \$OUTPUT_DIR/built-splits/"
+  fi
 fi
 
 echo "[Container] Comparison complete"
@@ -890,6 +986,10 @@ RUN git clone --branch v${VERSION} https://github.com/SatoshiPortal/bullbitcoin-
 
 WORKDIR /app
 
+# Force cargokit to build Rust libraries from source instead of downloading precompiled binaries
+# This is CRITICAL for reproducibility - precompiled binaries differ from source builds
+RUN sed -i 's/use_precompiled_binaries: true/use_precompiled_binaries: false/' /app/cargokit_options.yaml
+
 # Setup the project (using direct flutter commands instead of make/fvm)
 # Skip clean since this is a fresh clone
 RUN flutter pub get
@@ -979,7 +1079,9 @@ build_and_verify() {
           github \
           /official-apks \
           /workspace/results \
-          $appVersion
+          $appVersion \
+          '' \
+          $preserveSplits
 
         # Copy AAB to workspace for host access
         cp /app/build/app/outputs/bundle/release/app-release.aab /workspace/
@@ -1030,7 +1132,8 @@ build_and_verify() {
           /official-apks \
           /workspace/results \
           '' \
-          /workspace/device-spec.json
+          /workspace/device-spec.json \
+          $preserveSplits
 
         # Copy AAB to workspace for host access
         cp /app/build/app/outputs/bundle/release/app-release.aab /workspace/
@@ -1208,10 +1311,27 @@ result() {
     verdict="differences found"
   fi
 
+  local preservedApksInfo=""
+  if [[ "$preserveSplits" == true ]]; then
+    if [[ "$verificationMode" == "device" ]]; then
+      preservedApksInfo="
+Preserved split APKs:
+  Official: $workDir/results/official-splits/
+  Built:    $workDir/results/built-splits/
+"
+    else
+      preservedApksInfo="
+Preserved universal APKs:
+  Official: $workDir/results/official-apk/
+  Built:    $workDir/results/built-apk/
+"
+    fi
+  fi
+
   local diffGuide="
 Detailed diff files available at:
 $workDir/results/
-
+${preservedApksInfo}
 To investigate further, you can re-run the container:
 podman run -it --rm \\
   --volume $workDir:/workspace:rw \\
@@ -1282,9 +1402,11 @@ echo "Session End: $(date -Iseconds)"
 
 # Determine exit code based on verdict (v0.3.0: Luis compliance)
 if [[ "$verdict" == "reproducible" ]]; then
-  cleanup
-  exit 0
+  exitCode=0
 else
-  cleanup
-  exit 1
+  exitCode=1
 fi
+
+cleanup
+echo "Exit code: $exitCode"
+exit $exitCode
