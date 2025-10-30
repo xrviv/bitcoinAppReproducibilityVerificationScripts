@@ -2,57 +2,12 @@
 # ==============================================================================
 # verify_nunchukandroid.sh - Nunchuk Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.5.3
-# Author:        Daniel Garcia (dannybuntu)
+# Version:       v0.5.5
 # Organization:  WalletScrutiny.com
-# Last Modified: 2025-10-30 (Philippine Time - AAB path fix)
+# Last Modified: 2025-10-30
 # Project:       https://github.com/nunchuk-io/nunchuk-android
 # ==============================================================================
-# Changes in v0.5.3:
-# - CRITICAL FIX: Corrected AAB artifact path in container
-# - Changed: /app/app/build/.../app-production-release.aab
-# - To: /app/nunchuk-app/build/.../nunchuk-app-production-release.aab
-# - Build now completes successfully (was failing at artifact copy stage)
-#
-# Changes in v0.5.2:
-# - Added exit code echo at end of script for visibility
-# - Script now prints "Exit code: 0" or "Exit code: 1" before exiting
-#
-# Changes in v0.5.1:
-# - CRITICAL: Fixed Gradle daemon crash due to OOM
-# - Increased container build memory: 4GB → 6GB
-# - Increased container runtime memory: 6GB → 10GB
-# - Added Gradle JVM args: -Xmx6g -XX:MaxMetaspaceSize=512m
-# - Disabled Gradle parallel builds to reduce memory pressure
-# - Added --no-daemon flag to gradlew command
-# - Added heap dump on OOM for debugging
-#
-# Changes in v0.5.0:
-# - BREAKING: Updated to new Luis script guidelines (2025-10-29)
-# - Changed short flags to long flags: -v → --version, -a → --apk, -t → --type
-# - Added --arch parameter (optional, for future multi-architecture support)
-# - Kept --revision as custom flag (not in guidelines but useful)
-# - --apk now accepts both file (single APK) or directory (split APKs)
-# - All examples updated to use new long-form parameters
-#
-# Changes in v0.4.0:
-# - BREAKING: Full Luis Guidelines compliance refactor
-# - Changed workspace from /tmp to execution directory (Luis guideline #2)
-# - Changed -v to required parameter (app version to build)
-# - Changed -a to optional parameter (APK directory)
-# - Added Path 1: GitHub universal APK verification (no -a, downloads from GitHub)
-# - Added Path 2: Device split APK verification (with -a, uses provided splits)
-# - Removed -t flag (not applicable for this app)
-# - Containerized all dependencies (only podman/docker on host)
-# - Uses Nunchuk's official reproducible-builds/Dockerfile as base
-# - Extends Dockerfile with verification tools (bundletool, apktool)
-# - Gradle build system instead of Flutter
-# - Tag format: android.{version}, v{version}, or {version}
-#
-# Changes in v0.3.0:
-# - Initial containerization with host dependencies
-# - Split APK verification support
-# - Device-spec.json generation
+# LICENSE: MIT License
 # ==============================================================================
 #
 # TECHNICAL DISCLAIMER:
@@ -516,58 +471,62 @@ workDir=$(cd "$workDir" && pwd)
 echo "Absolute workspace path: $workDir"
 echo ""
 
-# Clone Nunchuk repository to get Dockerfile
-# ============================================
+# Fetch Nunchuk's Dockerfile from GitHub (no git required)
+# ===========================================================
 
-echo "Cloning Nunchuk repository to get official Dockerfile..."
-repoDir="$workDir/nunchuk-android-source"
+echo "Fetching Nunchuk's official Dockerfile from GitHub..."
 
-# Determine git tag to check out
+# Determine git tag to use
 gitTag=""
+originalDockerfile=""
+
 if [[ -n "$revisionOverride" ]]; then
   gitTag="$revisionOverride"
   echo "Using revision override: $gitTag"
+
+  # Try to fetch Dockerfile
+  dockerfileUrl="https://raw.githubusercontent.com/nunchuk-io/nunchuk-android/$gitTag/reproducible-builds/Dockerfile"
+  echo "Fetching from: $dockerfileUrl"
+  originalDockerfile=$(curl -sS -f "$dockerfileUrl" 2>/dev/null)
+
+  if [[ -z "$originalDockerfile" ]]; then
+    echo -e "${RED}Error: Could not fetch Dockerfile for revision $gitTag${NC}"
+    echo "URL tried: $dockerfileUrl"
+    exit 1
+  fi
 else
   # Try common tag patterns for Nunchuk
   candidates=("android.${appVersion}" "v${appVersion}" "${appVersion}")
-  
-  # Clone repository first
-  git clone --quiet "$repo" "$repoDir"
-  cd "$repoDir"
-  git fetch --all --tags --prune --quiet
-  
+
+  echo "Trying tag patterns: ${candidates[*]}"
+
   for candidate in "${candidates[@]}"; do
-    if git rev-parse "refs/tags/$candidate" >/dev/null 2>&1; then
+    dockerfileUrl="https://raw.githubusercontent.com/nunchuk-io/nunchuk-android/$candidate/reproducible-builds/Dockerfile"
+    echo -n "  Trying $candidate... "
+
+    originalDockerfile=$(curl -sS -f "$dockerfileUrl" 2>/dev/null)
+
+    if [[ -n "$originalDockerfile" ]]; then
       gitTag="$candidate"
-      echo "Found git tag: $gitTag"
+      echo -e "${GREEN}Found!${NC}"
       break
+    else
+      echo "not found"
     fi
   done
-  
+
   if [[ -z "$gitTag" ]]; then
-    echo -e "${RED}Error: Could not find git tag for version $appVersion${NC}"
-    echo -e "${YELLOW}Tried: ${candidates[*]}${NC}"
+    echo -e "${RED}Error: Could not find Dockerfile for version $appVersion${NC}"
+    echo -e "${YELLOW}Tried tags: ${candidates[*]}${NC}"
     echo ""
-    echo "Available tags:"
-    git tag | grep -E "(android\.|v)?${appVersion}" | head -5
-    echo ""
-    echo "Use -r to specify exact commit/tag:"
-    echo "  verify_nunchukandroid.sh -v $appVersion -r android.$appVersion"
+    echo "Use --revision to specify exact commit/tag:"
+    echo "  $0 --version $appVersion --revision android.$appVersion"
     exit 1
   fi
 fi
 
-# Checkout the tag
-if [[ -d "$repoDir/.git" ]]; then
-  cd "$repoDir"
-else
-  git clone --quiet "$repo" "$repoDir"
-  cd "$repoDir"
-fi
-
-git checkout "$gitTag" --quiet
-commit=$(git rev-parse HEAD)
-echo "Checked out commit: $commit"
+echo "Using git tag: $gitTag"
+echo "Dockerfile successfully fetched"
 echo ""
 
 # Generate device-spec.json (only for device mode)
@@ -654,15 +613,7 @@ echo ""
 
 echo "Creating extended Dockerfile from Nunchuk's official Dockerfile..."
 
-if [ ! -f "$repoDir/reproducible-builds/Dockerfile" ]; then
-  echo -e "${RED}Error: Nunchuk's Dockerfile not found at $repoDir/reproducible-builds/Dockerfile${NC}"
-  exit 1
-fi
-
-# Read Nunchuk's original Dockerfile
-originalDockerfile=$(cat "$repoDir/reproducible-builds/Dockerfile")
-
-# Create extended Dockerfile
+# Create extended Dockerfile (originalDockerfile already fetched via curl)
 cat > "$workDir/Dockerfile" <<DOCKERFILE_EOF
 # Extended Nunchuk Android Reproducible Build Dockerfile
 # Base: Nunchuk's official reproducible-builds/Dockerfile
@@ -809,10 +760,17 @@ if [[ "$MODE" == "github" ]]; then
   
   echo "[Container] Comparing universal APKs..."
   diff_output=$(diff -r /tmp/official-decoded /tmp/built-decoded 2>/dev/null || true)
-  
+
   if [[ -n "$diff_output" ]]; then
     echo "$diff_output" > "$OUTPUT_DIR/diff_universal.txt"
-    non_meta=$(echo "$diff_output" | grep -vcE "(META-INF|^$)" || echo "0")
+
+    # Count non-META-INF diffs using Leo's stricter filtering (2025-10-30)
+    # Get brief file list for accurate counting
+    diff_brief=$(diff -qr /tmp/official-decoded /tmp/built-decoded 2>/dev/null || true)
+    # Filter out ONLY root-level META-INF using Leo's precise regex
+    filtered=$(echo "$diff_brief" | grep -vE '^Only in [^/:]+: META-INF$|^Only in [^/:]+/META-INF:|^Files [^/]+/META-INF/' || true)
+    non_meta=$(echo "$filtered" | grep -c '^' || echo "0")
+
     echo "    Differences: $non_meta (non-META-INF)"
   else
     touch "$OUTPUT_DIR/diff_universal.txt"
@@ -892,7 +850,14 @@ else
     diff_output=$(diff -r "$official" "$built" 2>/dev/null || true)
     if [[ -n "$diff_output" ]]; then
       echo "$diff_output" > "$OUTPUT_DIR/diff_$split_name.txt"
-      non_meta=$(echo "$diff_output" | grep -vcE "(META-INF|^$)" || echo "0")
+
+      # Count non-META-INF diffs using Leo's stricter filtering (2025-10-30)
+      # Get brief file list for accurate counting
+      diff_brief=$(diff -qr "$official" "$built" 2>/dev/null || true)
+      # Filter out ONLY root-level META-INF using Leo's precise regex
+      filtered=$(echo "$diff_brief" | grep -vE '^Only in [^/:]+: META-INF$|^Only in [^/:]+/META-INF:|^Files [^/]+/META-INF/' || true)
+      non_meta=$(echo "$filtered" | grep -c '^' || echo "0")
+
       total_diffs=$((total_diffs + non_meta))
       echo "    Differences: $non_meta (non-META-INF)"
     else
