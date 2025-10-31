@@ -24,7 +24,7 @@
 #
 # SCRIPT SUMMARY:
 # - Reads official Nunchuk Android split APKs from provided directory OR downloads from GitHub
-# - Clones Nunchuk repository and uses their official reproducible-builds/Dockerfile
+# - Fetches Nunchuk's official reproducible-builds/Dockerfile from GitHub (via curl)
 # - Extends Dockerfile with verification tools (bundletool, apktool)
 # - Builds container image with Android SDK/NDK + Gradle build system
 # - Runs single container that:
@@ -227,7 +227,8 @@ OPTIONS
                                Creates: workspace/official-splits/ and workspace/built-splits/
 
 REQUIREMENTS
-       docker OR podman (required - that's it!)
+       docker OR podman (required)
+       curl (required - for fetching Nunchuk's Dockerfile from GitHub)
        aapt (optional - falls back to container if missing)
 
        Minimum 12GB RAM (16GB+ recommended for stability)
@@ -237,7 +238,7 @@ REQUIREMENTS
 
        Standard tools (typically pre-installed): sha256sum, grep, awk, sed
 
-       Note: APK downloads happen inside container, no curl/wget needed on host
+       Note: APK downloads happen inside container (wget used in container)
 
 EXIT CODES
        0    Verification reproducible
@@ -292,7 +293,7 @@ done
 
 # Show script version and exit if requested
 if [ "$showScriptVersion" = true ]; then
-  echo "verify_nunchukandroid.sh v0.5.3"
+  echo "verify_nunchukandroid.sh v0.5.5"
   exit 0
 fi
 
@@ -443,7 +444,6 @@ fi
 # Define workspace (use appVersion from -v flag)
 # Use execution directory as workspace (Luis guideline #2: use directory where script is executed)
 workDir="./nunchuk_${appVersion}_verification"
-repo="https://github.com/nunchuk-io/nunchuk-android"
 container_name="nunchuk_verifier_$$"
 additionalInfo=""
 
