@@ -2,26 +2,15 @@
 # ==============================================================================
 # verify_electrumandroid.sh - Electrum Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.3.1
-# Author:        Daniel Garcia (dannybuntu)
+# Version:       v0.6.0
 # Organization:  WalletScrutiny.com
-# Last Modified: 2025-10-17 (Philippine Time)
+# Last Modified: 2025-11-01
 # Project:       https://github.com/spesmilo/electrum
 # ==============================================================================
-# Changes in v0.3.1:
-# - CRITICAL FIX: grep -v in result() now handles zero-match case (reproducible builds)
-# - Fixed script exit when all diffs are META-INF (verification summary now displays)
+# LICENSE: MIT License
 #
-# Changes in v0.3.0:
-# - Refactored for brevity: condensed help text from 233 to 48 lines
-# - Simplified signature verification logic (removed complex key management)
-# - Removed self-modifying add_known_key() function and KNOWN_SIGNING_KEYS feature
-# - Reduced overall verbosity while maintaining all core verification functionality
-#
-# Changes in v0.2.1:
-# - Added workspace collision detection to prevent stale artifact issues
-#
-# For full changelog history, see: git log verify_electrumandroid.sh
+# IMPORTANT: Changelog maintained separately at:
+# ~/work/ws-notes/script-notes/android/org.electrum.electrum/changelog.md
 # ==============================================================================
 #
 # TECHNICAL DISCLAIMER:
@@ -29,7 +18,6 @@
 # No warranty is provided regarding the security, functionality, or fitness for any particular purpose.
 # Users assume all risks associated with running this script and analyzing the software.
 # This script performs automated builds and APK/AAB comparisons - review all operations before execution.
-# This script may require access to connected Android devices for APK extraction.
 #
 # LEGAL DISCLAIMER:
 # This script is designed for legitimate security research and reproducible build verification.
@@ -38,10 +26,10 @@
 # By using this script, you acknowledge these disclaimers and accept full responsibility.
 #
 # SCRIPT SUMMARY:
-# - Downloads official Electrum APK/AAB from app stores or extracts from connected device
+# - Verifies provided Electrum APK file against reproducible build from source
 # - Clones source code repository and checks out the exact release tag/commit
 # - Performs containerized reproducible build using official Android build system
-# - Compares built APK/AAB against official releases using apktool and binary analysis
+# - Compares built APK against provided APK using apktool and binary analysis
 # - Documents differences and generates detailed reproducibility assessment report
 
 set -euo pipefail
@@ -65,11 +53,6 @@ on_error() {
     $CONTAINER_CMD rm -f "$container_image" 2>/dev/null || true
   fi
 
-  # ADB cleanup
-  if command -v adb >/dev/null 2>&1; then
-    adb kill-server 2>/dev/null || true
-  fi
-
   # Workspace preservation
   if [[ -n "${workDir:-}" && -d "$workDir" ]]; then
     echo -e "${YELLOW}Partial workspace available at: $workDir${NC}"
@@ -83,7 +66,6 @@ trap 'on_error $LINENO' ERR
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 wsContainer="docker.io/walletscrutiny/android:5"
 shouldCleanup=false
-extractFromPhone=false
 
 # Color constants
 YELLOW='\033[1;33m'
@@ -114,102 +96,15 @@ fi
 # Helper functions
 # ===============
 
-# Function to check if a command exists and print status
-check_command() {
-  if command -v $1 &> /dev/null || alias | grep -q "$1"; then
-    echo -e "$1 - ${GREEN}${SUCCESS_ICON} installed${NC}"
-  else
-    echo -e "$1 - ${RED}${ERROR_ICON} not installed${NC}"
-    MISSING_DEPENDENCIES=true
-  fi
-}
-
-is_app_installed() {
-  local package_name="$1"
-  if adb shell pm list packages | grep -q "^package:$package_name$"; then
-    return 0 # App is installed
-  else
-    return 1 # App is not installed
-  fi
-}
-
-extract_apk_from_phone() {
-  local bundleId="org.electrum.electrum"
-
-  echo -e "${YELLOW}======== PHONE EXTRACTION MODE ========${NC}"
-  echo -e "${YELLOW}Ensure phone is connected via USB with $bundleId installed.${NC}"
-  echo -e "${RED}WARNING: This grants script access to your Android device. Review code before running.${NC}"
-  echo
-
-  MISSING_DEPENDENCIES=false
-
-  # Check dependencies
-  check_command "adb"
-  check_command "java"
-  check_command "aapt"
-
-  if [ "$MISSING_DEPENDENCIES" = true ]; then
-    echo -e "${RED}Please install the missing dependencies before running the script.${NC}"
-    exit 1
-  fi
-
-  # Check if a phone is connected
-  connected_devices=$(adb devices | grep -w "device")
-  if [ -z "$connected_devices" ]; then
-    echo -e "${RED}No phone connected. Enable USB Debugging on your Android device and connect it.${NC}"
-    exit 1
-  fi
-
-  echo -e "${GREEN}Device connected successfully.${NC}"
-
-  # Check if the app is installed
-  if ! is_app_installed "$bundleId"; then
-    echo -e "${RED}Error: The app '$bundleId' is not installed on the connected device.${NC}"
-    exit 1
-  fi
-
-  # Get APK paths
-  echo "Retrieving APK paths for bundle ID: $bundleId"
-  apks=$(adb shell pm path $bundleId)
-
-  echo "APK paths retrieved:"
-  echo "$apks"
-
-  # Determine if the app uses single or split APKS
-  if echo "$apks" | grep -qE "split_|config."; then
-    echo -e "${YELLOW}App uses split APKs${NC}"
-  else
-    echo -e "${YELLOW}App uses single APK${NC}"
-  fi
-
-  # Create temporary directory for APKs
-  local temp_dir="/tmp/test_org.electrum.electrum_$(date +%s)"
-  mkdir -p "$temp_dir/official-apk"
-
-  # Pull APKs
-  echo "Pulling APKs..."
-  for apk in $apks; do
-    apkPath=$(echo $apk | awk '{print $NF}' FS=':' | tr -d '\r\n')
-    echo "Pulling $apkPath"
-    adb pull "$apkPath" "$temp_dir/official-apk/"
-  done
-
-  # Set downloadedApk to the base.apk
-  downloadedApk="$temp_dir/official-apk/base.apk"
-
-  echo "APK extracted to: $downloadedApk"
-}
-
 usage() {
   cat <<'EOF'
 NAME
        verify_electrumandroid.sh - Electrum Android reproducible build verification
 
 SYNOPSIS
-       verify_electrumandroid.sh -a <apk_file> [OPTIONS]
-       verify_electrumandroid.sh -b <version> [OPTIONS]
-       verify_electrumandroid.sh -x [OPTIONS]
-       verify_electrumandroid.sh -v | -h
+       verify_electrumandroid.sh --apk <apk_file> [OPTIONS]
+       verify_electrumandroid.sh --build <version> [OPTIONS]
+       verify_electrumandroid.sh --version | --help
 
 DESCRIPTION
        Performs containerized reproducible build verification for Electrum Android.
@@ -217,29 +112,26 @@ DESCRIPTION
        and verifies signatures. Workspace: /tmp/test_org.electrum.electrum_<version>/
 
 OPTIONS
-       -v, --version           Show script version and exit
-       -h, --help              Show this help and exit
+       --version               Show script version and exit
+       --help                  Show this help and exit
 
-       -a, --apk <file>        Path to APK file to verify (auto-detects version)
-       -b, --build <version>   Build version from source without APK comparison
-       -x, --extract           Extract APK from connected Android device via ADB
+       --apk <file>            Path to APK file to verify (auto-detects version)
+       --build <version>       Build version from source without APK comparison
 
-       -r, --revision <hash>   Override git tag, checkout specific commit
-       -c, --cleanup           Remove temporary files after completion
+       --revision <hash>       Override git tag, checkout specific commit
+       --cleanup               Remove temporary files after completion
 
 REQUIREMENTS
-       docker OR podman, git, unzip, sha256sum, grep, awk, sed
-       Optional: adb (for -x), aapt, java, diffoscope, meld
+       docker OR podman (ONLY dependency - fully containerized)
+       Optional: diffoscope, meld (for manual diff inspection)
 
 EXIT CODES
-       0    Verification completed (check verdict in output for reproducibility status)
-       1    Build failed, dependency missing, or runtime error
-       2    Unsupported appId (not org.electrum.electrum)
+       0    Reproducible - binaries match (only acceptable differences)
+       1    Not reproducible - differences found OR build/runtime error
 
 EXAMPLES
-       verify_electrumandroid.sh -a ~/Downloads/Electrum-4.6.2.apk
-       verify_electrumandroid.sh -b 4.6.2
-       verify_electrumandroid.sh -x -c
+       verify_electrumandroid.sh --apk ~/Downloads/Electrum-4.6.2.apk
+       verify_electrumandroid.sh --build 4.6.2 --cleanup
 
 For detailed documentation, see: https://walletscrutiny.com
 
@@ -256,31 +148,32 @@ showVersion=false
 
 while [[ "$#" -gt 0 ]]; do
   case $1 in
-    -v|--version) showVersion=true ;;
-    -b|--build) buildVersion="$2"; shift ;;
-    -a|--apk) downloadedApk="$2"; shift ;;
-    -x|--extract) extractFromPhone=true ;;
-    -r|--revision-override) revisionOverride="$2"; shift ;;
-    -c|--cleanup) shouldCleanup=true ;;
-    --help|-h) usage; exit 0 ;;
-    *) echo "Unknown argument: $1"; usage; exit 1 ;;
+    --version) showVersion=true ;;
+    --build) buildVersion="$2"; shift ;;
+    --apk) downloadedApk="$2"; shift ;;
+    --revision) revisionOverride="$2"; shift ;;
+    --cleanup) shouldCleanup=true ;;
+    --help) usage; echo "Exit code: 0"; exit 0 ;;
+    *) echo "Unknown argument: $1"; usage; echo "Exit code: 1"; exit 1 ;;
   esac
   shift
 done
 
 # Show script version and exit if requested
 if [ "$showVersion" = true ]; then
-  echo "verify_electrumandroid.sh v0.3.1"
+  echo "verify_electrumandroid.sh v0.6.0"
+  echo "Exit code: 0"
   exit 0
 fi
 
-# Check for mutual exclusivity of -a and -b flags
+# Check for mutual exclusivity of --apk and --build flags
 if [[ -n "$downloadedApk" && -n "$buildVersion" ]]; then
-  echo "Error: Cannot use -a and -b together."
-  echo "  -a: Verify APK (auto-detects version from APK metadata)"
-  echo "  -b: Build specific version from source (no APK needed)"
+  echo "Error: Cannot use --apk and --build together."
+  echo "  --apk: Verify APK (auto-detects version from APK metadata)"
+  echo "  --build: Build specific version from source (no APK needed)"
   echo
   usage
+  echo "Exit code: 1"
   exit 1
 fi
 
@@ -342,7 +235,7 @@ getSigner() {
   echo $s
 }
 
-# Handle different modes: -b (build mode), -x (extract), or -a (verify APK)
+# Handle different modes: --build (build mode) or --apk (verify APK)
 if [[ -n "$buildVersion" ]]; then
   # Build mode: no APK needed, just build from source
   appId="org.electrum.electrum"
@@ -358,32 +251,13 @@ if [[ -n "$buildVersion" ]]; then
   echo "Building version: $versionName"
   echo "Mode: Build only (no APK comparison)"
 
-elif [ "$extractFromPhone" = true ]; then
-  # Extract mode: pull APK from connected phone
-  extract_apk_from_phone
-
-  # Extract metadata after pulling
-  if ! command -v "$CONTAINER_CMD" >/dev/null 2>&1; then
-    echo "Error: $CONTAINER_CMD is required to run this script" >&2
-    exit 1
-  fi
-
-  appHash=$(sha256sum "$downloadedApk" | awk '{print $1;}')
-  fromPlayFolder="/tmp/fromPlay$appHash"
-  rm -rf "$fromPlayFolder"
-  signer=$( getSigner "$downloadedApk" )
-  echo "Extracting APK content ..."
-  containerApktool "$fromPlayFolder" "$downloadedApk" || exit 1
-  appId=$( head -n 1 "$fromPlayFolder/AndroidManifest.xml" | sed 's/.*package="//g' | sed 's/".*//g' )
-  versionName=$( grep versionName "$fromPlayFolder/apktool.yml" | sed 's/.*: //g' | tr -d "'" )
-  versionCode=$( grep versionCode "$fromPlayFolder/apktool.yml" | sed 's/.*: //g' | tr -d "'" )
-
 else
   # Verify mode: validate APK file and extract metadata
   if [[ -z "$downloadedApk" ]]; then
-    echo "Error: APK file not specified. Use -a to provide APK or -b to build without APK."
+    echo "Error: APK file not specified. Use --apk to provide APK or --build to build without APK."
     echo
     usage
+    echo "Exit code: 1"
     exit 1
   fi
 
@@ -391,6 +265,7 @@ else
     echo "APK file not found: $downloadedApk"
     echo
     usage
+    echo "Exit code: 1"
     exit 1
   fi
 
@@ -399,7 +274,12 @@ else
     exit 1
   fi
 
-  appHash=$(sha256sum "$downloadedApk" | awk '{print $1;}')
+  # Calculate hash in container
+  local apk_dir apk_name
+  apk_dir="$(dirname "$downloadedApk")"
+  apk_name="$(basename "$downloadedApk")"
+  appHash=$($CONTAINER_CMD run --rm --volume "$apk_dir":/apk:ro "$wsContainer" \
+    sh -c "sha256sum /apk/$apk_name | awk '{print \$1}'")
   fromPlayFolder="/tmp/fromPlay$appHash"
   rm -rf "$fromPlayFolder"
   signer=$( getSigner "$downloadedApk" )
@@ -433,23 +313,27 @@ fi
 
 if [[ -z "$appId" ]]; then
   echo "appId could not be determined"
+  echo "Exit code: 1"
   exit 1
 fi
 
 if [[ -z "$versionName" ]]; then
   echo "versionName could not be determined"
+  echo "Exit code: 1"
   exit 1
 fi
 
 # versionCode not required for build-only mode
 if [[ -z "$buildVersion" && -z "$versionCode" ]]; then
   echo "versionCode could not be determined"
+  echo "Exit code: 1"
   exit 1
 fi
 
 if [[ "$appId" != "org.electrum.electrum" ]]; then
   echo "Unsupported appId $appId (expected org.electrum.electrum)"
-  exit 2
+  echo "Exit code: 1"
+  exit 1
 fi
 
 if [[ -z "$buildVersion" ]]; then
@@ -473,6 +357,7 @@ if [[ -d "$workDir" ]]; then
   echo -e "${CYAN}  rm -rf $workDir${NC}"
   echo
   echo -e "${YELLOW}Then re-run the script.${NC}"
+  echo "Exit code: 1"
   exit 1
 fi
 
@@ -518,15 +403,12 @@ determine_architectures() {
   local apk="$1"
   local output
 
-  if command -v aapt >/dev/null 2>&1; then
-    output=$(aapt dump badging "$apk" 2>/dev/null || true)
-  else
-    local apk_dir apk_name
-    apk_dir="$(dirname "$apk")"
-    apk_name="$(basename "$apk")"
-    output=$($CONTAINER_CMD run --rm --volume "$apk_dir":/apk:ro "$wsContainer" \
-      sh -c "aapt dump badging /apk/$apk_name" 2>/dev/null || true)
-  fi
+  # Always use containerized aapt
+  local apk_dir apk_name
+  apk_dir="$(dirname "$apk")"
+  apk_name="$(basename "$apk")"
+  output=$($CONTAINER_CMD run --rm --volume "$apk_dir":/apk:ro "$wsContainer" \
+    sh -c "aapt dump badging /apk/$apk_name" 2>/dev/null || true)
 
   if [[ -z "$output" ]]; then
     return 0
@@ -536,41 +418,74 @@ determine_architectures() {
 }
 
 prepare() {
-  echo "Preparing Electrum source repository..."
+  echo "Preparing Electrum source repository (containerized)..."
   rm -rf "$workDir"
   mkdir -p "$workDir"
-  cd "$workDir"
 
-  git clone --quiet --recurse-submodules "$repo" "$electrum_checkout"
-  cd "$electrum_checkout"
-  git fetch --quiet --tags
+  # Run git operations in container
+  echo "Cloning repository in container..."
+  $CONTAINER_CMD run --rm \
+    --volume "$workDir":/workspace:Z \
+    --workdir /workspace \
+    "$wsContainer" \
+    sh -c "git clone --quiet --recurse-submodules '$repo' app"
 
-  if [[ -n "$revisionOverride" ]]; then
-    git checkout --quiet "$revisionOverride"
-    tag="$revisionOverride"
-  else
-    local resolved
-    if resolved=$(resolve_tag); then
-      git checkout --quiet "refs/tags/$resolved"
-      tag="$resolved"
-    else
-      tag="$(git rev-parse HEAD)"
-      echo "Warning: No matching tag for version $versionName; using commit $tag" >&2
-      if [[ -n "$additionalInfo" ]]; then
-        additionalInfo+=$'\n'
-      fi
-      additionalInfo+="No upstream tag matched version $versionName; using commit $tag."
-    fi
+  # Determine which tag/commit to use
+  local target_ref="$revisionOverride"
+  if [[ -z "$target_ref" ]]; then
+    # Try to resolve tag from version name
+    target_ref=$($CONTAINER_CMD run --rm \
+      --volume "$workDir":/workspace:Z \
+      --workdir /workspace/app \
+      "$wsContainer" \
+      sh -c "
+        git fetch --quiet --tags
+        # Try version as-is
+        if git rev-parse --verify 'refs/tags/$versionName^{tag}' >/dev/null 2>&1; then
+          echo '$versionName'
+        # Try with v prefix
+        elif git rev-parse --verify 'refs/tags/v$versionName^{tag}' >/dev/null 2>&1; then
+          echo 'v$versionName'
+        # Try without .0 suffix
+        elif [[ '$versionName' =~ ^(.+)\.0$ ]] && git rev-parse --verify \"refs/tags/\${BASH_REMATCH[1]}^{tag}\" >/dev/null 2>&1; then
+          echo '\${BASH_REMATCH[1]}'
+        # Try without .0 suffix and with v prefix
+        elif [[ '$versionName' =~ ^(.+)\.0$ ]] && git rev-parse --verify \"refs/tags/v\${BASH_REMATCH[1]}^{tag}\" >/dev/null 2>&1; then
+          echo 'v\${BASH_REMATCH[1]}'
+        else
+          echo 'HEAD'
+        fi
+      " || echo "HEAD")
   fi
 
-  git submodule update --init --recursive
-  commit="$(git rev-parse HEAD)"
+  # Checkout the target ref
+  echo "Checking out $target_ref..."
+  $CONTAINER_CMD run --rm \
+    --volume "$workDir":/workspace:Z \
+    --workdir /workspace/app \
+    "$wsContainer" \
+    sh -c "git checkout --quiet '$target_ref' && git submodule update --init --recursive"
+
+  # Get commit hash and tag info
+  commit=$($CONTAINER_CMD run --rm \
+    --volume "$workDir":/workspace:Z \
+    --workdir /workspace/app \
+    "$wsContainer" \
+    sh -c "git rev-parse HEAD")
+  
+  tag="$target_ref"
+  if [[ "$tag" == "HEAD" ]]; then
+    echo "Warning: No matching tag for version $versionName; using commit $commit" >&2
+    if [[ -n "$additionalInfo" ]]; then
+      additionalInfo+=$'\n'
+    fi
+    additionalInfo+="No upstream tag matched version $versionName; using commit $commit."
+  fi
+
   echo "Using Electrum revision $tag (commit $commit)"
 }
 
 test() {
-  cd "$electrum_checkout"
-
   local build_arch
   if [[ -n "$buildVersion" ]]; then
     # Build-only mode: default to armeabi-v7a (most common architecture)
@@ -595,12 +510,12 @@ test() {
     fi
   fi
 
-  if [[ ! -f contrib/android/Dockerfile ]]; then
+  if [[ ! -f "$electrum_checkout/contrib/android/Dockerfile" ]]; then
     echo "Missing contrib/android/Dockerfile in Electrum checkout" >&2
     exit 1
   fi
 
-  cp contrib/deterministic-build/requirements-build-android.txt contrib/android/ || true
+  cp "$electrum_checkout/contrib/deterministic-build/requirements-build-android.txt" "$electrum_checkout/contrib/android/" 2>/dev/null || true
 
   local uid gid
   uid="$(id -u)"
@@ -608,10 +523,10 @@ test() {
 
   $CONTAINER_CMD build \
     --tag "$container_image" \
-    --file contrib/android/Dockerfile \
+    --file "$electrum_checkout/contrib/android/Dockerfile" \
     --build-arg UID="$uid" \
     --build-arg GID="$gid" \
-    .
+    "$electrum_checkout"
 
   # Pre-create directories that the build process expects
   # This prevents FileNotFoundError when buildozer tries to copy APK to dist/
@@ -714,11 +629,36 @@ result() {
   local fromBuildUnzipped="$workDir/fromBuild_${appId}_$versionCode"
 
   rm -rf "$fromBuildUnzipped" "$fromPlayUnzipped"
-  unzip -qq "$downloadedApk" -d "$fromPlayUnzipped"
-  unzip -qq "$builtApk" -d "$fromBuildUnzipped"
+  mkdir -p "$fromPlayUnzipped" "$fromBuildUnzipped"
 
+  # Unzip in container
+  echo "Extracting APKs in container..."
+  local apk_dir apk_name built_dir built_name
+  apk_dir="$(dirname "$downloadedApk")"
+  apk_name="$(basename "$downloadedApk")"
+  built_dir="$(dirname "$builtApk")"
+  built_name="$(basename "$builtApk")"
+
+  $CONTAINER_CMD run --rm \
+    --volume "$apk_dir":/official:ro \
+    --volume "$fromPlayUnzipped":/output:Z \
+    "$wsContainer" \
+    sh -c "unzip -qq /official/$apk_name -d /output"
+
+  $CONTAINER_CMD run --rm \
+    --volume "$built_dir":/built:ro \
+    --volume "$fromBuildUnzipped":/output:Z \
+    "$wsContainer" \
+    sh -c "unzip -qq /built/$built_name -d /output"
+
+  # Diff in container
+  echo "Comparing APKs in container..."
   local diffResult
-  diffResult=$(diff --brief --recursive "$fromPlayUnzipped" "$fromBuildUnzipped" || true)
+  diffResult=$($CONTAINER_CMD run --rm \
+    --volume "$fromPlayUnzipped":/official:ro \
+    --volume "$fromBuildUnzipped":/built:ro \
+    "$wsContainer" \
+    sh -c "diff --brief --recursive /official /built || true" | sed 's|/official|$fromPlayUnzipped|g; s|/built|$fromBuildUnzipped|g')
 
   local diffCount=0
   if [[ -n "$diffResult" ]]; then
@@ -726,10 +666,13 @@ result() {
   fi
 
   local verdict=""
+  local exit_code=0
   if [[ $diffCount -eq 0 ]]; then
     verdict="reproducible"
+    exit_code=0
   else
     verdict="differences found"
+    exit_code=1
   fi
 
   local diffGuide="
@@ -782,6 +725,8 @@ $additionalInfo
 
   echo -e "\n${infoBlock}===== End Results ====="
   echo "$diffGuide"
+  
+  return $exit_code
 }
 
 cleanup() {
@@ -800,19 +745,19 @@ test
 # Only run result() and cleanup() if we have an APK to compare
 if [[ -z "$buildVersion" ]]; then
   result
+  verification_exit_code=$?
   echo "=== Verification Complete ==="
+  cleanup
+  echo "Session End: $(date -Iseconds)"
+  echo "Exit code: $verification_exit_code"
+  exit $verification_exit_code
 else
   echo "=== Build Complete ==="
   echo "Built APK: $builtApk"
   ls -lh "$builtApk"
   echo "Workspace: $workDir"
-fi
-
-echo "Session End: $(date -Iseconds)"
-
-# Always run cleanup to handle logs
-if [[ -z "$buildVersion" ]]; then
-  cleanup
-else
   echo "Build artifacts preserved at: $workDir"
+  echo "Session End: $(date -Iseconds)"
+  echo "Exit code: 0"
+  exit 0
 fi
