@@ -2,7 +2,7 @@
 # ==============================================================================
 # verify_electrumdesktop.sh - Electrum Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.3.1
+# Version:       v0.3.2
 # Organization:  WalletScrutiny.com
 # Last Modified: 2025-11-05
 # Project:       https://github.com/spesmilo/electrum
@@ -45,7 +45,7 @@ INFO_ICON="ℹ️"
 
 APP_NAME="Electrum Desktop"
 APP_ID="org.electrum.electrum"
-SCRIPT_VERSION="v0.3.1"
+SCRIPT_VERSION="v0.3.2"
 REPO_URL="https://github.com/spesmilo/electrum"
 
 # ---------- Logging Functions ----------
@@ -66,8 +66,8 @@ Required Parameters:
   --version <version>    Electrum version to verify (e.g., 4.6.2)
 
 Optional Parameters:
-  --arch <arch>          Architecture to build (default: windows)
-                         Supported: windows (win64 executables)
+  --arch <arch>          Architecture to build (default: win64)
+                         Supported: win64 (64-bit Windows executables)
   --type <type>          Build type (accepted but ignored - no variants for Electrum)
 
 Flags:
@@ -75,8 +75,8 @@ Flags:
 
 Examples:
   $(basename "$0") --version 4.6.2
-  $(basename "$0") --version 4.6.2 --arch windows
-  $(basename "$0") --version 4.6.2 --arch windows --type bitcoin
+  $(basename "$0") --version 4.6.2 --arch win64
+  $(basename "$0") --version 4.6.2 --arch win64 --type bitcoin
 
 Requirements:
   - Docker or Podman installed
@@ -96,7 +96,7 @@ EOF
 
 # ---------- Parameter Parsing ----------
 version=""
-arch="windows"
+arch="win64"
 build_type=""
 
 while [[ $# -gt 0 ]]; do
@@ -133,9 +133,9 @@ if [[ -z "$version" ]]; then
 fi
 
 # Validate architecture
-if [[ "$arch" != "windows" ]]; then
-  log_error "Unsupported architecture: $arch"
-  log_error "Currently only 'windows' is supported"
+if [[ "$arch" != "win64" ]]; then
+  log_error "Unsupported architecture: ${arch}"
+  log_error "Only 'win64' is currently supported for Electrum Desktop"
   exit 1
 fi
 
