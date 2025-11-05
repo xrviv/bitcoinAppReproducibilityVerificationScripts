@@ -2,7 +2,7 @@
 # ==============================================================================
 # verify_electrumdesktop.sh - Electrum Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.1
+# Version:       v0.3.1
 # Organization:  WalletScrutiny.com
 # Last Modified: 2025-11-05
 # Project:       https://github.com/spesmilo/electrum
@@ -45,7 +45,7 @@ INFO_ICON="ℹ️"
 
 APP_NAME="Electrum Desktop"
 APP_ID="org.electrum.electrum"
-SCRIPT_VERSION="v0.2.1"
+SCRIPT_VERSION="v0.3.1"
 REPO_URL="https://github.com/spesmilo/electrum"
 
 # ---------- Logging Functions ----------
@@ -87,6 +87,7 @@ Output:
   - Exit code 0: Binaries are reproducible
   - Exit code 1: Binaries differ or verification failed
   - COMPARISON_RESULTS.txt: Machine-readable comparison results
+  - Standardized results format between ===== Begin/End Results =====
 
 Version: ${SCRIPT_VERSION}
 Organization: WalletScrutiny.com
@@ -392,6 +393,30 @@ else
   sed -i '1s/^/BUILDS DO NOT MATCH BINARIES\n/' "$comparison_file"
   verdict="not_reproducible"
 fi
+
+# ---------- Standardized Output Format ----------
+echo ""
+echo "===== Begin Results ====="
+echo "appId:          ${APP_ID}"
+echo "signer:         N/A"
+echo "apkVersionName: ${version}"
+echo "apkVersionCode: N/A"
+echo "verdict:        ${verdict}"
+echo "appHash:        $(sha256sum "$official_dir/${official_files[0]}" 2>/dev/null | awk '{print $1}' || echo 'N/A')"
+echo "commit:         N/A"
+echo ""
+echo "Diff:"
+# Read and display comparison results
+if [[ -f "$comparison_file" ]]; then
+  grep -v "^Date:" "$comparison_file" | grep -v "^$" | head -1
+  tail -n +3 "$comparison_file" | grep -v "^$"
+fi
+echo ""
+echo "Revision, tag (and its signature):"
+echo "N/A - Binary verification only (no source checkout)"
+echo ""
+echo "===== End Results ====="
+echo ""
 
 # ---------- Summary ----------
 log_info "=============================================="
