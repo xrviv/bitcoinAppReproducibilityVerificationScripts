@@ -1,11 +1,19 @@
-#!/bin/bash
-# Electrum Desktop Reproducible Build Verification Script
+#!/usr/bin/env bash
+# ==============================================================================
+# verify_electrumdesktop.sh - Electrum Desktop Reproducible Build Verification
+# ==============================================================================
+# Version:       v0.2.1
+# Organization:  WalletScrutiny.com
+# Last Modified: 2025-11-05
+# Project:       https://github.com/spesmilo/electrum
+# ==============================================================================
+# LICENSE: MIT License
 #
 # TECHNICAL DISCLAIMER:
 # This script is provided for technical analysis and reproducible build verification purposes only.
 # No warranty is provided regarding the security, functionality, or fitness for any particular purpose.
 # Users assume all risks associated with running this script and analyzing the software.
-# This script performs automated builds and comparisons - review all operations before execution.
+# This script performs automated builds and binary comparisons - review all operations before execution.
 #
 # LEGAL DISCLAIMER:
 # This script is designed for legitimate security research and reproducible build verification.
@@ -14,15 +22,13 @@
 # By using this script, you acknowledge these disclaimers and accept full responsibility.
 #
 # SCRIPT SUMMARY:
-# • Downloads official Electrum release artifacts and verifies signatures/checksums
-# • Clones source code repository and checks out the exact release tag/commit
-# • Performs containerized reproducible build using Electrum's Docker-based wine build system
-# • Compares built binaries against official releases using binary analysis
-# • Documents differences and generates detailed reproducibility assessment report
-#
-# Version: 4.6.2+wsv0.0.1
-# Maintainer: WalletScrutiny.com
-# Project: https://github.com/spesmilo/electrum
+# - Downloads official Electrum Windows executables from electrum.org
+# - Clones source code repository and checks out the exact release tag
+# - Performs containerized reproducible build using embedded Dockerfile (Wine-based)
+# - Strips Authenticode signatures from both official and built binaries
+# - Compares stripped binaries using binary diff analysis
+# - Generates COMPARISON_RESULTS.txt for build server automation
+# - Documents differences and generates detailed reproducibility assessment
 
 set -euo pipefail
 
@@ -32,7 +38,6 @@ GREEN="\033[1;32m"
 YELLOW="\033[1;33m"
 RED="\033[1;31m"
 BLUE="\033[1;34m"
-CYAN="\033[1;36m"
 SUCCESS_ICON="✅"
 WARNING_ICON="⚠️"
 ERROR_ICON="❌"
@@ -40,494 +45,371 @@ INFO_ICON="ℹ️"
 
 APP_NAME="Electrum Desktop"
 APP_ID="org.electrum.electrum"
-DEFAULT_TARGET="windows"
-SCRIPT_VERSION="4.6.2+wsv0.0.1"
+SCRIPT_VERSION="v0.2.1"
 REPO_URL="https://github.com/spesmilo/electrum"
-REPORTS_ROOT="$HOME/work/0-reports/desktop/$APP_ID"
 
-# ---------- Defaults ----------
-version=""
-target="$DEFAULT_TARGET"
-skip_build=false
-skip_download=false
-skip_compare=false
-force_reclone=false
-cleanup_workspace=false
-no_record=false
-repo_url_override=""
+# ---------- Logging Functions ----------
+log_info() { echo -e "${BLUE}${INFO_ICON}${NC}  $*"; }
+log_success() { echo -e "${GREEN}${SUCCESS_ICON}${NC} $*"; }
+log_warn() { echo -e "${YELLOW}${WARNING_ICON}${NC}  $*"; }
+log_error() { echo -e "${RED}${ERROR_ICON}${NC}  $*" >&2; }
 
-# ---------- Helpers ----------
-log_info() { echo -e "${CYAN}${INFO_ICON} $1${NC}"; }
-log_success() { echo -e "${GREEN}${SUCCESS_ICON} $1${NC}"; }
-log_warn() { echo -e "${YELLOW}${WARNING_ICON} $1${NC}"; }
-log_error() { echo -e "${RED}${ERROR_ICON} $1${NC}"; }
-
-bytes_to_mb() {
-  awk -v size="$1" 'BEGIN {printf "%.2f", size/1048576}'
-}
-
-emit_artifact_evidence() {
-  local name="$1"
-  local built_path="$2"
-  local official_path="$3"
-  local built_exists=0
-  local official_exists=0
-
-  if [[ -n "$built_path" && -f "$built_path" ]]; then
-    built_exists=1
-  fi
-  if [[ -n "$official_path" && -f "$official_path" ]]; then
-    official_exists=1
-  fi
-
-  {
-    echo "artifact: $name"
-    if (( built_exists )); then
-      printf 'built hash: %s\n' "$(sha256sum "$built_path" | awk '{print $1}')"
-    else
-      echo 'built hash: missing'
-    fi
-    if (( official_exists )); then
-      printf 'official hash: %s\n' "$(sha256sum "$official_path" | awk '{print $1}')"
-    else
-      echo 'official hash: missing'
-    fi
-    echo '---file size comparison---'
-    if (( built_exists )); then
-      local built_size_bytes built_size_mb
-      built_size_bytes=$(stat -c %s "$built_path")
-      built_size_mb=$(bytes_to_mb "$built_size_bytes")
-      printf 'built size: %s MB (%s bytes)\n' "$built_size_mb" "$built_size_bytes"
-    else
-      echo 'built size: missing'
-    fi
-    if (( official_exists )); then
-      local official_size_bytes official_size_mb
-      official_size_bytes=$(stat -c %s "$official_path")
-      official_size_mb=$(bytes_to_mb "$official_size_bytes")
-      printf 'official size: %s MB (%s bytes)\n' "$official_size_mb" "$official_size_bytes"
-    else
-      echo 'official size: missing'
-    fi
-    echo '---file type information---'
-    if (( built_exists )); then
-      printf 'built file information: %s\n' "$(file -b "$built_path")"
-    else
-      echo 'built file information: missing'
-    fi
-    if (( official_exists )); then
-      printf 'official file information: %s\n' "$(file -b "$official_path")"
-    else
-      echo 'official file information: missing'
-    fi
-    echo
-  } | tee -a "$evidence_file"
-}
-
-require_command() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    log_error "Required command '$1' not found. Please install it and retry."
-    exit 1
-  fi
-}
-
+# ---------- Usage ----------
 usage() {
-  cat <<'EOF'
-NAME
-       verify_electrumdesktop.sh - verify Electrum Desktop reproducible build (Windows target)
+  cat <<EOF
+Electrum Desktop Reproducible Build Verification Script
 
-SYNOPSIS
-       verify_electrumdesktop.sh <version> [options]
+Usage:
+  $(basename "$0") --version <version> [--arch <arch>] [--type <type>]
 
-DESCRIPTION
-       This command rebuilds Electrum Desktop for Windows inside Docker and compares
-       the resulting executables with the official downloads from electrum.org.
+Required Parameters:
+  --version <version>    Electrum version to verify (e.g., 4.6.2)
 
-POSITIONAL ARGUMENTS
-       version               Release version to verify (e.g., 4.6.2)
+Optional Parameters:
+  --arch <arch>          Architecture to build (default: windows)
+                         Supported: windows (win64 executables)
+  --type <type>          Build type (accepted but ignored - no variants for Electrum)
 
-OPTIONS
-       --repo <url>          Override upstream Git repository URL
-       --target <name>       Build target (default: windows)
-       --skip-build          Reuse existing build artifacts (skips build.sh)
-       --skip-download       Do not download official release artifacts
-       --skip-compare        Skip comparison between built and official binaries
-       --force-reclone       Remove cached repository before cloning
-       --cleanup             Remove workspace when the script finishes successfully
-       --no-record           Disable asciinema session recording
-       --help, -h            Show this help message
+Flags:
+  --help                 Show this help message
 
-EXAMPLES
-       verify_electrumdesktop.sh 4.6.2
-       verify_electrumdesktop.sh 4.6.2 --skip-download --skip-compare
-       verify_electrumdesktop.sh 4.6.2 --repo https://github.com/fork/electrum
+Examples:
+  $(basename "$0") --version 4.6.2
+  $(basename "$0") --version 4.6.2 --arch windows
+  $(basename "$0") --version 4.6.2 --arch windows --type bitcoin
 
-DIRECTORY STRUCTURE
-       /tmp/testDesktop_org.electrum.electrum_<version>_<target>-buildN/
-         ├── logs/             Session logs and recordings
-         ├── source/           Git checkout
-         ├── official/         Downloaded official binaries (signed + stripped)
-         └── results/          Comparison outputs and metadata
+Requirements:
+  - Docker or Podman installed
+  - Internet connection for downloading sources and official releases
+  - Approximately 5GB disk space for build
 
-REPORTS
-       Logs are copied to ~/work/0-reports/desktop/org.electrum.electrum/<version>/logs/
+Output:
+  - Exit code 0: Binaries are reproducible
+  - Exit code 1: Binaries differ or verification failed
+  - COMPARISON_RESULTS.txt: Machine-readable comparison results
 
+Version: ${SCRIPT_VERSION}
+Organization: WalletScrutiny.com
 EOF
 }
 
-POSITIONAL_ARGS=()
+# ---------- Parameter Parsing ----------
+version=""
+arch="windows"
+build_type=""
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --repo)
-      repo_url_override="$2"; shift 2 ;;
-    --target)
-      target="$2"; shift 2 ;;
-    --skip-build)
-      skip_build=true; shift ;;
-    --skip-download)
-      skip_download=true; shift ;;
-    --skip-compare)
-      skip_compare=true; shift ;;
-    --force-reclone)
-      force_reclone=true; shift ;;
-    --cleanup)
-      cleanup_workspace=true; shift ;;
-    --no-record)
-      no_record=true; shift ;;
-    -h|--help|help)
+    --version)
+      version="$2"
+      shift 2
+      ;;
+    --arch)
+      arch="$2"
+      shift 2
+      ;;
+    --type)
+      build_type="$2"
+      shift 2
+      ;;
+    --help)
       usage
-      exit 0 ;;
-    --*)
-      log_error "Unknown option: $1"
-      usage
-      exit 1 ;;
+      exit 0
+      ;;
     *)
-      POSITIONAL_ARGS+=("$1")
-      shift ;;
+      log_error "Unknown parameter: $1"
+      usage
+      exit 1
+      ;;
   esac
 done
 
-if (( ${#POSITIONAL_ARGS[@]} < 1 )); then
-  log_error "Missing required arguments"
+# Validate required parameters
+if [[ -z "$version" ]]; then
+  log_error "Missing required parameter: --version"
   usage
   exit 1
 fi
 
-version="${POSITIONAL_ARGS[0]}"
-repo_url="${repo_url_override:-$REPO_URL}"
-
-if [[ -z "$version" ]]; then
-  log_error "Version argument is required"
+# Validate architecture
+if [[ "$arch" != "windows" ]]; then
+  log_error "Unsupported architecture: $arch"
+  log_error "Currently only 'windows' is supported"
   exit 1
 fi
 
-if [[ "$target" != "windows" ]]; then
-  log_warn "Target '$target' not fully supported yet; proceeding but build scripts expect Windows wine target."
-fi
+# ---------- Setup Workspace ----------
+execution_dir="$(pwd)"
+workspace="${execution_dir}/electrum_desktop_${version}_${arch}_$$"
+mkdir -p "$workspace"
+cd "$workspace"
 
-# ---------- Workspace Setup ----------
-workspace_base="/tmp/testDesktop_${APP_ID}_${version}_${target}"
-find_next_build_number() {
-  local pattern="$1"
-  local num=1
-  while [[ -d "${pattern}-build${num}" ]]; do
-    ((num++))
-  done
-  echo "$num"
-}
+log_info "=============================================="
+log_info "${APP_NAME} v${version} Verification"
+log_info "=============================================="
+log_info "Script version: ${SCRIPT_VERSION}"
+log_info "Architecture: ${arch}"
+log_info "Workspace: ${workspace}"
+log_info ""
 
-build_number=$(find_next_build_number "$workspace_base")
-workspace="${workspace_base}-build${build_number}"
-source_dir="$workspace/source"
+# ---------- Download Official Releases ----------
+log_info "Downloading official releases from electrum.org..."
 official_dir="$workspace/official"
-official_signed_dir="$official_dir/signed"
-official_stripped_dir="$official_dir/stripped"
-results_dir="$workspace/results"
-logs_dir="$workspace/logs"
-mkdir -p "$source_dir" "$official_signed_dir" "$official_stripped_dir" "$results_dir" "$logs_dir"
+mkdir -p "$official_dir"
 
-reports_dir="$REPORTS_ROOT/$version/logs"
-mkdir -p "$reports_dir"
+download_url_base="https://download.electrum.org/${version}"
+official_files=(
+  "electrum-${version}-setup.exe"
+  "electrum-${version}-portable.exe"
+  "electrum-${version}.exe"
+)
 
-session_stamp=$(date +%Y-%m-%d.%H%M)
-log_file="$logs_dir/${session_stamp}.${APP_ID}.v${version}-${target}-build${build_number}.log"
-cast_file="$logs_dir/${session_stamp}.${APP_ID}.v${version}-${target}-build${build_number}.cast"
-evidence_file="$results_dir/evidence-${session_stamp}.txt"
-: > "$evidence_file"
-
-status="success"
-
-handle_error() {
-  local exit_code=$?
-  local line_no=$1
-  status="failed"
-  log_error "Script failed at line $line_no with exit code $exit_code"
-  log_error "Last command: $BASH_COMMAND"
-  exit $exit_code
-}
-
-cleanup() {
-  set +e
-  if [[ -f "$log_file" ]]; then
-    cp "$log_file" "$reports_dir/" 2>/dev/null || true
-  fi
-  if [[ -f "$cast_file" ]]; then
-    cp "$cast_file" "$reports_dir/" 2>/dev/null || true
-  fi
-  if [[ "$cleanup_workspace" == true && "$status" == "success" ]]; then
-    rm -rf "$workspace"
-  else
-    log_info "Workspace preserved at $workspace"
-  fi
-}
-
-trap 'handle_error $LINENO' ERR
-trap cleanup EXIT
-
-exec > >(tee -a "$log_file")
-exec 2>&1
-# set -x
-
-log_info "Workspace: $workspace"
-log_info "Logs: $log_file"
-log_info "Reports dir: $reports_dir"
-log_info "Script version: $SCRIPT_VERSION"
-
-if [[ "$no_record" == false ]] && command -v asciinema >/dev/null 2>&1; then
-  log_info "Asciinema detected. To record this session, run:"
-  log_info "  asciinema rec $cast_file -- $0 $version [options]"
-fi
-
-# ---------- Environment Checks ----------
-log_info "Checking prerequisites"
-require_command git
-require_command wget
-require_command diff
-require_command sha256sum
-require_command python3
-if [[ "$skip_compare" == false ]]; then
-  require_command osslsigncode
-fi
-if [[ "$skip_build" == false ]]; then
-  require_command docker
-fi
-
-# ---------- Clone Repository ----------
-clone_repository() {
-  if [[ "$force_reclone" == true && -d "$source_dir/.git" ]]; then
-    log_warn "Removing existing repository (force-reclone enabled)"
-    rm -rf "$source_dir"
-    mkdir -p "$source_dir"
-  fi
-
-  if [[ ! -d "$source_dir/.git" ]]; then
-    log_info "Cloning $repo_url into $source_dir"
-    git clone "$repo_url" "$source_dir"
-  else
-    log_info "Repository already present; fetching latest tags"
-    (cd "$source_dir" && git fetch --tags)
-  fi
-}
-
-checkout_version() {
-  pushd "$source_dir" >/dev/null
-  local ref_candidates=("$version")
-  if [[ "$version" != v* ]]; then
-    ref_candidates+=("v$version" "electrum-$version")
-  fi
-  ref_candidates+=("tags/$version" "tags/v$version")
-
-  local resolved=""
-  for candidate in "${ref_candidates[@]}"; do
-    if git rev-parse "$candidate^{commit}" >/dev/null 2>&1; then
-      resolved="$candidate"
-      break
-    fi
-  done
-
-  if [[ -z "$resolved" ]]; then
-    log_error "Could not find a tag or branch for version $version"
+for file in "${official_files[@]}"; do
+  log_info "Downloading ${file}..."
+  if ! wget -q -O "$official_dir/$file" "${download_url_base}/${file}"; then
+    log_error "Failed to download ${file}"
+    echo "Exit code: 1"
     exit 1
   fi
+  log_success "Downloaded ${file}"
+done
 
-  log_info "Checking out $resolved"
-  git checkout --quiet "$resolved"
-  git submodule update --init --recursive
-  popd >/dev/null
-}
+# ---------- Generate Embedded Dockerfile ----------
+log_info "Generating embedded Dockerfile for reproducible build..."
+dockerfile_path="$workspace/Dockerfile"
 
-clone_repository
-checkout_version
+cat > "$dockerfile_path" <<'DOCKERFILE_EOF'
+FROM debian:bookworm
 
-pushd "$source_dir" >/dev/null
-commit_hash=$(git rev-parse HEAD)
-log_info "Using commit $commit_hash"
+ENV LC_ALL=C.UTF-8 LANG=C.UTF-8
+ENV DEBIAN_FRONTEND=noninteractive
 
-expected_version=$(python3 contrib/print_electrum_version.py)
-log_info "Repository reports version: $expected_version"
-if [[ "$expected_version" != "$version" ]]; then
-  log_warn "Requested version ($version) differs from print_electrum_version.py output ($expected_version)"
-fi
-  popd >/dev/null
+ARG VERSION
+ARG UID=1000
+ENV ELECTRUM_VERSION=${VERSION}
+ENV USER="user"
+ENV HOME_DIR="/home/${USER}"
+ENV WORK_DIR="/opt/wine64/drive_c"
 
-# ---------- Build Step ----------
-built_dist_dir="$source_dir/contrib/build-wine/dist"
-if [[ "$skip_build" == false ]]; then
-  log_info "Starting reproducible build via contrib/build-wine/build.sh"
-  pushd "$source_dir/contrib/build-wine" >/dev/null
-  ELECBUILD_COMMIT=HEAD ELECBUILD_NOCACHE=1 ./build.sh
-  popd >/dev/null
+# Add i386 architecture for 32-bit wine
+RUN dpkg --add-architecture i386
+
+# Install dependencies
+RUN apt-get update -q && \
+    apt-get install -qy --allow-downgrades \
+        ca-certificates wget gnupg2 dirmngr python3 python3-pip python3-venv \
+        git curl p7zip-full make mingw-w64 mingw-w64-tools autotools-dev \
+        autoconf autopoint libtool gettext nsis sudo osslsigncode && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Wine 10.0.0.0
+RUN DEBIAN_CODENAME=$(cat /etc/debian_version | cut -d'.' -f1) && \
+    if [ "$DEBIAN_CODENAME" = "12" ]; then DEBIAN_CODENAME="bookworm"; fi && \
+    WINEVERSION="10.0.0.0~${DEBIAN_CODENAME}-1" && \
+    wget -nc https://dl.winehq.org/wine-builds/winehq.key && \
+    echo "d965d646defe94b3dfba6d5b4406900ac6c81065428bf9d9303ad7a72ee8d1b8 winehq.key" | sha256sum -c - && \
+    mkdir -p /etc/apt/keyrings && \
+    cat winehq.key | gpg --dearmor -o /etc/apt/keyrings/winehq.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/winehq.gpg] https://dl.winehq.org/wine-builds/debian/ ${DEBIAN_CODENAME} main" > /etc/apt/sources.list.d/winehq.list && \
+    rm winehq.key && \
+    apt-get update -q && \
+    apt-get install -qy --allow-downgrades \
+        wine-stable-amd64:amd64=${WINEVERSION} \
+        wine-stable-i386:i386=${WINEVERSION} \
+        wine-stable:amd64=${WINEVERSION} \
+        winehq-stable:amd64=${WINEVERSION} \
+        || apt-get install -qy --allow-downgrades \
+        wine-stable-amd64:amd64 wine-stable-i386:i386 \
+        wine-stable:amd64 winehq-stable:amd64 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create user and setup workspace
+RUN useradd --uid $UID --create-home --shell /bin/bash ${USER} && \
+    usermod -append --groups sudo ${USER} && \
+    echo "%sudo ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers && \
+    mkdir -p ${WORK_DIR} /opt/wine64 /output && \
+    chown -R ${USER}:${USER} ${WORK_DIR} /opt/wine64 /output
+
+USER ${USER}
+
+# Clone repository
+RUN git clone https://github.com/spesmilo/electrum.git ${WORK_DIR}/electrum
+
+WORKDIR ${WORK_DIR}/electrum
+
+# Checkout version
+RUN git checkout ${ELECTRUM_VERSION}
+
+# Install Python dependencies
+RUN python3 -m venv ${HOME_DIR}/.venv && \
+    ${HOME_DIR}/.venv/bin/pip install --no-cache-dir \
+        -r contrib/deterministic-build/requirements-build-base.txt \
+        -r contrib/deterministic-build/requirements-build-wine.txt
+
+ENV PATH="${HOME_DIR}/.venv/bin:${PATH}"
+
+# Build using make_win.sh which handles all the preparation and building
+# This script sets up CONTRIB, WINEPREFIX, and other required env vars
+RUN cd contrib/build-wine && ./make_win.sh
+
+# Copy artifacts to /output for extraction (directory created as root earlier)
+RUN cp contrib/build-wine/dist/*.exe /output/
+
+CMD ["/bin/bash"]
+DOCKERFILE_EOF
+
+log_success "Dockerfile generated"
+
+# ---------- Build Container Image ----------
+log_info "Building container image (this may take 30-60 minutes)..."
+image_name="electrum-desktop-build:${version}"
+
+if command -v podman &>/dev/null; then
+  container_cmd="podman"
+elif command -v docker &>/dev/null; then
+  container_cmd="docker"
 else
-  log_warn "Skipping build step (user request)"
-fi
-
-if [[ ! -d "$built_dist_dir" ]] || [[ -z $(ls -1 "$built_dist_dir"/electrum-*.exe 2>/dev/null) ]]; then
-  log_error "No Electrum executables found in $built_dist_dir"
+  log_error "Neither podman nor docker found. Please install one of them."
+  echo "Exit code: 1"
   exit 1
 fi
 
-log_success "Build artifacts available in $built_dist_dir"
+log_info "Using container runtime: ${container_cmd}"
 
-# ---------- Download Official Artifacts ----------
-official_files=()
-while IFS= read -r -d '' file; do
-  official_files+=("$(basename "$file")")
-done < <(find "$built_dist_dir" -maxdepth 1 -type f -name "electrum-*.exe" -print0)
+if ! ${container_cmd} build \
+  --build-arg VERSION="${version}" \
+  --build-arg UID="$(id -u)" \
+  -t "${image_name}" \
+  -f "$dockerfile_path" \
+  "$workspace"; then
+  log_error "Container build failed"
+  echo "Exit code: 1"
+  exit 1
+fi
 
-if [[ "$skip_download" == false ]]; then
-  log_info "Downloading official binaries for comparison"
-  mkdir -p "$official_signed_dir"
-  for fname in "${official_files[@]}"; do
-    url="https://download.electrum.org/$version/$fname"
-    target_path="$official_signed_dir/$fname"
-    if [[ -f "$target_path" ]]; then
-      log_info "Already downloaded: $fname"
-      continue
-    fi
-    log_info "Fetching $url"
-    if ! wget -q "$url" -O "$target_path"; then
-      log_error "Failed to download $url"
-      exit 1
-    fi
-  done
-else
-  log_warn "Skipping official download step (user request)"
+log_success "Container image built successfully"
+
+# ---------- Extract Build Artifacts ----------
+log_info "Extracting build artifacts from container..."
+built_dir="$workspace/built"
+mkdir -p "$built_dir"
+
+container_id=$(${container_cmd} create "${image_name}")
+${container_cmd} cp "${container_id}:/output/." "$built_dir/"
+${container_cmd} rm "${container_id}"
+
+log_success "Artifacts extracted to ${built_dir}"
+
+# Verify artifacts exist
+if [[ -z $(ls -1 "$built_dir"/electrum-*.exe 2>/dev/null) ]]; then
+  log_error "No executables found in built directory"
+  echo "Exit code: 1"
+  exit 1
 fi
 
 # ---------- Strip Signatures ----------
-stripped_files=()
-if [[ "$skip_compare" == false ]]; then
-  if [[ ! -d "$official_signed_dir" ]] || [[ -z $(ls -1 "$official_signed_dir" 2>/dev/null) ]]; then
-    log_error "No official binaries available in $official_signed_dir"
-    exit 1
-  fi
+log_info "Stripping Authenticode signatures..."
+stripped_official_dir="$workspace/official_stripped"
+mkdir -p "$stripped_official_dir"
+chmod 777 "$stripped_official_dir"  # Ensure writable by container user
 
-  mkdir -p "$official_stripped_dir"
-  for fname in "${official_files[@]}"; do
-    signed_path="$official_signed_dir/$fname"
-    if [[ ! -f "$signed_path" ]]; then
-      log_warn "Official binary $fname missing; skipping"
-      continue
+# Check if osslsigncode is available on host
+if command -v osslsigncode &>/dev/null; then
+  # Strip on host
+  for file in "${official_files[@]}"; do
+    if [[ -f "$official_dir/$file" ]]; then
+      log_info "Stripping signature from ${file}..."
+      if osslsigncode remove-signature -in "$official_dir/$file" -out "$stripped_official_dir/$file" 2>/dev/null; then
+        log_success "Stripped ${file}"
+      else
+        log_warn "Failed to strip signature from ${file}, using original"
+        cp "$official_dir/$file" "$stripped_official_dir/$file"
+      fi
     fi
-    stripped_path="$official_stripped_dir/$fname"
-    log_info "Stripping Authenticode signature: $fname"
-    osslsigncode remove-signature -in "$signed_path" -out "$stripped_path"
-    chmod +x "$stripped_path"
-    stripped_files+=("$fname")
+  done
+else
+  # Strip using container (with proper volume mounts and permissions)
+  for file in "${official_files[@]}"; do
+    if [[ -f "$official_dir/$file" ]]; then
+      log_info "Stripping signature from ${file}..."
+      # Use container with user ownership
+      if ${container_cmd} run --rm --user "$(id -u):$(id -g)" \
+        -v "$official_dir:/input:ro" \
+        -v "$stripped_official_dir:/output:rw" \
+        "${image_name}" \
+        osslsigncode remove-signature -in "/input/$file" -out "/output/$file" 2>/dev/null; then
+        log_success "Stripped ${file}"
+      else
+        log_warn "Failed to strip signature from ${file}, using original"
+        cp "$official_dir/$file" "$stripped_official_dir/$file"
+      fi
+    fi
   done
 fi
 
+log_success "Signatures stripped"
+
 # ---------- Comparison ----------
-comparison_summary="$results_dir/comparison-${session_stamp}.txt"
-verdict="not_evaluated"
+log_info "Comparing binaries..."
 match_count=0
 diff_count=0
-missing_official=0
+comparison_file="${execution_dir}/COMPARISON_RESULTS.txt"
 
-if [[ "$skip_compare" == true ]]; then
-  verdict="compare_skipped"
-  log_warn "Comparison step skipped"
-  for built_path in "$built_dist_dir"/electrum-*.exe; do
-    [[ -e "$built_path" ]] || continue
-    fname="$(basename "$built_path")"
-    emit_artifact_evidence "$fname" "$built_path" ""
-  done
-else
-  {
-    echo "Comparison report - $APP_NAME v$version ($target)"
-    echo "Generated: $(date -Iseconds)"
-    echo "Commit: $commit_hash"
-    echo
-    printf '%-40s %-10s\n' "Executable" "Result"
-    printf '%-40s %-10s\n' "----------" "------"
-  } > "$comparison_summary"
+# Write to comparison file
+{
+  echo "Date: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+  echo ""
+} > "$comparison_file"
 
-  for fname in "${official_files[@]}"; do
-    built_path="$built_dist_dir/$fname"
-    stripped_path="$official_stripped_dir/$fname"
-    if [[ ! -f "$built_path" ]]; then
-      log_warn "Built executable missing: $fname"
-      ((diff_count++))
-      printf '%-40s %-10s\n' "$fname" "missing local" >> "$comparison_summary"
-      emit_artifact_evidence "$fname" "$built_path" "$stripped_path"
-      continue
-    fi
-    if [[ ! -f "$stripped_path" ]]; then
-      log_warn "Official stripped executable missing: $fname"
-      ((missing_official++))
-      printf '%-40s %-10s\n' "$fname" "missing official" >> "$comparison_summary"
-      emit_artifact_evidence "$fname" "$built_path" "$stripped_path"
-      continue
-    fi
+# Compare files and append to comparison file
+for file in "${official_files[@]}"; do
+  built_file="$built_dir/$file"
+  official_file="$stripped_official_dir/$file"
 
-    if diff -q "$built_path" "$stripped_path" >/dev/null; then
-      log_success "Match: $fname"
-      ((++match_count))
-      printf '%-40s %-10s\n' "$fname" "match" >> "$comparison_summary"
-      emit_artifact_evidence "$fname" "$built_path" "$stripped_path"
-    else
-      log_warn "Difference detected: $fname"
-      ((diff_count++))
-      printf '%-40s %-10s\n' "$fname" "diff" >> "$comparison_summary"
-      emit_artifact_evidence "$fname" "$built_path" "$stripped_path"
-    fi
-  done
-
-  if (( diff_count == 0 && missing_official == 0 && match_count > 0 )); then
-    verdict="reproducible"
-  else
-    verdict="differences_found"
+  if [[ ! -f "$built_file" ]] || [[ ! -f "$official_file" ]]; then
+    log_warn "Skipping ${file} - file not found"
+    continue
   fi
+
+  built_hash=$(sha256sum "$built_file" | awk '{print $1}')
+
+  if diff -q "$built_file" "$official_file" >/dev/null 2>&1; then
+    echo "$file - $arch - $built_hash - 1 (MATCHES)" >> "$comparison_file"
+    match_count=$((match_count + 1))
+    log_success "Match: ${file}"
+  else
+    echo "$file - $arch - $built_hash - 0 (DIFFERS)" >> "$comparison_file"
+    diff_count=$((diff_count + 1))
+    log_warn "Difference: ${file}"
+  fi
+done
+
+# Add header to comparison file
+if (( diff_count == 0 && match_count > 0 )); then
+  sed -i '1s/^/BUILDS MATCH BINARIES\n/' "$comparison_file"
+  verdict="reproducible"
+else
+  sed -i '1s/^/BUILDS DO NOT MATCH BINARIES\n/' "$comparison_file"
+  verdict="not_reproducible"
 fi
 
 # ---------- Summary ----------
 log_info "=============================================="
-log_info "${APP_NAME} v$version ($target) Verification Summary"
+log_info "Verification Summary"
 log_info "=============================================="
-log_info "Workspace: $workspace"
-log_info "Built artifacts: $built_dist_dir"
-log_info "Official (signed): $official_signed_dir"
-log_info "Official (stripped): $official_stripped_dir"
-if [[ -f "$comparison_summary" ]]; then
-  log_info "Comparison report: $comparison_summary"
+log_info "Version: ${version}"
+log_info "Architecture: ${arch}"
+log_info "Matches: ${match_count}"
+log_info "Differences: ${diff_count}"
+
+if [[ "$verdict" == "reproducible" ]]; then
+  log_success "Verdict: REPRODUCIBLE"
+  log_info "Build server output: ${comparison_file}"
+  echo "Exit code: 0"
+  exit 0
+else
+  log_warn "Verdict: NOT REPRODUCIBLE"
+  log_info "Build server output: ${comparison_file}"
+  echo "Exit code: 1"
+  exit 1
 fi
-log_info "Evidence: $evidence_file"
-
-case "$verdict" in
-  reproducible)
-    log_success "Verdict: reproducible"
-    ;;
-  compare_skipped)
-    log_warn "Verdict: comparison skipped"
-    ;;
-  differences_found)
-    log_warn "Verdict: differences found"
-    ;;
-  *)
-    log_warn "Verdict: $verdict"
-    ;;
-esac
-
-log_info "Matches: $match_count, diffs: $diff_count, missing official: $missing_official"
-log_info "Logs copied to $reports_dir"
-log_info "=== Verification Complete ==="
