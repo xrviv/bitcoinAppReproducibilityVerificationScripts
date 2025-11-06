@@ -2,9 +2,9 @@
 # ==============================================================================
 # verify_electrumdesktop.sh - Electrum Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.5.3
+# Version:       v0.6.5
 # Organization:  WalletScrutiny.com
-# Last Modified: 2025-11-05
+# Last Modified: 2025-11-06
 # Project:       https://github.com/spesmilo/electrum
 # ==============================================================================
 # LICENSE: MIT License
@@ -45,7 +45,7 @@ INFO_ICON="[INFO]"
 
 APP_NAME="Electrum Desktop"
 APP_ID="org.electrum.electrum"
-SCRIPT_VERSION="v0.5.3"
+SCRIPT_VERSION="v0.6.5"
 REPO_URL="https://github.com/spesmilo/electrum"
 
 # ---------- Logging Functions ----------
@@ -191,7 +191,7 @@ elif [[ "$arch" == "x86_64-linux-gnu" ]]; then
     )
   elif [[ "$build_type" == "tarball" ]]; then
     official_files=(
-      "electrum-${version}.tar.gz"
+      "Electrum-${version}.tar.gz"
     )
   fi
 fi
@@ -292,11 +292,10 @@ RUN cp contrib/build-wine/dist/*.exe /output/
 CMD ["/bin/bash"]
 DOCKERFILE_EOF
 
-elif [[ "$arch" == "x86_64-linux-gnu" ]]; then
-  log_info "Generating Linux build Dockerfile..."
+elif [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" ]]; then
+  log_info "Generating Linux AppImage Dockerfile (Debian Bullseye)..."
   cat > "$dockerfile_path" <<'DOCKERFILE_EOF'
-# Using Electrum's exact pinned base image for reproducible builds
-# This ensures identical package versions and build environment
+# Using Electrum's exact pinned base image for AppImage reproducible builds
 FROM debian:bullseye@sha256:cf48c31af360e1c0a0aedd33aae4d928b68c2cdf093f1612650eb1ff434d1c34
 
 ENV LC_ALL=C.UTF-8 LANG=C.UTF-8
@@ -320,7 +319,7 @@ RUN echo "deb https://snapshot.debian.org/archive/debian/20250530T143637Z/ bulls
     echo "Pin: origin \"snapshot.debian.org\"" >> /etc/apt/preferences.d/snapshot && \
     echo "Pin-Priority: 1001" >> /etc/apt/preferences.d/snapshot
 
-# Install dependencies (matching Electrum's official Dockerfile for AppImage)
+# Install dependencies for AppImage (NO Python - built from source by make_appimage.sh)
 RUN apt-get update -q && \
     apt-get install -qy --allow-downgrades \
         sudo git wget make \
@@ -349,7 +348,7 @@ RUN useradd --uid $UID --create-home --shell /bin/bash ${USER} && \
 
 USER ${USER}
 
-# Clone repository directly as WORK_DIR (not into subdirectory)
+# Clone repository
 RUN git clone https://github.com/spesmilo/electrum.git ${WORK_DIR}
 
 WORKDIR ${WORK_DIR}
@@ -357,19 +356,73 @@ WORKDIR ${WORK_DIR}
 # Checkout version
 RUN git checkout ${ELECTRUM_VERSION}
 
-# Build based on type
-# Note: make_appimage.sh builds Python from source with proper SSL support
-# make_tgz.sh uses system Python and installs dependencies via pip
-ARG BUILD_TYPE
-RUN if [ "$BUILD_TYPE" = "appimage" ]; then \
-        cd contrib/build-linux/appimage && ./make_appimage.sh && \
-        cp ../../../dist/*.AppImage /output/; \
-    elif [ "$BUILD_TYPE" = "tarball" ]; then \
-        python3 -m pip install --user \
-            -r contrib/deterministic-build/requirements-build-base.txt && \
-        ./contrib/build-linux/make_tgz.sh && \
-        cp dist/*.tar.gz /output/; \
-    fi
+# Build AppImage (make_appimage.sh builds Python 3.12.11 from source)
+RUN cd contrib/build-linux/appimage && ./make_appimage.sh && \
+    cp ../../../dist/*.AppImage /output/
+
+CMD ["/bin/bash"]
+DOCKERFILE_EOF
+
+elif [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "tarball" ]]; then
+  log_info "Generating Linux Tarball Dockerfile (Debian Bookworm)..."
+  cat > "$dockerfile_path" <<'DOCKERFILE_EOF'
+# Using Electrum's exact base image for tarball builds (requires Python 3.10+)
+# Build as unprivileged user matching Electrum's official tarball workflow
+FROM debian:bookworm@sha256:b877a1a3fdf02469440f1768cf69c9771338a875b7add5e80c45b756c92ac20a
+
+ENV LC_ALL=C.UTF-8 LANG=C.UTF-8
+ENV DEBIAN_FRONTEND=noninteractive
+
+ARG VERSION
+ARG UID=1000
+ENV USER="user"
+ENV HOME_DIR="/home/${USER}"
+ENV ELECTRUM_VERSION=${VERSION}
+ENV WORK_DIR="/opt/electrum"
+
+# Install ca-certificates first (needed for snapshot.debian.org)
+RUN apt-get update -qq > /dev/null && apt-get install -qq --yes --no-install-recommends \
+    ca-certificates
+
+# Pin packages to Debian snapshot for reproducible builds
+# Using snapshot from 2024-06-17 (around Debian 12.6 stable release)
+RUN echo "deb https://snapshot.debian.org/archive/debian/20240617T085507Z/ bookworm main" > /etc/apt/sources.list && \
+    echo "deb-src https://snapshot.debian.org/archive/debian/20240617T085507Z/ bookworm main" >> /etc/apt/sources.list && \
+    echo "Package: *" > /etc/apt/preferences.d/snapshot && \
+    echo "Pin: origin \"snapshot.debian.org\"" >> /etc/apt/preferences.d/snapshot && \
+    echo "Pin-Priority: 1001" >> /etc/apt/preferences.d/snapshot
+
+# Install minimal dependencies for tarball build
+RUN apt-get update -q && \
+    apt-get install -qy --allow-downgrades \
+        git \
+        gettext \
+        python3 \
+        python3-pip \
+        python3-setuptools \
+        python3-venv && \
+    rm -rf /var/lib/apt/lists/* && \
+    apt-get autoremove -y && \
+    apt-get clean
+
+# Create user and setup workspace (Electrum tarball built as regular user)
+RUN useradd --uid $UID --non-unique --create-home --shell /bin/bash ${USER} && \
+    mkdir -p ${WORK_DIR} /output && \
+    chown -R ${USER}:${USER} ${WORK_DIR} /output
+
+USER ${USER}
+
+# Clone repository
+RUN git clone https://github.com/spesmilo/electrum.git ${WORK_DIR}
+
+WORKDIR ${WORK_DIR}
+
+# Checkout version
+RUN git checkout ${ELECTRUM_VERSION}
+
+# Build tarball (make_sdist.sh uses system Python with setup.py)
+RUN ./contrib/build-linux/sdist/make_sdist.sh && \
+    cp dist/*.tar.gz /output/
 
 CMD ["/bin/bash"]
 DOCKERFILE_EOF
@@ -395,7 +448,14 @@ fi
 log_info "Using container runtime: ${container_cmd}"
 
 # Build container with appropriate build args
-build_args="--build-arg VERSION=${version} --build-arg UID=$(id -u)"
+host_uid=$(id -u)
+host_gid=$(id -g)
+container_uid=${host_uid}
+if [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "tarball" ]]; then
+  container_uid=1000
+fi
+
+build_args="--build-arg VERSION=${version} --build-arg UID=${container_uid}"
 if [[ "$arch" == "x86_64-linux-gnu" ]]; then
   build_args="${build_args} --build-arg BUILD_TYPE=${build_type}"
 fi
@@ -421,6 +481,9 @@ container_id=$(${container_cmd} create "${image_name}")
 ${container_cmd} cp "${container_id}:/output/." "$built_dir/"
 ${container_cmd} rm "${container_id}"
 
+# Ensure extracted artifacts are owned by host user
+chown -R "${host_uid}:${host_gid}" "$built_dir" || true
+
 log_success "Artifacts extracted to ${built_dir}"
 
 # Verify artifacts exist
@@ -431,7 +494,7 @@ if [[ "$arch" == "win64" ]]; then
     exit 1
   fi
 elif [[ "$arch" == "x86_64-linux-gnu" ]]; then
-  if [[ -z $(ls -1 "$built_dir"/electrum-*) ]]; then
+  if [[ -z $(ls -1 "$built_dir"/[Ee]lectrum-* 2>/dev/null) ]]; then
     log_error "No artifacts found in built directory"
     echo "Exit code: 1"
     exit 1
