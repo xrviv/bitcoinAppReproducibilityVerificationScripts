@@ -2,7 +2,7 @@
 # ==============================================================================
 # verify_electrumdesktop.sh - Electrum Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.3.2
+# Version:       v0.5.3
 # Organization:  WalletScrutiny.com
 # Last Modified: 2025-11-05
 # Project:       https://github.com/spesmilo/electrum
@@ -38,21 +38,21 @@ GREEN="\033[1;32m"
 YELLOW="\033[1;33m"
 RED="\033[1;31m"
 BLUE="\033[1;34m"
-SUCCESS_ICON="✅"
-WARNING_ICON="⚠️"
-ERROR_ICON="❌"
-INFO_ICON="ℹ️"
+SUCCESS_ICON="[OK]"
+WARNING_ICON="[WARN]"
+ERROR_ICON="[ERROR]"
+INFO_ICON="[INFO]"
 
 APP_NAME="Electrum Desktop"
 APP_ID="org.electrum.electrum"
-SCRIPT_VERSION="v0.3.2"
+SCRIPT_VERSION="v0.5.3"
 REPO_URL="https://github.com/spesmilo/electrum"
 
 # ---------- Logging Functions ----------
-log_info() { echo -e "${BLUE}${INFO_ICON}${NC}  $*"; }
+log_info() { echo -e "${BLUE}${INFO_ICON}${NC} $*"; }
 log_success() { echo -e "${GREEN}${SUCCESS_ICON}${NC} $*"; }
-log_warn() { echo -e "${YELLOW}${WARNING_ICON}${NC}  $*"; }
-log_error() { echo -e "${RED}${ERROR_ICON}${NC}  $*" >&2; }
+log_warn() { echo -e "${YELLOW}${WARNING_ICON}${NC} $*"; }
+log_error() { echo -e "${RED}${ERROR_ICON}${NC} $*" >&2; }
 
 # ---------- Usage ----------
 usage() {
@@ -67,8 +67,10 @@ Required Parameters:
 
 Optional Parameters:
   --arch <arch>          Architecture to build (default: win64)
-                         Supported: win64 (64-bit Windows executables)
-  --type <type>          Build type (accepted but ignored - no variants for Electrum)
+                         Supported: win64, x86_64-linux-gnu
+  --type <type>          Package type (required for x86_64-linux-gnu)
+                         For x86_64-linux-gnu: appimage, tarball
+                         For win64: ignored (builds all executables)
 
 Flags:
   --help                 Show this help message
@@ -76,7 +78,8 @@ Flags:
 Examples:
   $(basename "$0") --version 4.6.2
   $(basename "$0") --version 4.6.2 --arch win64
-  $(basename "$0") --version 4.6.2 --arch win64 --type bitcoin
+  $(basename "$0") --version 4.6.2 --arch x86_64-linux-gnu --type appimage
+  $(basename "$0") --version 4.6.2 --arch x86_64-linux-gnu --type tarball
 
 Requirements:
   - Docker or Podman installed
@@ -133,10 +136,24 @@ if [[ -z "$version" ]]; then
 fi
 
 # Validate architecture
-if [[ "$arch" != "win64" ]]; then
+if [[ "$arch" != "win64" && "$arch" != "x86_64-linux-gnu" ]]; then
   log_error "Unsupported architecture: ${arch}"
-  log_error "Only 'win64' is currently supported for Electrum Desktop"
+  log_error "Supported architectures: win64, x86_64-linux-gnu"
   exit 1
+fi
+
+# Validate type for Linux
+if [[ "$arch" == "x86_64-linux-gnu" ]]; then
+  if [[ -z "$build_type" ]]; then
+    log_error "--type is required for x86_64-linux-gnu architecture"
+    log_error "Supported types: appimage, tarball"
+    exit 1
+  fi
+  if [[ "$build_type" != "appimage" && "$build_type" != "tarball" ]]; then
+    log_error "Unsupported type for x86_64-linux-gnu: ${build_type}"
+    log_error "Supported types: appimage, tarball"
+    exit 1
+  fi
 fi
 
 # ---------- Setup Workspace ----------
@@ -159,15 +176,29 @@ official_dir="$workspace/official"
 mkdir -p "$official_dir"
 
 download_url_base="https://download.electrum.org/${version}"
-official_files=(
-  "electrum-${version}-setup.exe"
-  "electrum-${version}-portable.exe"
-  "electrum-${version}.exe"
-)
+
+# Set files based on architecture and type
+if [[ "$arch" == "win64" ]]; then
+  official_files=(
+    "electrum-${version}-setup.exe"
+    "electrum-${version}-portable.exe"
+    "electrum-${version}.exe"
+  )
+elif [[ "$arch" == "x86_64-linux-gnu" ]]; then
+  if [[ "$build_type" == "appimage" ]]; then
+    official_files=(
+      "electrum-${version}-x86_64.AppImage"
+    )
+  elif [[ "$build_type" == "tarball" ]]; then
+    official_files=(
+      "electrum-${version}.tar.gz"
+    )
+  fi
+fi
 
 for file in "${official_files[@]}"; do
   log_info "Downloading ${file}..."
-  if ! wget -q -O "$official_dir/$file" "${download_url_base}/${file}"; then
+  if ! wget -O "$official_dir/$file" "${download_url_base}/${file}"; then
     log_error "Failed to download ${file}"
     echo "Exit code: 1"
     exit 1
@@ -179,7 +210,9 @@ done
 log_info "Generating embedded Dockerfile for reproducible build..."
 dockerfile_path="$workspace/Dockerfile"
 
-cat > "$dockerfile_path" <<'DOCKERFILE_EOF'
+if [[ "$arch" == "win64" ]]; then
+  log_info "Generating Windows (Wine) build Dockerfile..."
+  cat > "$dockerfile_path" <<'DOCKERFILE_EOF'
 FROM debian:bookworm
 
 ENV LC_ALL=C.UTF-8 LANG=C.UTF-8
@@ -259,15 +292,99 @@ RUN cp contrib/build-wine/dist/*.exe /output/
 CMD ["/bin/bash"]
 DOCKERFILE_EOF
 
+elif [[ "$arch" == "x86_64-linux-gnu" ]]; then
+  log_info "Generating Linux build Dockerfile..."
+  cat > "$dockerfile_path" <<'DOCKERFILE_EOF'
+# Using Electrum's exact pinned base image for reproducible builds
+# This ensures identical package versions and build environment
+FROM debian:bullseye@sha256:cf48c31af360e1c0a0aedd33aae4d928b68c2cdf093f1612650eb1ff434d1c34
+
+ENV LC_ALL=C.UTF-8 LANG=C.UTF-8
+ENV DEBIAN_FRONTEND=noninteractive
+
+ARG VERSION
+ARG UID=1000
+ENV ELECTRUM_VERSION=${VERSION}
+ENV USER="user"
+ENV HOME_DIR="/home/${USER}"
+ENV WORK_DIR="/opt/electrum"
+
+# Install ca-certificates first (needed for snapshot.debian.org)
+RUN apt-get update -qq > /dev/null && apt-get install -qq --yes --no-install-recommends \
+    ca-certificates
+
+# Pin packages to Debian snapshot for reproducible builds
+RUN echo "deb https://snapshot.debian.org/archive/debian/20250530T143637Z/ bullseye main" > /etc/apt/sources.list && \
+    echo "deb-src https://snapshot.debian.org/archive/debian/20250530T143637Z/ bullseye main" >> /etc/apt/sources.list && \
+    echo "Package: *" > /etc/apt/preferences.d/snapshot && \
+    echo "Pin: origin \"snapshot.debian.org\"" >> /etc/apt/preferences.d/snapshot && \
+    echo "Pin-Priority: 1001" >> /etc/apt/preferences.d/snapshot
+
+# Install dependencies (matching Electrum's official Dockerfile for AppImage)
+RUN apt-get update -q && \
+    apt-get install -qy --allow-downgrades \
+        sudo git wget make \
+        autotools-dev autoconf libtool autopoint pkg-config xz-utils gettext \
+        libssl-dev libssl1.1 openssl \
+        zlib1g-dev libffi-dev \
+        libncurses5-dev libncurses5 libtinfo-dev libtinfo5 \
+        libsqlite3-dev \
+        libusb-1.0-0-dev libudev-dev libudev1 \
+        libdbus-1-3 xutils-dev \
+        libxkbcommon0 libxkbcommon-x11-0 \
+        libxcb1-dev libxcb-xinerama0 libxcb-randr0 libxcb-render0 \
+        libxcb-shm0 libxcb-shape0 libxcb-sync1 libxcb-xfixes0 libxcb-xkb1 \
+        libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-util1 \
+        libxcb-render-util0 libxcb-cursor0 libx11-xcb1 \
+        libc6-dev libc6 libc-dev-bin \
+        libv4l-dev libjpeg62-turbo-dev libx11-dev && \
+    rm -rf /var/lib/apt/lists/* && \
+    apt-get autoremove -y && \
+    apt-get clean
+
+# Create user and setup workspace
+RUN useradd --uid $UID --create-home --shell /bin/bash ${USER} && \
+    mkdir -p ${WORK_DIR} /output && \
+    chown -R ${USER}:${USER} ${WORK_DIR} /output
+
+USER ${USER}
+
+# Clone repository directly as WORK_DIR (not into subdirectory)
+RUN git clone https://github.com/spesmilo/electrum.git ${WORK_DIR}
+
+WORKDIR ${WORK_DIR}
+
+# Checkout version
+RUN git checkout ${ELECTRUM_VERSION}
+
+# Build based on type
+# Note: make_appimage.sh builds Python from source with proper SSL support
+# make_tgz.sh uses system Python and installs dependencies via pip
+ARG BUILD_TYPE
+RUN if [ "$BUILD_TYPE" = "appimage" ]; then \
+        cd contrib/build-linux/appimage && ./make_appimage.sh && \
+        cp ../../../dist/*.AppImage /output/; \
+    elif [ "$BUILD_TYPE" = "tarball" ]; then \
+        python3 -m pip install --user \
+            -r contrib/deterministic-build/requirements-build-base.txt && \
+        ./contrib/build-linux/make_tgz.sh && \
+        cp dist/*.tar.gz /output/; \
+    fi
+
+CMD ["/bin/bash"]
+DOCKERFILE_EOF
+
+fi
+
 log_success "Dockerfile generated"
 
 # ---------- Build Container Image ----------
 log_info "Building container image (this may take 30-60 minutes)..."
 image_name="electrum-desktop-build:${version}"
 
-if command -v podman &>/dev/null; then
+if command -v podman >/dev/null 2>&1; then
   container_cmd="podman"
-elif command -v docker &>/dev/null; then
+elif command -v docker >/dev/null 2>&1; then
   container_cmd="docker"
 else
   log_error "Neither podman nor docker found. Please install one of them."
@@ -277,9 +394,14 @@ fi
 
 log_info "Using container runtime: ${container_cmd}"
 
+# Build container with appropriate build args
+build_args="--build-arg VERSION=${version} --build-arg UID=$(id -u)"
+if [[ "$arch" == "x86_64-linux-gnu" ]]; then
+  build_args="${build_args} --build-arg BUILD_TYPE=${build_type}"
+fi
+
 if ! ${container_cmd} build \
-  --build-arg VERSION="${version}" \
-  --build-arg UID="$(id -u)" \
+  ${build_args} \
   -t "${image_name}" \
   -f "$dockerfile_path" \
   "$workspace"; then
@@ -302,25 +424,35 @@ ${container_cmd} rm "${container_id}"
 log_success "Artifacts extracted to ${built_dir}"
 
 # Verify artifacts exist
-if [[ -z $(ls -1 "$built_dir"/electrum-*.exe 2>/dev/null) ]]; then
-  log_error "No executables found in built directory"
-  echo "Exit code: 1"
-  exit 1
+if [[ "$arch" == "win64" ]]; then
+  if [[ -z $(ls -1 "$built_dir"/electrum-*.exe) ]]; then
+    log_error "No executables found in built directory"
+    echo "Exit code: 1"
+    exit 1
+  fi
+elif [[ "$arch" == "x86_64-linux-gnu" ]]; then
+  if [[ -z $(ls -1 "$built_dir"/electrum-*) ]]; then
+    log_error "No artifacts found in built directory"
+    echo "Exit code: 1"
+    exit 1
+  fi
 fi
 
-# ---------- Strip Signatures ----------
-log_info "Stripping Authenticode signatures..."
+# ---------- Strip Signatures (Windows only) ----------
 stripped_official_dir="$workspace/official_stripped"
 mkdir -p "$stripped_official_dir"
-chmod 777 "$stripped_official_dir"  # Ensure writable by container user
+
+if [[ "$arch" == "win64" ]]; then
+  log_info "Stripping Authenticode signatures..."
+  chmod 777 "$stripped_official_dir"  # Ensure writable by container user
 
 # Check if osslsigncode is available on host
-if command -v osslsigncode &>/dev/null; then
+if command -v osslsigncode >/dev/null 2>&1; then
   # Strip on host
   for file in "${official_files[@]}"; do
     if [[ -f "$official_dir/$file" ]]; then
       log_info "Stripping signature from ${file}..."
-      if osslsigncode remove-signature -in "$official_dir/$file" -out "$stripped_official_dir/$file" 2>/dev/null; then
+      if osslsigncode remove-signature -in "$official_dir/$file" -out "$stripped_official_dir/$file"; then
         log_success "Stripped ${file}"
       else
         log_warn "Failed to strip signature from ${file}, using original"
@@ -338,7 +470,7 @@ else
         -v "$official_dir:/input:ro" \
         -v "$stripped_official_dir:/output:rw" \
         "${image_name}" \
-        osslsigncode remove-signature -in "/input/$file" -out "/output/$file" 2>/dev/null; then
+        osslsigncode remove-signature -in "/input/$file" -out "/output/$file"; then
         log_success "Stripped ${file}"
       else
         log_warn "Failed to strip signature from ${file}, using original"
@@ -348,7 +480,13 @@ else
   done
 fi
 
-log_success "Signatures stripped"
+  log_success "Signatures stripped"
+elif [[ "$arch" == "x86_64-linux-gnu" ]]; then
+  # Linux binaries don't have Authenticode signatures, copy directly
+  log_info "Linux binaries - no signature stripping needed"
+  cp "$official_dir"/* "$stripped_official_dir/"
+  log_success "Official files copied for comparison"
+fi
 
 # ---------- Comparison ----------
 log_info "Comparing binaries..."
@@ -374,7 +512,7 @@ for file in "${official_files[@]}"; do
 
   built_hash=$(sha256sum "$built_file" | awk '{print $1}')
 
-  if diff -q "$built_file" "$official_file" >/dev/null 2>&1; then
+  if diff "$built_file" "$official_file" >/dev/null 2>&1; then
     echo "$file - $arch - $built_hash - 1 (MATCHES)" >> "$comparison_file"
     match_count=$((match_count + 1))
     log_success "Match: ${file}"
@@ -402,7 +540,7 @@ echo "signer:         N/A"
 echo "apkVersionName: ${version}"
 echo "apkVersionCode: N/A"
 echo "verdict:        ${verdict}"
-echo "appHash:        $(sha256sum "$official_dir/${official_files[0]}" 2>/dev/null | awk '{print $1}' || echo 'N/A')"
+echo "appHash:        $(sha256sum "$official_dir/${official_files[0]}" | awk '{print $1}' || echo 'N/A')"
 echo "commit:         N/A"
 echo ""
 echo "Diff:"
