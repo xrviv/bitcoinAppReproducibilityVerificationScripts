@@ -2,7 +2,7 @@
 # ==============================================================================
 # verify_electrumdesktop.sh - Electrum Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.6.5
+# Version:       v0.6.6
 # Organization:  WalletScrutiny.com
 # Last Modified: 2025-11-06
 # Project:       https://github.com/spesmilo/electrum
@@ -45,7 +45,7 @@ INFO_ICON="[INFO]"
 
 APP_NAME="Electrum Desktop"
 APP_ID="org.electrum.electrum"
-SCRIPT_VERSION="v0.6.5"
+SCRIPT_VERSION="v0.6.6"
 REPO_URL="https://github.com/spesmilo/electrum"
 
 # ---------- Logging Functions ----------
@@ -68,8 +68,10 @@ Required Parameters:
 Optional Parameters:
   --arch <arch>          Architecture to build (default: win64)
                          Supported: win64, x86_64-linux-gnu
+                         Aliases: win/windows → win64, linux → x86_64-linux-gnu
   --type <type>          Package type (required for x86_64-linux-gnu)
                          For x86_64-linux-gnu: appimage, tarball
+                         Aliases: tar/targz → tarball
                          For win64: ignored (builds all executables)
 
 Flags:
@@ -127,6 +129,37 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Normalize architecture aliases
+arch_input="$arch"
+arch_lower="${arch,,}"
+case "$arch_lower" in
+  win|windows)
+    arch="win64"
+    ;;
+  x86_64-linux-gnu|linux)
+    arch="x86_64-linux-gnu"
+    ;;
+  *)
+    arch="$arch_lower"
+    ;;
+esac
+
+# Normalize type aliases (if provided)
+if [[ -n "$build_type" ]]; then
+  build_type_lower="${build_type,,}"
+  case "$build_type_lower" in
+    tarball|targz|tar)
+      build_type="tarball"
+      ;;
+    appimage)
+      build_type="appimage"
+      ;;
+    *)
+      build_type="$build_type_lower"
+      ;;
+  esac
+fi
 
 # Validate required parameters
 if [[ -z "$version" ]]; then
