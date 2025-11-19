@@ -1,12 +1,24 @@
 #!/bin/bash
 # apkextractor_sync.sh - Extracts APKs from Android device and syncs to server
-# Version: v0.7.0
+# Version: v0.7.2
 # Usage: ./apkextractor_sync.sh <appID> [user@server] [OPTIONS]
-# Options: -b/--both, --no-extract, -h/--help
+# Options: -b/--both, --no-extract, --remote-dir <path>, -h/--help
+#
+# Changelog v0.7.2:
+#   - Skip remote extraction if unzip is not available on server
+#   - Added remote unzip availability check before upload
+#   - Show warning when remote extraction is skipped (APKs still uploaded successfully)
+#
+# Changelog v0.7.1:
+#   - Changed remote base directory from ~/apks to /home/danny/apks
+#   - Removed /splits subdirectory for remote uploads (split APKs now go directly in version dir)
+#   - Updated mismatch detection to work with flat directory structure
+#   - Fixed adb pull command: removed duplicate path argument that could cause protocol faults
 #
 # Directory structure:
-#   Single APK: /var/shared/apk/{appID}/{versionName}/
-#   Split APKs: /var/shared/apk/{appID}/{versionName}/splits/
+#   Local single APK: /var/shared/apk/{appID}/{versionName}/
+#   Local split APKs: /var/shared/apk/{appID}/{versionName}/splits/
+#   Remote (both types): /home/danny/apks/{appID}/{versionName}/
 #   Apps using versionCode: app.zeusln.zeus (hardcoded exceptions)
 #
 # Naming conventions:
@@ -20,6 +32,8 @@ set -e
 bundletoolPath=""
 extractApk=true
 saveBoth=false
+remoteBaseDir="/home/danny/apks"
+remoteDirProvided=false
 
 # Show help function
 show_help() {
@@ -31,11 +45,13 @@ show_help() {
   echo "Arguments:"
   echo "  <appID>         Package name of the app (required)"
   echo "  [user@server]   SSH credentials for remote upload (optional)"
+  echo "                  Remote save defaults to /home/danny/apks/ on that server"
   echo "                  If omitted, saves locally to /var/shared/apk/"
   echo ""
   echo "Options:"
   echo "  -b, --both      Save both locally AND to server (requires server argument)"
   echo "  --no-extract    Do not extract APK contents (default: extracts to 'base/' folder)"
+  echo "  --remote-dir    Remote base directory (default: ~/apks)."
   echo "  -h, --help      Show this help message"
   echo ""
   echo "Examples:"
@@ -44,8 +60,9 @@ show_help() {
   echo "  ./apkextractor_sync.sh com.example.app user@server"
   echo "  ./apkextractor_sync.sh com.example.app user@server -b"
   echo "  ./apkextractor_sync.sh com.example.app user@server --both --no-extract"
+  echo "  ./apkextractor_sync.sh com.example.app user@server --remote-dir /data/shared/apks"
   echo ""
-  echo "Version: v0.7.0"
+  echo "Version: v0.7.2"
   exit 0
 }
 
@@ -131,23 +148,38 @@ determine_naming_convention() {
 bundleId=""
 sshCredentials=""
 
-for arg in "$@"; do
-  case "$arg" in
+while [[ $# -gt 0 ]]; do
+  case "$1" in
     --help|-h)
       show_help
       ;;
     --no-extract)
       extractApk=false
+      shift
       ;;
     -b|--both)
       saveBoth=true
+      shift
+      ;;
+    --remote-dir)
+      if [[ $# -lt 2 ]]; then
+        echo -e "\033[1;31mError: --remote-dir requires a path argument.\033[0m"
+        exit 1
+      fi
+      remoteBaseDir="$2"
+      remoteDirProvided=true
+      shift 2
       ;;
     *)
       if [ -z "$bundleId" ]; then
-        bundleId="$arg"
+        bundleId="$1"
       elif [ -z "$sshCredentials" ]; then
-        sshCredentials="$arg"
+        sshCredentials="$1"
+      else
+        echo -e "\033[1;31mError: Unexpected argument '$1'.\033[0m"
+        exit 1
       fi
+      shift
       ;;
   esac
 done
@@ -162,6 +194,11 @@ fi
 if [ "$saveBoth" = true ] && [ -z "$sshCredentials" ]; then
   echo -e "\033[1;31mError: -b/--both flag requires a server argument.\033[0m"
   echo "Usage: ./apkextractor_sync.sh <appID> <user@server> -b"
+  exit 1
+fi
+
+if [ "$remoteDirProvided" = true ] && [ -z "$sshCredentials" ]; then
+  echo -e "\033[1;31mError: --remote-dir requires a server argument.\033[0m"
   exit 1
 fi
 
@@ -267,7 +304,7 @@ echo "Pulling APKs to temporary staging..."
 for apk in $apks; do
   apkPath=$(echo $apk | awk '{print $NF}' FS=':' | tr -d '\r\n')
   echo "Pulling $apkPath"
-  adb pull "$apkPath" "$apkPath" "$tempDir/"
+  adb pull "$apkPath" "$tempDir/"
 done
 
 # Determine version for directory naming (versionCode or versionName)
@@ -289,27 +326,28 @@ fi
 if [ ! -z "$sshCredentials" ]; then
   isRemote=true
 
+  # Trim trailing slash to avoid double separators during concatenation
+  remoteBaseDirTrimmed="${remoteBaseDir%/}"
+  remoteBundleDir="$remoteBaseDirTrimmed/$bundleId"
+  echo "Remote base directory for this app: $remoteBundleDir"
+
   echo -e "\033[1;33m▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮ Uploading files to server ▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮\033[0m"
 
-  ssh $sshCredentials "mkdir -p /var/shared/apk/$bundleId"
+  ssh $sshCredentials "mkdir -p $remoteBundleDir"
 
   # Determine naming convention
-  namingConvention=$(determine_naming_convention "/var/shared/apk/$bundleId" "$bundleId" true)
+  namingConvention=$(determine_naming_convention "$remoteBundleDir" "$bundleId" true)
 
-  # Determine target directory based on APK type
-  if [ "$isSplitApk" = true ]; then
-    uploadDir="/var/shared/apk/$bundleId/$version/splits"
-  else
-    uploadDir="/var/shared/apk/$bundleId/$version"
-  fi
+  # Determine target directory (no splits subdirectory for remote)
+  uploadDir="$remoteBundleDir/$version"
 
   # Check for existing files and detect mismatches
-  existingFiles=$(ssh $sshCredentials "ls -1 /var/shared/apk/$bundleId/$version/ 2>/dev/null" || echo "")
+  existingFiles=$(ssh $sshCredentials "ls -1 $remoteBundleDir/$version/ 2>/dev/null" || echo "")
 
   if [ ! -z "$existingFiles" ]; then
-    echo -e "\033[1;33m⚠️  Existing files detected in /var/shared/apk/$bundleId/$version/\033[0m"
+    echo -e "\033[1;33m⚠️  Existing files detected in $remoteBundleDir/$version/\033[0m"
 
-    # Check for type mismatch
+    # Check for type mismatch (split vs single APK)
     if [ "$isSplitApk" = true ]; then
       # New upload is split APKs, check if single APK exists
       if echo "$existingFiles" | grep -qE "^${bundleId}_v.*\.apk$|^${bundleId}-.*\.apk$"; then
@@ -317,25 +355,25 @@ if [ ! -z "$sshCredentials" ]; then
         echo "  Current upload: Split APKs"
         echo "  Existing files: Single APK"
         echo ""
-        echo "Existing files in /var/shared/apk/$bundleId/$version/:"
+        echo "Existing files in $remoteBundleDir/$version/:"
         echo "$existingFiles" | sed 's/^/    /'
         echo ""
         echo -e "\033[1;33mPlease manually clean the directory before proceeding:\033[0m"
-        echo "  ssh $sshCredentials 'rm -rf /var/shared/apk/$bundleId/$version/*'"
+        echo "  ssh $sshCredentials \"rm -rf $remoteBundleDir/$version/*\""
         exit 1
       fi
     else
-      # New upload is single APK, check if splits/ directory exists
-      if echo "$existingFiles" | grep -q "^splits$"; then
+      # New upload is single APK, check if split APK files exist
+      if echo "$existingFiles" | grep -qE "^base\.apk$|^split_.*\.apk$|^split_config\..*\.apk$"; then
         echo -e "\033[1;31m❌ MISMATCH DETECTED:\033[0m"
         echo "  Current upload: Single APK"
-        echo "  Existing files: Split APKs (splits/ directory found)"
+        echo "  Existing files: Split APKs (base.apk or split_*.apk found)"
         echo ""
-        echo "Existing files in /var/shared/apk/$bundleId/$version/:"
+        echo "Existing files in $remoteBundleDir/$version/:"
         echo "$existingFiles" | sed 's/^/    /'
         echo ""
         echo -e "\033[1;33mPlease manually clean the directory before proceeding:\033[0m"
-        echo "  ssh $sshCredentials 'rm -rf /var/shared/apk/$bundleId/$version/*'"
+        echo "  ssh $sshCredentials \"rm -rf $remoteBundleDir/$version/*\""
         exit 1
       fi
     fi
@@ -344,13 +382,25 @@ if [ ! -z "$sshCredentials" ]; then
     echo -e "\033[1;31m❌ Aborting to prevent accidental overwrite.\033[0m"
     echo ""
     echo -e "\033[1;33mTo proceed, manually clean the directory first:\033[0m"
-    echo "  ssh $sshCredentials 'rm -rf /var/shared/apk/$bundleId/$version/*'"
+    echo "  ssh $sshCredentials \"rm -rf $remoteBundleDir/$version/*\""
     echo ""
     exit 1
   fi
 
   # Create the version-specific directory
   ssh $sshCredentials "mkdir -p $uploadDir"
+
+  # Check if unzip is available on remote server
+  remoteCanExtract=false
+  if [ "$extractApk" = true ]; then
+    if ssh $sshCredentials "command -v unzip >/dev/null 2>&1"; then
+      remoteCanExtract=true
+    else
+      echo -e "\033[1;33m⚠️  Warning: unzip not available on remote server\033[0m"
+      echo "    APKs will be uploaded but not extracted"
+      echo ""
+    fi
+  fi
 
   # Upload and rename APKs
   uploadedFiles=()
@@ -368,14 +418,18 @@ if [ ! -z "$sshCredentials" ]; then
     scp "$apk" "$sshCredentials:$uploadDir/$newName"
     uploadedFiles+=("$uploadDir/$newName")
 
-    # Extract APK contents if enabled
-    if [ "$extractApk" = true ]; then
+    # Extract APK contents if enabled and unzip is available on remote
+    if [ "$remoteCanExtract" = true ]; then
       extractDir=$(echo "$apkName" | sed 's/\.apk$//' | sed 's/split_config\.//')
       ssh $sshCredentials "mkdir -p $uploadDir/$extractDir && unzip -q $uploadDir/$newName -d $uploadDir/$extractDir"
     fi
   done
 
-  echo "APK files have been uploaded, renamed, and extracted on the server."
+  if [ "$remoteCanExtract" = true ]; then
+    echo "APK files have been uploaded, renamed, and extracted on the server."
+  else
+    echo "APK files have been uploaded and renamed on the server (extraction skipped)."
+  fi
 
   # Display summary
   echo ""
@@ -555,4 +609,3 @@ fi
 echo "Cleaning up temporary files..."
 rm -rf "$tempDir"
 echo "Done!"
-
