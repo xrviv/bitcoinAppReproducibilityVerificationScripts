@@ -2,7 +2,7 @@
 # ==============================================================================
 # wasabidesktop_build.sh - Wasabi Wallet Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v1.1.3
+# Version:       v1.1.4
 # Organization:  WalletScrutiny.com
 # Last Modified: 2025-11-26
 # Project:       https://github.com/WalletWasabi/WalletWasabi
@@ -44,7 +44,7 @@
 set -euo pipefail
 
 # ---------- Script Metadata ----------
-SCRIPT_VERSION="v1.1.3"
+SCRIPT_VERSION="v1.1.4"
 APP_NAME="Wasabi Wallet"
 APP_ID="wasabi"
 
@@ -223,7 +223,7 @@ if ! $CONTAINER_CMD run --rm \
     apt-get update -qq && apt-get install -y -qq wget git > /dev/null 2>&1 && \
     wget -q --show-progress '$DOWNLOAD_URL' -O 'official-$EXPECTED_FILE' && \
     git clone --depth=1 --branch='$GIT_TAG' --single-branch \
-      https://github.com/walletwasabi/walletwasabi walletwasabi
+      https://github.com/WalletWasabi/WalletWasabi walletwasabi
   "; then
   log_error "Failed to download release or clone repository"
   exit 1
@@ -308,8 +308,8 @@ DOCKERFILE_PATH="$WORKSPACE/Dockerfile"
 
 cat > "$DOCKERFILE_PATH" <<'DOCKERFILE_EOF'
 # Wasabi Wallet Reproducible Build Container
-# Based on Microsoft's official .NET SDK image
-FROM mcr.microsoft.com/dotnet/sdk:8.0
+# Based on Microsoft's official .NET SDK image (pinned)
+FROM mcr.microsoft.com/dotnet/sdk:8.0.404-bookworm-slim
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -356,9 +356,8 @@ log_success "Container image built: $IMAGE_NAME"
 # ---------- Run Build Inside Container ----------
 log_info "Running reproducible build inside container for target: $BUILD_TARGET..."
 
-# Create output directory and loosen permissions to avoid mount permission issues
+# Create output directory
 mkdir -p "$WORKSPACE/output"
-chmod 777 "$WORKSPACE/output"
 
 # Run the build in a named container (no bind mount), then copy out the artifact
 CONTAINER_NAME="wasabi-build-run-${VERSION_NO_V}-${ARCH}-$$"
