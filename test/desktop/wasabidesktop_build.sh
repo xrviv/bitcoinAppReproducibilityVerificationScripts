@@ -2,7 +2,7 @@
 # ==============================================================================
 # wasabidesktop_build.sh - Wasabi Wallet Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v1.1.2
+# Version:       v1.1.3
 # Organization:  WalletScrutiny.com
 # Last Modified: 2025-11-26
 # Project:       https://github.com/WalletWasabi/WalletWasabi
@@ -44,7 +44,7 @@
 set -euo pipefail
 
 # ---------- Script Metadata ----------
-SCRIPT_VERSION="v1.1.2"
+SCRIPT_VERSION="v1.1.3"
 APP_NAME="Wasabi Wallet"
 APP_ID="wasabi"
 
@@ -78,22 +78,39 @@ log_error() {
 
 usage() {
   cat <<EOF
-Usage: $0 --version <version> [--arch <architecture>]
+Wasabi Desktop Reproducible Build Verification Script
 
-Required:
-  --version <version>    Wallet version (e.g., 2.7.0 or v2.7.0)
+Usage:
+  $(basename "$0") --version <version> [--arch <architecture>]
 
-Optional:
-  --arch <architecture>  Target architecture (default: x86_64-linux-gnu)
+Required Parameters:
+  --version <version>    Wasabi version to verify (e.g., 2.7.1)
+
+Optional Parameters:
+  --arch <architecture>  Architecture to build (default: x86_64-linux-gnu)
                          Supported: x86_64-linux-gnu, win64, osx64
+
+Flags:
   --help                 Show this help message
 
-Example:
-  $0 --version 2.7.0 --arch x86_64-linux-gnu
+Examples:
+  $(basename "$0") --version 2.7.1
+  $(basename "$0") --version 2.7.1 --arch x86_64-linux-gnu
+  $(basename "$0") --version 2.7.1 --arch win64
 
 Requirements:
-  - Docker or Podman (no other dependencies needed)
-  - Internet connection
+  - Docker or Podman installed
+  - Internet connection for downloading sources and official releases
+  - ~2GB disk space for build artifacts
+
+Output:
+  - Exit code 0: Binaries are reproducible
+  - Exit code 1: Binaries differ or verification failed
+  - COMPARISON_RESULTS.yaml: Machine-readable comparison results
+  - Standardized results between ===== Begin/End Results =====
+
+Version: ${SCRIPT_VERSION}
+Organization: WalletScrutiny.com
 EOF
 }
 
