@@ -2,7 +2,7 @@
 # ==============================================================================
 # wasabidesktop_build.sh - Wasabi Wallet Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v1.1.1
+# Version:       v1.1.2
 # Organization:  WalletScrutiny.com
 # Last Modified: 2025-11-26
 # Project:       https://github.com/WalletWasabi/WalletWasabi
@@ -44,7 +44,7 @@
 set -euo pipefail
 
 # ---------- Script Metadata ----------
-SCRIPT_VERSION="v1.1.1"
+SCRIPT_VERSION="v1.1.2"
 APP_NAME="Wasabi Wallet"
 APP_ID="wasabi"
 
@@ -433,16 +433,17 @@ echo "===== Begin Results ====="
 echo "appId:          $APP_ID"
 echo "signer:         N/A"
 echo "apkVersionName: $VERSION"
-echo "apkVersionCode: $VERSION_NO_V"
+echo "apkVersionCode: N/A"
 echo "verdict:        $VERDICT"
 echo "appHash:        $OFFICIAL_HASH"
 echo "commit:         $ACTUAL_COMMIT"
 echo ""
 echo "Diff:"
-echo "BUILDS MATCH BINARIES"
 if [ "$MATCH" == "true" ]; then
+  echo "BUILDS MATCH BINARIES"
   echo "$EXPECTED_FILE - $ARCH - $BUILT_HASH - 1 (MATCHES)"
 else
+  echo "BUILDS DO NOT MATCH BINARIES"
   echo "$EXPECTED_FILE - $ARCH - $BUILT_HASH - 0 (DOESN'T MATCH)"
 fi
 echo ""
