@@ -2,7 +2,7 @@
 # ==============================================================================
 # wasabidesktop_build.sh - Wasabi Wallet Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v1.1.4
+# Version:       v1.3.0
 # Organization:  WalletScrutiny.com
 # Last Modified: 2025-11-26
 # Project:       https://github.com/WalletWasabi/WalletWasabi
@@ -44,7 +44,7 @@
 set -euo pipefail
 
 # ---------- Script Metadata ----------
-SCRIPT_VERSION="v1.1.4"
+SCRIPT_VERSION="v1.3.0"
 APP_NAME="Wasabi Wallet"
 APP_ID="wasabi"
 
@@ -80,23 +80,29 @@ usage() {
   cat <<EOF
 Wasabi Desktop Reproducible Build Verification Script
 
-Usage:
-  $(basename "$0") --version <version> [--arch <architecture>]
+Usage (Named Parameters - Recommended):
+  $(basename "$0") --version <version> [--arch <architecture>] [--type <type>]
 
-Required Parameters:
+Usage (Positional Parameters - Legacy):
+  $(basename "$0") <version> [<architecture>]
+
+Parameters:
   --version <version>    Wasabi version to verify (e.g., 2.7.1)
-
-Optional Parameters:
   --arch <architecture>  Architecture to build (default: x86_64-linux-gnu)
-                         Supported: x86_64-linux-gnu, win64, osx64
+                         Supported: x86_64-linux-gnu, win64
+  --type <type>          Package type to verify (default: varies by arch)
+                         x86_64-linux-gnu: deb (default), tarball, zip
+                         win64: zip (default), msi
 
 Flags:
-  --help                 Show this help message
+  --help, -h             Show this help message
 
 Examples:
   $(basename "$0") --version 2.7.1
-  $(basename "$0") --version 2.7.1 --arch x86_64-linux-gnu
-  $(basename "$0") --version 2.7.1 --arch win64
+  $(basename "$0") --version 2.7.1 --arch x86_64-linux-gnu --type deb
+  $(basename "$0") --version 2.7.1 --arch x86_64-linux-gnu --type tarball
+  $(basename "$0") --version 2.7.1 --arch win64 --type msi
+  $(basename "$0") 2.7.1
 
 Requirements:
   - Docker or Podman installed
@@ -106,6 +112,7 @@ Requirements:
 Output:
   - Exit code 0: Binaries are reproducible
   - Exit code 1: Binaries differ or verification failed
+  - Exit code 2: Invalid parameters
   - COMPARISON_RESULTS.yaml: Machine-readable comparison results
   - Standardized results between ===== Begin/End Results =====
 
@@ -117,28 +124,43 @@ EOF
 # ---------- Parse Arguments ----------
 VERSION=""
 ARCH="x86_64-linux-gnu"  # Default architecture
+TYPE=""  # Will be set based on architecture if not specified
 
-while [[ $# -gt 0 ]]; do
-  case $1 in
-    --version)
-      VERSION="$2"
-      shift 2
-      ;;
-    --arch)
-      ARCH="$2"
-      shift 2
-      ;;
-    --help|-h)
-      usage
-      exit 0
-      ;;
-    *)
-      log_error "Unknown parameter: $1"
-      usage
-      exit 1
-      ;;
-  esac
-done
+# Support both positional and named parameters for backward compatibility
+if [[ $# -gt 0 && "$1" != --* ]]; then
+  # Old style: positional parameters
+  VERSION="$1"
+  if [[ $# -gt 1 ]]; then
+    ARCH="$2"
+  fi
+else
+  # New style: named parameters
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --version)
+        VERSION="$2"
+        shift 2
+        ;;
+      --arch)
+        ARCH="$2"
+        shift 2
+        ;;
+      --type)
+        TYPE="$2"
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        log_error "Unknown parameter: $1"
+        usage
+        exit 2
+        ;;
+    esac
+  done
+fi
 
 # ---------- Validate Parameters ----------
 if [ -z "$VERSION" ]; then
@@ -155,11 +177,41 @@ if ! [[ "$VERSION" =~ ^[vV]?[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
 fi
 
 # Validate architecture
-if [[ "$ARCH" != "x86_64-linux-gnu" && "$ARCH" != "win64" && "$ARCH" != "osx64" ]]; then
+if [[ "$ARCH" != "x86_64-linux-gnu" && "$ARCH" != "win64" ]]; then
   log_error "Unsupported architecture: $ARCH"
-  echo "Supported architectures: x86_64-linux-gnu, win64, osx64"
-  exit 1
+  echo "Supported architectures: x86_64-linux-gnu, win64"
+  exit 2
 fi
+
+# Set default TYPE based on ARCH if not specified
+if [ -z "$TYPE" ]; then
+  case "$ARCH" in
+    x86_64-linux-gnu)
+      TYPE="deb"
+      ;;
+    win64)
+      TYPE="zip"
+      ;;
+  esac
+fi
+
+# Validate TYPE for the given ARCH
+case "$ARCH" in
+  x86_64-linux-gnu)
+    if [[ "$TYPE" != "deb" && "$TYPE" != "tarball" && "$TYPE" != "zip" ]]; then
+      log_error "Invalid type '$TYPE' for architecture '$ARCH'"
+      echo "Valid types for x86_64-linux-gnu: deb, tarball, zip"
+      exit 2
+    fi
+    ;;
+  win64)
+    if [[ "$TYPE" != "zip" && "$TYPE" != "msi" ]]; then
+      log_error "Invalid type '$TYPE' for architecture '$ARCH'"
+      echo "Valid types for win64: zip, msi"
+      exit 2
+    fi
+    ;;
+esac
 
 # ---------- Detect Container Runtime ----------
 CONTAINER_CMD=""
@@ -182,34 +234,47 @@ if [[ ! $GIT_TAG =~ ^v ]]; then
 fi
 VERSION_NO_V="${VERSION#v}"
 
-log_info "Building $APP_NAME version: $VERSION (tag: $GIT_TAG) for architecture: $ARCH"
+log_info "Building $APP_NAME version: $VERSION (tag: $GIT_TAG) for architecture: $ARCH, type: $TYPE"
 
 # ---------- Setup Workspace ----------
 ORIG_DIR="$(pwd)"
-WORKSPACE="$(pwd)/wasabi_build_${VERSION_NO_V}_${ARCH}"
+WORKSPACE="$(pwd)/wasabi_build_${VERSION_NO_V}_${ARCH}_${TYPE}"
 log_info "Creating workspace: $WORKSPACE"
 rm -rf "$WORKSPACE"
 mkdir -p "$WORKSPACE"
 cd "$WORKSPACE"
 
 # ---------- Determine Build Configuration ----------
+# BUILD_TARGET is based on ARCH, EXPECTED_FILE is based on TYPE
 case "$ARCH" in
   x86_64-linux-gnu)
     BUILD_TARGET="debian"
-    EXPECTED_FILE="Wasabi-${VERSION_NO_V}.deb"
-    DOWNLOAD_URL="https://github.com/WalletWasabi/WalletWasabi/releases/download/$GIT_TAG/Wasabi-${VERSION_NO_V}.deb"
+    case "$TYPE" in
+      deb)
+        EXPECTED_FILE="Wasabi-${VERSION_NO_V}.deb"
+        ;;
+      tarball)
+        EXPECTED_FILE="Wasabi-${VERSION_NO_V}-linux-x64.tar.gz"
+        ;;
+      zip)
+        EXPECTED_FILE="Wasabi-${VERSION_NO_V}-linux-x64.zip"
+        ;;
+    esac
     ;;
   win64)
-    BUILD_TARGET="windows"
-    EXPECTED_FILE="Wasabi-${VERSION_NO_V}-win-x64.zip"
-    DOWNLOAD_URL="https://github.com/WalletWasabi/WalletWasabi/releases/download/$GIT_TAG/Wasabi-${VERSION_NO_V}-win-x64.zip"
-    ;;
-  osx64)
-    BUILD_TARGET="osx"
-    EXPECTED_FILE="Wasabi-${VERSION_NO_V}-osx-x64.dmg"
-    DOWNLOAD_URL="https://github.com/WalletWasabi/WalletWasabi/releases/download/$GIT_TAG/Wasabi-${VERSION_NO_V}-osx-x64.dmg"
+    BUILD_TARGET="wininstaller"
+    case "$TYPE" in
+      msi)
+        EXPECTED_FILE="Wasabi-${VERSION_NO_V}.msi"
+        ;;
+      zip)
+        EXPECTED_FILE="Wasabi-${VERSION_NO_V}-win-x64.zip"
+        ;;
+    esac
     ;;
 esac
+
+DOWNLOAD_URL="https://github.com/WalletWasabi/WalletWasabi/releases/download/$GIT_TAG/$EXPECTED_FILE"
 
 # ---------- Download and Clone Inside Container ----------
 log_info "Downloading official release and cloning repository inside container..."
@@ -344,7 +409,7 @@ DOCKERFILE_EOF
 log_success "Dockerfile generated"
 
 # ---------- Build Container Image ----------
-IMAGE_NAME="wasabi-build:${VERSION_NO_V}-${ARCH}"
+IMAGE_NAME="wasabi-build:${VERSION_NO_V}-${ARCH}-${TYPE}"
 log_info "Building container image (this may take several minutes)..."
 
 if ! $CONTAINER_CMD build -t "$IMAGE_NAME" -f "$DOCKERFILE_PATH" "$WORKSPACE"; then
@@ -360,7 +425,7 @@ log_info "Running reproducible build inside container for target: $BUILD_TARGET.
 mkdir -p "$WORKSPACE/output"
 
 # Run the build in a named container (no bind mount), then copy out the artifact
-CONTAINER_NAME="wasabi-build-run-${VERSION_NO_V}-${ARCH}-$$"
+CONTAINER_NAME="wasabi-build-run-${VERSION_NO_V}-${ARCH}-${TYPE}-$$"
 cleanup_container() {
   $CONTAINER_CMD rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 }
@@ -430,6 +495,7 @@ date: $(date -u +"%Y-%m-%dT%H:%M:%S%:z")
 script_version: $SCRIPT_VERSION
 results:
   - architecture: $ARCH
+    type: $TYPE
     files:
       - filename: $EXPECTED_FILE
         hash: $BUILT_HASH
