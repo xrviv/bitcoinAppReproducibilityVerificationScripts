@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitcoincore_build.sh - Bitcoin Core Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.1
+# Version:       v0.3.0
 # Organization:  WalletScrutiny.com
-# Last Modified: 2025-11-07
+# Last Modified: 2025-11-27
 # Project:       https://github.com/bitcoin/bitcoin
 # ==============================================================================
 # LICENSE: MIT License
@@ -27,7 +27,7 @@
 # - Performs containerized reproducible build using embedded Dockerfile (Alpine Guix)
 # - Builds only standard release binaries (no debug/unsigned variants)
 # - Compares checksums between official and built binaries
-# - Generates COMPARISON_RESULTS.txt for build server automation
+# - Generates COMPARISON_RESULTS.yaml for build server automation
 # - Documents differences and generates detailed reproducibility assessment
 #
 # CREDITS:
@@ -39,10 +39,10 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v0.2.1"
+SCRIPT_VERSION="v0.3.0"
 SCRIPT_NAME="bitcoincore_build.sh"
 APP_NAME="Bitcoin Core"
-APP_ID="org.bitcoincore.bitcoin-qt"
+APP_ID="bitcoincore"
 REPO_URL="https://github.com/bitcoin/bitcoin"
 DEFAULT_VERSION="29.1"
 CONTAINER_NAME="ws_bitcoin_verifier"
@@ -71,16 +71,16 @@ usage() {
 Bitcoin Core Reproducible Build Verification Script
 
 Usage:
-  $(basename "$0") --version <version> [--arch <arch>]
+  $(basename "$0") --version <version> --arch <arch> --type <type>
 
 Required Parameters:
   --version <version>    Bitcoin Core version to verify (e.g., 29.1, 30.0)
+  --arch <arch>          Target architecture
+                         Supported: x86_64-linux, aarch64-linux, arm-linux,
+                                   x86_64-windows, x86_64-macos, arm64-macos
+  --type <type>          Build type (tarball for linux/macos, zip for windows)
 
 Optional Parameters:
-  --arch <arch>          Target architecture (default: x86_64-linux-gnu)
-                         Supported: x86_64-linux-gnu, aarch64-linux-gnu, 
-                                   arm-linux-gnueabihf, x86_64-w64-mingw32,
-                                   x86_64-apple-darwin, arm64-apple-darwin
 
 Flags:
   --help                 Show this help message
@@ -89,10 +89,10 @@ Flags:
   --list-targets         Show available build targets
 
 Examples:
-  $(basename "$0") --version 29.1
-  $(basename "$0") --version 29.1 --arch x86_64-linux-gnu
-  $(basename "$0") --version 30.0 --arch aarch64-linux-gnu
-  $(basename "$0") --version 29.1 --arch x86_64-w64-mingw32
+  $(basename "$0") --version 29.1 --arch x86_64-linux --type tarball
+  $(basename "$0") --version 29.1 --arch aarch64-linux --type tarball
+  $(basename "$0") --version 30.0 --arch x86_64-windows --type zip
+  $(basename "$0") --version 29.1 --arch x86_64-macos --type tarball
   $(basename "$0") --list-targets
 
 Requirements:
@@ -104,7 +104,7 @@ Requirements:
 Output:
   - Exit code 0: Binaries are reproducible
   - Exit code 1: Binaries differ or verification failed
-  - COMPARISON_RESULTS.txt: Machine-readable comparison results
+  - COMPARISON_RESULTS.yaml: Machine-readable comparison results
   - Standardized results format between ===== Begin/End Results =====
 
 Version: ${SCRIPT_VERSION}
@@ -181,7 +181,8 @@ show_version() {
 
 # ---------- Parameter Parsing ----------
 version=""
-arch="x86_64-linux-gnu"
+arch=""
+build_type=""
 clean_flag="false"
 keep_container="false"
 
@@ -193,6 +194,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --arch)
       arch="$2"
+      shift 2
+      ;;
+    --type)
+      build_type="$2"
       shift 2
       ;;
     --help)
@@ -226,10 +231,112 @@ if [[ -z "$version" ]]; then
   exit 1
 fi
 
+if [[ -z "$arch" ]]; then
+  log_error "Missing required parameter: --arch"
+  usage
+  exit 1
+fi
+
+if [[ -z "$build_type" ]]; then
+  log_error "Missing required parameter: --type"
+  usage
+  exit 1
+fi
+
+# Validate build type per arch
+case "$arch" in
+  x86_64-windows)
+    if [[ "$build_type" != "zip" ]]; then
+      log_error "Unsupported type for ${arch}: ${build_type}. Use --type zip"
+      exit 1
+    fi
+    ;;
+  x86_64-linux|aarch64-linux|arm-linux|x86_64-macos|arm64-macos)
+    if [[ "$build_type" != "tarball" ]]; then
+      log_error "Unsupported type for ${arch}: ${build_type}. Use --type tarball"
+      exit 1
+    fi
+    ;;
+  *)
+    log_error "Unsupported architecture/type combo: ${arch}/${build_type}"
+    exit 1
+    ;;
+esac
+
 # Add 'v' prefix if not present (Bitcoin Core uses v-prefixed tags)
 if [[ ! "$version" =~ ^v ]]; then
   version="v${version}"
 fi
+
+# Map build server architecture to Guix host triplet
+map_arch_to_guix() {
+    local bs_arch="$1"
+    case "$bs_arch" in
+        x86_64-linux)
+            echo "x86_64-linux-gnu"
+            ;;
+        aarch64-linux)
+            echo "aarch64-linux-gnu"
+            ;;
+        arm-linux)
+            echo "arm-linux-gnueabihf"
+            ;;
+        x86_64-windows)
+            echo "x86_64-w64-mingw32"
+            ;;
+        x86_64-macos)
+            echo "x86_64-apple-darwin"
+            ;;
+        arm64-macos)
+            echo "arm64-apple-darwin"
+            ;;
+        *)
+            log_error "Unsupported architecture: $bs_arch"
+            exit 1
+            ;;
+    esac
+}
+
+# Generate error YAML
+generate_error_yaml() {
+    local output_file="$1"
+    local error_msg="$2"
+    local status="${3:-ftbfs}"
+    
+    cat > "$output_file" << EOF
+date: $(date -Iseconds)
+script_version: ${SCRIPT_VERSION}
+build_type: ${build_type}
+results:
+  - architecture: ${arch}
+    filename: N/A
+    hash: N/A
+    match: false
+    status: ${status}
+    error: ${error_msg}
+EOF
+}
+
+# Generate success YAML
+generate_yaml() {
+    local output_file="$1"
+    local filename="$2"
+    local hash="$3"
+    local match="$4"
+    local status="$5"
+    
+    cat > "$output_file" << EOF
+date: $(date -Iseconds)
+script_version: ${SCRIPT_VERSION}
+build_type: ${build_type}
+results:
+  - architecture: ${arch}
+    filename: ${filename}
+    hash: ${hash}
+    match: ${match}
+    status: ${status}
+EOF
+}
 
 # Dependency checks
 check_dependencies() {
@@ -339,6 +446,7 @@ build_container() {
 
     if ! ${container_cmd} build --pull --no-cache -t "$IMAGE_NAME" - < "$imagefile_path"; then
         log_error "Container build failed"
+        generate_error_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" "Container image build failed" "ftbfs"
         exit 1
     fi
 
@@ -357,6 +465,7 @@ start_container() {
 
     if ! ${container_cmd} run -d --name "$CONTAINER_NAME" --privileged "$IMAGE_NAME"; then
         log_error "Failed to start container"
+        generate_error_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" "Failed to start container daemon" "ftbfs"
         exit 1
     fi
 
@@ -375,24 +484,25 @@ prepare_bitcoin_build() {
 
     # Clean previous build artifacts
     log_info "Cleaning previous build artifacts..."
-    ${container_cmd} exec -it "$CONTAINER_NAME" bash -c "cd /bitcoin && rm -rf depends/work/ guix-build-*/ base_cache/*" || true
-    ${container_cmd} exec -it "$CONTAINER_NAME" bash -c "cd /bitcoin && make -C depends clean-all" || true
+        ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && rm -rf depends/work/ guix-build-*/ base_cache/*" || true
+        ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && make -C depends clean-all" || true
 
     # Update repository and checkout version
     log_info "Fetching latest Bitcoin Core repository..."
-    ${container_cmd} exec -it "$CONTAINER_NAME" bash -c "cd /bitcoin && git fetch --all --tags"
+        ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git fetch --all --tags"
 
     log_info "Checking out version: $version"
-    if ! ${container_cmd} exec -it "$CONTAINER_NAME" bash -c "cd /bitcoin && git checkout $version"; then
+        if ! ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git checkout $version"; then
         log_error "Failed to checkout version: $version"
         log_error "Available tags:"
         ${container_cmd} exec -it "$CONTAINER_NAME" bash -c "cd /bitcoin && git tag | grep -E '^v[0-9]' | tail -10"
+        generate_error_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" "Git checkout failed for version $version" "nosource"
         exit 1
     fi
 
     # Verify GPG signature
     log_info "Verifying GPG signature for $version..."
-    if ${container_cmd} exec -it "$CONTAINER_NAME" bash -c "cd /bitcoin && git verify-tag $version 2>/dev/null"; then
+    if ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git verify-tag $version 2>/dev/null"; then
         log_success "GPG signature verified for $version"
     else
         log_warn "GPG signature verification failed for $version"
@@ -416,12 +526,13 @@ execute_build() {
     # Execute the build (disable debug builds to save time and space)
     local build_cmd="cd /bitcoin && time BASE_CACHE='/base_cache' SOURCE_PATH='/sources' SDK_PATH='/SDKs' HOSTS='$arch' SKIP_DEBUG=1 ./contrib/guix/guix-build"
 
-    if ${container_cmd} exec -it "$CONTAINER_NAME" bash -c "$build_cmd"; then
+    if ${container_cmd} exec "$CONTAINER_NAME" bash -c "$build_cmd"; then
         local end_time=$(date +%s)
         local duration=$((end_time - start_time))
         log_success "Build completed successfully in $duration seconds"
     else
         log_error "Build failed"
+        generate_error_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" "Guix build process failed" "ftbfs"
         exit 1
     fi
 }
@@ -438,10 +549,11 @@ verify_checksums() {
     log_info "Extracting build artifacts from: $build_dir"
 
     # Check if build directory exists
-    if ! ${container_cmd} exec -it "$CONTAINER_NAME" bash -c "test -d $build_dir"; then
+    if ! ${container_cmd} exec "$CONTAINER_NAME" bash -c "test -d $build_dir"; then
         log_error "Build output directory not found: $build_dir"
         log_info "Available directories:"
         ${container_cmd} exec -it "$CONTAINER_NAME" bash -c "ls -la /bitcoin/guix-build-*/" || true
+        generate_error_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" "Build output directory not found" "ftbfs"
         echo "Exit code: 1"
         exit 1
     fi
@@ -450,13 +562,13 @@ verify_checksums() {
     echo ""
     log_success "Build artifacts produced:"
     echo ""
-    ${container_cmd} exec -it "$CONTAINER_NAME" bash -c "cd $build_dir && ls -lh *.tar.gz *.zip *.exe 2>/dev/null || ls -lh *"
+    ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd $build_dir && ls -lh *.tar.gz *.zip *.exe 2>/dev/null || ls -lh *"
 
     echo ""
     log_info "Downloading official Bitcoin Core release for comparison..."
     
     # Create directories for comparison (inside container)
-    ${container_cmd} exec -it "$CONTAINER_NAME" bash -c "mkdir -p /official /built"
+    ${container_cmd} exec "$CONTAINER_NAME" bash -c "mkdir -p /official /built"
     
     # Determine artifact name (standard release only)
     local main_artifact="bitcoin-${clean_version}-${arch}.tar.gz"
@@ -469,7 +581,7 @@ verify_checksums() {
     # Download official release inside container
     local official_url="https://bitcoincore.org/bin/bitcoin-core-${clean_version}"
     log_info "Downloading ${main_artifact} inside container..."
-    if ${container_cmd} exec -it "$CONTAINER_NAME" bash -c "curl -fsSL -o /official/${main_artifact} ${official_url}/${main_artifact}"; then
+    if ${container_cmd} exec "$CONTAINER_NAME" bash -c "curl -fsSL -o /official/${main_artifact} ${official_url}/${main_artifact}"; then
         log_success "Downloaded official release"
     else
         log_warn "Could not download official release - manual verification required"
@@ -478,7 +590,7 @@ verify_checksums() {
     
     # Copy built artifacts to /built inside container
     log_info "Organizing built artifacts inside container..."
-    ${container_cmd} exec -it "$CONTAINER_NAME" bash -c "cp $build_dir/* /built/"
+    ${container_cmd} exec "$CONTAINER_NAME" bash -c "cp $build_dir/* /built/"
     
     # Create local directories for extraction
     official_dir="$workspace/official"
@@ -493,15 +605,9 @@ verify_checksums() {
     echo ""
     log_info "Comparing checksums..."
     
-    comparison_file="${execution_dir}/COMPARISON_RESULTS.txt"
+    comparison_file="${execution_dir}/COMPARISON_RESULTS.yaml"
     match_count=0
     diff_count=0
-    
-    # Write header to comparison file
-    {
-      echo "Date: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-      echo ""
-    } > "$comparison_file"
     
     # Compare main artifact if official exists
     if [[ -f "${official_dir}/${main_artifact}" && -f "${built_dir}/${main_artifact}" ]]; then
@@ -509,13 +615,15 @@ verify_checksums() {
         official_hash=$(sha256sum "${official_dir}/${main_artifact}" | awk '{print $1}')
         
         if [[ "$built_hash" == "$official_hash" ]]; then
-            echo "${main_artifact} - ${arch} - ${built_hash} - 1 (MATCHES)" >> "$comparison_file"
+            generate_yaml "$comparison_file" "$main_artifact" "$built_hash" "true" "reproducible"
             match_count=$((match_count + 1))
+            verdict="reproducible"
             log_success "Match: ${main_artifact}"
             log_success "Hash: ${built_hash}"
         else
-            echo "${main_artifact} - ${arch} - ${built_hash} - 0 (DIFFERS)" >> "$comparison_file"
+            generate_yaml "$comparison_file" "$main_artifact" "$built_hash" "false" "not_reproducible"
             diff_count=$((diff_count + 1))
+            verdict="not_reproducible"
             log_warn "Difference: ${main_artifact}"
             log_warn "Built:    ${built_hash}"
             log_warn "Official: ${official_hash}"
@@ -524,20 +632,16 @@ verify_checksums() {
         # No official to compare - just report built hash
         if [[ -f "${built_dir}/${main_artifact}" ]]; then
             built_hash=$(sha256sum "${built_dir}/${main_artifact}" | awk '{print $1}')
-            echo "${main_artifact} - ${arch} - ${built_hash} - 0 (NO_OFFICIAL)" >> "$comparison_file"
+            generate_error_yaml "$comparison_file" "No official release available for comparison" "nosource"
             diff_count=$((diff_count + 1))
+            verdict="not_reproducible"
             log_warn "No official release to compare - manual verification required"
             log_info "Built hash: ${built_hash}"
+        else
+            generate_error_yaml "$comparison_file" "Built artifact not found" "ftbfs"
+            verdict="not_reproducible"
+            log_error "Built artifact not found: ${main_artifact}"
         fi
-    fi
-    
-    # Add header to comparison file
-    if (( diff_count == 0 && match_count > 0 )); then
-        sed -i '1s/^/BUILDS MATCH BINARIES\n/' "$comparison_file"
-        verdict="reproducible"
-    else
-        sed -i '1s/^/BUILDS DO NOT MATCH BINARIES\n/' "$comparison_file"
-        verdict="not_reproducible"
     fi
     
     # ---------- Standardized Output Format ----------
@@ -556,9 +660,22 @@ verify_checksums() {
     echo "commit:         ${version}"
     echo ""
     echo "Diff:"
-    if [[ -f "$comparison_file" ]]; then
-        grep -v "^Date:" "$comparison_file" | grep -v "^$" | head -1
-        tail -n +3 "$comparison_file" | grep -v "^$"
+    if [[ "$verdict" == "reproducible" ]]; then
+        echo "BUILDS MATCH BINARIES"
+    else
+        echo "BUILDS DO NOT MATCH BINARIES"
+    fi
+    
+    # Machine-readable format for desktop binaries
+    if [[ -f "${built_dir}/${main_artifact}" ]]; then
+        local built_hash=$(sha256sum "${built_dir}/${main_artifact}" | awk '{print $1}')
+        local match_flag="0"
+        local match_text="DOESN'T MATCH"
+        if [[ "$verdict" == "reproducible" ]]; then
+            match_flag="1"
+            match_text="MATCHES"
+        fi
+        echo "${main_artifact} - ${guix_arch} - ${built_hash} - ${match_flag} (${match_text})"
     fi
     echo ""
     echo "Revision, tag (and its signature):"
@@ -608,6 +725,10 @@ final_cleanup() {
 
 # ---------- Setup Workspace ----------
 execution_dir="$(pwd)"
+
+# Map architecture to Guix format
+guix_arch=$(map_arch_to_guix "$arch")
+
 workspace="${execution_dir}/bitcoin_core_${version}_${arch}_$$"
 mkdir -p "$workspace"
 cd "$workspace"
@@ -616,7 +737,9 @@ log_info "=============================================="
 log_info "${APP_NAME} ${version} Verification"
 log_info "=============================================="
 log_info "Script version: ${SCRIPT_VERSION}"
-log_info "Architecture: ${arch}"
+log_info "Build server architecture: ${arch}"
+log_info "Guix host triplet: ${guix_arch}"
+log_info "Build type: ${build_type}"
 log_info "Workspace: ${workspace}"
 log_info ""
 
@@ -634,7 +757,7 @@ trap "rm -f $temp_imagefile" EXIT
 create_imagefile "$temp_imagefile"
 build_container "$temp_imagefile"
 start_container
-prepare_bitcoin_build "$version" "$arch"
-execute_build "$version" "$arch"
-verify_checksums "$version" "$arch"
+prepare_bitcoin_build "$version" "$guix_arch"
+execute_build "$version" "$guix_arch"
+verify_checksums "$version" "$guix_arch"
 final_cleanup "$keep_container"
