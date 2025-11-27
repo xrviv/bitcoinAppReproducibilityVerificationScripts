@@ -1,42 +1,45 @@
-#!/bin/bash
-
-# Bitcoin Knots Reproducible Build Verification Script
-# Based on fanquake's Alpine Guix methodology (adapted from verify_bitcoincore.sh)
-# WalletScrutiny.com - Version v0.9.0
-#
-# DESCRIPTION:
-# Standalone script for verifying Bitcoin Knots releases using containerized
-# reproducible builds. Performs binary comparison between built artifacts and
-# official releases for definitive reproducibility verification.
-#
-# REQUIREMENTS:
-# - Podman installed (sudo apt install podman)
-# - Internet connection
-# - ~2GB disk space
-# - 4GB+ RAM recommended
-#
-# AUTHOR: WalletScrutiny.com
-# DATE: 2025-10-20
+#!/usr/bin/env bash
+# ==============================================================================
+# bitcoinknotsdesktop_build.sh - Bitcoin Knots Reproducible Build Verification
+# ==============================================================================
+# Version:       v1.0.2
+# Organization:  WalletScrutiny.com
+# Last Modified: 2025-11-28
+# Project:       https://github.com/bitcoinknots/bitcoin
+# ==============================================================================
 # LICENSE: MIT License
 #
-# CHANGELOG:
-# v0.9.0 (2025-10-24): Release-only verification by default, optional debug flag, machine-readable summary
-# v0.8.1 (2025-10-24): Use POSIX '.' in embedded Dockerfile for BusyBox compatibility
-# v0.8.0 (2025-10-23): Stream official downloads + build artifacts via container; force wget for Guix deps
-# v0.7.0 (2025-10-23): Fix parameter contract - use -v for app version per Luis guidelines
-# v0.6.0 (2025-10-23): Full Luis compliance - user-owned files, /tmp workspace, no host git requirement
-# v0.5.0 (2025-10-20): Fix multi-target podman cp failure - handle spaces in paths, flatten artifacts
-# v0.4.0 (2025-10-17): Default builds all Linux + Windows targets; version normalization (v prefix optional)
-# v0.3.0 (2025-10-16): Luis guideline compliance - proper exit codes (0=reproducible, 1=not, 2=manual)
-# v0.2.0 (2025-10-16): Binary comparison method, GitHub redirect fix
-# v0.1.1: Initial Alpine Guix implementation
+# TECHNICAL DISCLAIMER:
+# This script is provided for technical analysis and reproducible build verification purposes only.
+# No warranty is provided regarding the security, functionality, or fitness for any particular purpose.
+# Users assume all risks associated with running this script and analyzing the software.
+# This script performs automated builds and binary comparisons - review all operations before execution.
 #
-# LUIS GUIDELINE COMPLIANCE:
-# This script fully complies with WalletScrutiny script generation guidelines:
-# - Uses -v for app version (without v prefix) as required
-# - Uses --script-version for showing script version (not -v)
-# - Supports -t for type (not applicable for Bitcoin Knots, accepts but ignores)
-# - Does not support -a (not applicable for desktop builds)
+# LEGAL DISCLAIMER:
+# This script is an independent verification tool and is not affiliated with, endorsed by,
+# or officially connected to Bitcoin Knots or its developers. All trademarks belong to their
+# respective owners.
+#
+# SCRIPT SUMMARY:
+# - Downloads official Bitcoin Knots release artifacts from GitHub releases
+# - Clones source code repository and checks out the exact release tag
+# - Performs containerized reproducible build using Guix build system
+# - Compares built artifacts against official releases using binary analysis
+# - Generates COMPARISON_RESULTS.yaml for build server automation
+# - Documents differences and generates detailed reproducibility assessment report
+#
+# ==============================================================================
+# BUILD SERVER AUTOMATION (BSA) COMPLIANCE:
+# This script complies with WalletScrutiny build server automation requirements:
+# - Uses --version, --arch, --type parameters (BSA standard)
+# - Single architecture/type per execution (no multi-target builds)
+# - Generates COMPARISON_RESULTS.yaml in flat structure format
+# - Outputs standardized verification summary between ===== markers
+# - Returns exit code 0 for reproducible, 1 for not reproducible
+# - Fully containerized (Docker/Podman) with minimal host dependencies
+# ==============================================================================
+#
+# CHANGELOG: See ~/work/ws-notes/script-notes/desktop/bitcoinknots/changelog.md
 #
 # CREDITS:
 # This script's containerized approach is inspired by Michael Ford's (fanquake)
@@ -50,8 +53,11 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v0.9.0"
-SCRIPT_NAME="verify_bitcoinknots.sh"
+SCRIPT_VERSION="v1.0.2"
+SCRIPT_NAME="bitcoinknotsdesktop_build.sh"
+APP_ID="bitcoinknots"
+APP_NAME="Bitcoin Knots"
+REPO_URL="https://github.com/bitcoinknots/bitcoin"
 DEFAULT_VERSION="29.2.knots20251010"
 CONTAINER_NAME="ws_bitcoinknots_verifier"
 IMAGE_NAME="ws_bitcoinknots_verifier"
@@ -62,6 +68,7 @@ OFFICIAL_CHECKSUMS_FILE=""
 COPY_SUCCESS="false"
 INCLUDE_DEBUG_ARTIFACTS="false"
 OUTPUT_TARGET_LABEL=""
+CONTAINER_CMD=""  # Will be set to 'docker' or 'podman' by detect_container_runtime()
 declare -a SELECTED_ARTIFACTS=()
 declare -a SKIPPED_OPTIONAL_ARTIFACTS=()
 
@@ -72,15 +79,77 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Version normalization function
-normalize_version() {
-    local ver="$1"
-    # Add 'v' prefix if not present
-    if [[ ! "$ver" =~ ^v ]]; then
-        echo "v${ver}"
-    else
-        echo "$ver"
-    fi
+# Map build server architecture to Guix host triplet
+map_arch_to_guix() {
+    local bs_arch="$1"
+    case "$bs_arch" in
+        x86_64-linux)
+            echo "x86_64-linux-gnu"
+            ;;
+        aarch64-linux)
+            echo "aarch64-linux-gnu"
+            ;;
+        arm-linux)
+            echo "arm-linux-gnueabihf"
+            ;;
+        x86_64-windows)
+            echo "x86_64-w64-mingw32"
+            ;;
+        powerpc64-linux)
+            echo "powerpc64-linux-gnu"
+            ;;
+        powerpc64le-linux)
+            echo "powerpc64le-linux-gnu"
+            ;;
+        riscv64-linux)
+            echo "riscv64-linux-gnu"
+            ;;
+        *)
+            log_error "Unsupported architecture: $bs_arch"
+            exit 1
+            ;;
+    esac
+}
+
+# Generate error YAML
+generate_error_yaml() {
+    local output_file="$1"
+    local error_msg="$2"
+    local status="${3:-ftbfs}"
+    
+    cat > "$output_file" << EOF
+date: $(date -Iseconds)
+script_version: ${SCRIPT_VERSION}
+build_type: ${build_type}
+results:
+  - architecture: ${arch}
+    filename: N/A
+    hash: N/A
+    match: false
+    status: ${status}
+    error: ${error_msg}
+EOF
+}
+
+# Generate success YAML
+generate_yaml() {
+    local output_file="$1"
+    local filename="$2"
+    local hash="$3"
+    local match="$4"
+    local status="$5"
+    
+    cat > "$output_file" << EOF
+date: $(date -Iseconds)
+script_version: ${SCRIPT_VERSION}
+build_type: ${build_type}
+results:
+  - filename: ${filename}
+    architecture: ${arch}
+    hash: ${hash}
+    match: ${match}
+    status: ${status}
+EOF
 }
 
 # Logging functions
@@ -263,58 +332,46 @@ write_summary_file() {
 # Help function
 show_help() {
     cat << EOF
-$SCRIPT_NAME $SCRIPT_VERSION - Bitcoin Knots Reproducible Build Verification
+Bitcoin Knots Reproducible Build Verification Script
 
-USAGE:
-    $SCRIPT_NAME [OPTIONS] [VERSION]
+Usage:
+  $(basename "$0") --version <version> --arch <arch> --type <type>
 
-DESCRIPTION:
-    Verifies Bitcoin Knots releases using fanquake's Alpine Guix methodology.
-    Builds Bitcoin Knots from source in a containerized environment and compares
-    checksums against official releases.
+Required Parameters:
+  --version <version>    Bitcoin Knots version to verify (e.g., 29.2.knots20251010)
+  --arch <arch>          Target architecture
+                         Supported: x86_64-linux, aarch64-linux, arm-linux,
+                                   x86_64-windows, powerpc64-linux, powerpc64le-linux,
+                                   riscv64-linux
+  --type <type>          Build type (tarball for linux, zip for windows)
 
-OPTIONS:
-    -h, --help              Show this help message
-    --script-version        Show script version
-    -v VERSION              Bitcoin Knots version to verify (without v prefix)
-                           Examples: 29.2.knots20251010, 29.1.knots20250903
-    -t TYPE                 Wallet type (not applicable, ignored)
-    -c, --clean             Clean up containers and images before build
-    --target HOST           Build target (default: all Linux + Windows targets)
-                           Specify single target or space-separated list
-    --no-verify             Skip checksum verification against official release
-    --keep-container        Keep container running after build
-    --list-targets          Show available build targets
-    --no-copy               Skip copying build artifacts to host (container only)
-    --with-debug            Include debug/codesigning/unsigned artifacts in verification
+Optional Parameters:
 
-EXAMPLES:
-    $SCRIPT_NAME -v 29.2.knots20251010                           # Build all targets
-    $SCRIPT_NAME -v 29.2.knots20251010 --clean                   # Clean up and build
-    $SCRIPT_NAME -v 29.2.knots20251010 --target x86_64-linux-gnu # Single Linux target
-    $SCRIPT_NAME -v 29.1.knots20250903 --target x86_64-w64-mingw32 # Single Windows target
-    $SCRIPT_NAME --list-targets                                  # Show all available build targets
-    $SCRIPT_NAME --script-version                                # Show script version
+Flags:
+  --help                 Show this help message
+  --clean                Clean up containers and images before build
+  --keep-container       Keep container running after build
+  --list-targets         Show available build targets
 
-REQUIREMENTS:
-    - Podman installed and working
-    - Internet connection for source download
-    - ~2GB disk space for build
-    - 30+ minutes build time
+Examples:
+  $(basename "$0") --version 29.2.knots20251010 --arch x86_64-linux --type tarball
+  $(basename "$0") --version 29.2.knots20251010 --arch aarch64-linux --type tarball
+  $(basename "$0") --version 29.2.knots20251010 --arch x86_64-windows --type zip
+  $(basename "$0") --list-targets
 
-CONTAINER DETAILS:
-    Base: Alpine Linux 3.22
-    Guix: v1.4.0 binary installation
-    Build users: 32 parallel builders
-    Auto-cleanup: Containers and images removed after verification
+Requirements:
+  - Docker or Podman installed
+  - Internet connection for downloading sources and official releases
+  - Approximately 2GB disk space for build
+  - 30-60 minutes build time
 
-CREDITS:
-    This script's containerized approach is inspired by Michael Ford's (fanquake)
-    excellent work on reproducible Bitcoin Core builds. Bitcoin Knots is a
-    Bitcoin Core fork that uses the same Guix-based reproducible build system.
+Output:
+  - Exit code 0: Binaries are reproducible
+  - Exit code 1: Binaries differ or verification failed
+  - COMPARISON_RESULTS.yaml: Machine-readable comparison results
+  - Standardized results format between ===== Begin/End Results =====
 
-LICENSE:
-    MIT License
+Version: ${SCRIPT_VERSION}
 
 EOF
 }
@@ -404,18 +461,32 @@ show_version() {
     echo "WalletScrutiny.com Bitcoin Knots verification tool"
 }
 
+# Detect container runtime (Podman primary, Docker fallback)
+detect_container_runtime() {
+    if command -v podman &> /dev/null && podman info &> /dev/null 2>&1; then
+        echo "podman"
+    elif command -v docker &> /dev/null && docker info &> /dev/null 2>&1; then
+        echo "docker"
+    else
+        log_error "Neither Podman nor Docker found or working"
+        log_error "Install one of:"
+        log_error "  - Podman (preferred): sudo apt install podman"
+        log_error "  - Docker (fallback): https://docs.docker.com/engine/install/"
+        exit 1
+    fi
+}
+
 # Dependency checks
 check_dependencies() {
     log_info "Checking dependencies..."
 
-    if ! command -v podman &> /dev/null; then
-        echo "Error: Podman is required. Install with: sudo apt install podman"
-        exit 1
-    fi
+    # Detect and set container runtime
+    CONTAINER_CMD=$(detect_container_runtime)
+    log_success "Container runtime detected: ${CONTAINER_CMD}"
 
-    # Test podman functionality
-    if ! podman --version &> /dev/null; then
-        echo "Error: Podman is not working properly"
+    # Test container functionality
+    if ! ${CONTAINER_CMD} --version &> /dev/null; then
+        log_error "${CONTAINER_CMD} is not working properly"
         exit 1
     fi
 
@@ -427,15 +498,15 @@ cleanup_containers() {
     log_info "Cleaning up existing containers and images..."
 
     # Remove container if exists
-    if podman container exists "$CONTAINER_NAME" 2>/dev/null; then
+    if ${CONTAINER_CMD} container exists "$CONTAINER_NAME" 2>/dev/null; then
         log_info "Removing existing container: $CONTAINER_NAME"
-        podman rm -f "$CONTAINER_NAME" || true
+        ${CONTAINER_CMD} rm -f "$CONTAINER_NAME" || true
     fi
 
     # Remove image if exists
-    if podman image exists "$IMAGE_NAME" 2>/dev/null; then
+    if ${CONTAINER_CMD} image exists "$IMAGE_NAME" 2>/dev/null; then
         log_info "Removing existing image: $IMAGE_NAME"
-        podman rmi -f "$IMAGE_NAME" || true
+        ${CONTAINER_CMD} rmi -f "$IMAGE_NAME" || true
     fi
 
     log_success "Cleanup completed"
@@ -529,7 +600,7 @@ build_container() {
     log_info "Building Bitcoin Knots verification container..."
     log_info "This may take 5-15 minutes depending on network speed..."
 
-    if ! podman build --pull --no-cache -t "$IMAGE_NAME" - < "$imagefile_path"; then
+    if ! ${CONTAINER_CMD} build --pull --no-cache -t "$IMAGE_NAME" - < "$imagefile_path"; then
         log_error "Container build failed"
         exit 1
     fi
@@ -542,14 +613,14 @@ start_container() {
     log_info "Starting container daemon: $CONTAINER_NAME"
 
     # Remove any existing container with the same name first
-    if podman container exists "$CONTAINER_NAME" 2>/dev/null; then
+    if ${CONTAINER_CMD} container exists "$CONTAINER_NAME" 2>/dev/null; then
         log_info "Removing existing container: $CONTAINER_NAME"
-        podman rm -f "$CONTAINER_NAME" || true
+        ${CONTAINER_CMD} rm -f "$CONTAINER_NAME" || true
     fi
 
     # Run container as root (required for guix-daemon and mounts)
     # Files will be owned by root, we'll handle ownership in copy function
-    if ! podman run -d --name "$CONTAINER_NAME" --privileged \
+    if ! ${CONTAINER_CMD} run -d --name "$CONTAINER_NAME" --privileged \
       "$IMAGE_NAME"; then
         log_error "Failed to start container"
         exit 1
@@ -570,24 +641,24 @@ prepare_bitcoin_build() {
 
     # Clean previous build artifacts
     log_info "Cleaning previous build artifacts..."
-    podman exec "$CONTAINER_NAME" bash -c "cd /bitcoin && rm -rf depends/work/ guix-build-*/ base_cache/*" || true
-    podman exec "$CONTAINER_NAME" bash -c "cd /bitcoin && make -C depends clean-all" || true
+    ${CONTAINER_CMD} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && rm -rf depends/work/ guix-build-*/ base_cache/*" || true
+    ${CONTAINER_CMD} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && make -C depends clean-all" || true
 
     # Update repository and checkout version
     log_info "Fetching latest Bitcoin Knots repository..."
-    podman exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git fetch --all --tags"
+    ${CONTAINER_CMD} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git fetch --all --tags"
 
     log_info "Checking out version: $version"
-    if ! podman exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git checkout $version"; then
+    if ! ${CONTAINER_CMD} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git checkout $version"; then
         log_error "Failed to checkout version: $version"
         log_error "Available tags:"
-        podman exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git tag | grep -E 'knots' | tail -10"
+        ${CONTAINER_CMD} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git tag | grep -E 'knots' | tail -10"
         exit 1
     fi
 
     # Verify GPG signature
     log_info "Verifying GPG signature for $version..."
-    if podman exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git verify-tag $version 2>/dev/null"; then
+    if ${CONTAINER_CMD} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git verify-tag $version 2>/dev/null"; then
         log_success "GPG signature verified for $version"
     else
         log_warning "GPG signature verification failed for $version"
@@ -611,7 +682,7 @@ execute_build() {
     # Execute the build
     local build_cmd="cd /bitcoin && time FORCE_USE_WGET=1 BASE_CACHE='/base_cache' SOURCE_PATH='/sources' SDK_PATH='/SDKs' HOSTS='$target' ./contrib/guix/guix-build"
 
-    if podman exec "$CONTAINER_NAME" bash -c "$build_cmd"; then
+    if ${CONTAINER_CMD} exec "$CONTAINER_NAME" bash -c "$build_cmd"; then
         local end_time=$(date +%s)
         local duration=$((end_time - start_time))
         log_success "Build completed successfully in $duration seconds"
@@ -1208,10 +1279,10 @@ final_cleanup() {
         log_warning "Artifact copy failed, keeping container for manual extraction"
         log_info "Container: $CONTAINER_NAME"
         log_info "To extract artifacts manually:"
-        log_info "  podman exec $CONTAINER_NAME bash"
+        log_info "  ${CONTAINER_CMD} exec $CONTAINER_NAME bash"
         log_info "  # Inside container, artifacts are in /bitcoin/guix-build-*/output/"
         log_info "To clean up later:"
-        log_info "  podman rm -f $CONTAINER_NAME && podman rmi -f $IMAGE_NAME"
+        log_info "  ${CONTAINER_CMD} rm -f $CONTAINER_NAME && ${CONTAINER_CMD} rmi -f $IMAGE_NAME"
         return 0
     fi
 
@@ -1221,20 +1292,193 @@ final_cleanup() {
         log_success "Cleanup completed"
     else
         log_info "Container kept running as requested: $CONTAINER_NAME"
-        log_info "To connect: podman exec $CONTAINER_NAME bash"
-        log_info "To clean up later: podman rm -f $CONTAINER_NAME && podman rmi -f $IMAGE_NAME"
+        log_info "To connect: ${CONTAINER_CMD} exec $CONTAINER_NAME bash"
+        log_info "To clean up later: ${CONTAINER_CMD} rm -f $CONTAINER_NAME && ${CONTAINER_CMD} rmi -f $IMAGE_NAME"
+    fi
+}
+
+# Extract and verify checksums (BSA-compliant version)
+verify_checksums() {
+    local version="$1"
+    local guix_arch="$2"
+    local build_type="$3"
+    
+    # Clean version string for directory names (remove 'v' prefix)
+    local clean_version="${version#v}"
+    local build_dir="/bitcoin/guix-build-$clean_version/output/$guix_arch"
+    
+    log_info "Extracting build artifacts from: $build_dir"
+    
+    # Check if build directory exists
+    if ! ${CONTAINER_CMD} exec "$CONTAINER_NAME" bash -c "test -d $build_dir"; then
+        log_error "Build output directory not found: $build_dir"
+        log_info "Available directories:"
+        ${CONTAINER_CMD} exec "$CONTAINER_NAME" bash -c "ls -la /bitcoin/guix-build-*/" || true
+        generate_error_yaml "${PWD}/COMPARISON_RESULTS.yaml" "Build output directory not found" "ftbfs"
+        echo "Exit code: 1"
+        exit 1
+    fi
+    
+    # Enhanced artifact listing with file sizes
+    echo ""
+    log_success "Build artifacts produced:"
+    echo ""
+    ${CONTAINER_CMD} exec "$CONTAINER_NAME" bash -c "cd $build_dir && ls -lh *.tar.gz *.zip *.exe 2>/dev/null || ls -lh *"
+    
+    echo ""
+    log_info "Downloading official Bitcoin Knots release for comparison..."
+    
+    # Create directories for comparison (inside container)
+    ${CONTAINER_CMD} exec "$CONTAINER_NAME" bash -c "mkdir -p /official /built"
+    
+    # Determine artifact name (standard release only)
+    local main_artifact="bitcoin-${clean_version}-${guix_arch}.tar.gz"
+    if [[ "$guix_arch" == "x86_64-w64-mingw32" ]]; then
+        # Bitcoin Knots uses -win64-pgpverifiable.zip for Windows releases
+        main_artifact="bitcoin-${clean_version}-win64-pgpverifiable.zip"
+    fi
+    
+    # Download official release inside container from GitHub
+    local official_url="https://github.com/bitcoinknots/bitcoin/releases/download/${version}"
+    log_info "Downloading ${main_artifact} inside container..."
+    if ${CONTAINER_CMD} exec "$CONTAINER_NAME" bash -c "curl -fsSL -o /official/${main_artifact} ${official_url}/${main_artifact}"; then
+        log_success "Downloaded official release"
+    else
+        log_warn "Could not download official release - manual verification required"
+        log_info "URL attempted: ${official_url}/${main_artifact}"
+    fi
+    
+    # Copy built artifacts to /built inside container
+    log_info "Organizing built artifacts inside container..."
+    ${CONTAINER_CMD} exec "$CONTAINER_NAME" bash -c "cp $build_dir/* /built/"
+    
+    # Create local directories for extraction
+    local official_dir="$PWD/official"
+    local built_dir="$PWD/built"
+    mkdir -p "$official_dir" "$built_dir"
+    
+    # Copy artifacts from container to host for final comparison
+    ${CONTAINER_CMD} cp "$CONTAINER_NAME:/official/." "$official_dir/" 2>/dev/null || true
+    ${CONTAINER_CMD} cp "$CONTAINER_NAME:/built/." "$built_dir/"
+    
+    # Generate checksums and compare
+    echo ""
+    log_info "Comparing checksums..."
+    
+    local comparison_file="${PWD}/COMPARISON_RESULTS.yaml"
+    local match_count=0
+    local diff_count=0
+    local verdict=""
+    
+    # Compare main artifact if official exists
+    if [[ -f "${official_dir}/${main_artifact}" && -f "${built_dir}/${main_artifact}" ]]; then
+        local built_hash=$(sha256sum "${built_dir}/${main_artifact}" | awk '{print $1}')
+        local official_hash=$(sha256sum "${official_dir}/${main_artifact}" | awk '{print $1}')
+        
+        if [[ "$built_hash" == "$official_hash" ]]; then
+            generate_yaml "$comparison_file" "$main_artifact" "$built_hash" "true" "reproducible"
+            match_count=$((match_count + 1))
+            verdict="reproducible"
+            log_success "Match: ${main_artifact}"
+            log_success "Hash: ${built_hash}"
+        else
+            generate_yaml "$comparison_file" "$main_artifact" "$built_hash" "false" "not_reproducible"
+            diff_count=$((diff_count + 1))
+            verdict="not_reproducible"
+            log_warn "Difference: ${main_artifact}"
+            log_warn "Built:    ${built_hash}"
+            log_warn "Official: ${official_hash}"
+        fi
+    else
+        # No official to compare - just report built hash
+        if [[ -f "${built_dir}/${main_artifact}" ]]; then
+            local built_hash=$(sha256sum "${built_dir}/${main_artifact}" | awk '{print $1}')
+            generate_error_yaml "$comparison_file" "No official release available for comparison" "nosource"
+            diff_count=$((diff_count + 1))
+            verdict="not_reproducible"
+            log_warn "No official release to compare - manual verification required"
+            log_info "Built hash: ${built_hash}"
+        else
+            generate_error_yaml "$comparison_file" "Built artifact not found" "ftbfs"
+            verdict="not_reproducible"
+            log_error "Built artifact not found: ${main_artifact}"
+        fi
+    fi
+    
+    # ---------- Standardized Output Format ----------
+    echo ""
+    echo "===== Begin Results ====="
+    echo "appId:          ${APP_ID}"
+    echo "signer:         N/A"
+    echo "apkVersionName: ${clean_version}"
+    echo "apkVersionCode: N/A"
+    echo "verdict:        ${verdict}"
+    if [[ -f "${official_dir}/${main_artifact}" ]]; then
+        echo "appHash:        $(sha256sum "${official_dir}/${main_artifact}" | awk '{print $1}')"
+    else
+        echo "appHash:        N/A (no official release)"
+    fi
+    echo "commit:         ${version}"
+    echo ""
+    echo "Diff:"
+    if [[ "$verdict" == "reproducible" ]]; then
+        echo "BUILDS MATCH BINARIES"
+    else
+        echo "BUILDS DO NOT MATCH BINARIES"
+    fi
+    
+    # Machine-readable format for desktop binaries
+    if [[ -f "${built_dir}/${main_artifact}" ]]; then
+        local built_hash=$(sha256sum "${built_dir}/${main_artifact}" | awk '{print $1}')
+        local match_flag="0"
+        local match_text="DOESN'T MATCH"
+        if [[ "$verdict" == "reproducible" ]]; then
+            match_flag="1"
+            match_text="MATCHES"
+        fi
+        echo "${main_artifact} - ${guix_arch} - ${built_hash} - ${match_flag} (${match_text})"
+    fi
+    echo ""
+    echo "Revision, tag (and its signature):"
+    echo "Git tag: ${version}"
+    echo ""
+    echo "===== End Results ====="
+    echo ""
+    
+    # ---------- Summary ----------
+    log_info "=============================================="
+    log_info "Verification Summary"
+    log_info "=============================================="
+    log_info "Version: ${clean_version}"
+    log_info "Architecture: ${guix_arch}"
+    log_info "Matches: ${match_count}"
+    log_info "Differences: ${diff_count}"
+    
+    if [[ "$verdict" == "reproducible" ]]; then
+        log_success "Verdict: REPRODUCIBLE"
+        log_info "Build server output: ${comparison_file}"
+        echo "Exit code: 0"
+        exit 0
+    else
+        log_warn "Verdict: NOT REPRODUCIBLE"
+        log_info "Build server output: ${comparison_file}"
+        log_info "Official checksums: https://github.com/bitcoinknots/bitcoin/releases/download/${version}/SHA256SUMS"
+        echo "Exit code: 1"
+        exit 1
     fi
 }
 
 # Main execution function
 main() {
-    local version="$DEFAULT_VERSION"
-    local target="x86_64-linux-gnu aarch64-linux-gnu arm-linux-gnueabihf powerpc64-linux-gnu powerpc64le-linux-gnu riscv64-linux-gnu x86_64-w64-mingw32"
+    # Display script version first
+    log_info "Script version: ${SCRIPT_VERSION}"
+    echo ""
+    
+    local version=""
+    local arch=""
+    local build_type=""
     local clean_flag="false"
-    local verify_flag="true"
     local keep_container="false"
-    local copy_flag="true"
-    local include_debug="false"
 
     # Parse command line arguments
     while [[ $# -gt 0 ]]; do
@@ -1243,46 +1487,28 @@ main() {
                 show_help
                 exit 0
                 ;;
-            --script-version)
-                show_version
-                exit 0
-                ;;
-            -v)
+            --version)
                 version="$2"
                 shift 2
                 ;;
-            -t)
-                # Type parameter (not applicable for Bitcoin Knots, but accepted for Luis compliance)
-                log_warning "Type parameter (-t) not applicable for Bitcoin Knots, ignoring"
+            --arch)
+                arch="$2"
+                shift 2
+                ;;
+            --type)
+                build_type="$2"
                 shift 2
                 ;;
             --list-targets)
                 show_targets
                 exit 0
                 ;;
-            -c|--clean)
+            --clean)
                 clean_flag="true"
-                shift
-                ;;
-            --target)
-                target="$2"
-                shift 2
-                ;;
-            --no-verify)
-                verify_flag="false"
                 shift
                 ;;
             --keep-container)
                 keep_container="true"
-                shift
-                ;;
-            --no-copy)
-                copy_flag="false"
-                shift
-                ;;
-            --with-debug)
-                include_debug="true"
-                INCLUDE_DEBUG_ARTIFACTS="true"
                 shift
                 ;;
             -*)
@@ -1292,22 +1518,68 @@ main() {
                 ;;
             *)
                 log_error "Unexpected positional argument: $1"
-                log_error "Use -v VERSION to specify version"
                 show_help
                 exit 1
                 ;;
         esac
     done
 
-    # Normalize version (add 'v' prefix if missing)
-    version=$(normalize_version "$version")
+    # Validate required parameters
+    if [[ -z "$version" ]]; then
+        log_error "Missing required parameter: --version"
+        show_help
+        exit 1
+    fi
+
+    if [[ -z "$arch" ]]; then
+        log_error "Missing required parameter: --arch"
+        show_help
+        exit 1
+    fi
+
+    if [[ -z "$build_type" ]]; then
+        log_error "Missing required parameter: --type"
+        show_help
+        exit 1
+    fi
+
+    # Validate build type per arch
+    case "$arch" in
+        x86_64-windows)
+            if [[ "$build_type" != "zip" ]]; then
+                log_error "Unsupported type for ${arch}: ${build_type}. Use --type zip"
+                exit 1
+            fi
+            ;;
+        x86_64-linux|aarch64-linux|arm-linux|powerpc64-linux|powerpc64le-linux|riscv64-linux)
+            if [[ "$build_type" != "tarball" ]]; then
+                log_error "Unsupported type for ${arch}: ${build_type}. Use --type tarball"
+                exit 1
+            fi
+            ;;
+        *)
+            log_error "Unsupported architecture/type combo: ${arch}/${build_type}"
+            exit 1
+            ;;
+    esac
+
+    # Add 'v' prefix if not present (Bitcoin Knots uses v-prefixed tags)
+    if [[ ! "$version" =~ ^v ]]; then
+        version="v${version}"
+    fi
+
+    # Map architecture to Guix format
+    local guix_arch=$(map_arch_to_guix "$arch")
 
     # Display configuration
     echo ""
-    log_info "Bitcoin Knots Reproducible Build Verification"
-    log_info "Version: $version"
-    log_info "Target: $target"
-    log_info "Verify checksums: $verify_flag"
+    log_info "=============================================="
+    log_info "${APP_NAME} ${version} Verification"
+    log_info "=============================================="
+    log_info "Script version: ${SCRIPT_VERSION}"
+    log_info "Build server architecture: ${arch}"
+    log_info "Guix host triplet: ${guix_arch}"
+    log_info "Build type: ${build_type}"
     echo ""
 
     # Main execution flow
@@ -1324,43 +1596,9 @@ main() {
     create_imagefile "$temp_imagefile"
     build_container "$temp_imagefile"
     start_container
-    prepare_bitcoin_build "$version" "$target"
-    execute_build "$version" "$target"
-    
-    # Generate checksums in container
-    generate_container_checksums "$version" "$target" || true
-    
-    # Copy artifacts to host BEFORE any cleanup
-    copy_artifacts_to_host "$version" "$target" "$copy_flag" || true
-
-    if [[ "$COPY_SUCCESS" == "true" ]]; then
-        select_artifacts_for_verification "$OUTPUT_DIR" "$include_debug" || true
-    else
-        SELECTED_ARTIFACTS=()
-        SKIPPED_OPTIONAL_ARTIFACTS=()
-    fi
-
-    # Download and compare with official artifacts (NEW PRIMARY METHOD)
-    local verification_result=2  # Default: no comparison performed
-
-    if [[ "$verify_flag" == "true" ]] && [[ "$COPY_SUCCESS" == "true" ]]; then
-        if download_official_artifacts "$version" "$OUTPUT_DIR"; then
-            compare_artifacts_binary "$OUTPUT_DIR" "$version"
-            verification_result=$?
-        else
-            log_warning "Failed to download official artifacts for binary comparison"
-            # Fallback to checksum-only verification
-            download_official_checksums "$version" || true
-            verification_result=2  # No binary comparison available
-        fi
-    fi
-
-    # Print verification summary
-    print_verification_summary "$version" "$target" || true
-
-    if [[ "$COPY_SUCCESS" == "true" ]]; then
-        write_summary_file "$version" "$target" "$verification_result" || true
-    fi
+    prepare_bitcoin_build "$version" "$guix_arch"
+    execute_build "$version" "$guix_arch"
+    verify_checksums "$version" "$guix_arch" "$build_type"
     
     # Print standardized WalletScrutiny results format
     # Get commit hash from container if available
@@ -1393,12 +1631,10 @@ main() {
     elif [[ $verification_result -eq 0 ]]; then
         log_success "Bitcoin Knots verification completed: REPRODUCIBLE"
         exit 0
-    elif [[ $verification_result -eq 1 ]]; then
+    else
+        # Any non-zero result (including manual verification) is treated as not reproducible
         log_error "Bitcoin Knots verification completed: NOT REPRODUCIBLE"
         exit 1
-    else
-        log_warning "Bitcoin Knots verification completed: MANUAL VERIFICATION REQUIRED"
-        exit 2
     fi
 }
 
