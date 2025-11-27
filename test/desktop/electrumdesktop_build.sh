@@ -2,9 +2,9 @@
 # ==============================================================================
 # electrumdesktop_build.sh - Electrum Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.7.1
+# Version:       v0.9.2
 # Organization:  WalletScrutiny.com
-# Last Modified: 2025-11-06
+# Last Modified: 2025-11-26
 # Project:       https://github.com/spesmilo/electrum
 # ==============================================================================
 # LICENSE: MIT License
@@ -27,8 +27,11 @@
 # - Performs containerized reproducible build using embedded Dockerfile (Wine-based)
 # - Strips Authenticode signatures from both official and built binaries
 # - Compares stripped binaries using binary diff analysis
-# - Generates COMPARISON_RESULTS.txt for build server automation
+# - Generates COMPARISON_RESULTS.yaml for build server automation
 # - Documents differences and generates detailed reproducibility assessment
+#
+# NOTE: For Windows builds, Electrum's make_win.sh always produces all 3 .exe types;
+#       the script filters which one to download/verify based on --type parameter.
 
 set -euo pipefail
 
@@ -45,7 +48,7 @@ INFO_ICON="[INFO]"
 
 APP_NAME="Electrum Desktop"
 APP_ID="org.electrum.electrum"
-SCRIPT_VERSION="v0.7.1"
+SCRIPT_VERSION="v0.9.2"
 REPO_URL="https://github.com/spesmilo/electrum"
 
 # ---------- Logging Functions ----------
@@ -93,7 +96,7 @@ Requirements:
 Output:
   - Exit code 0: Binaries are reproducible
   - Exit code 1: Binaries differ or verification failed
-  - COMPARISON_RESULTS.txt: Machine-readable comparison results
+  - COMPARISON_RESULTS.yaml: Machine-readable comparison results
   - Standardized results format between ===== Begin/End Results =====
 
 Version: ${SCRIPT_VERSION}
@@ -627,15 +630,8 @@ fi
 log_info "Comparing binaries..."
 match_count=0
 diff_count=0
-comparison_file="${execution_dir}/COMPARISON_RESULTS.txt"
 
-# Write to comparison file
-{
-  echo "Date: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-  echo ""
-} > "$comparison_file"
-
-# Compare files and append to comparison file
+# Compare files (results will be written to YAML)
 for file in "${official_files[@]}"; do
   built_file="$built_dir/$file"
   official_file="$stripped_official_dir/$file"
@@ -645,27 +641,78 @@ for file in "${official_files[@]}"; do
     continue
   fi
 
-  built_hash=$(sha256sum "$built_file" | awk '{print $1}')
-
   if diff "$built_file" "$official_file" >/dev/null 2>&1; then
-    echo "$file - $arch - $built_hash - 1 (MATCHES)" >> "$comparison_file"
     match_count=$((match_count + 1))
     log_success "Match: ${file}"
   else
-    echo "$file - $arch - $built_hash - 0 (DIFFERS)" >> "$comparison_file"
     diff_count=$((diff_count + 1))
     log_warn "Difference: ${file}"
   fi
 done
 
-# Add header to comparison file
+# Determine verdict
 if (( diff_count == 0 && match_count > 0 )); then
-  sed -i '1s/^/BUILDS MATCH BINARIES\n/' "$comparison_file"
   verdict="reproducible"
 else
-  sed -i '1s/^/BUILDS DO NOT MATCH BINARIES\n/' "$comparison_file"
   verdict="not_reproducible"
 fi
+
+# ---------- Generate YAML Comparison Results ----------
+generate_comparison_yaml() {
+  local yaml_file="${execution_dir}/COMPARISON_RESULTS.yaml"
+
+  log_info "Generating COMPARISON_RESULTS.yaml..."
+
+  # Write YAML header with metadata
+  cat > "$yaml_file" <<EOF
+date: $(date -u '+%Y-%m-%dT%H:%M:%S%z')
+script_version: ${SCRIPT_VERSION}
+build_type: ${build_type:-null}
+results:
+EOF
+
+  # Generate one results entry per file (architecture + filename at the same level)
+  for file in "${official_files[@]}"; do
+    local built_file="$built_dir/$file"
+    local official_file="$stripped_official_dir/$file"
+
+    # Skip if files don't exist (same logic as TXT generation)
+    if [[ ! -f "$built_file" ]] || [[ ! -f "$official_file" ]]; then
+      continue
+    fi
+
+    # Calculate hash
+    local built_hash
+    built_hash=$(sha256sum "$built_file" | awk '{print $1}')
+
+    # Determine match status
+    local match_value
+    local status_value
+    if diff "$built_file" "$official_file" >/dev/null 2>&1; then
+      match_value="true"
+      status_value="reproducible"
+    else
+      match_value="false"
+      status_value="not_reproducible"
+    fi
+
+    # Append YAML file entry (directly under architecture)
+    cat >> "$yaml_file" <<EOF
+  - architecture: ${arch}
+    filename: ${file}
+    hash: ${built_hash}
+    match: ${match_value}
+    status: ${status_value}
+EOF
+  done
+
+  log_success "COMPARISON_RESULTS.yaml generated: ${yaml_file}"
+}
+
+# Generate YAML comparison results (build server will fallback to TXT for legacy scripts)
+generate_comparison_yaml
+
+yaml_file="${execution_dir}/COMPARISON_RESULTS.yaml"
 
 # ---------- Standardized Output Format ----------
 echo ""
@@ -679,11 +726,25 @@ echo "appHash:        $(sha256sum "$official_dir/${official_files[0]}" | awk '{p
 echo "commit:         N/A"
 echo ""
 echo "Diff:"
-# Read and display comparison results
-if [[ -f "$comparison_file" ]]; then
-  grep -v "^Date:" "$comparison_file" | grep -v "^$" | head -1
-  tail -n +3 "$comparison_file" | grep -v "^$"
+# Read and display comparison results from YAML
+if [[ "$verdict" == "reproducible" ]]; then
+  echo "BUILDS MATCH BINARIES"
+else
+  echo "BUILDS DO NOT MATCH BINARIES"
 fi
+# Display results from comparison loop
+for file in "${official_files[@]}"; do
+  built_file="$built_dir/$file"
+  official_file="$stripped_official_dir/$file"
+  if [[ -f "$built_file" ]] && [[ -f "$official_file" ]]; then
+    built_hash=$(sha256sum "$built_file" | awk '{print $1}')
+    if diff "$built_file" "$official_file" >/dev/null 2>&1; then
+      echo "$file - $arch - $built_hash - 1 (MATCHES)"
+    else
+      echo "$file - $arch - $built_hash - 0 (DIFFERS)"
+    fi
+  fi
+done
 echo ""
 echo "Revision, tag (and its signature):"
 echo "N/A - Binary verification only (no source checkout)"
@@ -702,12 +763,12 @@ log_info "Differences: ${diff_count}"
 
 if [[ "$verdict" == "reproducible" ]]; then
   log_success "Verdict: REPRODUCIBLE"
-  log_info "Build server output: ${comparison_file}"
+  log_info "Build server output: ${yaml_file}"
   echo "Exit code: 0"
   exit 0
 else
   log_warn "Verdict: NOT REPRODUCIBLE"
-  log_info "Build server output: ${comparison_file}"
+  log_info "Build server output: ${yaml_file}"
   echo "Exit code: 1"
   exit 1
 fi
