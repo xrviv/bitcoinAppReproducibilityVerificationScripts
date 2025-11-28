@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# bitcoincore_build.sh - Bitcoin Core Reproducible Build Verification
+# bitcoincoredesktop_build.sh - Bitcoin Core Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.3.0
+# Version:       v0.3.1
 # Organization:  WalletScrutiny.com
 # Last Modified: 2025-11-27
 # Project:       https://github.com/bitcoin/bitcoin
@@ -39,8 +39,8 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v0.3.0"
-SCRIPT_NAME="bitcoincore_build.sh"
+SCRIPT_VERSION="v0.3.1"
+SCRIPT_NAME="bitcoincoredesktop_build.sh"
 APP_NAME="Bitcoin Core"
 APP_ID="bitcoincore"
 REPO_URL="https://github.com/bitcoin/bitcoin"
@@ -245,13 +245,13 @@ fi
 
 # Validate build type per arch
 case "$arch" in
-  x86_64-windows)
-    if [[ "$build_type" != "zip" ]]; then
-      log_error "Unsupported type for ${arch}: ${build_type}. Use --type zip"
+  x86_64-windows|win64)
+    if [[ "$build_type" != "zip" && "$build_type" != "setup" ]]; then
+      log_error "Unsupported type for ${arch}: ${build_type}. Use --type zip or --type setup"
       exit 1
     fi
     ;;
-  x86_64-linux|aarch64-linux|arm-linux|x86_64-macos|arm64-macos)
+  x86_64-linux|x86_64-linux-gnu|aarch64-linux|arm-linux|x86_64-macos|arm64-macos)
     if [[ "$build_type" != "tarball" ]]; then
       log_error "Unsupported type for ${arch}: ${build_type}. Use --type tarball"
       exit 1
@@ -275,13 +275,16 @@ map_arch_to_guix() {
         x86_64-linux)
             echo "x86_64-linux-gnu"
             ;;
+        x86_64-linux-gnu)
+            echo "x86_64-linux-gnu"
+            ;;
         aarch64-linux)
             echo "aarch64-linux-gnu"
             ;;
         arm-linux)
             echo "arm-linux-gnueabihf"
             ;;
-        x86_64-windows)
+        x86_64-windows|win64)
             echo "x86_64-w64-mingw32"
             ;;
         x86_64-macos)
