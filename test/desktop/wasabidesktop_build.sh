@@ -2,7 +2,7 @@
 # ==============================================================================
 # wasabidesktop_build.sh - Wasabi Wallet Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v1.3.0
+# Version:       v1.3.1
 # Organization:  WalletScrutiny.com
 # Last Modified: 2025-11-26
 # Project:       https://github.com/WalletWasabi/WalletWasabi
@@ -44,7 +44,7 @@
 set -euo pipefail
 
 # ---------- Script Metadata ----------
-SCRIPT_VERSION="v1.3.0"
+SCRIPT_VERSION="v1.3.1"
 APP_NAME="Wasabi Wallet"
 APP_ID="wasabi"
 
@@ -448,7 +448,8 @@ fi
 
 log_success "Build completed and artifact copied"
 cleanup_container
-trap - EXIT
+
+# Trap remains active to ensure cleanup on any exit path
 
 # ---------- Verify Build Output ----------
 if [ ! -f "$WORKSPACE/output/$EXPECTED_FILE" ]; then
