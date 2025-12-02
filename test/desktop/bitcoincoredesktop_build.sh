@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitcoincoredesktop_build.sh - Bitcoin Core Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.3.1
+# Version:       v0.3.2
 # Organization:  WalletScrutiny.com
-# Last Modified: 2025-11-27
+# Last Modified: 2025-12-02
 # Project:       https://github.com/bitcoin/bitcoin
 # ==============================================================================
 # LICENSE: MIT License
@@ -39,14 +39,15 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v0.3.1"
+SCRIPT_VERSION="v0.3.2"
 SCRIPT_NAME="bitcoincoredesktop_build.sh"
 APP_NAME="Bitcoin Core"
 APP_ID="bitcoincore"
 REPO_URL="https://github.com/bitcoin/bitcoin"
 DEFAULT_VERSION="29.1"
-CONTAINER_NAME="ws_bitcoin_verifier"
-IMAGE_NAME="ws_bitcoin_verifier"
+CONTAINER_NAME=""
+IMAGE_NAME=""
+VERIFICATION_EXIT_CODE=1
 
 # ---------- Styling ----------
 NC="\033[0m"
@@ -268,6 +269,9 @@ if [[ ! "$version" =~ ^v ]]; then
   version="v${version}"
 fi
 
+# Generate unique container/image names for this invocation
+set_unique_names "$version" "$arch" "$build_type"
+
 # Map build server architecture to Guix host triplet
 map_arch_to_guix() {
     local bs_arch="$1"
@@ -298,6 +302,33 @@ map_arch_to_guix() {
             exit 1
             ;;
     esac
+}
+
+# Sanitize string for container/image names
+sanitize_component() {
+    local input="$1"
+    input=$(echo "$input" | tr '[:upper:]' '[:lower:]')
+    input=$(echo "$input" | sed -E 's/[^a-z0-9]+/-/g')
+    input="${input##-}"
+    input="${input%%-}"
+    if [[ -z "$input" ]]; then
+        input="na"
+    fi
+    echo "$input"
+}
+
+set_unique_names() {
+    local version_component
+    local arch_component
+    local type_component
+    version_component=$(sanitize_component "$1")
+    arch_component=$(sanitize_component "$2")
+    type_component=$(sanitize_component "$3")
+    local suffix
+    suffix=$(sanitize_component "$(date +%s)-$$")
+
+    CONTAINER_NAME="ws-bitcoin-verifier-${version_component}-${arch_component}-${type_component}-${suffix}"
+    IMAGE_NAME="ws-bitcoin-image-${version_component}-${arch_component}-${type_component}-${suffix}"
 }
 
 # Generate error YAML
@@ -363,6 +394,10 @@ check_dependencies() {
 
 # Cleanup function
 cleanup_containers() {
+    if [[ -z "${container_cmd:-}" ]]; then
+        return
+    fi
+
     log_info "Cleaning up existing containers and images..."
 
     # Remove container if exists
@@ -378,6 +413,21 @@ cleanup_containers() {
     fi
 
     log_success "Cleanup completed"
+}
+
+# Trap cleanup handler (runs on exit for failure paths)
+TRAP_CLEANUP_COMPLETED=false
+cleanup_on_exit() {
+    local exit_code=$?
+    if [[ -n "${temp_imagefile:-}" && -f "${temp_imagefile:-}" ]]; then
+        rm -f "$temp_imagefile"
+    fi
+
+    if [[ "${TRAP_CLEANUP_COMPLETED:-false}" != "true" && "${keep_container:-false}" != "true" ]]; then
+        cleanup_containers
+    fi
+
+    return "$exit_code"
 }
 
 # Create embedded imagefile
@@ -700,13 +750,13 @@ verify_checksums() {
         log_success "Verdict: REPRODUCIBLE"
         log_info "Build server output: ${comparison_file}"
         echo "Exit code: 0"
-        exit 0
+        VERIFICATION_EXIT_CODE=0
     else
         log_warn "Verdict: NOT REPRODUCIBLE"
         log_info "Build server output: ${comparison_file}"
         log_info "Official checksums: https://bitcoincore.org/bin/bitcoin-core-${clean_version}/SHA256SUMS"
         echo "Exit code: 1"
-        exit 1
+        VERIFICATION_EXIT_CODE=1
     fi
 }
 
@@ -724,6 +774,8 @@ final_cleanup() {
         log_info "To connect: podman exec -it $CONTAINER_NAME bash"
         log_info "To clean up later: podman rm -f $CONTAINER_NAME && podman rmi -f $IMAGE_NAME"
     fi
+
+    TRAP_CLEANUP_COMPLETED=true
 }
 
 # ---------- Setup Workspace ----------
@@ -755,7 +807,7 @@ fi
 
 # Create temporary imagefile
 temp_imagefile=$(mktemp)
-trap "rm -f $temp_imagefile" EXIT
+trap cleanup_on_exit EXIT
 
 create_imagefile "$temp_imagefile"
 build_container "$temp_imagefile"
@@ -764,3 +816,4 @@ prepare_bitcoin_build "$version" "$guix_arch"
 execute_build "$version" "$guix_arch"
 verify_checksums "$version" "$guix_arch"
 final_cleanup "$keep_container"
+exit "$VERIFICATION_EXIT_CODE"
