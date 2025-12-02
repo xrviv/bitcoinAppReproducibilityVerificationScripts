@@ -2,7 +2,7 @@
 # ==============================================================================
 # bitcoincoredesktop_build.sh - Bitcoin Core Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.3.2
+# Version:       v0.3.3
 # Organization:  WalletScrutiny.com
 # Last Modified: 2025-12-02
 # Project:       https://github.com/bitcoin/bitcoin
@@ -39,7 +39,7 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v0.3.2"
+SCRIPT_VERSION="v0.3.3"
 SCRIPT_NAME="bitcoincoredesktop_build.sh"
 APP_NAME="Bitcoin Core"
 APP_ID="bitcoincore"
@@ -65,6 +65,34 @@ log_info() { echo -e "${BLUE}${INFO_ICON}${NC} $*"; }
 log_success() { echo -e "${GREEN}${SUCCESS_ICON}${NC} $*"; }
 log_warn() { echo -e "${YELLOW}${WARNING_ICON}${NC} $*"; }
 log_error() { echo -e "${RED}${ERROR_ICON}${NC} $*" >&2; }
+
+# ---------- Helper Functions ----------
+# Sanitize string for container/image names
+sanitize_component() {
+    local input="$1"
+    input=$(echo "$input" | tr '[:upper:]' '[:lower:]')
+    input=$(echo "$input" | sed -E 's/[^a-z0-9]+/-/g')
+    input="${input##-}"
+    input="${input%%-}"
+    if [[ -z "$input" ]]; then
+        input="na"
+    fi
+    echo "$input"
+}
+
+set_unique_names() {
+    local version_component
+    local arch_component
+    local type_component
+    version_component=$(sanitize_component "$1")
+    arch_component=$(sanitize_component "$2")
+    type_component=$(sanitize_component "$3")
+    local suffix
+    suffix=$(sanitize_component "$(date +%s)-$$")
+
+    CONTAINER_NAME="ws-bitcoin-verifier-${version_component}-${arch_component}-${type_component}-${suffix}"
+    IMAGE_NAME="ws-bitcoin-image-${version_component}-${arch_component}-${type_component}-${suffix}"
+}
 
 # ---------- Usage ----------
 usage() {
@@ -302,33 +330,6 @@ map_arch_to_guix() {
             exit 1
             ;;
     esac
-}
-
-# Sanitize string for container/image names
-sanitize_component() {
-    local input="$1"
-    input=$(echo "$input" | tr '[:upper:]' '[:lower:]')
-    input=$(echo "$input" | sed -E 's/[^a-z0-9]+/-/g')
-    input="${input##-}"
-    input="${input%%-}"
-    if [[ -z "$input" ]]; then
-        input="na"
-    fi
-    echo "$input"
-}
-
-set_unique_names() {
-    local version_component
-    local arch_component
-    local type_component
-    version_component=$(sanitize_component "$1")
-    arch_component=$(sanitize_component "$2")
-    type_component=$(sanitize_component "$3")
-    local suffix
-    suffix=$(sanitize_component "$(date +%s)-$$")
-
-    CONTAINER_NAME="ws-bitcoin-verifier-${version_component}-${arch_component}-${type_component}-${suffix}"
-    IMAGE_NAME="ws-bitcoin-image-${version_component}-${arch_component}-${type_component}-${suffix}"
 }
 
 # Generate error YAML
