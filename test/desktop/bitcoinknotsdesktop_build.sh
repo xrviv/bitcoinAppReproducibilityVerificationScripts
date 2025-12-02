@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitcoinknotsdesktop_build.sh - Bitcoin Knots Reproducible Build Verification
 # ==============================================================================
-# Version:       v1.0.2
+# Version:       v1.1.4
 # Organization:  WalletScrutiny.com
-# Last Modified: 2025-11-28
+# Last Modified: 2025-12-02
 # Project:       https://github.com/bitcoinknots/bitcoin
 # ==============================================================================
 # LICENSE: MIT License
@@ -53,14 +53,14 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v1.1.3"
+SCRIPT_VERSION="v1.1.4"
 SCRIPT_NAME="bitcoinknotsdesktop_build.sh"
 APP_ID="bitcoinknots"
 APP_NAME="Bitcoin Knots"
 REPO_URL="https://github.com/bitcoinknots/bitcoin"
 DEFAULT_VERSION="29.2.knots20251010"
-CONTAINER_NAME="ws_bitcoinknots_verifier"
-IMAGE_NAME="ws_bitcoinknots_verifier"
+CONTAINER_NAME=""
+IMAGE_NAME=""
 
 # Global variables for tracking
 OUTPUT_DIR=""
@@ -167,6 +167,33 @@ log_warning() {
 
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Sanitize string for container/image names
+sanitize_component() {
+    local input="$1"
+    input=$(echo "$input" | tr '[:upper:]' '[:lower:]')
+    input=$(echo "$input" | sed -E 's/[^a-z0-9]+/-/g')
+    input="${input##-}"
+    input="${input%%-}"
+    if [[ -z "$input" ]]; then
+        input="na"
+    fi
+    echo "$input"
+}
+
+set_unique_names() {
+    local version_component
+    local arch_component
+    local type_component
+    version_component=$(sanitize_component "$1")
+    arch_component=$(sanitize_component "$2")
+    type_component=$(sanitize_component "$3")
+    local suffix
+    suffix=$(sanitize_component "$(date +%s)-$$")
+
+    CONTAINER_NAME="ws-bitcoinknots-verifier-${version_component}-${arch_component}-${type_component}-${suffix}"
+    IMAGE_NAME="ws-bitcoinknots-image-${version_component}-${arch_component}-${type_component}-${suffix}"
 }
 
 is_optional_artifact() {
@@ -1045,6 +1072,9 @@ main() {
     if [[ ! "$version" =~ ^v ]]; then
         version="v${version}"
     fi
+
+    # Generate unique container/image names for this invocation
+    set_unique_names "$version" "$arch" "$build_type"
 
     # Map architecture to Guix format
     local guix_arch=$(map_arch_to_guix "$arch")
