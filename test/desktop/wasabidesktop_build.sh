@@ -2,9 +2,9 @@
 # ==============================================================================
 # wasabidesktop_build.sh - Wasabi Wallet Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v1.3.1
+# Version:       v1.5.0
 # Organization:  WalletScrutiny.com
-# Last Modified: 2025-11-26
+# Last Modified: 2025-12-03
 # Project:       https://github.com/WalletWasabi/WalletWasabi
 # ==============================================================================
 # LICENSE: MIT License
@@ -44,7 +44,7 @@
 set -euo pipefail
 
 # ---------- Script Metadata ----------
-SCRIPT_VERSION="v1.3.1"
+SCRIPT_VERSION="v1.4.0"
 APP_NAME="Wasabi Wallet"
 APP_ID="wasabi"
 
@@ -295,6 +295,15 @@ if ! $CONTAINER_CMD run --rm \
 fi
 
 log_success "Downloaded official release and cloned repository"
+log_info "Extracting commit timestamp for SOURCE_DATE_EPOCH..."
+SOURCE_DATE_EPOCH=$($CONTAINER_CMD run --rm \
+  -v "$WORKSPACE:/workspace:Z" \
+  -w /workspace/walletwasabi \
+  debian:bookworm-slim \
+  bash -c "apt-get update -qq && apt-get install -y -qq git > /dev/null 2>&1 && \
+    git log -1 --format=%ct")
+
+log_info "SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH (commit timestamp)"
 
 # ---------- Verify Git Tag Authenticity (Inside Container) ----------
 log_info "Verifying Git tag authenticity..."
@@ -367,6 +376,22 @@ log_info "  2. Verify commit hash: $ACTUAL_COMMIT"
 log_info "  3. Check release notes and community announcements"
 echo ""
 
+# ---------- Patch Wasabi's release.sh for Reproducible Build ----------
+log_info "Patching Wasabi's release.sh to use SOURCE_DATE_EPOCH..."
+
+# Patch the tar command to use --mtime for reproducible timestamps
+if ! $CONTAINER_CMD run --rm \
+ -v "$WORKSPACE:/workspace:Z" \
+ -w /workspace/walletwasabi \
+ debian:bookworm-slim \
+ bash -c "
+ apt-get update -qq && apt-get install -y -qq sed > /dev/null 2>&1 && \
+ sed -i 's|tar -pczvf|tar --mtime=\"@\${SOURCE_DATE_EPOCH:-0}\" -pczvf|g' Contrib/release.sh && \
+ echo 'Patched tar command in release.sh'"; then
+  log_error "Failed to patch release.sh"
+  exit 1
+fi
+
 # ---------- Generate Embedded Dockerfile ----------
 log_info "Generating embedded Dockerfile for reproducible build..."
 DOCKERFILE_PATH="$WORKSPACE/Dockerfile"
@@ -394,13 +419,13 @@ RUN apt-get update && apt-get install -y \
 # Create build user (non-root)
 RUN useradd -m -u 1000 builder
 USER builder
-WORKDIR /home/builder
+WORKDIR /home/builder/workspace
 
 # Copy source code
-COPY --chown=builder:builder walletwasabi /home/builder/walletwasabi
+COPY --chown=builder:builder walletwasabi /home/builder/workspace/WalletWasabi
 
 # Set working directory
-WORKDIR /home/builder/walletwasabi
+WORKDIR /home/builder/workspace/WalletWasabi
 
 # Build script will be passed as argument
 CMD ["/bin/bash"]
@@ -432,15 +457,17 @@ cleanup_container() {
 trap cleanup_container EXIT
 
 log_info "Executing build script: ./Contrib/release.sh $BUILD_TARGET"
-if ! $CONTAINER_CMD run --name "$CONTAINER_NAME" "$IMAGE_NAME" \
-  bash -c "set -euo pipefail && cd /home/builder/walletwasabi && ./Contrib/release.sh $BUILD_TARGET"; then
+if ! $CONTAINER_CMD run --name "$CONTAINER_NAME" \
+  -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+  "$IMAGE_NAME" \
+  bash -c "set -euo pipefail && cd /home/builder/workspace/WalletWasabi && ./Contrib/release.sh $BUILD_TARGET"; then
   log_error "Build failed inside container"
   cleanup_container
   exit 1
 fi
 
 log_info "Copying build artifact from container: $EXPECTED_FILE"
-if ! $CONTAINER_CMD cp "$CONTAINER_NAME:/home/builder/walletwasabi/packages/$EXPECTED_FILE" "$WORKSPACE/output/$EXPECTED_FILE"; then
+if ! $CONTAINER_CMD cp "$CONTAINER_NAME:/home/builder/workspace/WalletWasabi/packages/$EXPECTED_FILE" "$WORKSPACE/output/$EXPECTED_FILE"; then
   log_error "Failed to copy build artifact from container"
   cleanup_container
   exit 1
@@ -491,12 +518,14 @@ fi
 
 # ---------- Generate COMPARISON_RESULTS.yaml ----------
 log_info "Generating COMPARISON_RESULTS.yaml..."
+OVERALL_STATUS=$([ "$MATCH" == "true" ] && echo "reproducible" || echo "not_reproducible")
 cat > "$WORKSPACE/COMPARISON_RESULTS.yaml" <<EOF
 date: $(date -u +"%Y-%m-%dT%H:%M:%S%:z")
 script_version: $SCRIPT_VERSION
+build_type: ${TYPE}
 results:
   - architecture: $ARCH
-    type: $TYPE
+    status: $OVERALL_STATUS
     files:
       - filename: $EXPECTED_FILE
         hash: $BUILT_HASH
