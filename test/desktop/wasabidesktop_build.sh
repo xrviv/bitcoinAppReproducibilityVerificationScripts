@@ -44,7 +44,7 @@
 set -euo pipefail
 
 # ---------- Script Metadata ----------
-SCRIPT_VERSION="v1.4.0"
+SCRIPT_VERSION="v1.5.0"
 APP_NAME="Wasabi Wallet"
 APP_ID="wasabi"
 
@@ -87,22 +87,19 @@ Usage (Positional Parameters - Legacy):
   $(basename "$0") <version> [<architecture>]
 
 Parameters:
-  --version <version>    Wasabi version to verify (e.g., 2.7.1)
+  --version <version>    Wasabi version to verify (e.g., 2.7.2)
   --arch <architecture>  Architecture to build (default: x86_64-linux-gnu)
-                         Supported: x86_64-linux-gnu, win64
-  --type <type>          Package type to verify (default: varies by arch)
-                         x86_64-linux-gnu: deb (default), tarball, zip
-                         win64: zip (default), msi
+                         Supported: x86_64-linux-gnu
+  --type <type>          Package type to verify (default: tarball)
+                         Supported: deb, tarball, zip
 
-Flags:
   --help, -h             Show this help message
 
 Examples:
-  $(basename "$0") --version 2.7.1
-  $(basename "$0") --version 2.7.1 --arch x86_64-linux-gnu --type deb
-  $(basename "$0") --version 2.7.1 --arch x86_64-linux-gnu --type tarball
-  $(basename "$0") --version 2.7.1 --arch win64 --type msi
-  $(basename "$0") 2.7.1
+  $(basename "$0") --version 2.7.2
+  $(basename "$0") --version 2.7.2 --arch x86_64-linux-gnu --type deb
+  $(basename "$0") --version 2.7.2 --arch x86_64-linux-gnu --type tarball
+  $(basename "$0") 2.7.2
 
 Requirements:
   - Docker or Podman installed
