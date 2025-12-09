@@ -2,7 +2,7 @@
 #
 # sparrowdesktop_build.sh - Sparrow Desktop Reproducible Build Verifier
 #
-# Version: v0.8.3
+# Version: v0.9.1
 #
 # Description:
 #   Fully containerized reproducible build verification for Sparrow Desktop.
@@ -34,7 +34,7 @@
 set -euo pipefail
 
 # Script version
-SCRIPT_VERSION="v0.8.3"
+SCRIPT_VERSION="v0.9.1"
 
 # Exit codes (BSA compliant)
 EXIT_SUCCESS=0
@@ -282,6 +282,7 @@ RUN apt-get update && apt-get install -y \
     git \
     tar \
     xz-utils \
+    zstd \
     rpm \
     fakeroot \
     binutils \
@@ -309,15 +310,43 @@ RUN git checkout "${SPARROW_VERSION}" && \
     git submodule update --init --recursive
 
 # Build with jpackage (creates image + deb + rpm on Linux)
-RUN ./gradlew jpackage
+ARG BUILD_TYPE
+RUN ./gradlew jpackage && \
+    # Repackage deb: convert ZSTD -> XZ compression (matching official release)
+    if [ "${BUILD_TYPE}" = "deb" ]; then \
+        cd build/jpackage && \
+        DEB_FILE=$(ls *.deb | head -1) && \
+        echo "Repackaging $DEB_FILE: ZSTD -> XZ compression" && \
+        ar x "$DEB_FILE" && \
+        unzstd control.tar.zst && \
+        unzstd data.tar.zst && \
+        xz -c control.tar > control.tar.xz && \
+        xz -c data.tar > data.tar.xz && \
+        rm "$DEB_FILE" && \
+        ar cr "$DEB_FILE" debian-binary control.tar.xz data.tar.xz && \
+        rm -f control.tar* data.tar* debian-binary && \
+        echo "Repackaging complete: $DEB_FILE"; \
+    fi
 
 # Copy built binary
 ARG BUILD_TYPE
 RUN mkdir -p /built && \
-    cp -r build/jpackage/Sparrow /built/ && \
     if [ "${BUILD_TYPE}" = "deb" ]; then \
-        # Also copy the .deb file for hash comparison
-        cp build/jpackage/*.deb /built/; \
+        # For deb: extract Sparrow folder from repackaged .deb
+        cp build/jpackage/*.deb /built/ && \
+        cd /built && \
+        DEB_FILE=$(ls *.deb | head -1) && \
+        ar x "$DEB_FILE" && \
+        tar -xf data.tar.xz && \
+        SPARROW_DIR=$(find . -maxdepth 3 -type d \( -name 'Sparrow' -o -name 'sparrow' -o -name 'sparrowwallet' \) | head -1) && \
+        if [ -z "$SPARROW_DIR" ]; then \
+            echo "ERROR: Could not find Sparrow directory in repackaged deb" && exit 1; \
+        fi && \
+        mv "$SPARROW_DIR" Sparrow && \
+        rm -rf opt usr control.tar.* data.tar.* debian-binary; \
+    else \
+        # For tarball: just copy the Sparrow folder
+        cp -r build/jpackage/Sparrow /built/; \
     fi
 
 # Download official release
