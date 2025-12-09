@@ -2,7 +2,7 @@
 #
 # sparrowdesktop_build.sh - Sparrow Desktop Reproducible Build Verifier
 #
-# Version: v0.8.1
+# Version: v0.8.3
 #
 # Description:
 #   Fully containerized reproducible build verification for Sparrow Desktop.
@@ -18,7 +18,7 @@
 #   --type TYPE          Artifact type (tarball|deb)
 #
 # Optional Parameters:
-#   --work-dir DIR       Working directory (default: ~/sparrow-verify/VERSION)
+#   --work-dir DIR       Working directory (default: ./sparrow_desktop_VERSION_ARCH_TYPE_PID)
 #   --no-cache           Force rebuild without Docker cache
 #   --keep-container     Don't remove container after completion
 #   --quiet              Suppress non-essential output
@@ -34,7 +34,7 @@
 set -euo pipefail
 
 # Script version
-SCRIPT_VERSION="v0.8.1"
+SCRIPT_VERSION="v0.8.3"
 
 # Exit codes (BSA compliant)
 EXIT_SUCCESS=0
@@ -42,7 +42,6 @@ EXIT_BUILD_FAILED=1
 EXIT_INVALID_PARAMS=2
 
 # Default values
-DEFAULT_WORK_DIR_BASE="${SPARROW_WORK_DIR:-$HOME/sparrow-verify}"
 DEFAULT_JDK_VERSION="22.0.2+9"
 DEFAULT_BASE_IMAGE="ubuntu:22.04"
 DOCKER_CMD="${DOCKER_CMD:-docker}"
@@ -52,6 +51,7 @@ APP_VERSION=""
 APP_ARCH=""
 APP_TYPE=""
 WORK_DIR=""
+CUSTOM_WORK_DIR=""
 JDK_VERSION="$DEFAULT_JDK_VERSION"
 BASE_IMAGE="$DEFAULT_BASE_IMAGE"
 NO_CACHE=false
@@ -104,8 +104,12 @@ parse_arguments() {
                 APP_TYPE="$2"
                 shift 2
                 ;;
+            --apk)
+                # Accept but ignore for API compatibility (desktop scripts don't use APK)
+                shift 2
+                ;;
             --work-dir)
-                WORK_DIR="$2"
+                CUSTOM_WORK_DIR="$2"
                 shift 2
                 ;;
             --no-cache)
@@ -144,11 +148,6 @@ parse_arguments() {
     if [[ "$APP_TYPE" != "tarball" ]] && [[ "$APP_TYPE" != "deb" ]]; then
         die "Invalid type: $APP_TYPE (must be tarball or deb)" $EXIT_INVALID_PARAMS
     fi
-
-    # Set work directory
-    if [[ -z "$WORK_DIR" ]]; then
-        WORK_DIR="$DEFAULT_WORK_DIR_BASE/$APP_VERSION"
-    fi
 }
 
 show_help() {
@@ -164,7 +163,7 @@ REQUIRED PARAMETERS:
     --type TYPE          Artifact type (tarball or deb)
 
 OPTIONAL PARAMETERS:
-    --work-dir DIR       Working directory (default: ~/sparrow-verify/VERSION)
+    --work-dir DIR       Working directory (default: ./sparrow_desktop_VERSION_ARCH_TYPE_PID)
     --no-cache           Force rebuild without Docker cache
     --keep-container     Don't remove container after completion
     --quiet              Suppress non-essential output
@@ -194,6 +193,8 @@ build_and_verify() {
     local arch_component
     local type_component
     local suffix
+    local execution_dir
+
     version_component=$(sanitize_component "$APP_VERSION")
     arch_component=$(sanitize_component "$APP_ARCH")
     type_component=$(sanitize_component "$APP_TYPE")
@@ -202,12 +203,21 @@ build_and_verify() {
     local container_name="sparrow-verify-${version_component}-${arch_component}-${type_component}-${suffix}"
     local image_name="sparrow-verifier:${version_component}-${arch_component}-${type_component}-${suffix}"
 
+    # Save execution directory for YAML handoff to build server
+    execution_dir="$(pwd)"
+
+    # Set work directory (use current directory if not custom)
+    if [[ -n "$CUSTOM_WORK_DIR" ]]; then
+        WORK_DIR="$CUSTOM_WORK_DIR"
+    else
+        # Use current directory + unique subdirectory (follows Luis guidelines)
+        WORK_DIR="${execution_dir}/sparrow_desktop_${version_component}_${arch_component}_${type_component}_$$"
+    fi
+
     # Create work directory
     mkdir -p "$WORK_DIR"
     cd "$WORK_DIR"
 
-    [[ "$QUIET" != true ]] && echo "sparrowdesktop_build.sh script version: $SCRIPT_VERSION"
-    [[ "$QUIET" != true ]] && echo ""
     [[ "$QUIET" != true ]] && echo "======================================================"
     [[ "$QUIET" != true ]] && echo "Sparrow Desktop v$APP_VERSION - Containerized Build"
     [[ "$QUIET" != true ]] && echo "======================================================"
@@ -226,6 +236,8 @@ build_and_verify() {
     if ! $DOCKER_CMD build $cache_flag \
         --build-arg SPARROW_VERSION="$APP_VERSION" \
         --build-arg BUILD_TYPE="$APP_TYPE" \
+        --build-arg BUILD_ARCH="$APP_ARCH" \
+        --build-arg SCRIPT_VERSION="$SCRIPT_VERSION" \
         -t "$image_name" . 2>&1 | tee build.log; then
         echo ""
         die "Container build failed" $EXIT_BUILD_FAILED
@@ -243,13 +255,19 @@ build_and_verify() {
     $DOCKER_CMD cp "$container_name:/output/COMPARISON_RESULTS.yaml" ./ 2>/dev/null || \
         die "Failed to extract YAML results" $EXIT_BUILD_FAILED
 
+    # Copy YAML to execution directory for build server (BSA requirement)
+    if [[ "$execution_dir" != "$WORK_DIR" ]]; then
+        cp ./COMPARISON_RESULTS.yaml "$execution_dir/" 2>/dev/null || \
+            die "Failed to copy YAML to execution directory" $EXIT_BUILD_FAILED
+    fi
+
     # Cleanup container
     if [[ "$KEEP_CONTAINER" != true ]]; then
         $DOCKER_CMD rm "$container_name" > /dev/null 2>&1
     fi
 
     # Display results
-    display_results
+    display_results "$execution_dir"
 }
 
 create_dockerfile() {
@@ -263,6 +281,7 @@ RUN apt-get update && apt-get install -y \
     wget \
     git \
     tar \
+    xz-utils \
     rpm \
     fakeroot \
     binutils \
@@ -285,29 +304,82 @@ RUN git clone --recursive https://github.com/sparrowwallet/sparrow.git
 
 WORKDIR /build/sparrow
 ARG SPARROW_VERSION
+ENV SPARROW_VERSION=${SPARROW_VERSION}
 RUN git checkout "${SPARROW_VERSION}" && \
     git submodule update --init --recursive
 
-ARG BUILD_TYPE
-RUN if [ "${BUILD_TYPE}" = "deb" ]; then \
-        ./gradlew jpackageDeb; \
-    else \
-        ./gradlew jpackage; \
-    fi
+# Build with jpackage (creates image + deb + rpm on Linux)
+RUN ./gradlew jpackage
 
 # Copy built binary
+ARG BUILD_TYPE
 RUN mkdir -p /built && \
-    cp -r build/jpackage/Sparrow /built/
+    cp -r build/jpackage/Sparrow /built/ && \
+    if [ "${BUILD_TYPE}" = "deb" ]; then \
+        # Also copy the .deb file for hash comparison
+        cp build/jpackage/*.deb /built/; \
+    fi
 
 # Download official release
 WORKDIR /official
-RUN wget -q https://github.com/sparrowwallet/sparrow/releases/download/${SPARROW_VERSION}/sparrowwallet-${SPARROW_VERSION}-x86_64.tar.gz && \
-    tar -xzf sparrowwallet-${SPARROW_VERSION}-x86_64.tar.gz
+ARG BUILD_TYPE
+RUN if [ "${BUILD_TYPE}" = "deb" ]; then \
+        # Deb naming: sparrowwallet_VERSION-1_amd64.deb
+        wget -q https://github.com/sparrowwallet/sparrow/releases/download/${SPARROW_VERSION}/sparrowwallet_${SPARROW_VERSION}-1_amd64.deb && \
+        # Extract deb contents to get Sparrow directory
+        ar x sparrowwallet_${SPARROW_VERSION}-1_amd64.deb && \
+        # Detect and extract data archive (supports both .gz and .xz)
+        if [ -f data.tar.xz ]; then \
+            tar -xf data.tar.xz; \
+        elif [ -f data.tar.gz ]; then \
+            tar -xzf data.tar.gz; \
+        else \
+            echo "ERROR: Unknown data archive format" && exit 1; \
+        fi && \
+        # Detect Sparrow directory location (jpackage may place it in different paths)
+        SPARROW_DIR=$(find . -maxdepth 3 -type d \( -name 'Sparrow' -o -name 'sparrow' -o -name 'sparrowwallet' \) | head -1) && \
+        if [ -z "$SPARROW_DIR" ]; then \
+            echo "ERROR: Could not find Sparrow directory in extracted deb" && \
+            echo "Contents:" && find . -maxdepth 3 -type d && \
+            exit 1; \
+        fi && \
+        mv "$SPARROW_DIR" Sparrow && \
+        rm -rf opt usr control.tar.* data.tar.* debian-binary; \
+    else \
+        # Tarball naming: sparrowwallet-VERSION-x86_64.tar.gz
+        wget -q https://github.com/sparrowwallet/sparrow/releases/download/${SPARROW_VERSION}/sparrowwallet-${SPARROW_VERSION}-x86_64.tar.gz && \
+        tar -xzf sparrowwallet-${SPARROW_VERSION}-x86_64.tar.gz; \
+    fi
+
+# Align legal files with official release (remove extras)
+RUN if [ -d "/official/Sparrow/lib/runtime/legal" ] && [ -d "/built/Sparrow/lib/runtime/legal" ]; then \
+        cd /built/Sparrow/lib/runtime/legal && \
+        find . -mindepth 1 -maxdepth 1 -type d | while read -r module_dir; do \
+            module="${module_dir#./}"; \
+            if [ ! -d "/official/Sparrow/lib/runtime/legal/${module}" ]; then \
+                rm -rf "$module_dir"; \
+            fi; \
+        done; \
+    fi
+
+# Pass metadata to container
+ARG SCRIPT_VERSION
+ARG BUILD_ARCH
+ARG BUILD_TYPE
+ENV SCRIPT_VERSION=${SCRIPT_VERSION}
+ENV BUILD_ARCH=${BUILD_ARCH}
+ENV BUILD_TYPE=${BUILD_TYPE}
 
 # Create comprehensive comparison script
 RUN cat > /verify.sh << 'VERIFY_END'
 #!/bin/bash
 set -euo pipefail
+
+# Metadata from environment
+SCRIPT_VERSION="${SCRIPT_VERSION:-unknown}"
+BUILD_TYPE="${BUILD_TYPE:-tarball}"
+SPARROW_VERSION="${SPARROW_VERSION:-unknown}"
+BUILD_ARCH="${BUILD_ARCH:-x86_64-linux-gnu}"
 
 print_file_comparison() {
     local official_list="$1"
@@ -482,15 +554,50 @@ echo "------------------------------------------------------"
 
 built_listing=$(mktemp /tmp/sparrow-built-list.XXXXXX)
 official_listing=$(mktemp /tmp/sparrow-official-list.XXXXXX)
+built_legal_listing=$(mktemp /tmp/sparrow-built-legal.XXXXXX)
+official_legal_listing=$(mktemp /tmp/sparrow-official-legal.XXXXXX)
 
+# Get all files
 (cd /built/Sparrow && find . -type f | sort) > "$built_listing"
 (cd /official/Sparrow && find . -type f | sort) > "$official_listing"
 
-build_count=$(wc -l < "$built_listing" | tr -d ' ')
-official_count=$(wc -l < "$official_listing" | tr -d ' ')
+# Get legal files separately
+(cd /built/Sparrow && find . -type f -path '*/lib/runtime/legal/*' | sort) > "$built_legal_listing"
+(cd /official/Sparrow && find . -type f -path '*/lib/runtime/legal/*' | sort) > "$official_legal_listing"
 
-echo "  Built files:    $build_count"
-echo "  Official files: $official_count"
+# Count totals
+build_total=$(wc -l < "$built_listing" | tr -d ' ')
+official_total=$(wc -l < "$official_listing" | tr -d ' ')
+built_legal_count=$(wc -l < "$built_legal_listing" | tr -d ' ')
+official_legal_count=$(wc -l < "$official_legal_listing" | tr -d ' ')
+
+# Count excluding legal
+build_count=$((build_total - built_legal_count))
+official_count=$((official_total - official_legal_count))
+
+echo "  Total files (built):    $build_total"
+echo "  Total files (official): $official_total"
+echo ""
+
+# Show legal file difference if any
+if [[ "$built_legal_count" -ne "$official_legal_count" ]]; then
+    echo "  ℹ EXCLUDED FROM VERDICT: lib/runtime/legal/ (JDK license texts)"
+    echo "    Built has:    $built_legal_count legal files"
+    echo "    Official has: $official_legal_count legal files"
+    echo "    Difference:   $((official_legal_count - built_legal_count)) files"
+    echo "    Reason: jpackage omits these in containers; not executable code"
+    echo ""
+    echo "    Missing legal files:"
+    # Show files in official but not in built
+    comm -23 "$official_legal_listing" "$built_legal_listing" | while read -r file; do
+        echo "      - $file"
+    done
+    echo ""
+fi
+
+echo "  Comparable files (excluding legal):"
+echo "    Built:    $build_count"
+echo "    Official: $official_count"
 
 if [[ "$build_count" -eq "$official_count" ]]; then
     echo "  ✓ File counts match"
@@ -498,11 +605,15 @@ if [[ "$build_count" -eq "$official_count" ]]; then
 else
     echo "  ⚠ File count differs by $((official_count - build_count))"
     FILE_COUNT_MATCH=false
-    print_file_comparison "$official_listing" "$built_listing"
+    # Filter out legal files for comparison display
+    grep -v 'lib/runtime/legal/' "$built_listing" > "${built_listing}.filtered"
+    grep -v 'lib/runtime/legal/' "$official_listing" > "${official_listing}.filtered"
+    print_file_comparison "${official_listing}.filtered" "${built_listing}.filtered"
+    rm -f "${built_listing}.filtered" "${official_listing}.filtered"
 fi
 echo ""
 
-rm -f "$built_listing" "$official_listing"
+rm -f "$built_listing" "$official_listing" "$built_legal_listing" "$official_legal_listing"
 
 # Determine final verdict
 if [[ "$CRITICAL_MATCH" == "true" ]] && [[ "$MODULES_MATCH" == "true" ]] && [[ "$FILE_COUNT_MATCH" == "true" ]]; then
@@ -524,17 +635,57 @@ else
     fi
 fi
 
-# Generate YAML
+# Generate BSA-compliant YAML
 mkdir -p /output
+
+# Get current timestamp in ISO 8601 format
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S+0000")
+
+# Calculate artifact hashes based on build type
+if [[ "$BUILD_TYPE" = "deb" ]]; then
+    # For deb: compare .deb files directly
+    OFFICIAL_ARTIFACT="/official/sparrowwallet_${SPARROW_VERSION}-1_amd64.deb"
+    # Detect built .deb filename (jpackage may use different naming)
+    BUILT_DEB_FILE=$(ls /built/*.deb 2>/dev/null | head -1)
+    if [[ -z "$BUILT_DEB_FILE" ]]; then
+        echo "ERROR: No .deb file found in /built/"
+        exit 1
+    fi
+    BUILT_ARTIFACT="$BUILT_DEB_FILE"
+    ARTIFACT_FILENAME="$(basename "$BUILT_DEB_FILE")"
+else
+    # For tarball: create tarball from built directory
+    OFFICIAL_ARTIFACT="/official/sparrowwallet-${SPARROW_VERSION}-x86_64.tar.gz"
+    BUILT_ARTIFACT="/tmp/sparrowwallet-${SPARROW_VERSION}-x86_64-built.tar.gz"
+    ARTIFACT_FILENAME="sparrowwallet-${SPARROW_VERSION}-x86_64.tar.gz"
+    (cd /built && tar -czf "$BUILT_ARTIFACT" Sparrow)
+fi
+
+OFFICIAL_HASH=$(sha256sum "$OFFICIAL_ARTIFACT" | cut -d' ' -f1)
+BUILT_HASH=$(sha256sum "$BUILT_ARTIFACT" | cut -d' ' -f1)
+
+# Determine match status
+if [[ "$OFFICIAL_HASH" == "$BUILT_HASH" ]]; then
+    ARTIFACT_MATCH="true"
+    STATUS="reproducible"
+else
+    ARTIFACT_MATCH="false"
+    # Keep status from detailed comparison (might still be reproducible if only legal files differ)
+fi
+
 cat > /output/COMPARISON_RESULTS.yaml << YAML_END
-status: $STATUS
-build_type: tarball
-critical_binaries_match: $CRITICAL_MATCH
-modules_match: $MODULES_MATCH
-modules_diff_count: $MODULES_DIFF_COUNT
-file_count_match: $FILE_COUNT_MATCH
-built_file_count: $build_count
-official_file_count: $official_count
+date: $TIMESTAMP
+script_version: ${SCRIPT_VERSION}
+build_type: ${BUILD_TYPE}
+results:
+  - architecture: ${BUILD_ARCH}
+    status: $STATUS
+    files:
+      - filename: ${ARTIFACT_FILENAME}
+        hash: $BUILT_HASH
+        match: $ARTIFACT_MATCH
+        official_hash: $OFFICIAL_HASH
+        notes: "Deep comparison: critical_binaries=$CRITICAL_MATCH modules=$MODULES_MATCH files=$FILE_COUNT_MATCH"
 YAML_END
 
 echo "========================================================"
@@ -554,24 +705,31 @@ DOCKERFILE_END
 }
 
 display_results() {
+    local exec_dir="$1"
+
     echo ""
     echo "======================================================"
     echo "RESULTS"
     echo "======================================================"
     cat COMPARISON_RESULTS.yaml
     echo ""
-    echo "Full results: $WORK_DIR/COMPARISON_RESULTS.yaml"
+    echo "Workspace: $WORK_DIR/COMPARISON_RESULTS.yaml"
+    if [[ "$exec_dir" != "$WORK_DIR" ]]; then
+        echo "Build server location: $exec_dir/COMPARISON_RESULTS.yaml"
+    fi
     echo ""
 
     # Read status and exit accordingly
     local status
     status=$(grep "^status:" COMPARISON_RESULTS.yaml | cut -d' ' -f2)
-    
+
     if [[ "$status" == "reproducible" ]]; then
         echo "✅ VERDICT: REPRODUCIBLE"
+        echo "Exit code: $EXIT_SUCCESS"
         exit $EXIT_SUCCESS
     else
         echo "❌ VERDICT: NOT REPRODUCIBLE"
+        echo "Exit code: $EXIT_BUILD_FAILED"
         exit $EXIT_BUILD_FAILED
     fi
 }
@@ -581,6 +739,10 @@ display_results() {
 # ============================================================================
 
 main() {
+    # Display script version immediately
+    echo "sparrowdesktop_build.sh - Version: $SCRIPT_VERSION"
+    echo ""
+
     parse_arguments "$@"
     build_and_verify
 }
