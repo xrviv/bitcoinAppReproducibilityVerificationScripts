@@ -2,7 +2,7 @@
 #
 # sparrowdesktop_build.sh - Sparrow Desktop Reproducible Build Verifier
 #
-# Version: v0.9.1
+# Version: v0.9.2
 #
 # Description:
 #   Fully containerized reproducible build verification for Sparrow Desktop.
@@ -34,7 +34,7 @@
 set -euo pipefail
 
 # Script version
-SCRIPT_VERSION="v0.9.1"
+SCRIPT_VERSION="v0.9.2"
 
 # Exit codes (BSA compliant)
 EXIT_SUCCESS=0
@@ -170,7 +170,7 @@ OPTIONAL PARAMETERS:
 
 EXAMPLES:
     sparrowdesktop_build.sh --version 2.3.0 --arch x86_64-linux-gnu --type tarball
-    sparrowdesktop_build.sh --version 2.3.0 --arch x86_64-linux-gnu --type tarball --no-cache
+    sparrowdesktop_build.sh --version 2.3.1 --arch x86_64-linux-gnu --type deb --no-cache
 
 EXIT CODES (BSA Compliant):
     0 - Reproducible (success)
@@ -179,6 +179,7 @@ EXIT CODES (BSA Compliant):
 
 OUTPUT:
     COMPARISON_RESULTS.yaml - Machine-readable verification results
+    Phase 4 terminal output lists the SHA256 hash for every file in the app bundle (149 files) so you can audit all matches/differences directly.
 
 EOF
     exit 0
@@ -643,6 +644,61 @@ fi
 echo ""
 
 rm -f "$built_listing" "$official_listing" "$built_legal_listing" "$official_legal_listing"
+
+# Phase 4: File-by-file hash verification
+echo "Phase 4: File-by-file Verification"
+echo "------------------------------------------------------"
+
+full_listing=$(mktemp /tmp/sparrow-full-list.XXXXXX)
+
+(
+    cd /official/Sparrow
+    find . -type f -print
+) | sort > "$full_listing"
+
+total_files=$(wc -l < "$full_listing" | tr -d ' ')
+
+file_index=0
+match_files=0
+diff_files=0
+
+while IFS= read -r rel_path; do
+    file_index=$((file_index + 1))
+    official_file="/official/Sparrow/${rel_path#./}"
+    built_file="/built/Sparrow/${rel_path#./}"
+
+    built_hash="(missing)"
+    official_hash="(missing)"
+    status_label="(missing)"
+
+    if [[ -f "$built_file" ]]; then
+        built_hash=$(sha256sum "$built_file" | cut -d' ' -f1)
+    fi
+    if [[ -f "$official_file" ]]; then
+        official_hash=$(sha256sum "$official_file" | cut -d' ' -f1)
+    fi
+
+    if [[ -f "$built_file" && -f "$official_file" ]]; then
+        if [[ "$built_hash" == "$official_hash" ]]; then
+            status_label="✓ MATCH"
+            match_files=$((match_files + 1))
+        else
+            status_label="⚠ DIFFER"
+            diff_files=$((diff_files + 1))
+        fi
+    else
+        status_label="⚠ MISSING"
+        diff_files=$((diff_files + 1))
+    fi
+
+    printf "  %3d/%-3d: %s\n" "$file_index" "$total_files" "${rel_path#./}"
+    echo "          Built:    $built_hash"
+    echo "          Official: $official_hash"
+    echo "          Status:   $status_label"
+    echo ""
+done < "$full_listing"
+
+rm -f "$full_listing"
 
 # Determine final verdict
 if [[ "$CRITICAL_MATCH" == "true" ]] && [[ "$MODULES_MATCH" == "true" ]] && [[ "$FILE_COUNT_MATCH" == "true" ]]; then
