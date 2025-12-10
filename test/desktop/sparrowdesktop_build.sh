@@ -2,7 +2,7 @@
 #
 # sparrowdesktop_build.sh - Sparrow Desktop Reproducible Build Verifier
 #
-# Version: v0.9.2
+# Version: v0.9.3
 #
 # Description:
 #   Fully containerized reproducible build verification for Sparrow Desktop.
@@ -34,7 +34,7 @@
 set -euo pipefail
 
 # Script version
-SCRIPT_VERSION="v0.9.2"
+SCRIPT_VERSION="v0.9.3"
 
 # Exit codes (BSA compliant)
 EXIT_SUCCESS=0
@@ -588,12 +588,12 @@ built_legal_listing=$(mktemp /tmp/sparrow-built-legal.XXXXXX)
 official_legal_listing=$(mktemp /tmp/sparrow-official-legal.XXXXXX)
 
 # Get all files
-(cd /built/Sparrow && find . -type f | sort) > "$built_listing"
-(cd /official/Sparrow && find . -type f | sort) > "$official_listing"
+(cd /built/Sparrow && find . \( -type f -o -type l \) | sort) > "$built_listing"
+(cd /official/Sparrow && find . \( -type f -o -type l \) | sort) > "$official_listing"
 
 # Get legal files separately
-(cd /built/Sparrow && find . -type f -path '*/lib/runtime/legal/*' | sort) > "$built_legal_listing"
-(cd /official/Sparrow && find . -type f -path '*/lib/runtime/legal/*' | sort) > "$official_legal_listing"
+(cd /built/Sparrow && find . \( -type f -o -type l \) -path '*/lib/runtime/legal/*' | sort) > "$built_legal_listing"
+(cd /official/Sparrow && find . \( -type f -o -type l \) -path '*/lib/runtime/legal/*' | sort) > "$official_legal_listing"
 
 # Count totals
 build_total=$(wc -l < "$built_listing" | tr -d ' ')
@@ -653,7 +653,7 @@ full_listing=$(mktemp /tmp/sparrow-full-list.XXXXXX)
 
 (
     cd /official/Sparrow
-    find . -type f -print
+    find . \( -type f -o -type l \) -print
 ) | sort > "$full_listing"
 
 total_files=$(wc -l < "$full_listing" | tr -d ' ')
