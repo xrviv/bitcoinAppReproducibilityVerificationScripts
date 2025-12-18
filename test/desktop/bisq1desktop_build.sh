@@ -2,7 +2,7 @@
 # ==============================================================================
 # bisq1desktop_build.sh - Bisq 1 Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.3.4
+# Version:       v0.3.5
 # Organization:  WalletScrutiny.com
 # Last Modified: 2025-12-18
 # Project:       https://github.com/bisq-network/bisq
@@ -26,7 +26,7 @@
 # By using this script, you acknowledge these disclaimers and accept full responsibility.
 #
 # SCRIPT SUMMARY:
-# - Downloads official Bisq .deb releases from GitHub
+# - Downloads official Bisq .deb or .rpm releases from GitHub
 # - Clones source code repository and checks out the exact release tag
 # - Performs containerized reproducible build using Gradle + jpackage
 # - Extracts and compares .class file hashes between official and built packages
@@ -36,7 +36,7 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v0.3.4"
+SCRIPT_VERSION="v0.3.5"
 SCRIPT_NAME="bisq1desktop_build.sh"
 APP_NAME="Bisq 1"
 APP_ID="bisq1"
@@ -119,9 +119,9 @@ Usage:
 Required Parameters:
   --version <version>    Bisq version to verify (e.g., 1.9.21, 1.9.20)
   --arch <arch>          Target architecture
-                         Supported: x86_64-linux-gnu
+                         Supported: x86_64-linux, x86_64-linux-gnu
   --type <type>          Package type
-                         Supported: deb
+                         Supported: deb, rpm
 
 Optional Parameters:
   --help                 Show this help message
@@ -129,7 +129,8 @@ Optional Parameters:
   --keep-container       Keep container after build for inspection
 
 Examples:
-  $(basename "$0") --version 1.9.21 --arch x86_64-linux-gnu --type deb
+  $(basename "$0") --version 1.9.21 --arch x86_64-linux --type deb
+  $(basename "$0") --version 1.9.21 --arch x86_64-linux --type rpm
   $(basename "$0") --version 1.9.20 --arch x86_64-linux-gnu --type deb --no-cache
 
 Requirements:
@@ -208,10 +209,15 @@ case "$BISQ_ARCH" in
         ;;
 esac
 
-# Validate type
-if [[ "$BISQ_TYPE" != "deb" ]]; then
-    die "Unsupported package type: $BISQ_TYPE (only deb is supported)" "$EXIT_INVALID_PARAMS"
-fi
+# Validate type (accept deb or rpm)
+case "$BISQ_TYPE" in
+    deb|rpm)
+        # Valid type
+        ;;
+    *)
+        die "Unsupported package type: $BISQ_TYPE (supported: deb, rpm)" "$EXIT_INVALID_PARAMS"
+        ;;
+esac
 
 # Ensure version has 'v' prefix
 if [[ ! "$BISQ_VERSION" =~ ^v ]]; then
@@ -297,7 +303,7 @@ FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y \
-    git wget curl unzip tar xz-utils zstd binutils \
+    git wget curl unzip tar xz-utils zstd binutils cpio \
     ca-certificates ca-certificates-java fakeroot dpkg-dev \
     build-essential debhelper rpm gnupg software-properties-common \
     && wget -q https://cdn.azul.com/zulu/bin/zulu-repo_1.0.0-3_all.deb \
@@ -352,7 +358,7 @@ generate_error_and_exit() {
     mkdir -p /output
     cat > /output/COMPARISON_RESULTS.yaml << ERRYAML
 date: $(date -u +"%Y-%m-%dT%H:%M:%S+0000")
-script_version: ${SCRIPT_VERSION:-v0.3.4}
+script_version: ${SCRIPT_VERSION:-v0.3.5}
 build_type: ${BISQ_TYPE:-deb}
 results:
   - architecture: ${BISQ_ARCH:-x86_64-linux-gnu}
@@ -382,9 +388,16 @@ echo "Checkout complete: $(git describe --tags)"
 
 echo "Downloading official release..."
 cd "$WORK_DIR" || generate_error_and_exit "Failed to change to work directory"
-OFFICIAL_DEB="Bisq-64bit-${BISQ_VERSION#v}.deb"
-if ! wget --progress=bar:force "https://github.com/bisq-network/bisq/releases/download/${BISQ_VERSION}/${OFFICIAL_DEB}"; then
-    generate_error_and_exit "Failed to download official release $OFFICIAL_DEB"
+
+# Set official package name based on type
+if [[ "$BISQ_TYPE" == "deb" ]]; then
+    OFFICIAL_PKG="Bisq-64bit-${BISQ_VERSION#v}.deb"
+elif [[ "$BISQ_TYPE" == "rpm" ]]; then
+    OFFICIAL_PKG="Bisq-64bit-${BISQ_VERSION#v}.rpm"
+fi
+
+if ! wget --progress=bar:force "https://github.com/bisq-network/bisq/releases/download/${BISQ_VERSION}/${OFFICIAL_PKG}"; then
+    generate_error_and_exit "Failed to download official release $OFFICIAL_PKG"
 fi
 echo "Download complete"
 
@@ -403,15 +416,22 @@ if ! ./gradlew desktop:generateInstallers --rerun-tasks; then
 fi
 echo "Build complete"
 
-# Find built package
-LOCAL_DEB=$(find desktop/build/packaging/jpackage/packages -name "bisq_*-1_amd64.deb" 2>/dev/null | head -1)
-if [[ -z "$LOCAL_DEB" ]]; then
-    echo "ERROR: Built .deb file not found"
+# Find built package based on type
+if [[ "$BISQ_TYPE" == "deb" ]]; then
+    LOCAL_PKG=$(find desktop/build/packaging/jpackage/packages -name "bisq_*-1_amd64.deb" 2>/dev/null | head -1)
+    PKG_PATTERN="bisq_*-1_amd64.deb"
+elif [[ "$BISQ_TYPE" == "rpm" ]]; then
+    LOCAL_PKG=$(find desktop/build/packaging/jpackage/packages -name "bisq-*.x86_64.rpm" 2>/dev/null | head -1)
+    PKG_PATTERN="bisq-*.x86_64.rpm"
+fi
+
+if [[ -z "$LOCAL_PKG" ]]; then
+    echo "ERROR: Built .$BISQ_TYPE file not found"
     mkdir -p /output
     cat > /output/COMPARISON_RESULTS.yaml << ERRYAML
 date: $(date -u +"%Y-%m-%dT%H:%M:%S+0000")
-script_version: ${SCRIPT_VERSION:-v0.3.4}
-build_type: ${BISQ_TYPE:-deb}
+script_version: ${SCRIPT_VERSION:-v0.3.5}
+build_type: ${BISQ_TYPE}
 results:
   - architecture: ${BISQ_ARCH:-x86_64-linux-gnu}
     status: ftbfs
@@ -420,18 +440,18 @@ results:
         hash: ""
         match: false
         official_hash: ""
-        notes: "Build failed: .deb file not found in desktop/build/packaging/jpackage/packages"
+        notes: "Build failed: .$BISQ_TYPE file not found in desktop/build/packaging/jpackage/packages (pattern: $PKG_PATTERN)"
 ERRYAML
     exit 1
 fi
-LOCAL_DEB=$(realpath "$LOCAL_DEB")
+LOCAL_PKG=$(realpath "$LOCAL_PKG")
 
-OFFICIAL_DEB="$WORK_DIR/${OFFICIAL_DEB}"
+OFFICIAL_PKG="$WORK_DIR/${OFFICIAL_PKG}"
 
 echo ""
 echo "Comparing packages..."
-echo "  Official: $(basename "$OFFICIAL_DEB")"
-echo "  Built:    $(basename "$LOCAL_DEB")"
+echo "  Official: $(basename "$OFFICIAL_PKG")"
+echo "  Built:    $(basename "$LOCAL_PKG")"
 echo ""
 
 # Extract packages
@@ -440,13 +460,27 @@ mkdir -p "$EXTRACT_DIR"/{official,local,jars/{official,local}}
 
 echo "Extracting official package..."
 cd "$EXTRACT_DIR/official"
-ar -x "$OFFICIAL_DEB"
-tar -xJf data.tar.xz 2>/dev/null || tar --zstd -xf data.tar.zst 2>/dev/null || tar -xzf data.tar.gz
+if [[ "$BISQ_TYPE" == "deb" ]]; then
+    ar -x "$OFFICIAL_PKG"
+    tar -xJf data.tar.xz 2>/dev/null || tar --zstd -xf data.tar.zst 2>/dev/null || tar -xzf data.tar.gz
+elif [[ "$BISQ_TYPE" == "rpm" ]]; then
+    rpm2cpio "$OFFICIAL_PKG" | cpio -idmv 2>&1 | tail -20
+fi
 
 echo "Extracting built package..."
 cd "$EXTRACT_DIR/local"
-ar -x "$LOCAL_DEB"
-tar -xJf data.tar.xz 2>/dev/null || tar --zstd -xf data.tar.zst 2>/dev/null || tar -xzf data.tar.gz
+if [[ "$BISQ_TYPE" == "deb" ]]; then
+    ar -x "$LOCAL_PKG"
+    tar -xJf data.tar.xz 2>/dev/null || tar --zstd -xf data.tar.zst 2>/dev/null || tar -xzf data.tar.gz
+elif [[ "$BISQ_TYPE" == "rpm" ]]; then
+    rpm2cpio "$LOCAL_PKG" | cpio -idmv 2>&1 | tail -20
+fi
+
+# Debug: Show what was extracted
+echo "DEBUG: Contents of official extract dir:"
+find "$EXTRACT_DIR/official" -type f -name "*.jar" 2>/dev/null | head -10
+echo "DEBUG: Contents of local extract dir:"
+find "$EXTRACT_DIR/local" -type f -name "*.jar" 2>/dev/null | head -10
 
 echo "Finding desktop.jar files..."
 OFFICIAL_JAR=$(find "$EXTRACT_DIR/official" -name "desktop.jar" | head -1)
@@ -457,7 +491,7 @@ if [[ -z "$OFFICIAL_JAR" ]] || [[ -z "$LOCAL_JAR" ]]; then
     mkdir -p /output
     cat > /output/COMPARISON_RESULTS.yaml << ERRYAML
 date: $(date -u +"%Y-%m-%dT%H:%M:%S+0000")
-script_version: ${SCRIPT_VERSION:-v0.3.4}
+script_version: ${SCRIPT_VERSION:-v0.3.5}
 build_type: ${BISQ_TYPE:-deb}
 results:
   - architecture: ${BISQ_ARCH:-x86_64-linux-gnu}
@@ -606,8 +640,8 @@ else
 fi
 
 # Calculate package hashes
-OFFICIAL_HASH=$(sha256sum "$OFFICIAL_DEB" 2>/dev/null | cut -d' ' -f1 || echo "unknown")
-LOCAL_HASH=$(sha256sum "$LOCAL_DEB" 2>/dev/null | cut -d' ' -f1 || echo "unknown")
+OFFICIAL_HASH=$(sha256sum "$OFFICIAL_PKG" 2>/dev/null | cut -d' ' -f1 || echo "unknown")
+LOCAL_HASH=$(sha256sum "$LOCAL_PKG" 2>/dev/null | cut -d' ' -f1 || echo "unknown")
 
 # Determine status with security consideration
 if [[ $DIFF_COUNT -eq 0 ]] && [[ $OFFICIAL_COUNT -eq $LOCAL_COUNT ]] && [[ $OFFICIAL_COUNT -gt 0 ]]; then
@@ -631,17 +665,17 @@ fi
 mkdir -p /output
 cat > /output/COMPARISON_RESULTS.yaml << EOF
 date: $(date -u +"%Y-%m-%dT%H:%M:%S+0000")
-script_version: ${SCRIPT_VERSION:-v0.3.2}
-build_type: ${BISQ_TYPE:-deb}
+script_version: ${SCRIPT_VERSION:-v0.3.5}
+build_type: ${BISQ_TYPE}
 results:
   - architecture: ${BISQ_ARCH:-x86_64-linux-gnu}
     status: ${STATUS:-not_reproducible}
     files:
-      - filename: $(basename "${LOCAL_DEB:-unknown.deb}")
+      - filename: $(basename "${LOCAL_PKG:-unknown}")
         hash: ${LOCAL_HASH:-unknown}
         match: ${MATCH:-false}
         official_hash: ${OFFICIAL_HASH:-unknown}
-        notes: "Compared ${OFFICIAL_COUNT:-0} .class files, ${DIFF_COUNT:-0} differences. Modules: core=${CORE_DIFFS:-0}, p2p=${P2P_DIFFS:-0}, desktop=${DESKTOP_DIFFS:-0}, common=${COMMON_DIFFS:-0}, proto=${PROTO_DIFFS:-0}. Security-critical: ${SECURITY_CRITICAL_DIFFS:-0} diffs"
+        notes: "Compared ${OFFICIAL_COUNT:-0} .class files from ${BISQ_TYPE}, ${DIFF_COUNT:-0} differences. Modules: core=${CORE_DIFFS:-0}, p2p=${P2P_DIFFS:-0}, desktop=${DESKTOP_DIFFS:-0}, common=${COMMON_DIFFS:-0}, proto=${PROTO_DIFFS:-0}. Security-critical: ${SECURITY_CRITICAL_DIFFS:-0} diffs"
         verdict: "${VERDICT:-unknown}"
 EOF
 
