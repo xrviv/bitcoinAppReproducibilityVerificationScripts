@@ -2,7 +2,7 @@
 # ==============================================================================
 # specterdesktop_build.sh - Specter Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.8
+# Version:       v0.2.9
 # Organization:  WalletScrutiny.com
 # Last Modified: 2025-12-19
 # Project:       https://github.com/cryptoadvance/specter-desktop
@@ -61,7 +61,7 @@
 set -euo pipefail
 
 # Script version
-SCRIPT_VERSION="v0.2.8"
+SCRIPT_VERSION="v0.2.9"
 
 # Exit codes (BSA compliant)
 EXIT_SUCCESS=0
@@ -196,7 +196,7 @@ parse_arguments() {
 
 show_help() {
     cat << 'EOF'
-specterdesktop_build.sh v0.2.8 - Specter Desktop Reproducible Build Verification
+specterdesktop_build.sh v0.2.9 - Specter Desktop Reproducible Build Verification
 
 USAGE:
     specterdesktop_build.sh --version VERSION --arch ARCH --type TYPE [OPTIONS]
@@ -649,8 +649,8 @@ if [[ "$MATCH" == "false" ]]; then
 fi
 
 if [[ "$BUILD_TYPE" == "electron-gui" ]]; then
-    # Electron-GUI builds: Single file entry (tarball - what users download)
-    # AppImage comparison details go in notes field
+    # Electron-GUI builds: Report AppImage (what we actually compare)
+    # Tarball info goes in notes for context
     cat > /output/COMPARISON_RESULTS.yaml << YAML_EOF
 date: $(date -u +"%Y-%m-%dT%H:%M:%S+0000")
 script_version: ${SCRIPT_VERSION}
@@ -659,10 +659,10 @@ results:
   - architecture: ${BUILD_ARCH}
     status: ${STATUS}
     files:
-      - filename: ${RELEASE_FILENAME}
-        hash: ${TARBALL_HASH}
+      - filename: ${ARTIFACT_NAME}
+        hash: ${BUILT_HASH}
         match: ${MATCH}
-    notes: "${NOTES} Compared inner AppImage (${ARTIFACT_NAME}, hash: ${BUILT_HASH})."
+    notes: "AppImage extracted from official tarball ${RELEASE_FILENAME} (tarball hash: ${TARBALL_HASH}). ${NOTES}"
 YAML_EOF
 else
     # Specterd builds: single artifact
@@ -699,8 +699,8 @@ else
     echo "verdict:        "
 fi
 if [[ "$BUILD_TYPE" == "electron-gui" ]]; then
-    echo "appHash:        ${TARBALL_HASH} (tarball)"
-    echo "comparedHash:   ${OFFICIAL_HASH} (AppImage inside)"
+    echo "appHash:        ${BUILT_HASH} (AppImage)"
+    echo "tarballHash:    ${TARBALL_HASH} (${RELEASE_FILENAME})"
 else
     echo "appHash:        ${OFFICIAL_HASH}"
 fi
