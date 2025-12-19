@@ -2,7 +2,7 @@
 # ==============================================================================
 # specterdesktop_build.sh - Specter Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.7
+# Version:       v0.2.8
 # Organization:  WalletScrutiny.com
 # Last Modified: 2025-12-19
 # Project:       https://github.com/cryptoadvance/specter-desktop
@@ -61,7 +61,7 @@
 set -euo pipefail
 
 # Script version
-SCRIPT_VERSION="v0.2.7"
+SCRIPT_VERSION="v0.2.8"
 
 # Exit codes (BSA compliant)
 EXIT_SUCCESS=0
@@ -196,7 +196,7 @@ parse_arguments() {
 
 show_help() {
     cat << 'EOF'
-specterdesktop_build.sh v0.2.7 - Specter Desktop Reproducible Build Verification
+specterdesktop_build.sh v0.2.8 - Specter Desktop Reproducible Build Verification
 
 USAGE:
     specterdesktop_build.sh --version VERSION --arch ARCH --type TYPE [OPTIONS]
@@ -618,7 +618,8 @@ elif [[ "$BUILD_TYPE" == "electron-gui" ]]; then
     echo ""
     
     # Compare extracted contents
-    DIFF_COUNT=$(diff -rq /build/extract_built/squashfs-root /build/extract_official/squashfs-root 2>/dev/null | wc -l || echo "0")
+    DIFF_COUNT=$(diff -rq /build/extract_built/squashfs-root /build/extract_official/squashfs-root 2>/dev/null | wc -l) || true
+    DIFF_COUNT=${DIFF_COUNT:-0}
     echo "Files differing: $DIFF_COUNT"
     
     if [[ "$DIFF_COUNT" -gt 0 ]]; then
