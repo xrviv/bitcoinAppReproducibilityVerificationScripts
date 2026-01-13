@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitcoincoredesktop_build.sh - Bitcoin Core Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.3.3
+# Version:       v0.3.10
 # Organization:  WalletScrutiny.com
-# Last Modified: 2025-12-02
+# Last Modified: 2025-01-13
 # Project:       https://github.com/bitcoin/bitcoin
 # ==============================================================================
 # LICENSE: MIT License
@@ -25,7 +25,7 @@
 # - Downloads official Bitcoin Core releases from bitcoincore.org
 # - Clones source code repository and checks out the exact release tag
 # - Performs containerized reproducible build using embedded Dockerfile (Alpine Guix)
-# - Builds only standard release binaries (no debug/unsigned variants)
+# - Builds standard release binaries; Windows outputs are unsigned by default
 # - Compares checksums between official and built binaries
 # - Generates COMPARISON_RESULTS.yaml for build server automation
 # - Documents differences and generates detailed reproducibility assessment
@@ -39,12 +39,10 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v0.3.3"
+SCRIPT_VERSION="v0.3.10"
 SCRIPT_NAME="bitcoincoredesktop_build.sh"
 APP_NAME="Bitcoin Core"
 APP_ID="bitcoincore"
-REPO_URL="https://github.com/bitcoin/bitcoin"
-DEFAULT_VERSION="29.1"
 CONTAINER_NAME=""
 IMAGE_NAME=""
 VERIFICATION_EXIT_CODE=1
@@ -105,9 +103,9 @@ Usage:
 Required Parameters:
   --version <version>    Bitcoin Core version to verify (e.g., 29.1, 30.0)
   --arch <arch>          Target architecture
-                         Supported: x86_64-linux, aarch64-linux, arm-linux,
+                         Supported: x86_64-linux, x86_64-linux-gnu, aarch64-linux, arm-linux,
                                    x86_64-windows, x86_64-macos, arm64-macos
-  --type <type>          Build type (tarball for linux/macos, zip for windows)
+  --type <type>          Build type (tarball for linux/macos, zip/setup for windows; zip/setup default to unsigned)
 
 Optional Parameters:
 
@@ -121,6 +119,9 @@ Examples:
   $(basename "$0") --version 29.1 --arch x86_64-linux --type tarball
   $(basename "$0") --version 29.1 --arch aarch64-linux --type tarball
   $(basename "$0") --version 30.0 --arch x86_64-windows --type zip
+  $(basename "$0") --version 30.0 --arch x86_64-windows --type unsigned-zip
+  $(basename "$0") --version 30.0 --arch x86_64-windows --type setup
+  $(basename "$0") --version 30.0 --arch x86_64-windows --type unsigned-setup
   $(basename "$0") --version 29.1 --arch x86_64-macos --type tarball
   $(basename "$0") --list-targets
 
@@ -150,20 +151,19 @@ SUPPORTED BUILD TARGETS:
 Bitcoin Core supports building for multiple platforms. Each target produces
 different output files based on the platform and architecture.
 
-LINUX TARGETS:
-    x86_64-linux-gnu        Standard 64-bit Linux (glibc) - DEFAULT
-    aarch64-linux-gnu       64-bit ARM Linux (e.g., Raspberry Pi 4)
-    arm-linux-gnueabihf     32-bit ARM Linux (e.g., Raspberry Pi 3)
-    powerpc64-linux-gnu     64-bit PowerPC Linux
-    powerpc64le-linux-gnu   64-bit PowerPC Little Endian Linux
-    riscv64-linux-gnu       64-bit RISC-V Linux
+LINUX TARGETS (use these with --arch):
+    x86_64-linux            Standard 64-bit Linux (glibc) - DEFAULT
+    aarch64-linux           64-bit ARM Linux (e.g., Raspberry Pi 4)
+    arm-linux               32-bit ARM Linux (e.g., Raspberry Pi 3)
 
-WINDOWS TARGETS:
-    x86_64-w64-mingw32      64-bit Windows
+WINDOWS TARGETS (use these with --arch):
+    x86_64-windows          64-bit Windows
 
-MACOS TARGETS:
-    x86_64-apple-darwin     64-bit macOS (Intel)
-    arm64-apple-darwin      64-bit macOS (Apple Silicon M1/M2)
+MACOS TARGETS (use these with --arch):
+    x86_64-macos            64-bit macOS (Intel)
+    arm64-macos             64-bit macOS (Apple Silicon M1/M2)
+
+NOTE: These are mapped internally to Guix host triplets (e.g., x86_64-linux → x86_64-linux-gnu)
 
 OUTPUT FILES PER TARGET:
 Each build produces ONE standard release binary per architecture:
@@ -172,13 +172,16 @@ FOR LINUX/DESKTOP TARGETS:
     bitcoin-VERSION-TARGET.tar.gz           # Main binaries only
 
 FOR WINDOWS TARGET (x86_64-w64-mingw32):
-    bitcoin-VERSION-win64.zip               # Main Windows binaries only
+    bitcoin-VERSION-win64-unsigned.zip      # Unsigned Windows zip (verifiable)
+    bitcoin-VERSION-win64-setup-unsigned.exe # Unsigned Windows installer (verifiable)
+    NOTE: Signed binaries cannot be verified as we don't have code signing keys.
 
 FOR MACOS TARGETS:
     bitcoin-VERSION-TARGET.tar.gz           # Main binaries only
 
-NOTE: Debug, unsigned, codesigning, and installer variants are NOT built.
-      Only the primary release binary is built and verified.
+NOTE: Debug and codesigning variants are NOT built.
+      Windows builds are unsigned by default; --type zip/setup map to unsigned outputs.
+      Unsigned Windows verification uses guix.sigs attestations.
 
 BUILD TIME ESTIMATES:
     Single target:    20-40 minutes
@@ -187,7 +190,7 @@ EXAMPLE OUTPUTS FOR v29.1 (standard releases only):
     bitcoin-29.1-x86_64-linux-gnu.tar.gz           (50.4 MB)
     bitcoin-29.1-aarch64-linux-gnu.tar.gz          (47.9 MB)
     bitcoin-29.1-arm-linux-gnueabihf.tar.gz        (44.5 MB)
-    bitcoin-29.1-win64.zip                         (47.8 MB)
+    bitcoin-29.1-win64-unsigned.zip                (43.6 MB)
     bitcoin-29.1-x86_64-apple-darwin.tar.gz        (39.0 MB)
     bitcoin-29.1-arm64-apple-darwin.tar.gz         (35.7 MB)
 
@@ -199,13 +202,6 @@ For latest releases and to check actual binary names:
     https://bitcoincore.org/bin/
 
 EOF
-}
-
-# Version function
-show_version() {
-    echo "$SCRIPT_NAME version $SCRIPT_VERSION"
-    echo "Based on fanquake's Alpine Guix methodology"
-    echo "WalletScrutiny.com Bitcoin Core verification tool"
 }
 
 # ---------- Parameter Parsing ----------
@@ -275,8 +271,8 @@ fi
 # Validate build type per arch
 case "$arch" in
   x86_64-windows|win64)
-    if [[ "$build_type" != "zip" && "$build_type" != "setup" ]]; then
-      log_error "Unsupported type for ${arch}: ${build_type}. Use --type zip or --type setup"
+    if [[ "$build_type" != "zip" && "$build_type" != "setup" && "$build_type" != "unsigned-zip" && "$build_type" != "unsigned-setup" ]]; then
+      log_error "Unsupported type for ${arch}: ${build_type}. Use --type zip, --type unsigned-zip, --type setup, or --type unsigned-setup"
       exit 1
     fi
     ;;
@@ -401,14 +397,14 @@ cleanup_containers() {
 
     log_info "Cleaning up existing containers and images..."
 
-    # Remove container if exists
-    if ${container_cmd} container exists "$CONTAINER_NAME" 2>/dev/null; then
+    # Remove container if exists (use inspect for Docker compatibility)
+    if ${container_cmd} container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
         log_info "Removing existing container: $CONTAINER_NAME"
         ${container_cmd} rm -f "$CONTAINER_NAME" || true
     fi
 
-    # Remove image if exists
-    if ${container_cmd} image exists "$IMAGE_NAME" 2>/dev/null; then
+    # Remove image if exists (use inspect for Docker compatibility)
+    if ${container_cmd} image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
         log_info "Removing existing image: $IMAGE_NAME"
         ${container_cmd} rmi -f "$IMAGE_NAME" || true
     fi
@@ -447,7 +443,9 @@ RUN apk --no-cache --update add \
       curl \
       git \
       make \
-      shadow
+      shadow \
+      wget \
+      xz
 
 ARG guix_download_path=https://ftpmirror.gnu.org/gnu/guix/
 ARG guix_version=1.4.0
@@ -469,7 +467,7 @@ RUN guix_file_name=guix-binary-${guix_version}.$(uname -m)-linux.tar.xz    && \
     mv gnu /                                                               && \
     mkdir -p ~root/.config/guix                                            && \
     ln -sf /var/guix/profiles/per-user/root/current-guix ~root/.config/guix/current && \
-    source ~root/.config/guix/current/etc/profile
+    . ~root/.config/guix/current/etc/profile
 
 RUN groupadd --system guixbuild
 RUN for i in $(seq -w 1 ${builder_count}); do    \
@@ -511,8 +509,8 @@ build_container() {
 start_container() {
     log_info "Starting container daemon: $CONTAINER_NAME"
 
-    # Remove any existing container with the same name first
-    if ${container_cmd} container exists "$CONTAINER_NAME" 2>/dev/null; then
+    # Remove any existing container with the same name first (use inspect for Docker compatibility)
+    if ${container_cmd} container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
         log_info "Removing existing container: $CONTAINER_NAME"
         ${container_cmd} rm -f "$CONTAINER_NAME" || true
     fi
@@ -591,6 +589,41 @@ execute_build() {
     fi
 }
 
+# Fetch matching guix.sigs hashes for unsigned artifacts
+# Uses curl to download tarball instead of git clone to avoid credential prompts
+fetch_guix_sigs_hashes() {
+    local version="$1"
+    local artifact="$2"
+    local sigs_dir="/tmp/guix.sigs"
+    local tarball_url="https://github.com/bitcoin-core/guix.sigs/archive/refs/heads/main.tar.gz"
+
+    log_info "Fetching guix.sigs attestations..." >&2
+
+    # Download and extract guix.sigs as tarball (avoids git credential prompts)
+    if ! ${container_cmd} exec "$CONTAINER_NAME" bash -c "test -d ${sigs_dir}" 2>/dev/null; then
+        if ! ${container_cmd} exec "$CONTAINER_NAME" bash -c "
+            mkdir -p ${sigs_dir} && \
+            curl -fsSL '${tarball_url}' | tar -xz -C ${sigs_dir} --strip-components=1
+        " 2>&1 | grep -v '^$' >&2; then
+            log_warn "Failed to download guix.sigs repository" >&2
+            return 1
+        fi
+    fi
+
+    # Extract hashes - only output valid 64-char hex strings (SHA256)
+    # Note: guix.sigs directories are named without 'v' prefix (e.g., "30.2" not "v30.2")
+    local result
+    result=$(${container_cmd} exec "$CONTAINER_NAME" bash -c "
+        if [ -d '${sigs_dir}/${version}' ]; then
+            find '${sigs_dir}/${version}' -type f -name 'noncodesigned.SHA256SUMS' -print0 2>/dev/null | \
+            xargs -0 -r awk -v f='${artifact}' '\$2==f {print \$1}'
+        fi
+    " 2>/dev/null)
+    
+    # Only output lines that look like valid SHA256 hashes (64 hex chars)
+    echo "$result" | grep -E '^[a-f0-9]{64}$' || true
+}
+
 # Extract and verify checksums
 verify_checksums() {
     local version="$1"
@@ -619,27 +652,42 @@ verify_checksums() {
     ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd $build_dir && ls -lh *.tar.gz *.zip *.exe 2>/dev/null || ls -lh *"
 
     echo ""
-    log_info "Downloading official Bitcoin Core release for comparison..."
-    
+    log_info "Preparing comparison artifacts..."
+
     # Create directories for comparison (inside container)
     ${container_cmd} exec "$CONTAINER_NAME" bash -c "mkdir -p /official /built"
-    
+
     # Determine artifact name (standard release only)
     local main_artifact="bitcoin-${clean_version}-${arch}.tar.gz"
-    
+
     # Handle Windows naming convention
     if [[ "$arch" == "x86_64-w64-mingw32" ]]; then
-        main_artifact="bitcoin-${clean_version}-win64.zip"
+        case "$build_type" in
+            zip|unsigned-zip)
+                main_artifact="bitcoin-${clean_version}-win64-unsigned.zip"
+                ;;
+            setup|unsigned-setup)
+                main_artifact="bitcoin-${clean_version}-win64-setup-unsigned.exe"
+                ;;
+        esac
     fi
-    
-    # Download official release inside container
+
+    local use_guix_sigs="false"
+    if [[ "$main_artifact" == *-unsigned.* ]]; then
+        use_guix_sigs="true"
+        log_info "Unsigned Windows artifact detected; using guix.sigs attestations"
+    fi
+
+    # Download official release inside container (signed artifacts only)
     local official_url="https://bitcoincore.org/bin/bitcoin-core-${clean_version}"
-    log_info "Downloading ${main_artifact} inside container..."
-    if ${container_cmd} exec "$CONTAINER_NAME" bash -c "curl -fsSL -o /official/${main_artifact} ${official_url}/${main_artifact}"; then
-        log_success "Downloaded official release"
-    else
-        log_warn "Could not download official release - manual verification required"
-        log_info "Official checksums: ${official_url}/SHA256SUMS"
+    if [[ "$use_guix_sigs" == "false" ]]; then
+        log_info "Downloading ${main_artifact} inside container..."
+        if ${container_cmd} exec "$CONTAINER_NAME" bash -c "curl -fsSL -o /official/${main_artifact} ${official_url}/${main_artifact}"; then
+            log_success "Downloaded official release"
+        else
+            log_warn "Could not download official release - manual verification required"
+            log_info "Official checksums: ${official_url}/SHA256SUMS"
+        fi
     fi
     
     # Copy built artifacts to /built inside container
@@ -662,39 +710,77 @@ verify_checksums() {
     comparison_file="${execution_dir}/COMPARISON_RESULTS.yaml"
     match_count=0
     diff_count=0
+    verdict="not_reproducible"
+    built_hash=""
+    official_hash=""
+    attestation_hashes=""
     
-    # Compare main artifact if official exists
-    if [[ -f "${official_dir}/${main_artifact}" && -f "${built_dir}/${main_artifact}" ]]; then
-        built_hash=$(sha256sum "${built_dir}/${main_artifact}" | awk '{print $1}')
-        official_hash=$(sha256sum "${official_dir}/${main_artifact}" | awk '{print $1}')
-        
-        if [[ "$built_hash" == "$official_hash" ]]; then
-            generate_yaml "$comparison_file" "$main_artifact" "$built_hash" "true" "reproducible"
-            match_count=$((match_count + 1))
-            verdict="reproducible"
-            log_success "Match: ${main_artifact}"
-            log_success "Hash: ${built_hash}"
-        else
-            generate_yaml "$comparison_file" "$main_artifact" "$built_hash" "false" "not_reproducible"
-            diff_count=$((diff_count + 1))
-            verdict="not_reproducible"
-            log_warn "Difference: ${main_artifact}"
-            log_warn "Built:    ${built_hash}"
-            log_warn "Official: ${official_hash}"
-        fi
-    else
-        # No official to compare - just report built hash
+    if [[ "$use_guix_sigs" == "true" ]]; then
         if [[ -f "${built_dir}/${main_artifact}" ]]; then
             built_hash=$(sha256sum "${built_dir}/${main_artifact}" | awk '{print $1}')
-            generate_error_yaml "$comparison_file" "No official release available for comparison" "nosource"
-            diff_count=$((diff_count + 1))
-            verdict="not_reproducible"
-            log_warn "No official release to compare - manual verification required"
-            log_info "Built hash: ${built_hash}"
+            attestation_hashes=$(fetch_guix_sigs_hashes "$clean_version" "$main_artifact") || attestation_hashes=""
+            if [[ -n "$attestation_hashes" ]]; then
+                official_hash=$(echo "$attestation_hashes" | head -n 1)
+                if echo "$attestation_hashes" | grep -Fxq "$built_hash"; then
+                    generate_yaml "$comparison_file" "$main_artifact" "$built_hash" "true" "reproducible"
+                    match_count=$((match_count + 1))
+                    verdict="reproducible"
+                    log_success "Match: ${main_artifact}"
+                    log_success "Hash: ${built_hash}"
+                else
+                    generate_yaml "$comparison_file" "$main_artifact" "$built_hash" "false" "not_reproducible"
+                    diff_count=$((diff_count + 1))
+                    verdict="not_reproducible"
+                    log_warn "Difference: ${main_artifact}"
+                    log_warn "Built:     ${built_hash}"
+                    log_warn "Attested:  ${official_hash}"
+                fi
+            else
+                generate_error_yaml "$comparison_file" "No guix.sigs attestation found for ${main_artifact}" "nosource"
+                diff_count=$((diff_count + 1))
+                verdict="not_reproducible"
+                log_warn "No guix.sigs attestation found - manual verification required"
+                log_info "Built hash: ${built_hash}"
+            fi
         else
             generate_error_yaml "$comparison_file" "Built artifact not found" "ftbfs"
             verdict="not_reproducible"
             log_error "Built artifact not found: ${main_artifact}"
+        fi
+    else
+        # Compare main artifact if official exists
+        if [[ -f "${official_dir}/${main_artifact}" && -f "${built_dir}/${main_artifact}" ]]; then
+            built_hash=$(sha256sum "${built_dir}/${main_artifact}" | awk '{print $1}')
+            official_hash=$(sha256sum "${official_dir}/${main_artifact}" | awk '{print $1}')
+
+            if [[ "$built_hash" == "$official_hash" ]]; then
+                generate_yaml "$comparison_file" "$main_artifact" "$built_hash" "true" "reproducible"
+                match_count=$((match_count + 1))
+                verdict="reproducible"
+                log_success "Match: ${main_artifact}"
+                log_success "Hash: ${built_hash}"
+            else
+                generate_yaml "$comparison_file" "$main_artifact" "$built_hash" "false" "not_reproducible"
+                diff_count=$((diff_count + 1))
+                verdict="not_reproducible"
+                log_warn "Difference: ${main_artifact}"
+                log_warn "Built:    ${built_hash}"
+                log_warn "Official: ${official_hash}"
+            fi
+        else
+            # No official to compare - just report built hash
+            if [[ -f "${built_dir}/${main_artifact}" ]]; then
+                built_hash=$(sha256sum "${built_dir}/${main_artifact}" | awk '{print $1}')
+                generate_error_yaml "$comparison_file" "No official release available for comparison" "nosource"
+                diff_count=$((diff_count + 1))
+                verdict="not_reproducible"
+                log_warn "No official release to compare - manual verification required"
+                log_info "Built hash: ${built_hash}"
+            else
+                generate_error_yaml "$comparison_file" "Built artifact not found" "ftbfs"
+                verdict="not_reproducible"
+                log_error "Built artifact not found: ${main_artifact}"
+            fi
         fi
     fi
     
@@ -706,8 +792,8 @@ verify_checksums() {
     echo "apkVersionName: ${clean_version}"
     echo "apkVersionCode: N/A"
     echo "verdict:        ${verdict}"
-    if [[ -f "${official_dir}/${main_artifact}" ]]; then
-        echo "appHash:        $(sha256sum "${official_dir}/${main_artifact}" | awk '{print $1}')"
+    if [[ -n "${official_hash}" ]]; then
+        echo "appHash:        ${official_hash}"
     else
         echo "appHash:        N/A (no official release)"
     fi
@@ -755,7 +841,11 @@ verify_checksums() {
     else
         log_warn "Verdict: NOT REPRODUCIBLE"
         log_info "Build server output: ${comparison_file}"
-        log_info "Official checksums: https://bitcoincore.org/bin/bitcoin-core-${clean_version}/SHA256SUMS"
+        if [[ "$use_guix_sigs" == "true" ]]; then
+            log_info "Attestations: https://github.com/bitcoin-core/guix.sigs"
+        else
+            log_info "Official checksums: https://bitcoincore.org/bin/bitcoin-core-${clean_version}/SHA256SUMS"
+        fi
         echo "Exit code: 1"
         VERIFICATION_EXIT_CODE=1
     fi
