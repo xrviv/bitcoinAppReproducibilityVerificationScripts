@@ -2,7 +2,7 @@
 # ==============================================================================
 # bitcoincoredesktop_build.sh - Bitcoin Core Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.3.10
+# Version:       v0.3.12
 # Organization:  WalletScrutiny.com
 # Last Modified: 2025-01-13
 # Project:       https://github.com/bitcoin/bitcoin
@@ -39,7 +39,7 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v0.3.10"
+SCRIPT_VERSION="v0.3.12"
 SCRIPT_NAME="bitcoincoredesktop_build.sh"
 APP_NAME="Bitcoin Core"
 APP_ID="bitcoincore"
@@ -547,7 +547,7 @@ prepare_bitcoin_build() {
         if ! ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git checkout $version"; then
         log_error "Failed to checkout version: $version"
         log_error "Available tags:"
-        ${container_cmd} exec -it "$CONTAINER_NAME" bash -c "cd /bitcoin && git tag | grep -E '^v[0-9]' | tail -10"
+        ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git tag | grep -E '^v[0-9]' | tail -10"
         generate_error_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" "Git checkout failed for version $version" "nosource"
         exit 1
     fi
@@ -601,11 +601,14 @@ fetch_guix_sigs_hashes() {
 
     # Download and extract guix.sigs as tarball (avoids git credential prompts)
     if ! ${container_cmd} exec "$CONTAINER_NAME" bash -c "test -d ${sigs_dir}" 2>/dev/null; then
-        if ! ${container_cmd} exec "$CONTAINER_NAME" bash -c "
+        local download_output
+        download_output=$(${container_cmd} exec "$CONTAINER_NAME" bash -c "
             mkdir -p ${sigs_dir} && \
-            curl -fsSL '${tarball_url}' | tar -xz -C ${sigs_dir} --strip-components=1
-        " 2>&1 | grep -v '^$' >&2; then
-            log_warn "Failed to download guix.sigs repository" >&2
+            curl -fsSL '${tarball_url}' | tar -xz -C ${sigs_dir} --strip-components=1 && \
+            echo 'OK'
+        " 2>&1)
+        if [[ "$download_output" != *"OK"* ]]; then
+            log_warn "Failed to download guix.sigs repository: $download_output" >&2
             return 1
         fi
     fi
@@ -639,7 +642,7 @@ verify_checksums() {
     if ! ${container_cmd} exec "$CONTAINER_NAME" bash -c "test -d $build_dir"; then
         log_error "Build output directory not found: $build_dir"
         log_info "Available directories:"
-        ${container_cmd} exec -it "$CONTAINER_NAME" bash -c "ls -la /bitcoin/guix-build-*/" || true
+        ${container_cmd} exec "$CONTAINER_NAME" bash -c "ls -la /bitcoin/guix-build-*/" || true
         generate_error_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" "Build output directory not found" "ftbfs"
         echo "Exit code: 1"
         exit 1
