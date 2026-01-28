@@ -2,9 +2,9 @@
 # ==============================================================================
 # gingerwallet_build.sh - GingerWallet Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.5.5
+# Version:       v0.6.5
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-01-27
+# Last Modified: 2026-01-28
 # Project:       https://github.com/GingerPrivacy/GingerWallet
 # ==============================================================================
 
@@ -12,9 +12,11 @@ set -euo pipefail
 
 APP_ID="gingerwallet"
 APP_NAME="GingerWallet"
-SCRIPT_VERSION="v0.5.6"
+SCRIPT_VERSION="v0.6.5"
 REPO_URL="https://github.com/GingerPrivacy/GingerWallet.git"
 DEFAULT_BUILD_TYPE="standalone"
+GH_REPO="xrviv/WalletScrutinyCom"
+GH_WORKFLOW="gingerwallet-build.yml"
 
 EXIT_SUCCESS=0
 EXIT_FAILURE=1
@@ -26,7 +28,7 @@ err() { echo "[ERROR] $*" >&2; }
 
 usage() {
   cat <<EOF
-${APP_NAME} reproducible build verification
+${APP_NAME} reproducible build verification (GitHub Actions)
 Version: ${SCRIPT_VERSION}
 Organization: WalletScrutiny.com
 
@@ -38,10 +40,16 @@ Required:
 
 Optional:
   --arch <arch>         Architecture label from build server metadata
-                        Supported values: linux-x64, linux64, x86_64-linux-gnu, x86_64-linux
+                        Supported values: linux-x64, linux64, x86_64-linux-gnu, x86_64-linux, win-x64
   --type <type>         Only "standalone" is supported for this script
   --apk <path>          Not supported for desktop builds (will exit 2)
   -h, --help            Show this message
+
+Build is performed on a Windows GitHub Actions runner via ${GH_REPO}.
+
+Examples:
+  $0 --version 2.0.23 --arch linux-x64
+  $0 --version 2.0.23 --arch win-x64
 EOF
 }
 
@@ -51,7 +59,6 @@ RESULTS_FILE="${EXECUTION_DIR}/COMPARISON_RESULTS.yaml"
 write_yaml_error() {
   local arch_out="$1"
   local status="$2"
-  local reason="$3"
   local now
   now="$(date -u +"%Y-%m-%dT%H:%M:%S+0000")"
 
@@ -63,10 +70,9 @@ results:
   - architecture: ${arch_out}
     status: ${status}
     files:
-      - filename: Ginger-${VERSION:-unknown}-linux-x64.zip
+      - filename: Ginger-${VERSION:-unknown}-${TARGET_ARCH:-linux-x64}.zip
         hash: 0000000000000000000000000000000000000000000000000000000000000000
         match: false
-    reason: ${reason}
 EOF
 }
 
@@ -154,6 +160,9 @@ case "${ARCH_OUT}" in
   linux-x64|linux64|x86_64-linux-gnu|x86_64-linux)
     TARGET_ARCH="linux-x64"
     ;;
+  win-x64)
+    TARGET_ARCH="win-x64"
+    ;;
   *)
     err "Unsupported --arch: ${ARCH_OUT}"
     write_yaml_error "${ARCH_OUT}" "ftbfs" "\"unsupported architecture ${ARCH_OUT}\""
@@ -162,223 +171,212 @@ case "${ARCH_OUT}" in
     ;;
 esac
 
-# Prefer CONTAINER_CMD env var, then docker, then podman.
-CONTAINER_CMD="${CONTAINER_CMD:-}"
-if [[ -z "${CONTAINER_CMD}" ]]; then
-  if command -v docker >/dev/null 2>&1; then
-    CONTAINER_CMD="docker"
-  elif command -v podman >/dev/null 2>&1; then
-    CONTAINER_CMD="podman"
-  else
-    err "Neither docker nor podman is available."
-    write_yaml_error "${ARCH_OUT}" "ftbfs" "\"docker/podman not available\""
-    echo "Exit code: ${EXIT_FAILURE}"
-    exit "${EXIT_FAILURE}"
-  fi
-fi
+# ==============================================================================
+# Prerequisites: gh CLI
+# ==============================================================================
 
-log "Using container command: ${CONTAINER_CMD}"
-
-if ! command -v "${CONTAINER_CMD}" >/dev/null 2>&1; then
-  err "Container command not found: ${CONTAINER_CMD}"
-  write_yaml_error "${ARCH_OUT}" "ftbfs" "\"container command not found\""
+if ! command -v gh >/dev/null 2>&1; then
+  err "GitHub CLI (gh) is not installed. Install from https://cli.github.com/"
+  write_yaml_error "${ARCH_OUT}" "ftbfs" "\"gh CLI not installed\""
   echo "Exit code: ${EXIT_FAILURE}"
   exit "${EXIT_FAILURE}"
 fi
 
-if [[ "${CONTAINER_CMD}" == "docker" ]]; then
-  if ! docker info >/dev/null 2>&1; then
-    err "Docker daemon is not running or not accessible."
-    write_yaml_error "${ARCH_OUT}" "ftbfs" "\"docker daemon not accessible\""
+if ! gh auth status >/dev/null 2>&1; then
+  err "GitHub CLI is not authenticated. Run: gh auth login"
+  write_yaml_error "${ARCH_OUT}" "ftbfs" "\"gh not authenticated\""
+  echo "Exit code: ${EXIT_FAILURE}"
+  exit "${EXIT_FAILURE}"
+fi
+
+log "Using GitHub Actions on ${GH_REPO}"
+
+# ==============================================================================
+# Working directory setup
+# ==============================================================================
+
+NOW="$(date -u +"%Y-%m-%dT%H:%M:%S+0000")"
+ART_DIR="${EXECUTION_DIR}/gingerwallet-${VERSION}-${ARCH_OUT}"
+LOG_DIR="${ART_DIR}/logs"
+mkdir -p "${ART_DIR}" "${LOG_DIR}"
+
+cleanup() {
+  : # Artifacts are kept for inspection
+}
+trap cleanup EXIT
+
+# ==============================================================================
+# Step 1: Download official release and extract SDK version from BUILDINFO.json
+# ==============================================================================
+
+OFFICIAL_DIR="${ART_DIR}/official-download"
+mkdir -p "${OFFICIAL_DIR}"
+OFFICIAL_ASSET_NAME=""
+OFFICIAL_URL=""
+
+log "Resolving official release asset for ${TARGET_ARCH}..."
+OFFICIAL_ASSET_NAME="$(gh api "repos/GingerPrivacy/GingerWallet/releases/tags/v${VERSION}" \
+  --jq ".assets[] | select(.name | contains(\"${TARGET_ARCH}\") and endswith(\".zip\")) | .name" \
+  2>/dev/null | head -n 1 || true)"
+
+if [[ -z "${OFFICIAL_ASSET_NAME}" ]]; then
+  err "Could not find official .zip asset for ${TARGET_ARCH} in release v${VERSION}"
+  write_yaml_error "${ARCH_OUT}" "ftbfs" "\"official ${TARGET_ARCH} release asset not found\""
+  echo "Exit code: ${EXIT_FAILURE}"
+  exit "${EXIT_FAILURE}"
+fi
+
+OFFICIAL_ZIP="${OFFICIAL_DIR}/${OFFICIAL_ASSET_NAME}"
+OFFICIAL_URL="$(gh api "repos/GingerPrivacy/GingerWallet/releases/tags/v${VERSION}" \
+  --jq ".assets[] | select(.name == \"${OFFICIAL_ASSET_NAME}\") | .browser_download_url" \
+  2>/dev/null | head -n 1 || true)"
+
+if [[ -z "${OFFICIAL_URL}" ]]; then
+  err "Could not resolve download URL for ${OFFICIAL_ASSET_NAME}"
+  write_yaml_error "${ARCH_OUT}" "ftbfs" "\"official download URL not found\""
+  echo "Exit code: ${EXIT_FAILURE}"
+  exit "${EXIT_FAILURE}"
+fi
+
+log "Downloading official release..."
+if [[ ! -f "${OFFICIAL_ZIP}" ]]; then
+  if ! curl -fL -o "${OFFICIAL_ZIP}" "${OFFICIAL_URL}"; then
+    err "Failed to download official release from ${OFFICIAL_URL}"
+    write_yaml_error "${ARCH_OUT}" "ftbfs" "\"failed to download official release\""
     echo "Exit code: ${EXIT_FAILURE}"
     exit "${EXIT_FAILURE}"
   fi
 fi
 
-WORK_DIR="$(mktemp -d "${EXECUTION_DIR}/.gingerwallet-${VERSION}-${ARCH_OUT}-XXXXXX")"
-IMAGE_NAME="ws-${APP_ID}-${VERSION}-${ARCH_OUT}-${TYPE_PARAM:-${DEFAULT_BUILD_TYPE}}-$(date -u +%s)"
-VOLUME_SUFFIX=""
-if [[ "${CONTAINER_CMD}" == "podman" ]]; then
-  VOLUME_SUFFIX=":Z"
-fi
-
-cleanup() {
-  rm -rf "${WORK_DIR}" >/dev/null 2>&1 || true
-  "${CONTAINER_CMD}" image rm -f "${IMAGE_NAME}" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
-
-cat >"${WORK_DIR}/run-verify.sh" <<'SCRIPT'
-#!/usr/bin/env bash
-set -euo pipefail
-
-NOW="$(date -u +"%Y-%m-%dT%H:%M:%S+0000")"
-OUT_DIR="/output"
-ART_DIR="${OUT_DIR}/artifacts-${VERSION}-${ARCH_OUT}"
-RESULT_FILE="${OUT_DIR}/COMPARISON_RESULTS.yaml"
-LOG_DIR="${ART_DIR}/logs"
-
-mkdir -p "${ART_DIR}"
-mkdir -p "${LOG_DIR}"
-
-# Force all dotnet/MSBuild invocations to use Release configuration.
-export Configuration=Release
-
-write_yaml() {
-  local status="$1"
-  local match="$2"
-  local built_hash="$3"
-  local official_hash="$4"
-  local reason="${5:-}"
-  cat >"${RESULT_FILE}" <<YAML
-date: ${NOW}
-script_version: ${SCRIPT_VERSION}
-build_type: ${BUILD_TYPE}
-results:
-  - architecture: ${ARCH_OUT}
-    status: ${status}
-    files:
-      - filename: Ginger-${VERSION}-${TARGET_ARCH}.zip
-        hash: ${built_hash}
-        match: ${match}
-    official_hash: ${official_hash}
-    built_hash: ${built_hash}
-    hash_diff: ${ART_DIR}/hash-diff-${VERSION}-${ARCH_OUT}.txt
-    reason: ${reason}
-YAML
-}
-
-fail_ftbfs() {
-  local reason="$1"
-  write_yaml "ftbfs" "false" "0000000000000000000000000000000000000000000000000000000000000000" "0000000000000000000000000000000000000000000000000000000000000000" "\"${reason}\""
-  exit 1
-}
-
-if [[ "${TARGET_ARCH}" != "linux-x64" ]]; then
-  write_yaml "ftbfs" "false" "0000000000000000000000000000000000000000000000000000000000000000" "0000000000000000000000000000000000000000000000000000000000000000" "\"unsupported TARGET_ARCH ${TARGET_ARCH}\""
-  exit 2
-fi
-
-cd /work
-
-# Download the official release early so we can read BUILDINFO.json.
-OFFICIAL_DIR="/work/official"
-mkdir -p "${OFFICIAL_DIR}"
-OFFICIAL_ZIP="${OFFICIAL_DIR}/Ginger-${VERSION}-linux-x64.zip"
-OFFICIAL_URL="https://github.com/GingerPrivacy/GingerWallet/releases/download/v${VERSION}/Ginger-${VERSION}-linux-x64.zip"
-if [[ ! -f "${OFFICIAL_ZIP}" ]]; then
-  if ! curl -fL -o "${OFFICIAL_ZIP}" "${OFFICIAL_URL}"; then
-    fail_ftbfs "failed to download official release"
-  fi
-fi
-
-# Prefer the SDK version from the official build if it is available.
 SDK_VERSION="8.0.100"
-BUILDINFO_PATH=""
-OFFICIAL_BUILDINFO="$(mktemp -d /work/official-buildinfo-XXXXXX)"
-if unzip -q -o "${OFFICIAL_ZIP}" -d "${OFFICIAL_BUILDINFO}" >/dev/null 2>&1; then
-  BUILDINFO_PATH="$(find "${OFFICIAL_BUILDINFO}" -type f -iname "BUILDINFO.json" | head -n 1 || true)"
-fi
-if [[ -n "${BUILDINFO_PATH}" ]]; then
-  sdk_from_buildinfo="$(jq -r '.NetSdkVersion // empty' "${BUILDINFO_PATH}" 2>/dev/null || true)"
-  if [[ -n "${sdk_from_buildinfo}" && "${sdk_from_buildinfo}" != "null" ]]; then
-    SDK_VERSION="${sdk_from_buildinfo}"
+RUNTIME_VERSION=""
+BUILDINFO_TMP="$(mktemp -d "${ART_DIR}/buildinfo-XXXXXX")"
+if unzip -q -o "${OFFICIAL_ZIP}" -d "${BUILDINFO_TMP}" >/dev/null 2>&1; then
+  BUILDINFO_PATH="$(find "${BUILDINFO_TMP}" -type f -iname "BUILDINFO.json" | head -n 1 || true)"
+  if [[ -n "${BUILDINFO_PATH}" ]]; then
+    sdk_from_buildinfo="$(jq -r '.NetSdkVersion // empty' "${BUILDINFO_PATH}" 2>/dev/null || true)"
+    runtime_from_buildinfo="$(jq -r '.NetRuntimeVersion // empty' "${BUILDINFO_PATH}" 2>/dev/null || true)"
+    if [[ -n "${sdk_from_buildinfo}" && "${sdk_from_buildinfo}" != "null" ]]; then
+      SDK_VERSION="${sdk_from_buildinfo}"
+    fi
+    if [[ -n "${runtime_from_buildinfo}" && "${runtime_from_buildinfo}" != "null" ]]; then
+      RUNTIME_VERSION="${runtime_from_buildinfo}"
+    fi
+    cp "${BUILDINFO_PATH}" "${LOG_DIR}/official-BUILDINFO.json" 2>/dev/null || true
   fi
 fi
+rm -rf "${BUILDINFO_TMP}" >/dev/null 2>&1 || true
+
 echo "${SDK_VERSION}" >"${LOG_DIR}/dotnet-sdk-version.txt"
-if [[ -n "${BUILDINFO_PATH}" ]]; then
-  cp "${BUILDINFO_PATH}" "${LOG_DIR}/official-BUILDINFO.json" >/dev/null 2>&1 || true
+if [[ -n "${RUNTIME_VERSION}" ]]; then
+  echo "${RUNTIME_VERSION}" >"${LOG_DIR}/dotnet-runtime-version.txt"
 fi
-rm -rf "${OFFICIAL_BUILDINFO}" >/dev/null 2>&1 || true
+log "SDK version from BUILDINFO.json: ${SDK_VERSION}"
+if [[ -n "${RUNTIME_VERSION}" ]]; then
+  log "Runtime version from BUILDINFO.json: ${RUNTIME_VERSION}"
+fi
 
-# Install the chosen SDK locally and force dotnet to use it.
-DOTNET_ROOT_LOCAL="/work/dotnet"
-DOTNET_INSTALL_SCRIPT="/work/dotnet-install.sh"
-if curl -fsSL https://dot.net/v1/dotnet-install.sh -o "${DOTNET_INSTALL_SCRIPT}"; then
-  if bash "${DOTNET_INSTALL_SCRIPT}" --version "${SDK_VERSION}" --install-dir "${DOTNET_ROOT_LOCAL}" >/dev/null 2>&1; then
-    export DOTNET_ROOT="${DOTNET_ROOT_LOCAL}"
-    export PATH="${DOTNET_ROOT_LOCAL}:${PATH}"
-    export DOTNET_MULTILEVEL_LOOKUP=0
+# ==============================================================================
+# Step 2: Trigger GitHub Actions workflow
+# ==============================================================================
+
+log "Triggering GitHub Actions workflow on ${GH_REPO}..."
+GH_WORKFLOW_REF="wallet-actions"
+WORKFLOW_CMD=(gh workflow run "${GH_WORKFLOW}" --repo "${GH_REPO}" --ref "${GH_WORKFLOW_REF}" -f version="${VERSION}" -f sdk_version="${SDK_VERSION}")
+if [[ -n "${RUNTIME_VERSION}" ]]; then
+  WORKFLOW_CMD+=(-f runtime_version="${RUNTIME_VERSION}")
+fi
+if ! "${WORKFLOW_CMD[@]}"; then
+  err "Failed to trigger workflow"
+  write_yaml_error "${ARCH_OUT}" "ftbfs" "\"failed to trigger GitHub Actions workflow\""
+  echo "Exit code: ${EXIT_FAILURE}"
+  exit "${EXIT_FAILURE}"
+fi
+
+# ==============================================================================
+# Step 3: Poll for the workflow run ID
+# ==============================================================================
+
+log "Waiting for workflow run to appear..."
+RUN_ID=""
+MAX_POLL=30
+POLL_INTERVAL=10
+for i in $(seq 1 "${MAX_POLL}"); do
+  sleep "${POLL_INTERVAL}"
+  RUN_ID="$(gh run list \
+    --repo "${GH_REPO}" \
+    --workflow "${GH_WORKFLOW}" \
+    --limit 1 \
+    --json databaseId,status,createdAt \
+    --jq '.[0].databaseId' 2>/dev/null || true)"
+  if [[ -n "${RUN_ID}" && "${RUN_ID}" != "null" ]]; then
+    log "Found workflow run ID: ${RUN_ID}"
+    break
   fi
-fi
-dotnet --info >"${LOG_DIR}/dotnet-info.log" 2>&1 || true
+  log "Poll attempt ${i}/${MAX_POLL}..."
+done
 
-if ! git clone --depth 1 --branch "v${VERSION}" "${REPO_URL}" src; then
-  write_yaml "nosource" "false" "0000000000000000000000000000000000000000000000000000000000000000" "0000000000000000000000000000000000000000000000000000000000000000" "\"failed to clone tag v${VERSION}\""
-  exit 1
-fi
-
-COMMIT_HASH="$(git -C /work/src rev-parse HEAD 2>/dev/null || echo "unknown")"
-
-# Packager prompts on uncommitted changes and crashes in non-interactive mode.
-# The force-evaluate restore can dirty lock files, so skip the prompt safely.
-PACKAGER_PROGRAM="/work/src/WalletWasabi.Packager/Program.cs"
-if [[ -f "${PACKAGER_PROGRAM}" ]]; then
-  export WS_SKIP_GIT_CHECK=1
-  sed -i '/private static void CheckUncommittedGitChanges()/,/^[[:space:]]*}/ s/if (TryStartProcessAndWaitForExit/if ((Console.IsInputRedirected || Environment.GetEnvironmentVariable("WS_SKIP_GIT_CHECK") == "1") ? false : TryStartProcessAndWaitForExit/' "${PACKAGER_PROGRAM}" || true
+if [[ -z "${RUN_ID}" || "${RUN_ID}" == "null" ]]; then
+  err "Could not find workflow run after ${MAX_POLL} attempts"
+  write_yaml_error "${ARCH_OUT}" "ftbfs" "\"workflow run not found\""
+  echo "Exit code: ${EXIT_FAILURE}"
+  exit "${EXIT_FAILURE}"
 fi
 
-cd /work/src/WalletWasabi.Packager
+# ==============================================================================
+# Step 4: Wait for workflow to complete
+# ==============================================================================
 
-dotnet nuget locals all --clear || true
-
-RESTORE_NOTE=""
-# GingerWallet lock files can differ between Debug and Release.
-# Do the Release force-evaluate sequence recommended in build notes.
-if ! dotnet restore /work/src/WalletWasabi.Fluent/WalletWasabi.Fluent.csproj -p:Configuration=Release --force-evaluate >"${LOG_DIR}/restore-fluent.log" 2>&1; then
-  RESTORE_NOTE="force-evaluate failed for WalletWasabi.Fluent"
-fi
-if ! dotnet restore /work/src/WalletWasabi.Fluent.Desktop/WalletWasabi.Fluent.Desktop.csproj -p:Configuration=Release --force-evaluate >"${LOG_DIR}/restore-fluent-desktop.log" 2>&1; then
-  RESTORE_NOTE="${RESTORE_NOTE}; force-evaluate failed for WalletWasabi.Fluent.Desktop"
-fi
-if ! dotnet restore /work/src/WalletWasabi.sln -p:Configuration=Release --locked-mode >"${LOG_DIR}/restore-sln-locked.log" 2>&1; then
-  RESTORE_NOTE="${RESTORE_NOTE}; locked-mode restore failed for solution"
-  dotnet restore /work/src/WalletWasabi.sln -p:Configuration=Release --force-evaluate >"${LOG_DIR}/restore-sln-force.log" 2>&1
+log "Watching workflow run ${RUN_ID}..."
+if ! gh run watch "${RUN_ID}" --repo "${GH_REPO}" --exit-status; then
+  err "Workflow run ${RUN_ID} failed"
+  write_yaml_error "${ARCH_OUT}" "ftbfs" "\"GitHub Actions workflow failed\""
+  echo "Exit code: ${EXIT_FAILURE}"
+  exit "${EXIT_FAILURE}"
 fi
 
-# Let the Packager handle the full build naturally.
-# The source generator (WalletWasabi.Fluent.Generators) is already referenced
-# as a ProjectReference with OutputItemType="Analyzer" in WalletWasabi.Fluent.csproj.
-# MSBuild resolves this automatically during a normal build — no manual injection needed.
-# Previous versions (v0.3.x–v0.4.0) tried to manually build and inject the generator DLL
-# as an <Analyzer> element, but --no-restore meant the patched csproj was never re-evaluated,
-# so Roslyn never loaded the generator and AutoNotify/AccessModifier symbols were missing.
-if ! dotnet build -c Release >"${LOG_DIR}/build-packager.log" 2>&1; then
-  fail_ftbfs "packager build failed; see ${LOG_DIR}/build-packager.log"
+log "Workflow run ${RUN_ID} completed successfully."
+
+# ==============================================================================
+# Step 4b: Print workflow logs
+# ==============================================================================
+
+log "Fetching workflow logs..."
+if ! gh run view "${RUN_ID}" --repo "${GH_REPO}" --log | tee "${LOG_DIR}/gh-run-${RUN_ID}.log"; then
+  warn "Failed to fetch workflow logs"
 fi
 
-# The Packager calls xdg-open at the end to open the output folder, which
-# crashes in a headless container.  Ignore its exit code — we check for the
-# output zip below instead.
-dotnet run -- --onlybinaries >"${LOG_DIR}/packager-run.log" 2>&1 || true
+# ==============================================================================
+# Step 5: Download build artifact
+# ==============================================================================
 
-# Capture generator diagnostic info for debugging.
-find /work/src/WalletWasabi.Fluent/obj -type d -path "*GeneratedFiles" -exec find {} -maxdepth 5 -type f \( -name "*AutoNotify*" -o -name "*AccessModifier*" \) \; >"${LOG_DIR}/generated-files.txt" 2>&1 || true
+ARTIFACT_NAME="gingerwallet-${VERSION}-${TARGET_ARCH}"
+BUILT_DIR="${ART_DIR}/built"
+mkdir -p "${BUILT_DIR}"
 
-# The Packager produces a directory, not a zip.
-BUILT_DIR="/work/src/WalletWasabi.Fluent.Desktop/bin/dist/linux-x64"
-if [[ ! -d "${BUILT_DIR}" ]]; then
-  fail_ftbfs "built directory not found at ${BUILT_DIR}"
+log "Downloading artifact: ${ARTIFACT_NAME}..."
+if ! gh run download "${RUN_ID}" \
+  --repo "${GH_REPO}" \
+  --name "${ARTIFACT_NAME}" \
+  --dir "${BUILT_DIR}"; then
+  err "Failed to download artifact ${ARTIFACT_NAME}"
+  write_yaml_error "${ARCH_OUT}" "ftbfs" "\"failed to download build artifact\""
+  echo "Exit code: ${EXIT_FAILURE}"
+  exit "${EXIT_FAILURE}"
 fi
 
-# The official zip should already be present from the BUILDINFO step.
-if [[ ! -f "${OFFICIAL_ZIP}" ]]; then
-  if ! curl -fL -o "${OFFICIAL_ZIP}" "${OFFICIAL_URL}"; then
-    fail_ftbfs "failed to download official release"
-  fi
-fi
+# ==============================================================================
+# Step 6: Extract official release and compare
+# ==============================================================================
 
-OFFICIAL_HASH="$(sha256sum "${OFFICIAL_ZIP}" | awk '{print $1}')"
-
-EXTRACT_BASE="/work/extracted"
-OFFICIAL_EXT="${EXTRACT_BASE}/official"
-BUILT_EXT="${BUILT_DIR}"
-rm -rf "${EXTRACT_BASE}"
+OFFICIAL_EXT="${ART_DIR}/official-extracted"
+rm -rf "${OFFICIAL_EXT}"
 mkdir -p "${OFFICIAL_EXT}"
-
 unzip -q "${OFFICIAL_ZIP}" -d "${OFFICIAL_EXT}"
 
-# Hash the built directory contents for the YAML and summary output.
+BUILT_EXT="${BUILT_DIR}"
+
+OFFICIAL_HASH="$(sha256sum "${OFFICIAL_ZIP}" | awk '{print $1}')"
 BUILT_HASH="$(cd "${BUILT_EXT}" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')"
 
 OFFICIAL_HASHES="${ART_DIR}/official-hashes-${VERSION}-${ARCH_OUT}.txt"
@@ -406,11 +404,53 @@ else
   VERDICT=""
 fi
 
-REASON="\"${RESTORE_NOTE}\""
-write_yaml "${STATUS}" "${MATCH}" "${BUILT_HASH}" "${OFFICIAL_HASH}" "${REASON}"
+# ==============================================================================
+# Per-file diffs for mismatched files
+# ==============================================================================
 
-# --- Verification Result Summary (see verification-result-summary-format.md) ---
-ZIP_NAME="Ginger-${VERSION}-${TARGET_ARCH}.zip"
+DIFFS_DIR="${ART_DIR}/diffs"
+if [[ "${MATCH_FLAG}" = "0" ]]; then
+  mkdir -p "${DIFFS_DIR}"
+  grep -E '^\+[^+]|^-[^-]' "${HASH_DIFF}" | awk '{print $2}' | sort -u | while read -r relpath; do
+    official_file="${OFFICIAL_EXT}/${relpath}"
+    built_file="${BUILT_EXT}/${relpath}"
+    safe_name="$(echo "${relpath}" | sed 's#^\./##; s#/#_#g')"
+    diff_out="${DIFFS_DIR}/${safe_name}.diff.txt"
+    if [[ -f "${official_file}" && -f "${built_file}" ]]; then
+      diff -u "${official_file}" "${built_file}" >"${diff_out}" 2>&1 || true
+    elif [[ -f "${official_file}" ]]; then
+      echo "File only in official release (not in built output)." >"${diff_out}"
+    elif [[ -f "${built_file}" ]]; then
+      echo "File only in built output (not in official release)." >"${diff_out}"
+    fi
+  done
+  log "Per-file diffs written to ${DIFFS_DIR}/"
+fi
+
+# ==============================================================================
+# Write COMPARISON_RESULTS.yaml
+# ==============================================================================
+
+cat >"${RESULTS_FILE}" <<YAML
+date: ${NOW}
+script_version: ${SCRIPT_VERSION}
+build_type: ${DEFAULT_BUILD_TYPE}
+results:
+  - architecture: ${ARCH_OUT}
+    status: ${STATUS}
+    files:
+      - filename: ${OFFICIAL_ASSET_NAME}
+        hash: ${BUILT_HASH}
+        match: ${MATCH}
+YAML
+
+# ==============================================================================
+# Verification Result Summary
+# ==============================================================================
+
+COMMIT_HASH="$(gh api "repos/GingerPrivacy/GingerWallet/git/ref/tags/v${VERSION}" --jq '.object.sha' 2>/dev/null || echo "unknown")"
+
+ZIP_NAME="${OFFICIAL_ASSET_NAME}"
 
 echo ""
 echo "===== Begin Results ====="
@@ -436,10 +476,16 @@ if [[ -s "${HASH_DIFF}" ]]; then
 else
   echo "(no differences)"
 fi
+DIFF_FILES=0
+if [[ -s "${HASH_DIFF}" ]]; then
+  DIFF_FILES="$(grep -E '^\+[^+]|^-[^-]' "${HASH_DIFF}" | awk '{print $2}' | sort -u | wc -l)"
+fi
+echo ""
+echo "Total number of files that differ: ${DIFF_FILES}"
 echo ""
 echo "Revision, tag (and its signature):"
 echo "Tag type: commit-only"
-echo "[INFO] Signature verification not performed in container"
+echo "[INFO] Signature verification not performed"
 echo ""
 echo "===== End Results ====="
 echo ""
@@ -450,95 +496,9 @@ echo "diffoscope ${OFFICIAL_EXT} ${BUILT_EXT}"
 echo "for more details."
 
 if [[ "${MATCH_FLAG}" = "1" ]]; then
-  exit 0
-else
-  exit 1
-fi
-SCRIPT
-
-cat >"${WORK_DIR}/Dockerfile" <<EOF
-FROM mcr.microsoft.com/dotnet/sdk:8.0.100-jammy
-SHELL ["/bin/bash", "-lc"]
-
-ARG VERSION
-ARG ARCH_OUT
-ARG TARGET_ARCH
-ARG SCRIPT_VERSION
-ARG BUILD_TYPE
-ARG REPO_URL
-
-ENV VERSION="\${VERSION}"
-ENV ARCH_OUT="\${ARCH_OUT}"
-ENV TARGET_ARCH="\${TARGET_ARCH}"
-ENV SCRIPT_VERSION="\${SCRIPT_VERSION}"
-ENV BUILD_TYPE="\${BUILD_TYPE}"
-ENV REPO_URL="\${REPO_URL}"
-ENV HOME="/work/home"
-ENV DOTNET_CLI_HOME="/work/home"
-ENV NUGET_PACKAGES="/work/nuget-packages"
-ENV DOTNET_SKIP_FIRST_TIME_EXPERIENCE="1"
-ENV DOTNET_CLI_TELEMETRY_OPTOUT="1"
-
-RUN apt-get update && apt-get install -y --no-install-recommends \\
-    git \\
-    curl \\
-    unzip \\
-    jq \\
-    diffutils \\
-    findutils \\
-    ca-certificates \\
-  && rm -rf /var/lib/apt/lists/*
-
-RUN mkdir -p /work /work/home /work/nuget-packages \\
-  && chmod 0777 /work /work/home /work/nuget-packages
-
-COPY run-verify.sh /usr/local/bin/run-verify.sh
-RUN chmod +x /usr/local/bin/run-verify.sh
-
-CMD ["/usr/local/bin/run-verify.sh"]
-EOF
-
-log "Building container image: ${IMAGE_NAME}"
-if ! "${CONTAINER_CMD}" build \
-  --no-cache \
-  --build-arg VERSION="${VERSION}" \
-  --build-arg ARCH_OUT="${ARCH_OUT}" \
-  --build-arg TARGET_ARCH="${TARGET_ARCH}" \
-  --build-arg SCRIPT_VERSION="${SCRIPT_VERSION}" \
-  --build-arg BUILD_TYPE="${DEFAULT_BUILD_TYPE}" \
-  --build-arg REPO_URL="${REPO_URL}" \
-  -t "${IMAGE_NAME}" \
-  "${WORK_DIR}"; then
-  err "Container build failed."
-  write_yaml_error "${ARCH_OUT}" "ftbfs" "\"container build failed\""
-  echo "Exit code: ${EXIT_FAILURE}"
-  exit "${EXIT_FAILURE}"
-fi
-
-log "Running verification inside container."
-set +e
-"${CONTAINER_CMD}" run --rm \
-  --user "$(id -u):$(id -g)" \
-  -v "${EXECUTION_DIR}:/output${VOLUME_SUFFIX}" \
-  "${IMAGE_NAME}"
-container_rc=$?
-set -e
-
-if [[ -f "${RESULTS_FILE}" ]]; then
-  # Make sure host files are readable by the current user.
-  chown "$(id -u):$(id -g)" "${RESULTS_FILE}" >/dev/null 2>&1 || true
-fi
-
-if [[ ${container_rc} -eq 0 ]]; then
-  log "Reproducible build."
   echo "Exit code: ${EXIT_SUCCESS}"
   exit "${EXIT_SUCCESS}"
-elif [[ ${container_rc} -eq ${EXIT_INVALID_PARAMS} ]]; then
-  err "Invalid parameters inside container."
-  echo "Exit code: ${EXIT_INVALID_PARAMS}"
-  exit "${EXIT_INVALID_PARAMS}"
 else
-  warn "Build completed but did not match, or failed."
   echo "Exit code: ${EXIT_FAILURE}"
   exit "${EXIT_FAILURE}"
 fi
