@@ -88,7 +88,7 @@ detect_from_binary() {
         detected_type="tarball"
     elif [[ "$binary" == *.zip ]]; then
         detected_type="zip"
-        # Peek inside to distinguish Windows from macOS
+        # Peek inside to confirm a supported Windows artifact
         local zip_inner zip_file_output
         zip_inner=$(unzip -l "$binary" 2>/dev/null | awk 'NR>3 && /[0-9]/ && $4 !~ /\/$/ {print $4}' | head -1)
         if [[ -n "$zip_inner" ]]; then
@@ -96,17 +96,11 @@ detect_from_binary() {
             log_info "file(1) on zip inner entry: $zip_file_output"
             if [[ "$zip_file_output" == *"PE32"* || "$zip_file_output" == *"MS Windows"* ]]; then
                 detected_arch="x86_64-windows"
-            elif [[ "$zip_file_output" == *"Mach-O"*"x86_64"* ]]; then
-                detected_arch="x86_64-macos"
-            elif [[ "$zip_file_output" == *"Mach-O"*"arm64"* ]]; then
-                detected_arch="arm64-macos"
             else
-                log_warn "Cannot detect arch from zip contents; assuming Windows"
-                detected_arch="x86_64-windows"
+                log_warn "Unsupported zip contents for Bitcoin Core auto-detection"
             fi
         else
-            log_warn "Cannot peek inside zip; assuming Windows"
-            detected_arch="x86_64-windows"
+            log_warn "Cannot peek inside zip to detect a supported Windows artifact"
         fi
         return
     elif [[ "$binary" == *.exe ]]; then
@@ -141,10 +135,6 @@ detect_from_binary() {
         detected_arch="aarch64-linux"
     elif [[ "$file_output" == *"ELF 32-bit"*"ARM"* ]]; then
         detected_arch="arm-linux"
-    elif [[ "$file_output" == *"Mach-O"*"x86_64"* ]]; then
-        detected_arch="x86_64-macos"
-    elif [[ "$file_output" == *"Mach-O"*"arm64"* ]]; then
-        detected_arch="arm64-macos"
     elif [[ "$file_output" == *"RISC-V"* ]]; then
         detected_arch="riscv64-linux"
     elif [[ "$file_output" == *"PowerPC"* || "$file_output" == *"ppc64"* ]]; then
@@ -206,8 +196,8 @@ Required Parameters:
   --version <version>    Bitcoin Core version to verify (e.g., 29.1, 30.0)
   --arch <arch>          Target architecture
                          Supported: x86_64-linux, x86_64-linux-gnu, aarch64-linux, arm-linux,
-                                   x86_64-windows, x86_64-macos, arm64-macos
-  --type <type>          Build type (tarball for linux/macos, zip/setup for windows)
+                                   riscv64-linux, ppc64-linux, ppc64le-linux, x86_64-windows
+  --type <type>          Build type (tarball for linux, zip/setup for windows)
                          Note: Windows builds always verify unsigned artifacts against guix.sigs
 
 Optional Parameters:
@@ -223,8 +213,8 @@ Examples:
   $(basename "$0") --version 29.1 --arch aarch64-linux --type tarball
   $(basename "$0") --version 30.0 --arch x86_64-windows --type zip
   $(basename "$0") --version 30.0 --arch x86_64-windows --type setup
-  $(basename "$0") --version 29.1 --arch x86_64-macos --type tarball
-  $(basename "$0") --version 29.1 --arch arm64-macos --type tarball
+  $(basename "$0") --version 29.1 --arch riscv64-linux --type tarball
+  $(basename "$0") --version 29.1 --arch ppc64le-linux --type tarball
   $(basename "$0") --list-targets
 
 Requirements:
@@ -261,9 +251,10 @@ LINUX TARGETS (use these with --arch):
 WINDOWS TARGETS (use these with --arch):
     x86_64-windows          64-bit Windows
 
-MACOS TARGETS (use these with --arch):
-    x86_64-macos            64-bit macOS (Intel)
-    arm64-macos             64-bit macOS (Apple Silicon M1/M2)
+ADDITIONAL LINUX TARGETS (use these with --arch):
+    riscv64-linux           64-bit RISC-V Linux
+    ppc64-linux             64-bit PowerPC Linux
+    ppc64le-linux           64-bit PowerPC Little Endian Linux
 
 NOTE: These are mapped internally to Guix host triplets (e.g., x86_64-linux → x86_64-linux-gnu)
 
@@ -278,9 +269,6 @@ FOR WINDOWS TARGET (x86_64-w64-mingw32):
     bitcoin-VERSION-win64-setup-unsigned.exe # Unsigned Windows installer (verifiable)
     NOTE: Signed binaries cannot be verified as we don't have code signing keys.
 
-FOR MACOS TARGETS:
-    bitcoin-VERSION-TARGET.tar.gz           # Main binaries only
-
 NOTE: Debug and codesigning variants are NOT built.
       Windows builds are unsigned by default; --type zip/setup map to unsigned outputs.
       Unsigned Windows verification uses guix.sigs attestations.
@@ -293,8 +281,6 @@ EXAMPLE OUTPUTS FOR v29.1 (standard releases only):
     bitcoin-29.1-aarch64-linux-gnu.tar.gz          (47.9 MB)
     bitcoin-29.1-arm-linux-gnueabihf.tar.gz        (44.5 MB)
     bitcoin-29.1-win64-unsigned.zip                (43.6 MB)
-    bitcoin-29.1-x86_64-apple-darwin.tar.gz        (39.0 MB)
-    bitcoin-29.1-arm64-apple-darwin.tar.gz         (35.7 MB)
 
 VERIFICATION:
 All output files can be verified against official Bitcoin Core releases
@@ -364,6 +350,7 @@ done
 # Validate required parameters
 if [[ -z "$version" ]]; then
   log_error "Missing required parameter: --version"
+  generate_error_yaml "ftbfs"
   usage
   exit 1
 fi
@@ -372,6 +359,7 @@ fi
 if [[ -n "$binary_file" && ( -z "$arch" || -z "$build_type" ) ]]; then
     if [[ ! -f "$binary_file" ]]; then
         log_error "--binary file not found: $binary_file"
+        generate_error_yaml "ftbfs"
         exit 1
     fi
     log_info "Auto-detecting arch/type from binary: $(basename "$binary_file")"
@@ -388,12 +376,14 @@ fi
 
 if [[ -z "$arch" ]]; then
   log_error "Missing required parameter: --arch (could not be auto-detected from --binary)"
+  generate_error_yaml "ftbfs"
   usage
   exit 1
 fi
 
 if [[ -z "$build_type" ]]; then
   log_error "Missing required parameter: --type (could not be auto-detected from --binary)"
+  generate_error_yaml "ftbfs"
   usage
   exit 1
 fi
@@ -420,17 +410,20 @@ case "$arch" in
   x86_64-windows|win64)
     if [[ "$build_type" != "zip" && "$build_type" != "setup" && "$build_type" != "unsigned-zip" && "$build_type" != "unsigned-setup" ]]; then
       log_error "Unsupported type for ${arch}: ${build_type}. Use --type zip, --type unsigned-zip, --type setup, or --type unsigned-setup"
+      generate_error_yaml "ftbfs"
       exit 1
     fi
     ;;
-  x86_64-linux|x86_64-linux-gnu|aarch64-linux|arm-linux|x86_64-macos|arm64-macos)
+  x86_64-linux|x86_64-linux-gnu|aarch64-linux|arm-linux|riscv64-linux|ppc64-linux|ppc64le-linux)
     if [[ "$build_type" != "tarball" ]]; then
       log_error "Unsupported type for ${arch}: ${build_type}. Use --type tarball"
+      generate_error_yaml "ftbfs"
       exit 1
     fi
     ;;
   *)
     log_error "Unsupported architecture/type combo: ${arch}/${build_type}"
+    generate_error_yaml "ftbfs"
     exit 1
     ;;
 esac
@@ -462,12 +455,6 @@ map_arch_to_guix() {
         x86_64-windows|win64)
             echo "x86_64-w64-mingw32"
             ;;
-        x86_64-macos)
-            echo "x86_64-apple-darwin"
-            ;;
-        arm64-macos)
-            echo "arm64-apple-darwin"
-            ;;
         riscv64-linux)
             echo "riscv64-linux-gnu"
             ;;
@@ -479,6 +466,7 @@ map_arch_to_guix() {
             ;;
         *)
             log_error "Unsupported architecture: $bs_arch"
+            generate_error_yaml "ftbfs"
             exit 1
             ;;
     esac
@@ -516,6 +504,7 @@ check_dependencies() {
         container_cmd="docker"
     else
         log_error "Neither podman nor docker found. Please install one of them."
+        generate_error_yaml "ftbfs"
         echo "Exit code: 1"
         exit 1
     fi
