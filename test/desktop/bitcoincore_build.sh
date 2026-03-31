@@ -1,0 +1,1058 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# bitcoincore_build.sh - Bitcoin Core Reproducible Build Verification
+# ==============================================================================
+# Version:       v0.3.16
+# Organization:  WalletScrutiny.com
+# Last Modified: 2026-03-12
+# Project:       https://github.com/bitcoin/bitcoin
+# ==============================================================================
+# LICENSE: MIT License
+#
+# TECHNICAL DISCLAIMER:
+# This script is provided for technical analysis and reproducible build verification purposes only.
+# No warranty is provided regarding the security, functionality, or fitness for any particular purpose.
+# Users assume all risks associated with running this script and analyzing the software.
+# This script performs automated builds and binary comparisons - review all operations before execution.
+#
+# LEGAL DISCLAIMER:
+# This script is designed for legitimate security research and reproducible build verification.
+# Users are responsible for ensuring compliance with all applicable laws and regulations.
+# The developers assume no liability for any misuse or legal consequences arising from use.
+# By using this script, you acknowledge these disclaimers and accept full responsibility.
+#
+# SCRIPT SUMMARY:
+# - Downloads official Bitcoin Core releases from bitcoincore.org
+# - Clones source code repository and checks out the exact release tag
+# - Performs containerized reproducible build using embedded Dockerfile (Alpine Guix)
+# - Builds standard release binaries; Windows outputs are unsigned by default
+# - Compares checksums between official and built binaries
+# - Generates COMPARISON_RESULTS.yaml for build server automation
+# - Documents differences and generates detailed reproducibility assessment
+#
+# CREDITS:
+# This script's containerized approach is inspired by Michael Ford's (fanquake)
+# excellent work on reproducible Bitcoin Core builds. The embedded imagefile
+# is based on fanquake's Alpine Guix methodology from:
+# https://github.com/fanquake/core-review
+
+set -euo pipefail
+
+# Script metadata
+SCRIPT_VERSION="v0.3.16"
+SCRIPT_NAME="bitcoincore_build.sh"
+APP_NAME="Bitcoin Core"
+APP_ID="bitcoincore"
+CONTAINER_NAME=""
+IMAGE_NAME=""
+VERIFICATION_EXIT_CODE=1
+
+# ---------- Styling ----------
+NC="\033[0m"
+GREEN="\033[1;32m"
+YELLOW="\033[1;33m"
+RED="\033[1;31m"
+BLUE="\033[1;34m"
+SUCCESS_ICON="[OK]"
+WARNING_ICON="[WARN]"
+ERROR_ICON="[ERROR]"
+INFO_ICON="[INFO]"
+
+# ---------- Logging Functions ----------
+log_info() { echo -e "${BLUE}${INFO_ICON}${NC} $*"; }
+log_success() { echo -e "${GREEN}${SUCCESS_ICON}${NC} $*"; }
+log_warn() { echo -e "${YELLOW}${WARNING_ICON}${NC} $*"; }
+log_error() { echo -e "${RED}${ERROR_ICON}${NC} $*" >&2; }
+
+# ---------- Helper Functions ----------
+# Sanitize string for container/image names
+sanitize_component() {
+    local input="$1"
+    input=$(echo "$input" | tr '[:upper:]' '[:lower:]')
+    input=$(echo "$input" | sed -E 's/[^a-z0-9]+/-/g')
+    input="${input##-}"
+    input="${input%%-}"
+    if [[ -z "$input" ]]; then
+        input="na"
+    fi
+    echo "$input"
+}
+
+detect_from_binary() {
+    local binary="$1"
+    detected_arch=""
+    detected_type=""
+
+    # Detect type from extension
+    if [[ "$binary" == *.tar.gz ]]; then
+        detected_type="tarball"
+    elif [[ "$binary" == *.zip ]]; then
+        detected_type="zip"
+        # Peek inside to distinguish Windows from macOS
+        local zip_inner zip_file_output
+        zip_inner=$(unzip -l "$binary" 2>/dev/null | awk 'NR>3 && /[0-9]/ && $4 !~ /\/$/ {print $4}' | head -1)
+        if [[ -n "$zip_inner" ]]; then
+            zip_file_output=$(unzip -p "$binary" "$zip_inner" 2>/dev/null | file - 2>/dev/null)
+            log_info "file(1) on zip inner entry: $zip_file_output"
+            if [[ "$zip_file_output" == *"PE32"* || "$zip_file_output" == *"MS Windows"* ]]; then
+                detected_arch="x86_64-windows"
+            elif [[ "$zip_file_output" == *"Mach-O"*"x86_64"* ]]; then
+                detected_arch="x86_64-macos"
+            elif [[ "$zip_file_output" == *"Mach-O"*"arm64"* ]]; then
+                detected_arch="arm64-macos"
+            else
+                log_warn "Cannot detect arch from zip contents; assuming Windows"
+                detected_arch="x86_64-windows"
+            fi
+        else
+            log_warn "Cannot peek inside zip; assuming Windows"
+            detected_arch="x86_64-windows"
+        fi
+        return
+    elif [[ "$binary" == *.exe ]]; then
+        detected_type="setup"
+        detected_arch="x86_64-windows"
+        return
+    elif [[ "$binary" == *.snap ]]; then
+        detected_type="snap"
+        detected_arch="snap"
+        return
+    else
+        log_warn "Cannot detect type from binary extension: $(basename "$binary")"
+        return
+    fi
+
+    # Detect arch by inspecting an executable inside the tarball
+    local inner_path
+    inner_path=$(tar -tzf "$binary" 2>/dev/null | grep -E 'bin/bitcoin' | grep -v '/$' | head -1 || true)
+
+    if [[ -z "$inner_path" ]]; then
+        log_warn "Cannot find executable inside tarball to detect arch"
+        return
+    fi
+
+    local file_output
+    file_output=$(tar -xOzf "$binary" "$inner_path" 2>/dev/null | file - 2>/dev/null)
+    log_info "file(1) on inner binary: $file_output"
+
+    if [[ "$file_output" == *"ELF"*"x86-64"* ]]; then
+        detected_arch="x86_64-linux-gnu"
+    elif [[ "$file_output" == *"ELF"*"aarch64"* || "$file_output" == *"ELF"*"ARM aarch64"* ]]; then
+        detected_arch="aarch64-linux"
+    elif [[ "$file_output" == *"ELF 32-bit"*"ARM"* ]]; then
+        detected_arch="arm-linux"
+    elif [[ "$file_output" == *"Mach-O"*"x86_64"* ]]; then
+        detected_arch="x86_64-macos"
+    elif [[ "$file_output" == *"Mach-O"*"arm64"* ]]; then
+        detected_arch="arm64-macos"
+    elif [[ "$file_output" == *"RISC-V"* ]]; then
+        detected_arch="riscv64-linux"
+    elif [[ "$file_output" == *"PowerPC"* || "$file_output" == *"ppc64"* ]]; then
+        if [[ "$file_output" == *"LSB"* ]]; then
+            detected_arch="ppc64le-linux"
+        else
+            detected_arch="ppc64-linux"
+        fi
+    else
+        log_warn "Cannot detect arch from binary. file(1) output: $file_output"
+    fi
+}
+
+# Validate arch/type combo against bitcoincore.md builds array
+validate_supported_combo() {
+    local a="$1"
+    local t="$2"
+    [[ "$a" == "x86_64-linux" ]] && a="x86_64-linux-gnu"
+    case "${a}/${t}" in
+        x86_64-linux-gnu/tarball|\
+        aarch64-linux/tarball|\
+        arm-linux/tarball|\
+        riscv64-linux/tarball|\
+        ppc64-linux/tarball|\
+        ppc64le-linux/tarball|\
+        x86_64-windows/zip|\
+        x86_64-windows/setup)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+set_unique_names() {
+    local version_component
+    local arch_component
+    local type_component
+    version_component=$(sanitize_component "$1")
+    arch_component=$(sanitize_component "$2")
+    type_component=$(sanitize_component "$3")
+    local suffix
+    suffix=$(sanitize_component "$(date +%s)-$$")
+
+    CONTAINER_NAME="ws-bitcoin-verifier-${version_component}-${arch_component}-${type_component}-${suffix}"
+    IMAGE_NAME="ws-bitcoin-image-${version_component}-${arch_component}-${type_component}-${suffix}"
+}
+
+# ---------- Usage ----------
+usage() {
+  cat <<EOF
+Bitcoin Core Reproducible Build Verification Script
+
+Usage:
+  $(basename "$0") --version <version> --arch <arch> --type <type>
+
+Required Parameters:
+  --version <version>    Bitcoin Core version to verify (e.g., 29.1, 30.0)
+  --arch <arch>          Target architecture
+                         Supported: x86_64-linux, x86_64-linux-gnu, aarch64-linux, arm-linux,
+                                   x86_64-windows, x86_64-macos, arm64-macos
+  --type <type>          Build type (tarball for linux/macos, zip/setup for windows)
+                         Note: Windows builds always verify unsigned artifacts against guix.sigs
+
+Optional Parameters:
+
+Flags:
+  --help                 Show this help message
+  --clean                Clean up containers and images before build
+  --keep-container       Keep container running after build
+  --list-targets         Show available build targets
+
+Examples:
+  $(basename "$0") --version 29.1 --arch x86_64-linux --type tarball
+  $(basename "$0") --version 29.1 --arch aarch64-linux --type tarball
+  $(basename "$0") --version 30.0 --arch x86_64-windows --type zip
+  $(basename "$0") --version 30.0 --arch x86_64-windows --type setup
+  $(basename "$0") --version 29.1 --arch x86_64-macos --type tarball
+  $(basename "$0") --version 29.1 --arch arm64-macos --type tarball
+  $(basename "$0") --list-targets
+
+Requirements:
+  - Docker or Podman installed
+  - Internet connection for downloading sources and official releases
+  - Approximately 2GB disk space for build
+  - 30-60 minutes build time
+
+Output:
+  - Exit code 0: Binaries are reproducible
+  - Exit code 1: Binaries differ or verification failed
+  - COMPARISON_RESULTS.yaml: Machine-readable comparison results
+  - Standardized results format between ===== Begin/End Results =====
+
+Version: ${SCRIPT_VERSION}
+Organization: WalletScrutiny.com
+EOF
+}
+
+# Show available build targets
+show_targets() {
+    cat << EOF
+$SCRIPT_NAME v$SCRIPT_VERSION - Available Build Targets
+
+SUPPORTED BUILD TARGETS:
+Bitcoin Core supports building for multiple platforms. Each target produces
+different output files based on the platform and architecture.
+
+LINUX TARGETS (use these with --arch):
+    x86_64-linux            Standard 64-bit Linux (glibc) - DEFAULT
+    aarch64-linux           64-bit ARM Linux (e.g., Raspberry Pi 4)
+    arm-linux               32-bit ARM Linux (e.g., Raspberry Pi 3)
+
+WINDOWS TARGETS (use these with --arch):
+    x86_64-windows          64-bit Windows
+
+MACOS TARGETS (use these with --arch):
+    x86_64-macos            64-bit macOS (Intel)
+    arm64-macos             64-bit macOS (Apple Silicon M1/M2)
+
+NOTE: These are mapped internally to Guix host triplets (e.g., x86_64-linux → x86_64-linux-gnu)
+
+OUTPUT FILES PER TARGET:
+Each build produces ONE standard release binary per architecture:
+
+FOR LINUX/DESKTOP TARGETS:
+    bitcoin-VERSION-TARGET.tar.gz           # Main binaries only
+
+FOR WINDOWS TARGET (x86_64-w64-mingw32):
+    bitcoin-VERSION-win64-unsigned.zip      # Unsigned Windows zip (verifiable)
+    bitcoin-VERSION-win64-setup-unsigned.exe # Unsigned Windows installer (verifiable)
+    NOTE: Signed binaries cannot be verified as we don't have code signing keys.
+
+FOR MACOS TARGETS:
+    bitcoin-VERSION-TARGET.tar.gz           # Main binaries only
+
+NOTE: Debug and codesigning variants are NOT built.
+      Windows builds are unsigned by default; --type zip/setup map to unsigned outputs.
+      Unsigned Windows verification uses guix.sigs attestations.
+
+BUILD TIME ESTIMATES:
+    Single target:    20-40 minutes
+
+EXAMPLE OUTPUTS FOR v29.1 (standard releases only):
+    bitcoin-29.1-x86_64-linux-gnu.tar.gz           (50.4 MB)
+    bitcoin-29.1-aarch64-linux-gnu.tar.gz          (47.9 MB)
+    bitcoin-29.1-arm-linux-gnueabihf.tar.gz        (44.5 MB)
+    bitcoin-29.1-win64-unsigned.zip                (43.6 MB)
+    bitcoin-29.1-x86_64-apple-darwin.tar.gz        (39.0 MB)
+    bitcoin-29.1-arm64-apple-darwin.tar.gz         (35.7 MB)
+
+VERIFICATION:
+All output files can be verified against official Bitcoin Core releases
+available at: https://bitcoin.org/bin/bitcoin-core-VERSION/
+
+For latest releases and to check actual binary names:
+    https://bitcoincore.org/bin/
+
+EOF
+}
+
+# ---------- Parameter Parsing ----------
+execution_dir="$(pwd)"
+version=""
+arch=""
+build_type=""
+binary_file=""
+clean_flag="false"
+keep_container="false"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --version)
+      version="$2"
+      shift 2
+      ;;
+    --arch)
+      arch="$2"
+      shift 2
+      ;;
+    --type)
+      build_type="$2"
+      shift 2
+      ;;
+    --help)
+      usage
+      exit 0
+      ;;
+    --clean)
+      clean_flag="true"
+      shift
+      ;;
+    --binary)
+      binary_file="$2"
+      shift 2
+      ;;
+    --apk)
+      # Accept but ignore (not applicable to desktop scripts)
+      log_warn "--apk is not applicable to desktop scripts; ignoring"
+      shift 2
+      ;;
+    --keep-container)
+      keep_container="true"
+      shift
+      ;;
+    --list-targets)
+      show_targets
+      exit 0
+      ;;
+    *)
+      log_warn "Ignoring unknown parameter: $1"
+      shift
+      ;;
+  esac
+done
+
+# Validate required parameters
+if [[ -z "$version" ]]; then
+  log_error "Missing required parameter: --version"
+  usage
+  exit 1
+fi
+
+# Auto-detect arch and type from --binary if not explicitly provided
+if [[ -n "$binary_file" && ( -z "$arch" || -z "$build_type" ) ]]; then
+    if [[ ! -f "$binary_file" ]]; then
+        log_error "--binary file not found: $binary_file"
+        exit 1
+    fi
+    log_info "Auto-detecting arch/type from binary: $(basename "$binary_file")"
+    detect_from_binary "$binary_file"
+    if [[ -z "$arch" && -n "$detected_arch" ]]; then
+        arch="$detected_arch"
+        log_info "Auto-detected arch: $arch"
+    fi
+    if [[ -z "$build_type" && -n "$detected_type" ]]; then
+        build_type="$detected_type"
+        log_info "Auto-detected type: $build_type"
+    fi
+fi
+
+if [[ -z "$arch" ]]; then
+  log_error "Missing required parameter: --arch (could not be auto-detected from --binary)"
+  usage
+  exit 1
+fi
+
+if [[ -z "$build_type" ]]; then
+  log_error "Missing required parameter: --type (could not be auto-detected from --binary)"
+  usage
+  exit 1
+fi
+
+# Validate against supported combos from bitcoincore.md builds array
+if ! validate_supported_combo "$arch" "$build_type"; then
+    log_error "Unsupported arch/type combination: ${arch}/${build_type}"
+    log_error "Supported combinations (per bitcoincore.md builds array):"
+    log_error "  x86_64-linux-gnu / tarball"
+    log_error "  aarch64-linux    / tarball"
+    log_error "  arm-linux        / tarball"
+    log_error "  riscv64-linux    / tarball"
+    log_error "  ppc64-linux      / tarball"
+    log_error "  ppc64le-linux    / tarball"
+    log_error "  x86_64-windows   / zip"
+    log_error "  x86_64-windows   / setup"
+    generate_error_yaml "ftbfs"
+    echo "Exit code: 1"
+    exit 1
+fi
+
+# Validate build type per arch
+case "$arch" in
+  x86_64-windows|win64)
+    if [[ "$build_type" != "zip" && "$build_type" != "setup" && "$build_type" != "unsigned-zip" && "$build_type" != "unsigned-setup" ]]; then
+      log_error "Unsupported type for ${arch}: ${build_type}. Use --type zip, --type unsigned-zip, --type setup, or --type unsigned-setup"
+      exit 1
+    fi
+    ;;
+  x86_64-linux|x86_64-linux-gnu|aarch64-linux|arm-linux|x86_64-macos|arm64-macos)
+    if [[ "$build_type" != "tarball" ]]; then
+      log_error "Unsupported type for ${arch}: ${build_type}. Use --type tarball"
+      exit 1
+    fi
+    ;;
+  *)
+    log_error "Unsupported architecture/type combo: ${arch}/${build_type}"
+    exit 1
+    ;;
+esac
+
+# Add 'v' prefix if not present (Bitcoin Core uses v-prefixed tags)
+if [[ ! "$version" =~ ^v ]]; then
+  version="v${version}"
+fi
+
+# Generate unique container/image names for this invocation
+set_unique_names "$version" "$arch" "$build_type"
+
+# Map build server architecture to Guix host triplet
+map_arch_to_guix() {
+    local bs_arch="$1"
+    case "$bs_arch" in
+        x86_64-linux)
+            echo "x86_64-linux-gnu"
+            ;;
+        x86_64-linux-gnu)
+            echo "x86_64-linux-gnu"
+            ;;
+        aarch64-linux)
+            echo "aarch64-linux-gnu"
+            ;;
+        arm-linux)
+            echo "arm-linux-gnueabihf"
+            ;;
+        x86_64-windows|win64)
+            echo "x86_64-w64-mingw32"
+            ;;
+        x86_64-macos)
+            echo "x86_64-apple-darwin"
+            ;;
+        arm64-macos)
+            echo "arm64-apple-darwin"
+            ;;
+        riscv64-linux)
+            echo "riscv64-linux-gnu"
+            ;;
+        ppc64-linux)
+            echo "powerpc64-linux-gnu"
+            ;;
+        ppc64le-linux)
+            echo "powerpc64le-linux-gnu"
+            ;;
+        *)
+            log_error "Unsupported architecture: $bs_arch"
+            exit 1
+            ;;
+    esac
+}
+
+# Generate error YAML
+generate_error_yaml() {
+    local status="${1:-ftbfs}"
+    cat > "${execution_dir}/COMPARISON_RESULTS.yaml" << EOF
+script_version: ${SCRIPT_VERSION}
+verdict: ${status}
+EOF
+}
+
+# Generate comparison YAML
+generate_comparison_yaml() {
+    local verdict="$1"
+    cat > "${execution_dir}/COMPARISON_RESULTS.yaml" << EOF
+script_version: ${SCRIPT_VERSION}
+verdict: ${verdict}
+notes: |
+  Uses Guix for reproducible builds.
+  For unsigned Windows artifacts, compares against guix.sigs attestations from independent builders.
+EOF
+}
+
+# Dependency checks
+check_dependencies() {
+    log_info "Checking dependencies..."
+
+    # Check for container runtime (Podman first, Docker as fallback)
+    if command -v podman >/dev/null 2>&1; then
+        container_cmd="podman"
+    elif command -v docker >/dev/null 2>&1; then
+        container_cmd="docker"
+    else
+        log_error "Neither podman nor docker found. Please install one of them."
+        echo "Exit code: 1"
+        exit 1
+    fi
+
+    log_info "Using container runtime: ${container_cmd}"
+
+    log_success "All dependencies found"
+}
+
+# Cleanup function
+cleanup_containers() {
+    if [[ -z "${container_cmd:-}" ]]; then
+        return
+    fi
+
+    log_info "Cleaning up existing containers and images..."
+
+    # Remove container if exists (use inspect for Docker compatibility)
+    if ${container_cmd} container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+        log_info "Removing existing container: $CONTAINER_NAME"
+        ${container_cmd} rm -f "$CONTAINER_NAME" || true
+    fi
+
+    # Remove image if exists (use inspect for Docker compatibility)
+    if ${container_cmd} image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+        log_info "Removing existing image: $IMAGE_NAME"
+        ${container_cmd} rmi -f "$IMAGE_NAME" || true
+    fi
+
+    log_success "Cleanup completed"
+}
+
+# Trap cleanup handler (runs on exit for failure paths)
+TRAP_CLEANUP_COMPLETED=false
+cleanup_on_exit() {
+    local exit_code=$?
+    if [[ -n "${temp_imagefile:-}" && -f "${temp_imagefile:-}" ]]; then
+        rm -f "$temp_imagefile"
+    fi
+
+    if [[ "${TRAP_CLEANUP_COMPLETED:-false}" != "true" && "${keep_container:-false}" != "true" ]]; then
+        cleanup_containers
+    fi
+
+    return "$exit_code"
+}
+
+# Create embedded imagefile
+create_imagefile() {
+    local imagefile_path="$1"
+
+    log_info "Creating embedded Alpine Guix imagefile..."
+
+    cat > "$imagefile_path" << 'EOF'
+FROM alpine:3.22 AS base
+
+RUN apk --no-cache --update add \
+      bash \
+      bzip2 \
+      ca-certificates \
+      curl \
+      git \
+      make \
+      shadow \
+      wget \
+      xz
+
+ARG guix_download_path=https://ftpmirror.gnu.org/gnu/guix/
+ARG guix_version=1.4.0
+ARG guix_checksum_aarch64=72d807392889919940b7ec9632c45a259555e6b0942ea7bfd131101e08ebfcf4
+ARG guix_checksum_x86_64=236ca7c9c5958b1f396c2924fcc5bc9d6fdebcb1b4cf3c7c6d46d4bf660ed9c9
+ARG builder_count=32
+
+ENV PATH=/root/.config/guix/current/bin:$PATH
+ENV GUIX_LOCPATH=/root/.guix-profile/lib/locale
+ENV LC_ALL=en_US.UTF-8
+
+RUN guix_file_name=guix-binary-${guix_version}.$(uname -m)-linux.tar.xz    && \
+    eval "guix_checksum=\${guix_checksum_$(uname -m)}"                     && \
+    cd /tmp                                                                && \
+    wget -q -O "$guix_file_name" "${guix_download_path}/${guix_file_name}" && \
+    echo "${guix_checksum}  ${guix_file_name}" | sha256sum -c              && \
+    tar xJf "$guix_file_name"                                              && \
+    mv var/guix /var/                                                      && \
+    mv gnu /                                                               && \
+    mkdir -p ~root/.config/guix                                            && \
+    ln -sf /var/guix/profiles/per-user/root/current-guix ~root/.config/guix/current && \
+    . ~root/.config/guix/current/etc/profile
+
+RUN groupadd --system guixbuild
+RUN for i in $(seq -w 1 ${builder_count}); do    \
+      useradd -g guixbuild -G guixbuild          \
+              -d /var/empty -s $(which nologin)  \
+              -c "Guix build user ${i}" --system \
+              "guixbuilder${i}" ;                \
+    done
+
+RUN git clone https://github.com/bitcoin/bitcoin.git /bitcoin
+RUN mkdir base_cache sources SDKs
+
+WORKDIR /bitcoin
+
+RUN guix archive --authorize < ~root/.config/guix/current/share/guix/ci.guix.gnu.org.pub
+CMD ["/root/.config/guix/current/bin/guix-daemon","--build-users-group=guixbuild"]
+EOF
+
+    log_success "Imagefile created: $imagefile_path"
+}
+
+# Build container
+build_container() {
+    local imagefile_path="$1"
+
+    log_info "Building Bitcoin Core verification container..."
+    log_info "This may take 5-15 minutes depending on network speed..."
+
+    if ! ${container_cmd} build --pull --no-cache -t "$IMAGE_NAME" - < "$imagefile_path"; then
+        log_error "Container build failed"
+        generate_error_yaml "ftbfs"
+        exit 1
+    fi
+
+    log_success "Container built successfully: $IMAGE_NAME"
+}
+
+# Start container daemon
+start_container() {
+    log_info "Starting container daemon: $CONTAINER_NAME"
+
+    # Remove any existing container with the same name first (use inspect for Docker compatibility)
+    if ${container_cmd} container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+        log_info "Removing existing container: $CONTAINER_NAME"
+        ${container_cmd} rm -f "$CONTAINER_NAME" || true
+    fi
+
+    if ! ${container_cmd} run -d --name "$CONTAINER_NAME" --privileged "$IMAGE_NAME"; then
+        log_error "Failed to start container"
+        generate_error_yaml "ftbfs"
+        exit 1
+    fi
+
+    # Wait a moment for daemon to start
+    sleep 2
+
+    log_success "Container daemon started"
+}
+
+# Verify Bitcoin Core version and prepare build
+prepare_bitcoin_build() {
+    local version="$1"
+    local arch="$2"
+
+    log_info "Preparing Bitcoin Core $version build for architecture: $arch"
+
+    # Clean previous build artifacts
+    log_info "Cleaning previous build artifacts..."
+        ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && rm -rf depends/work/ guix-build-*/ base_cache/*" || true
+        ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && make -C depends clean-all" || true
+
+    # Update repository and checkout version
+    log_info "Fetching latest Bitcoin Core repository..."
+        ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git fetch --all --tags"
+
+    log_info "Checking out version: $version"
+        if ! ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git checkout $version"; then
+        log_error "Failed to checkout version: $version"
+        log_error "Available tags:"
+        ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git tag | grep -E '^v[0-9]' | tail -10"
+        generate_error_yaml "not_reproducible"
+        exit 1
+    fi
+
+    # Verify GPG signature
+    log_info "Verifying GPG signature for $version..."
+    if ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git verify-tag $version 2>/dev/null"; then
+        log_success "GPG signature verified for $version"
+    else
+        log_warn "GPG signature verification failed for $version"
+        log_warn "This may be normal for release candidates"
+    fi
+
+    log_success "Bitcoin Core $version prepared for build"
+}
+
+# Execute Guix build
+execute_build() {
+    local version="$1"
+    local arch="$2"
+
+    log_info "Starting Guix build for Bitcoin Core $version..."
+    log_info "Architecture: $arch"
+    log_info "This will take 20-60 minutes depending on hardware..."
+
+    local start_time=$(date +%s)
+
+    # Execute the build (disable debug builds to save time and space)
+    local build_cmd="cd /bitcoin && time BASE_CACHE='/base_cache' SOURCE_PATH='/sources' SDK_PATH='/SDKs' HOSTS='$arch' SKIP_DEBUG=1 ./contrib/guix/guix-build"
+
+    if ${container_cmd} exec "$CONTAINER_NAME" bash -c "$build_cmd"; then
+        local end_time=$(date +%s)
+        local duration=$((end_time - start_time))
+        log_success "Build completed successfully in $duration seconds"
+    else
+        log_error "Build failed"
+        generate_error_yaml "ftbfs"
+        exit 1
+    fi
+}
+
+# Fetch matching guix.sigs hashes for unsigned artifacts
+# Uses curl to download tarball instead of git clone to avoid credential prompts
+fetch_guix_sigs_hashes() {
+    local version="$1"
+    local artifact="$2"
+    local sigs_dir="/tmp/guix.sigs"
+    local tarball_url="https://github.com/bitcoin-core/guix.sigs/archive/refs/heads/main.tar.gz"
+
+    log_info "Fetching guix.sigs attestations..." >&2
+
+    # Download and extract guix.sigs as tarball (avoids git credential prompts)
+    if ! ${container_cmd} exec "$CONTAINER_NAME" bash -c "test -d ${sigs_dir}" 2>/dev/null; then
+        local download_output
+        download_output=$(${container_cmd} exec "$CONTAINER_NAME" bash -c "
+            mkdir -p ${sigs_dir} && \
+            curl -fsSL '${tarball_url}' | tar -xz -C ${sigs_dir} --strip-components=1 && \
+            echo 'OK'
+        " 2>&1)
+        if [[ "$download_output" != *"OK"* ]]; then
+            log_warn "Failed to download guix.sigs repository: $download_output" >&2
+            return 1
+        fi
+    fi
+
+    # Extract hashes - only output valid 64-char hex strings (SHA256)
+    # Note: guix.sigs directories are named without 'v' prefix (e.g., "30.2" not "v30.2")
+    local result
+    result=$(${container_cmd} exec "$CONTAINER_NAME" bash -c "
+        if [ -d '${sigs_dir}/${version}' ]; then
+            find '${sigs_dir}/${version}' -type f -name 'noncodesigned.SHA256SUMS' -print0 2>/dev/null | \
+            xargs -0 -r awk -v f='${artifact}' '\$2==f {print \$1}'
+        fi
+    " 2>/dev/null)
+    
+    # Only output lines that look like valid SHA256 hashes (64 hex chars)
+    echo "$result" | grep -E '^[a-f0-9]{64}$' || true
+}
+
+# Extract and verify checksums
+verify_checksums() {
+    local version="$1"
+    local arch="$2"
+
+    # Clean version string for directory names (remove 'v' prefix)
+    local clean_version="${version#v}"
+    local build_dir="/bitcoin/guix-build-$clean_version/output/$arch"
+
+    log_info "Extracting build artifacts from: $build_dir"
+
+    # Check if build directory exists
+    if ! ${container_cmd} exec "$CONTAINER_NAME" bash -c "test -d $build_dir"; then
+        log_error "Build output directory not found: $build_dir"
+        log_info "Available directories:"
+        ${container_cmd} exec "$CONTAINER_NAME" bash -c "ls -la /bitcoin/guix-build-*/" || true
+        generate_error_yaml "ftbfs"
+        echo "Exit code: 1"
+        exit 1
+    fi
+
+    # Enhanced artifact listing with file sizes
+    echo ""
+    log_success "Build artifacts produced:"
+    echo ""
+    ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd $build_dir && ls -lh *.tar.gz *.zip *.exe 2>/dev/null || ls -lh *"
+
+    echo ""
+    log_info "Preparing comparison artifacts..."
+
+    # Create directories for comparison (inside container)
+    ${container_cmd} exec "$CONTAINER_NAME" bash -c "mkdir -p /official /built"
+
+    # Determine artifact name (standard release only)
+    local main_artifact="bitcoin-${clean_version}-${arch}.tar.gz"
+
+    # Handle Windows naming convention
+    if [[ "$arch" == "x86_64-w64-mingw32" ]]; then
+        case "$build_type" in
+            zip|unsigned-zip)
+                main_artifact="bitcoin-${clean_version}-win64-unsigned.zip"
+                ;;
+            setup|unsigned-setup)
+                main_artifact="bitcoin-${clean_version}-win64-setup-unsigned.exe"
+                ;;
+        esac
+    fi
+
+    local use_guix_sigs="false"
+    if [[ "$main_artifact" == *-unsigned.* ]]; then
+        use_guix_sigs="true"
+        log_info "Unsigned Windows artifact detected; using guix.sigs attestations"
+    fi
+
+    # Create local directories for extraction (needed before --binary copy)
+    official_dir="$workspace/official"
+    built_dir="$workspace/built"
+    mkdir -p "$official_dir" "$built_dir"
+
+    # Acquire official release (use provided --binary or download)
+    local official_url="https://bitcoincore.org/bin/bitcoin-core-${clean_version}"
+    if [[ "$use_guix_sigs" == "false" ]]; then
+        if [[ -n "$binary_file" ]]; then
+            log_info "Using provided binary: $binary_file"
+            if [[ ! -f "$binary_file" ]]; then
+                log_error "--binary file not found: $binary_file"
+                generate_error_yaml "ftbfs"
+                exit 1
+            fi
+            cp "$binary_file" "${official_dir}/${main_artifact}"
+            log_success "Copied provided binary as official artifact"
+        else
+            log_info "Downloading ${main_artifact} inside container..."
+            if ${container_cmd} exec "$CONTAINER_NAME" bash -c "curl -fsSL -o /official/${main_artifact} ${official_url}/${main_artifact}"; then
+                log_success "Downloaded official release"
+            else
+                log_warn "Could not download official release - manual verification required"
+                log_info "Official checksums: ${official_url}/SHA256SUMS"
+            fi
+        fi
+    fi
+
+    # Copy built artifacts to /built inside container
+    log_info "Organizing built artifacts inside container..."
+    ${container_cmd} exec "$CONTAINER_NAME" bash -c "cp $build_dir/* /built/"
+    
+    # Copy artifacts from container to host for final comparison
+    ${container_cmd} cp "$CONTAINER_NAME:/official/." "$official_dir/" 2>/dev/null || true
+    ${container_cmd} cp "$CONTAINER_NAME:/built/." "$built_dir/"
+    
+    # Generate checksums and compare
+    echo ""
+    log_info "Comparing checksums..."
+    
+    comparison_file="${execution_dir}/COMPARISON_RESULTS.yaml"
+    match_count=0
+    diff_count=0
+    verdict="not_reproducible"
+    built_hash=""
+    official_hash=""
+    attestation_hashes=""
+    
+    if [[ "$use_guix_sigs" == "true" ]]; then
+        if [[ -f "${built_dir}/${main_artifact}" ]]; then
+            built_hash=$(sha256sum "${built_dir}/${main_artifact}" | awk '{print $1}')
+            attestation_hashes=$(fetch_guix_sigs_hashes "$clean_version" "$main_artifact") || attestation_hashes=""
+            if [[ -n "$attestation_hashes" ]]; then
+                official_hash=$(echo "$attestation_hashes" | head -n 1)
+                if echo "$attestation_hashes" | grep -Fxq "$built_hash"; then
+                    generate_comparison_yaml "reproducible"
+                    match_count=$((match_count + 1))
+                    verdict="reproducible"
+                    log_success "Match: ${main_artifact}"
+                    log_success "Hash: ${built_hash}"
+                else
+                    generate_comparison_yaml "not_reproducible"
+                    diff_count=$((diff_count + 1))
+                    verdict="not_reproducible"
+                    log_warn "Difference: ${main_artifact}"
+                    log_warn "Built:     ${built_hash}"
+                    log_warn "Attested:  ${official_hash}"
+                fi
+            else
+                generate_error_yaml "not_reproducible"
+                diff_count=$((diff_count + 1))
+                verdict="not_reproducible"
+                log_warn "No guix.sigs attestation found - manual verification required"
+                log_info "Built hash: ${built_hash}"
+            fi
+        else
+            generate_error_yaml "ftbfs"
+            verdict="not_reproducible"
+            log_error "Built artifact not found: ${main_artifact}"
+        fi
+    else
+        # Compare main artifact if official exists
+        if [[ -f "${official_dir}/${main_artifact}" && -f "${built_dir}/${main_artifact}" ]]; then
+            built_hash=$(sha256sum "${built_dir}/${main_artifact}" | awk '{print $1}')
+            official_hash=$(sha256sum "${official_dir}/${main_artifact}" | awk '{print $1}')
+
+            if [[ "$built_hash" == "$official_hash" ]]; then
+                generate_comparison_yaml "reproducible"
+                match_count=$((match_count + 1))
+                verdict="reproducible"
+                log_success "Match: ${main_artifact}"
+                log_success "Hash: ${built_hash}"
+            else
+                generate_comparison_yaml "not_reproducible"
+                diff_count=$((diff_count + 1))
+                verdict="not_reproducible"
+                log_warn "Difference: ${main_artifact}"
+                log_warn "Built:    ${built_hash}"
+                log_warn "Official: ${official_hash}"
+            fi
+        else
+            # No official to compare - just report built hash
+            if [[ -f "${built_dir}/${main_artifact}" ]]; then
+                built_hash=$(sha256sum "${built_dir}/${main_artifact}" | awk '{print $1}')
+                generate_error_yaml "not_reproducible"
+                diff_count=$((diff_count + 1))
+                verdict="not_reproducible"
+                log_warn "No official release to compare - manual verification required"
+                log_info "Built hash: ${built_hash}"
+            else
+                generate_error_yaml "ftbfs"
+                verdict="not_reproducible"
+                log_error "Built artifact not found: ${main_artifact}"
+            fi
+        fi
+    fi
+    
+    # ---------- Standardized Output Format ----------
+    echo ""
+    echo "===== Begin Results ====="
+    echo "appId:          ${APP_ID}"
+    echo "signer:         N/A"
+    echo "apkVersionName: ${clean_version}"
+    echo "apkVersionCode: N/A"
+    echo "verdict:        ${verdict}"
+    if [[ -n "${official_hash}" ]]; then
+        echo "appHash:        ${official_hash}"
+    else
+        echo "appHash:        N/A (no official release)"
+    fi
+    echo "commit:         ${version}"
+    echo ""
+    echo "Diff:"
+    if [[ "$verdict" == "reproducible" ]]; then
+        echo "BUILDS MATCH BINARIES"
+    else
+        echo "BUILDS DO NOT MATCH BINARIES"
+    fi
+    
+    # Machine-readable format for desktop binaries
+    if [[ -f "${built_dir}/${main_artifact}" ]]; then
+        local built_hash=$(sha256sum "${built_dir}/${main_artifact}" | awk '{print $1}')
+        local match_flag="0"
+        local match_text="DOESN'T MATCH"
+        if [[ "$verdict" == "reproducible" ]]; then
+            match_flag="1"
+            match_text="MATCHES"
+        fi
+        echo "${main_artifact} - ${guix_arch} - ${built_hash} - ${match_flag} (${match_text})"
+    fi
+    echo ""
+    echo "Revision, tag (and its signature):"
+    echo "Git tag: ${version}"
+    echo ""
+    echo "===== End Results ====="
+    echo ""
+    
+    # ---------- Summary ----------
+    log_info "=============================================="
+    log_info "Verification Summary"
+    log_info "=============================================="
+    log_info "Version: ${clean_version}"
+    log_info "Architecture: ${arch}"
+    log_info "Matches: ${match_count}"
+    log_info "Differences: ${diff_count}"
+    
+    if [[ "$verdict" == "reproducible" ]]; then
+        log_success "Verdict: REPRODUCIBLE"
+        log_info "Build server output: ${comparison_file}"
+        echo "Exit code: 0"
+        VERIFICATION_EXIT_CODE=0
+    else
+        log_warn "Verdict: NOT REPRODUCIBLE"
+        log_info "Build server output: ${comparison_file}"
+        if [[ "$use_guix_sigs" == "true" ]]; then
+            log_info "Attestations: https://github.com/bitcoin-core/guix.sigs"
+        else
+            log_info "Official checksums: https://bitcoincore.org/bin/bitcoin-core-${clean_version}/SHA256SUMS"
+        fi
+        echo "Exit code: 1"
+        VERIFICATION_EXIT_CODE=1
+    fi
+}
+
+
+# Final cleanup
+final_cleanup() {
+    local keep_container="$1"
+
+    if [[ "$keep_container" == "false" ]]; then
+        log_info "Cleaning up containers and images..."
+        cleanup_containers
+        log_success "Cleanup completed"
+    else
+        log_info "Container kept running as requested: $CONTAINER_NAME"
+        log_info "To connect: podman exec -it $CONTAINER_NAME bash"
+        log_info "To clean up later: podman rm -f $CONTAINER_NAME && podman rmi -f $IMAGE_NAME"
+    fi
+
+    TRAP_CLEANUP_COMPLETED=true
+}
+
+# ---------- Setup Workspace ----------
+# Map architecture to Guix format
+guix_arch=$(map_arch_to_guix "$arch")
+
+workspace="${execution_dir}/bitcoin_core_${version}_${arch}_$$"
+mkdir -p "$workspace"
+cd "$workspace"
+
+log_info "=============================================="
+log_info "${APP_NAME} ${version} Verification"
+log_info "=============================================="
+log_info "Script version: ${SCRIPT_VERSION}"
+log_info "Build server architecture: ${arch}"
+log_info "Guix host triplet: ${guix_arch}"
+log_info "Build type: ${build_type}"
+log_info "Workspace: ${workspace}"
+log_info ""
+
+# Main execution flow
+check_dependencies
+
+if [[ "$clean_flag" == "true" ]]; then
+    cleanup_containers
+fi
+
+# Create temporary imagefile
+temp_imagefile=$(mktemp)
+trap cleanup_on_exit EXIT
+
+create_imagefile "$temp_imagefile"
+build_container "$temp_imagefile"
+start_container
+prepare_bitcoin_build "$version" "$guix_arch"
+execute_build "$version" "$guix_arch"
+verify_checksums "$version" "$guix_arch"
+final_cleanup "$keep_container"
+exit "$VERIFICATION_EXIT_CODE"
