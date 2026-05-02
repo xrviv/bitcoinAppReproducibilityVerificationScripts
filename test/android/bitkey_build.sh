@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitkey_build.sh - Bitkey Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.18
+# Version:       v0.2.19
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-05-02 (v0.2.18)
+# Last Modified: 2026-05-02 (v0.2.19)
 # Project:       https://github.com/proto-at-block/bitkey
 # ==============================================================================
 # LICENSE: MIT License
@@ -33,7 +33,7 @@ CYAN='\033[1;36m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-readonly SCRIPT_VERSION="v0.2.18"
+readonly SCRIPT_VERSION="v0.2.19"
 readonly SCRIPT_NAME="bitkey_build.sh"
 readonly APP_ID="world.bitkey.app"
 readonly REPO_URL="https://github.com/proto-at-block/bitkey.git"
@@ -257,7 +257,8 @@ print_signature_section() {
 
     if [[ -n "${SIGNATURE_WARNINGS}" ]]; then
         echo
-        echo "Warnings:${SIGNATURE_WARNINGS}"
+        echo "Warnings:"
+        echo -e "${SIGNATURE_WARNINGS}"
     fi
 }
 
