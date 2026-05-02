@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitkey_build.sh - Bitkey Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.16
+# Version:       v0.2.17
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-05-02 (v0.2.16)
+# Last Modified: 2026-05-02 (v0.2.17)
 # Project:       https://github.com/proto-at-block/bitkey
 # ==============================================================================
 # LICENSE: MIT License
@@ -33,7 +33,7 @@ CYAN='\033[1;36m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-readonly SCRIPT_VERSION="v0.2.16"
+readonly SCRIPT_VERSION="v0.2.17"
 readonly SCRIPT_NAME="bitkey_build.sh"
 readonly APP_ID="world.bitkey.app"
 readonly REPO_URL="https://github.com/proto-at-block/bitkey.git"
@@ -371,15 +371,6 @@ Inputs:
                         - single .apk file (GitHub release emergency APK)
                       Alias: --apk
 
-                      Split APK mode (Play Store): provide the full set so that
-                      base.apk is present — it contains the reproducible-build-
-                      variables.json needed to match the exact upstream build.
-
-                      Single APK mode (GitHub release): provide the standalone
-                      Bitkey-app-<version>.apk downloaded from the GitHub release
-                      page. The script detects this automatically and uses the
-                      emergency build path (assembleEmergency).
-
 Options:
   --version <ver>     Bitkey app version, for example: 2026.2.1
                       If omitted, the script reads versionName from base.apk.
@@ -512,7 +503,6 @@ fast_apk_pre_check() {
 
 assert_package_name() {
     local image="$1"
-    # Single APK mode: already verified inside detect_single_apk_type (same container run)
     [[ "${SINGLE_APK_PKG_VERIFIED:-false}" == "true" ]] && return 0
     local apk_path
     if [[ "${SINGLE_APK_MODE}" == "true" ]]; then
@@ -537,7 +527,6 @@ detect_single_apk_type() {
     local apk_abs="$2"
     local apk_rel="${apk_abs#"${WORK_DIR}/"}"
 
-    # Run split= check, signer hash, and package name in one container call
     local meta
     meta="$(container_exec "${image}" "
         AAPT2='/opt/android-sdk/build-tools/${ANDROID_BUILD_TOOLS_VERSION}/aapt2'
@@ -571,7 +560,6 @@ detect_single_apk_type() {
         log_info "Signer matches known Bitkey certificate."
     fi
 
-    # Package name check — replaces the separate assert_package_name container call
     if [[ -n "${pkg}" && "${pkg}" != "${APP_ID}" ]]; then
         log_fail "Package name mismatch: expected ${APP_ID}, got ${pkg}"
         emit_failure_and_exit "Package name mismatch: expected ${APP_ID}, got ${pkg}. Wrong APK provided." "${EXIT_INVALID}"
@@ -1354,7 +1342,6 @@ run_single_apk_compare() {
 
     COMPARE_LOG_FILE="$(comparison_dir)/compare-single-apk.txt"
 
-    # Preserve a raw diff for the standardized output block.
     container_exec "${image}" "
         set -euo pipefail
         rm -rf single-compare
