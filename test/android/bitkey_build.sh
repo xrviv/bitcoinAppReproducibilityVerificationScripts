@@ -317,7 +317,7 @@ emit_failure_and_exit() {
 
 if [[ ${EUID} -eq 0 ]]; then
     log_fail "Do not run this script as root."
-    emit_failure_and_exit "Do not run this script as root." 1
+    emit_failure_and_exit "Do not run this script as root." "${EXIT_FAILED}"
 fi
 
 on_error() {
