@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitkey_build.sh - Bitkey Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.15
+# Version:       v0.2.16
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-05-02 (v0.2.12)
+# Last Modified: 2026-05-02 (v0.2.16)
 # Project:       https://github.com/proto-at-block/bitkey
 # ==============================================================================
 # LICENSE: MIT License
@@ -21,19 +21,6 @@
 # applicable laws and regulations. The developers assume no liability for any
 # misuse or legal consequences arising from use. By using this script, you
 # acknowledge these disclaimers and accept full responsibility.
-#
-# SCRIPT SUMMARY:
-# - Accepts official Bitkey APKs via --binary/--apk in two modes:
-#     Split APK mode: directory, .apks, or .zip with base.apk + config splits
-#                     (Play Store distribution — uses bundleCustomer + bundletool)
-#     Single APK mode: standalone .apk from the Bitkey GitHub releases page
-#                     (emergency APK — uses assembleEmergency)
-# - Resolves the matching upstream tag (app/<version>), clones the repo with
-#   submodules, and builds Bitkey with its official Dockerfile on linux/amd64.
-# - Reuses Bitkey's upstream normalize/compare scripts for split APK mode.
-#   For single APK mode: preserves a raw diff for output, then runs a filtered
-#   compare plus aapt2 diff for verdicting.
-# - Writes COMPARISON_RESULTS.yaml and keeps the work directory for inspection.
 # ==============================================================================
 
 set -euo pipefail
@@ -46,7 +33,7 @@ CYAN='\033[1;36m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-readonly SCRIPT_VERSION="v0.2.15"
+readonly SCRIPT_VERSION="v0.2.16"
 readonly SCRIPT_NAME="bitkey_build.sh"
 readonly APP_ID="world.bitkey.app"
 readonly REPO_URL="https://github.com/proto-at-block/bitkey.git"
@@ -57,7 +44,7 @@ readonly HELPER_GIT_IMAGE="docker.io/alpine/git:2.47.2"
 
 readonly EXIT_SUCCESS=0
 readonly EXIT_FAILED=1
-readonly EXIT_INVALID=1
+readonly EXIT_INVALID=2
 readonly BITKEY_KNOWN_SIGNER="c0d0f9da7158cde788d0281e9ebd07034178165584d635f7ce17f77c037d961a"
 readonly GITHUB_RELEASE_BASE="https://github.com/proto-at-block/bitkey/releases/download"
 
