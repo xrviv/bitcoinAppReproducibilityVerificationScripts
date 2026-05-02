@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitkey_build.sh - Bitkey Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.17
+# Version:       v0.2.18
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-05-02 (v0.2.17)
+# Last Modified: 2026-05-02 (v0.2.18)
 # Project:       https://github.com/proto-at-block/bitkey
 # ==============================================================================
 # LICENSE: MIT License
@@ -33,7 +33,7 @@ CYAN='\033[1;36m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-readonly SCRIPT_VERSION="v0.2.17"
+readonly SCRIPT_VERSION="v0.2.18"
 readonly SCRIPT_NAME="bitkey_build.sh"
 readonly APP_ID="world.bitkey.app"
 readonly REPO_URL="https://github.com/proto-at-block/bitkey.git"
@@ -810,7 +810,6 @@ resolve_version_with_temp_helper() {
         emit_failure_and_exit "Could not determine versionName from APK. Provide --version explicitly." "${EXIT_INVALID}"
     fi
     # Strip Play Store build number suffix e.g. "2026.7.0 (2)" → "2026.7.0".
-    # Git tags are always "app/<base-version>" — no "(N)" variant exists in the repo.
     VERSION="${VERSION%% (*}"
     log_info "Version derived from APK metadata: ${VERSION}"
 }
@@ -842,7 +841,6 @@ collect_official_metadata() {
         OFFICIAL_SDK_VERSION="35"
     fi
 
-    # Strip trailing build number e.g. "2026.2.1 (2)" → "2026.2.1" for comparison
     local apk_version_base="${OFFICIAL_VERSION_NAME%% (*}"
     if [[ -n "${VERSION}" && -n "${apk_version_base}" && "${VERSION}" != "${apk_version_base}" ]]; then
         log_warn "Requested version ${VERSION}, but APK metadata reports ${OFFICIAL_VERSION_NAME}"
@@ -1428,7 +1426,7 @@ APK_INPUT="$(realpath "${APK_INPUT}")"
 mkdir -p "${LOG_DIR}"
 exec 5>&1 6>&2
 
-# ─── PHASE 1: PRE-FLIGHT ─────────────────────────────────────────────────────
+# --- PHASE 1: PRE-FLIGHT ---
 exec > >(tee "${LOG_DIR}/phase1-preflight.log" >&5) 2>&1
 phase_header 1 "PRE-FLIGHT"
 detect_container_runtime
@@ -1441,7 +1439,7 @@ mkdir -p "${WORK_DIR}" "$(comparison_dir)" "$(outputs_dir)"
 log_info "Workspace: ${WORK_DIR}"
 exec 1>&5 2>&6
 
-# ─── PHASE 2: RESOLVE ────────────────────────────────────────────────────────
+# --- PHASE 2: RESOLVE ---
 exec > >(tee "${LOG_DIR}/phase2-resolve.log" >&5) 2>&1
 phase_header 2 "RESOLVE"
 if [[ -z "${VERSION}" ]]; then
@@ -1456,9 +1454,7 @@ if [[ -z "${VERSION}" ]]; then
 fi
 
 clone_ref_into_repo "$(build_ref_from_version "${VERSION}")" "repo-exact" "false"
-# Two submodules required for the Android build:
-#   firmware/third-party/nanopb            — wca/build.rs compiles wallet.proto via prost_build
-#   firmware/third-party/memfault-firmware-sdk — teltra-sys/build.rs uses bindgen against memfault headers
+# Only these two firmware submodules are required for the Android Rust build.
 log_info "Initializing required firmware submodules (nanopb, memfault-firmware-sdk)..."
 run_git_container "git -C 'repo-exact' submodule update --init --depth 1 \
     firmware/third-party/nanopb \
@@ -1468,7 +1464,7 @@ collect_git_signature_info "$(build_ref_from_version "${VERSION}")"
 log_info "Resolved Bitkey commit: ${COMMIT_HASH}"
 exec 1>&5 2>&6
 
-# ─── PHASE 3: PREPARE ────────────────────────────────────────────────────────
+# --- PHASE 3: PREPARE ---
 exec > >(tee "${LOG_DIR}/phase3-prepare.log" >&5) 2>&1
 phase_header 3 "PREPARE"
 EXACT_BASE_IMAGE="ws-bitkey-base-$(sanitize_path_component "${VERSION}")-$$"
@@ -1485,7 +1481,7 @@ EXACT_BUILD_IMAGE="ws-bitkey-build-$(sanitize_path_component "${VERSION}")-$$"
 build_final_image "${EXACT_BUILD_IMAGE}" "$(repo_exact_dir)" "${BUILD_VARS_FILE}"
 exec 1>&5 2>&6
 
-# ─── PHASE 4: BUILD ──────────────────────────────────────────────────────────
+# --- PHASE 4: BUILD ---
 exec > >(tee "${LOG_DIR}/phase4-build-full.log" >&5) 2>&1
 phase_header 4 "BUILD"
 if [[ "${SINGLE_APK_MODE}" == "true" ]]; then
@@ -1500,7 +1496,7 @@ fi
 exec 1>&5 2>&6
 generate_filtered_build_log
 
-# ─── PHASE 5: COMPARE ────────────────────────────────────────────────────────
+# --- PHASE 5: COMPARE ---
 exec > >(tee "${LOG_DIR}/phase5-compare.log" >&5) 2>&1
 phase_header 5 "COMPARE"
 if [[ "${SINGLE_APK_MODE}" == "true" ]]; then
@@ -1515,7 +1511,7 @@ else
 fi
 exec 1>&5 2>&6
 
-# ─── PHASE 6: RESULTS ────────────────────────────────────────────────────────
+# --- PHASE 6: RESULTS ---
 exec > >(tee "${LOG_DIR}/phase6-results.log" >&5) 2>&1
 phase_header 6 "RESULTS"
 if [[ "${COMPARE_STATUS}" -eq 0 ]]; then
