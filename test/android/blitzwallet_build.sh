@@ -2,7 +2,7 @@
 # ==============================================================================
 # blitzwallet_build.sh - BlitzWallet Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.1.11
+# Version:       v0.1.19
 # Organization:  WalletScrutiny.com
 # Last Modified: 2026-05-06
 # Project:       https://github.com/BlitzWallet/BlitzWallet
@@ -53,7 +53,7 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 # Constants
 # ------------------------------------------------------------------------------
-SCRIPT_VERSION="v0.1.11"
+SCRIPT_VERSION="v0.1.19"
 APP_ID="com.blitzwallet"
 REPO_URL="https://github.com/BlitzWallet/BlitzWallet.git"
 REQUIRED_NDK_VERSION="27.1.12297006"
@@ -71,7 +71,8 @@ EXIT_SUCCESS=0
 EXIT_FAILED=1
 EXIT_INVALID=2
 
-execution_dir="$(pwd)"
+caller_dir="$(pwd)"
+execution_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 script_name="$(basename "$0")"
 
 should_cleanup=false
@@ -133,9 +134,27 @@ die_invalid() {
   exit "${EXIT_INVALID}"
 }
 
+print_ftbfs_results_block() {
+  local error_message="$1"
+  echo ""
+  echo "===== Begin Results ====="
+  echo "appId:          ${APP_ID}"
+  echo "signer:         ${signer:-unknown}"
+  echo "apkVersionName: ${version_name:-unknown}"
+  echo "apkVersionCode: ${version_code:-unknown}"
+  echo "verdict:        ftbfs"
+  echo "appHash:        ${app_hash:-unknown}"
+  echo "commit:         ${commit_hash:-unknown}"
+  echo ""
+  echo "Error: ${error_message}"
+  echo "===== End Results ====="
+  echo ""
+}
+
 die_failed() {
   log_error "$*"
   generate_error_yaml "ftbfs" "$*"
+  print_ftbfs_results_block "$*"
   echo "Exit code: ${EXIT_FAILED}"
   exit "${EXIT_FAILED}"
 }
@@ -148,6 +167,7 @@ on_error() {
   if [[ "${result_done}" != "true" ]]; then
     generate_error_yaml "ftbfs" "Script failed at line ${line_no} (exit code ${exit_code})."
   fi
+  print_ftbfs_results_block "Script failed at line ${line_no} (exit code ${exit_code})."
   echo "Exit code: ${EXIT_FAILED}"
   exit "${EXIT_FAILED}"
 }
@@ -161,20 +181,6 @@ CONTAINER_CMD=""
 VOLUME_RO_SUFFIX=""
 VOLUME_RW_SUFFIX=""
 CONTAINER_RUN_USER_ARGS=""
-
-if command -v podman >/dev/null 2>&1; then
-  CONTAINER_CMD="podman"
-  VOLUME_RO_SUFFIX=":ro,Z"
-  VOLUME_RW_SUFFIX=":Z"
-  CONTAINER_RUN_USER_ARGS="--userns=keep-id"
-elif command -v docker >/dev/null 2>&1; then
-  CONTAINER_CMD="docker"
-  VOLUME_RO_SUFFIX=":ro"
-  VOLUME_RW_SUFFIX=""
-  CONTAINER_RUN_USER_ARGS="--user $(id -u):$(id -g)"
-else
-  die_failed "Neither podman nor docker is available. Install one to continue."
-fi
 
 # ------------------------------------------------------------------------------
 # Usage
@@ -255,6 +261,8 @@ while [[ "$#" -gt 0 ]]; do
   shift
 done
 
+echo "Starting ${script_name} ${SCRIPT_VERSION}"
+
 # --binary is required for split APK builds (no auto-download: Play splits are device-specific)
 if [[ -z "${downloaded_apk}" ]]; then
   die_invalid "You must provide --binary <path> pointing to official split APKs directory or .apks file."
@@ -281,6 +289,20 @@ if [[ -n "${requested_type}" ]]; then
   append_additional_info "Build type '${requested_type}' accepted for compatibility; BlitzWallet has a single build type."
 fi
 
+if command -v podman >/dev/null 2>&1; then
+  CONTAINER_CMD="podman"
+  VOLUME_RO_SUFFIX=":ro,Z"
+  VOLUME_RW_SUFFIX=":Z"
+  CONTAINER_RUN_USER_ARGS="--userns=keep-id"
+elif command -v docker >/dev/null 2>&1; then
+  CONTAINER_CMD="docker"
+  VOLUME_RO_SUFFIX=":ro"
+  VOLUME_RW_SUFFIX=""
+  CONTAINER_RUN_USER_ARGS="--user $(id -u):$(id -g)"
+else
+  die_failed "Neither podman nor docker is available. Install one to continue."
+fi
+
 # git_ref is resolved after extract_official_metadata() sets version_name
 git_ref=""
 
@@ -296,7 +318,7 @@ container_sha256() {
   $CONTAINER_CMD run --rm \
     --volume "${file_dir}:/data${VOLUME_RO_SUFFIX}" \
     "$WS_CONTAINER" \
-    sh -c "sha256sum /data/${file_name} | awk '{print \$1}'"
+    sh -c 'sha256sum "/data/$1" | awk "{print \$1}"' sh "${file_name}"
 }
 
 # ------------------------------------------------------------------------------
@@ -311,7 +333,7 @@ container_signer() {
   $CONTAINER_CMD run --rm \
     --volume "${apk_dir}:/apk${VOLUME_RO_SUFFIX}" \
     "$WS_CONTAINER" \
-    sh -c "apksigner verify --print-certs /apk/${apk_name} 2>/dev/null | grep 'Signer #1 certificate SHA-256' | awk '{print \$6}'" \
+    sh -c 'apksigner verify --print-certs "/apk/$1" 2>/dev/null | grep "Signer #1 certificate SHA-256" | awk "{print \$6}"' sh "${apk_name}" \
     || echo "unknown"
 }
 
@@ -444,8 +466,8 @@ detect_build_image_failure() {
     if grep -q "@expo/cli is not resolvable" "${build_log}"; then
       die_failed "Expo CLI is not resolvable after yarn install. Gradle uses @expo/cli for bundleCommand export:embed, so JS bundling cannot proceed."
     fi
-    if grep -q "yarn.lock changed during yarn install" "${build_log}"; then
-      die_failed "yarn.lock changed during yarn install. This indicates dependency drift; refusing to continue with a mutated dependency graph."
+    if grep -q "yarn.lock or package.json changed during yarn install" "${build_log}"; then
+      die_failed "yarn.lock or package.json changed during yarn install. This indicates dependency drift; refusing to continue with a mutated dependency graph."
     fi
   fi
 }
@@ -457,9 +479,10 @@ detect_build_image_failure() {
 prepare_official_splits() {
   log_info "Preparing official split APKs..."
 
-  # Resolve absolute path
+  # Resolve absolute path relative to where the user invoked the script,
+  # not where the script lives (execution_dir is for workdir/YAML placement).
   if [[ "${downloaded_apk}" != /* ]]; then
-    downloaded_apk="${execution_dir}/${downloaded_apk}"
+    downloaded_apk="${caller_dir}/${downloaded_apk}"
   fi
 
   if [[ ! -e "${downloaded_apk}" ]]; then
@@ -482,7 +505,7 @@ prepare_official_splits() {
       --volume "$(dirname "${downloaded_apk}"):/input${VOLUME_RO_SUFFIX}" \
       --volume "${apks_extract_dir}:/output${VOLUME_RW_SUFFIX}" \
       "$WS_CONTAINER" \
-      sh -c "unzip -qq /input/$(basename "${downloaded_apk}") -d /output"
+      sh -c 'unzip -qq "/input/$1" -d /output' sh "$(basename "${downloaded_apk}")"
     # bundletool puts splits in a 'splits/' subdir inside the .apks archive
     if [[ -d "${apks_extract_dir}/splits" ]]; then
       official_splits_dir="${apks_extract_dir}/splits"
@@ -741,7 +764,7 @@ $CONTAINER_CMD run --rm \
 # Run the full build inside the React Native Android image.
 # Steps mirror the manual build instructions:
 #  1. Add JSR npm registry (required for some deps)
-#  2. immutable/frozen yarn install, then fail if yarn.lock changes
+#  2. immutable/frozen yarn install, then fail if dependency metadata changes
 #  3. bundleRelease -- produces app-release.aab
 if ! $CONTAINER_CMD run --rm \
   ${CONTAINER_RUN_USER_ARGS} \
@@ -752,6 +775,7 @@ if ! $CONTAINER_CMD run --rm \
   --env ANDROID_SDK_HOME=/tmp \
   --env ANDROID_PREFS_ROOT=/tmp \
   --env NODE_ENV=production \
+  --env COREPACK_ENABLE_AUTO_PIN=0 \
   "$RN_BUILD_IMAGE" \
   bash -c "
     set -euxo pipefail
@@ -777,16 +801,16 @@ if ! $CONTAINER_CMD run --rm \
     if grep -q '^__metadata:' yarn.lock; then
       echo 'Detected Yarn Berry lockfile; using pinned Corepack Yarn ${YARN_BERRY_VERSION} with --immutable.'
       corepack yarn@${YARN_BERRY_VERSION} --version | tee -a /workspace/gradle-build.log
-      NODE_ENV=development corepack yarn@${YARN_BERRY_VERSION} install --immutable
+      NODE_ENV=development corepack yarn@${YARN_BERRY_VERSION} install --immutable 2>&1 | tee -a /workspace/gradle-build.log
     else
       echo 'Detected Yarn 1 lockfile; using --frozen-lockfile.'
-      NODE_ENV=development yarn install --frozen-lockfile
+      NODE_ENV=development yarn install --frozen-lockfile 2>&1 | tee -a /workspace/gradle-build.log
     fi
 
-    echo '=== Step 2a: Check yarn.lock did not drift ==='
-    if ! git diff --quiet -- yarn.lock; then
-      echo '[ERROR] yarn.lock changed during yarn install.' | tee -a /workspace/gradle-build.log
-      git diff -- yarn.lock > /workspace/yarn-lock-drift.diff || true
+    echo '=== Step 2a: Check dependency metadata did not drift ==='
+    if ! git diff --quiet -- yarn.lock package.json; then
+      echo '[ERROR] yarn.lock or package.json changed during yarn install.' | tee -a /workspace/gradle-build.log
+      git diff -- yarn.lock package.json > /workspace/dependency-drift.diff || true
       exit 87
     fi
 
@@ -849,7 +873,7 @@ NODE
       -Dorg.gradle.jvmargs='-Xmx4096m -XX:MaxMetaspaceSize=1024m' \
       --no-daemon \
       --stacktrace \
-      2>&1 | tee /workspace/gradle-build.log
+      2>&1 | tee -a /workspace/gradle-build.log
     # Re-check exit code after tee (tee swallows it)
     grep -q "BUILD FAILED" /workspace/gradle-build.log && exit 1 || true
   "; then
@@ -994,7 +1018,7 @@ for split_apk_name in "${official_splits[@]}"; do
     --volume "${official_splits_dir}:/official${VOLUME_RO_SUFFIX}" \
     --volume "${official_unzipped}:/output${VOLUME_RW_SUFFIX}" \
     "$WS_CONTAINER" \
-    sh -c "unzip -qq /official/${split_apk_name} -d /output"
+    sh -c 'unzip -qq "/official/$1" -d /output' sh "${split_apk_name}"
 
   if [[ ! -f "${built_apk}" ]]; then
     log_warn "Built split not found: ${split_apk_name} -- skipping comparison for this split"
@@ -1009,7 +1033,7 @@ for split_apk_name in "${official_splits[@]}"; do
     --volume "${built_splits_dir}:/built${VOLUME_RO_SUFFIX}" \
     --volume "${built_unzipped}:/output${VOLUME_RW_SUFFIX}" \
     "$WS_CONTAINER" \
-    sh -c "unzip -qq /built/${split_apk_name} -d /output"
+    sh -c 'unzip -qq "/built/$1" -d /output' sh "${split_apk_name}"
 
   # Run diff -r and save full output to file
   # The diff runs with absolute paths substituted for human readability.
