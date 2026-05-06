@@ -2,9 +2,9 @@
 # ==============================================================================
 # org.electrum.electrum_build.sh - Electrum Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v2.1.13
+# Version:       v2.1.17
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-05-01
+# Last Modified: 2026-05-06
 # Project:       https://github.com/spesmilo/electrum
 # ==============================================================================
 # LICENSE: MIT License
@@ -24,7 +24,7 @@
 # The developers assume no liability for any misuse or legal consequences arising from use.
 # By using this script, you acknowledge these disclaimers and accept full responsibility.
 
-SCRIPT_VERSION="v2.1.14"
+SCRIPT_VERSION="v2.1.17"
 echo "Starting org.electrum.electrum_build.sh script version ${SCRIPT_VERSION}"
 
 set -eo pipefail
@@ -344,10 +344,11 @@ normalize_source_permissions() {
     --volume "$target_dir":/workspace \
     --workdir /workspace \
     $wsContainer \
-    sh -c "find . -type d -exec chmod 755 {} + && \
+    sh -c "git config --global --add safe.directory '*' && \
+           find . -type d -exec chmod 755 {} + && \
            find . -type f -exec chmod 644 {} + && \
-           find contrib/android -type f -name '*.sh' -exec chmod 755 {} + && \
-           chmod 755 contrib/android/make_apk.sh" || return 1
+           git ls-files -s | grep '^100755' | cut -f2 | while IFS= read -r path; do chmod 755 \"\$path\"; done && \
+           git submodule foreach --recursive 'git ls-files -s | grep \"^100755\" | cut -f2 | while IFS= read -r path; do chmod 755 \"\$path\"; done'" || return 1
 }
 
 prepare() {
@@ -464,8 +465,9 @@ build_electrum() {
         mkdir -p dist && \
         find /home/user/wspace/electrum -type d -exec chmod 755 {} + && \
         find /home/user/wspace/electrum -type f -exec chmod 644 {} + && \
-        find /home/user/wspace/electrum/contrib/android -type f -name '*.sh' -exec chmod 755 {} + && \
-        chmod 755 contrib/android/make_apk.sh && \
+        git config --global --add safe.directory '*' && \
+        git ls-files -s | grep '^100755' | cut -f2 | while IFS= read -r path; do chmod 755 \"\$path\"; done && \
+        git submodule foreach --recursive 'git ls-files -s | grep \"^100755\" | cut -f2 | while IFS= read -r path; do chmod 755 \"\$path\"; done' && \
         ./contrib/android/make_apk.sh qml '$build_arch' release-unsigned"; then
       echo -e "${RED}Build failed!${NC}"
       exit 1
