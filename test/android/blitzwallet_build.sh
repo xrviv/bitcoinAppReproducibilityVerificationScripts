@@ -2,7 +2,7 @@
 # ==============================================================================
 # blitzwallet_build.sh - BlitzWallet Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.1.9
+# Version:       v0.1.11
 # Organization:  WalletScrutiny.com
 # Last Modified: 2026-05-06
 # Project:       https://github.com/BlitzWallet/BlitzWallet
@@ -53,17 +53,18 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 # Constants
 # ------------------------------------------------------------------------------
-SCRIPT_VERSION="v0.1.9"
+SCRIPT_VERSION="v0.1.11"
 APP_ID="com.blitzwallet"
 REPO_URL="https://github.com/BlitzWallet/BlitzWallet.git"
 REQUIRED_NDK_VERSION="27.1.12297006"
+YARN_BERRY_VERSION="4.10.3"
 
 # WalletScrutiny utility container (apksigner, aapt, apktool, sha256sum, curl, git)
 WS_CONTAINER="docker.io/walletscrutiny/android:5"
 
 # React Native Android build image.
 # Verified 2026-05-06: contains /opt/android/ndk/27.1.12297006,
-# Node v22.14.0, and Yarn 1.22.22.
+# Node v22.14.0, Yarn 1.22.22, and Corepack 0.31.0.
 RN_BUILD_IMAGE="docker.io/reactnativecommunity/react-native-android@sha256:88d93a9282e0f54f84cec7b979da6c5e3f20d87f5be246b75c231838be852fec"
 
 EXIT_SUCCESS=0
@@ -427,7 +428,11 @@ detect_known_build_failure() {
     die_failed "Build failed because react-native-reanimated ${reanimated_version:-unknown} requires react-native-worklets 0.7.x or newer, but the repo installs ${worklets_version:-unknown}. This tag does not build cleanly from its checked-in dependency state."
   fi
 
-  die_failed "Gradle build failed. See ${build_log} for details."
+  if [[ -f "${build_log}" ]] && grep -q "YN0058" "${build_log}"; then
+    die_failed "Yarn Berry failed to pack a git dependency during yarn install --immutable. See ${build_log} for details. Known cause: spark-web-context prepack runs webpack before its own node_modules are installed."
+  fi
+
+  die_failed "Build failed (yarn install or Gradle). See ${build_log} for details."
 }
 
 detect_build_image_failure() {
@@ -736,7 +741,7 @@ $CONTAINER_CMD run --rm \
 # Run the full build inside the React Native Android image.
 # Steps mirror the manual build instructions:
 #  1. Add JSR npm registry (required for some deps)
-#  2. yarn install, then fail if yarn.lock changes
+#  2. immutable/frozen yarn install, then fail if yarn.lock changes
 #  3. bundleRelease -- produces app-release.aab
 if ! $CONTAINER_CMD run --rm \
   ${CONTAINER_RUN_USER_ARGS} \
@@ -760,6 +765,7 @@ if ! $CONTAINER_CMD run --rm \
     fi
     node --version | tee -a /workspace/gradle-build.log
     yarn --version | tee -a /workspace/gradle-build.log
+    corepack --version | tee -a /workspace/gradle-build.log
 
     echo '=== Step 1: Configure npm registry for JSR packages ==='
     echo '@jsr:registry=https://npm.jsr.io' >> .npmrc
@@ -768,7 +774,14 @@ if ! $CONTAINER_CMD run --rm \
     echo '=== Step 2: Install JavaScript dependencies ==='
     # NODE_ENV=production skips devDependencies; override for this step so Babel
     # plugins (react-native-dotenv, babel-plugin-module-resolver, etc.) are installed.
-    NODE_ENV=development yarn install
+    if grep -q '^__metadata:' yarn.lock; then
+      echo 'Detected Yarn Berry lockfile; using pinned Corepack Yarn ${YARN_BERRY_VERSION} with --immutable.'
+      corepack yarn@${YARN_BERRY_VERSION} --version | tee -a /workspace/gradle-build.log
+      NODE_ENV=development corepack yarn@${YARN_BERRY_VERSION} install --immutable
+    else
+      echo 'Detected Yarn 1 lockfile; using --frozen-lockfile.'
+      NODE_ENV=development yarn install --frozen-lockfile
+    fi
 
     echo '=== Step 2a: Check yarn.lock did not drift ==='
     if ! git diff --quiet -- yarn.lock; then
