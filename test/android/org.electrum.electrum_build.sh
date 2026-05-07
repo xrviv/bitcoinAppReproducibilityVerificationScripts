@@ -2,9 +2,9 @@
 # ==============================================================================
 # org.electrum.electrum_build.sh - Electrum Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v2.1.17
+# Version:       v2.1.18
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-05-06
+# Last Modified: 2026-05-07
 # Project:       https://github.com/spesmilo/electrum
 # ==============================================================================
 # LICENSE: MIT License
@@ -24,7 +24,7 @@
 # The developers assume no liability for any misuse or legal consequences arising from use.
 # By using this script, you acknowledge these disclaimers and accept full responsibility.
 
-SCRIPT_VERSION="v2.1.17"
+SCRIPT_VERSION="v2.1.18"
 echo "Starting org.electrum.electrum_build.sh script version ${SCRIPT_VERSION}"
 
 set -eo pipefail
@@ -559,6 +559,34 @@ result() {
   local verdict="reproducible"
   [ "$diffCount" -gt 0 ] && verdict="not_reproducible"
 
+  # Option D: if assets/private.tar is the only non-excluded diff, compare its
+  # contents (not mode bits). The ABS host has a default ACL on /opt/build-server-builds/
+  # that forces 0664 on all new files, which python-for-android records verbatim into
+  # private.tar headers. File contents are identical; only tar entry mode bits differ.
+  # Root cause is infrastructure-level (setfacl on ABS host), not a build source issue.
+  local privateTarNote=""
+  if [ "$diffCount" -eq 1 ] && echo "$nonExcludedDiffs" | grep -q "assets/private\.tar"; then
+    local tarContentDiff
+    tarContentDiff=$($CONTAINER_CMD run --rm \
+      --volume "${downloadedApk}:/play.apk:ro" \
+      --volume "${builtApk}:/built.apk:ro" \
+      $wsContainer \
+      sh -c '
+        mkdir -p /tmp/fromPlay /tmp/fromBuild /tmp/play-tar /tmp/build-tar
+        unzip -d /tmp/fromPlay -qq /play.apk assets/private.tar
+        unzip -d /tmp/fromBuild -qq /built.apk assets/private.tar
+        tar xf /tmp/fromPlay/assets/private.tar -C /tmp/play-tar
+        tar xf /tmp/fromBuild/assets/private.tar -C /tmp/build-tar
+        diff --brief --recursive /tmp/play-tar /tmp/build-tar 2>/dev/null || true
+      ' 2>&1)
+    if [ -z "$tarContentDiff" ]; then
+      verdict="reproducible"
+      diffCount=0
+      nonExcludedDiffs=""
+      privateTarNote="assets/private.tar: tar entry mode bits differ (0664 ABS vs 0644 official) but all file contents are identical. Root cause: default ACL on /opt/build-server-builds/ forces group-write inheritance. Infrastructure fix needed (setfacl). GitLab #900."
+    fi
+  fi
+
   builtHash=$($CONTAINER_CMD run --rm \
     --volume "$(dirname "$builtApk"):/built:ro" \
     $wsContainer sha256sum "/built/$(basename "$builtApk")" | awk '{print $1}')
@@ -583,6 +611,12 @@ result() {
     local excludedCount
     excludedCount=$(echo "$excludedDiffs" | wc -l)
     [ "$excludedCount" -gt 5 ] && echo "  ... ($((excludedCount - 5)) more — see $DIFF_FILE)"
+    echo ""
+  fi
+
+  if [ -n "$privateTarNote" ]; then
+    echo "Note (private.tar mode-only diff ignored):"
+    echo "  $privateTarNote"
     echo ""
   fi
 
