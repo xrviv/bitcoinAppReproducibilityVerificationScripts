@@ -33,7 +33,7 @@ CYAN='\033[1;36m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-readonly SCRIPT_VERSION="v0.2.20"
+readonly SCRIPT_VERSION="v0.2.21"
 readonly SCRIPT_NAME="bitkey_build.sh"
 readonly APP_ID="world.bitkey.app"
 readonly REPO_URL="https://github.com/proto-at-block/bitkey.git"
@@ -41,6 +41,7 @@ readonly DEFAULT_REF="main"
 readonly BUNDLETOOL_VERSION="1.15.6"
 readonly ANDROID_BUILD_TOOLS_VERSION="35.0.0"
 readonly HELPER_GIT_IMAGE="docker.io/alpine/git:2.47.2"
+readonly WS_CONTAINER="docker.io/walletscrutiny/android:5"
 
 readonly EXIT_SUCCESS=0
 readonly EXIT_FAILED=1
@@ -858,6 +859,106 @@ resolve_version_with_temp_helper() {
     log_info "Version derived from APK metadata: ${VERSION}"
 }
 
+host_aapt_version() {
+    local apk_path="$1"
+    local field="$2"
+    local tool out detected
+    for tool in aapt2 aapt; do
+        if command -v "${tool}" >/dev/null 2>&1; then
+            out="$("${tool}" dump badging "${apk_path}" 2>/dev/null || true)"
+            if [[ -n "${out}" ]]; then
+                detected="$(printf '%s\n' "${out}" \
+                    | sed -n "s/.*${field}='\([^']*\)'.*/\1/p" \
+                    | head -n1)"
+                [[ -n "${detected}" ]] && { printf '%s\n' "${detected}"; return 0; }
+            fi
+        fi
+    done
+    return 1
+}
+
+container_aapt_version() {
+    local apk_path="$1"
+    local field="$2"
+    local apk_dir apk_name
+    apk_dir="$(dirname "${apk_path}")"
+    apk_name="$(basename "${apk_path}")"
+    ${CONTAINER_CMD} run --rm \
+        ${CONTAINER_RUN_EXTRA} \
+        -v "${apk_dir}:/apk${VOLUME_RO}" \
+        "${WS_CONTAINER}" \
+        sh -c '
+            out="$({ aapt dump badging "/apk/'"${apk_name}"'" 2>/dev/null \
+                  || aapt2 dump badging "/apk/'"${apk_name}"'" 2>/dev/null; } || true)"
+            if [ -n "$out" ]; then
+                printf "%s\n" "$out" \
+                    | sed -n "s/.*'"${field}"'='"'"'\([^'"'"']*\)'"'"'.*/\1/p" \
+                    | head -n1
+                exit 0
+            fi
+        ' 2>/dev/null || true
+}
+
+detect_apk_metadata_field() {
+    local apk_path="$1"
+    local field="$2"
+    local detected
+    detected="$(host_aapt_version "${apk_path}" "${field}" || true)"
+    if [[ -n "${detected}" ]]; then
+        printf '%s\n' "${detected}"
+        return 0
+    fi
+    container_aapt_version "${apk_path}" "${field}" || true
+}
+
+detect_version_from_binary() {
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+    trap 'rm -rf "${tmp_dir}"' RETURN
+
+    local base_apk=""
+    if [[ -f "${APK_INPUT}" ]]; then
+        local _ct="unknown"
+        if file "${APK_INPUT}" | grep -q "Zip archive" && \
+           unzip -l "${APK_INPUT}" 2>/dev/null | grep -q "\.apk"; then
+            _ct="zip"
+        elif file "${APK_INPUT}" | grep -qE "gzip compressed|POSIX tar archive|tar archive" && \
+             tar -tf "${APK_INPUT}" 2>/dev/null | grep -q "\.apk"; then
+            _ct="tar"
+        fi
+
+        if [[ "${APK_INPUT}" == *.apk && "${_ct}" == "unknown" ]]; then
+            base_apk="${APK_INPUT}"
+        elif [[ "${_ct}" == "tar" || "${APK_INPUT}" == *.tar.gz || "${APK_INPUT}" == *.tgz || "${APK_INPUT}" == *.tar ]]; then
+            tar -xf "${APK_INPUT}" -C "${tmp_dir}" 2>/dev/null || true
+            base_apk="$(find "${tmp_dir}" -maxdepth 2 \( -name 'base.apk' -o -name 'base-master.apk' \) | head -n1 || true)"
+            [[ -z "${base_apk}" ]] && base_apk="$(find "${tmp_dir}" -maxdepth 2 -name '*.apk' | sort | head -n1 || true)"
+        elif [[ "${_ct}" == "zip" || "${APK_INPUT}" == *.zip || "${APK_INPUT}" == *.apks ]]; then
+            unzip -qq -o "${APK_INPUT}" -d "${tmp_dir}" 2>/dev/null || true
+            base_apk="$(find "${tmp_dir}" -maxdepth 2 \( -name 'base.apk' -o -name 'base-master.apk' \) | head -n1 || true)"
+            [[ -z "${base_apk}" ]] && base_apk="$(find "${tmp_dir}" -maxdepth 2 -name '*.apk' | sort | head -n1 || true)"
+        fi
+    elif [[ -d "${APK_INPUT}" ]]; then
+        base_apk="$(find "${APK_INPUT}" -maxdepth 1 \( -name 'base.apk' -o -name 'base-master.apk' \) | head -n1 || true)"
+        [[ -z "${base_apk}" ]] && base_apk="$(find "${APK_INPUT}" -maxdepth 1 -name '*.apk' | sort | head -n1 || true)"
+    fi
+
+    if [[ -z "${base_apk}" ]]; then
+        log_fail "Could not locate base.apk in --binary input to read versionName. Provide --version explicitly."
+        emit_failure_and_exit "Could not find APK to detect version." "${EXIT_INVALID}"
+    fi
+
+    log_info "Detecting version from: $(basename "${base_apk}")"
+    local ver
+    ver="$(detect_apk_metadata_field "${base_apk}" "versionName" || true)"
+    if [[ -z "${ver}" ]]; then
+        log_fail "Could not read versionName from APK. Provide --version explicitly."
+        emit_failure_and_exit "Could not determine versionName from APK." "${EXIT_INVALID}"
+    fi
+    VERSION="${ver%% (*}"
+    log_info "Version derived from APK metadata: ${VERSION}"
+}
+
 collect_official_metadata() {
     local image="$1"
     local apk_path
@@ -1487,12 +1588,8 @@ exec 1>&5 2>&6
 exec > >(tee "${LOG_DIR}/phase2-resolve.log" >&5) 2>&1
 phase_header 2 "RESOLVE"
 if [[ -z "${VERSION}" ]]; then
-    log_info "Version not provided. Building temporary helper image to read APK metadata."
-    clone_ref_into_repo "${DEFAULT_REF}" "repo-default" "false"
-    TEMP_BASE_IMAGE="ws-bitkey-temp-base-$(date +%s)-$$"
-    build_helper_image "${TEMP_BASE_IMAGE}" "$(repo_default_dir)"
-    prepare_official_inputs "${TEMP_BASE_IMAGE}"
-    resolve_version_with_temp_helper
+    log_info "Version not provided. Detecting from --binary input (host aapt2 or WS container)."
+    detect_version_from_binary
     ensure_work_dir_named_for_version "${VERSION}" "${ARCH:-auto}"
     log_info "Workspace renamed to: ${WORK_DIR}"
 fi
