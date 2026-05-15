@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitkey_build.sh - Bitkey Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.26
+# Version:       v0.2.27
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-05-15 (v0.2.26)
+# Last Modified: 2026-05-15 (v0.2.27)
 # Project:       https://github.com/proto-at-block/bitkey
 # ==============================================================================
 # LICENSE: MIT License
@@ -33,7 +33,7 @@ CYAN='\033[1;36m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-readonly SCRIPT_VERSION="v0.2.26"
+readonly SCRIPT_VERSION="v0.2.27"
 readonly SCRIPT_NAME="bitkey_build.sh"
 readonly APP_ID="world.bitkey.app"
 readonly REPO_URL="https://github.com/proto-at-block/bitkey.git"
@@ -627,16 +627,30 @@ container_exec_build() {
         "${cmd}"
 }
 
+patch_bitkey_dockerfile() {
+    local src="$1"
+    local dst="$2"
+    # curl=7.81.0-1ubuntu1.23 was superseded by 1ubuntu1.24 in Ubuntu Jammy repos;
+    # the pin breaks docker build. Strip it to the unversioned package name so future
+    # minor security bumps don't break the build again.
+    sed 's/curl=7\.81\.0-1ubuntu1\.[0-9]*/curl/' "${src}" > "${dst}"
+}
+
 build_helper_image() {
     local image="$1"
     local repo_dir="$2"
+    local orig_df="${repo_dir}/app/verifiable-build/android/Dockerfile"
+    local patched_df
+    patched_df="$(mktemp --suffix=.Dockerfile)"
+    patch_bitkey_dockerfile "${orig_df}" "${patched_df}"
     log_info "Building Bitkey helper image: ${image}"
     ${CONTAINER_CMD} build \
         --platform=linux/amd64 \
-        -f "${repo_dir}/app/verifiable-build/android/Dockerfile" \
+        -f "${patched_df}" \
         -t "${image}" \
         --target base \
         "${repo_dir}" >/dev/null
+    rm -f "${patched_df}"
 }
 
 build_final_image() {
@@ -645,14 +659,19 @@ build_final_image() {
     local build_vars_file="$3"
     local build_vars_json
     build_vars_json="$(tr -d '\n' < "${build_vars_file}")"
+    local orig_df="${repo_dir}/app/verifiable-build/android/Dockerfile"
+    local patched_df
+    patched_df="$(mktemp --suffix=.Dockerfile)"
+    patch_bitkey_dockerfile "${orig_df}" "${patched_df}"
     log_info "Building Bitkey verification image: ${image}"
     ${CONTAINER_CMD} build \
         --platform=linux/amd64 \
-        -f "${repo_dir}/app/verifiable-build/android/Dockerfile" \
+        -f "${patched_df}" \
         -t "${image}" \
         --target build \
         --build-arg "REPRODUCIBLE_BUILD_VARIABLES=${build_vars_json}" \
         "${repo_dir}" >/dev/null
+    rm -f "${patched_df}"
 }
 
 clone_ref_into_repo() {
