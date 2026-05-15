@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitkey_build.sh - Bitkey Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.21
+# Version:       v0.2.22
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-05-15 (v0.2.21)
+# Last Modified: 2026-05-15 (v0.2.22)
 # Project:       https://github.com/proto-at-block/bitkey
 # ==============================================================================
 # LICENSE: MIT License
@@ -33,7 +33,7 @@ CYAN='\033[1;36m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-readonly SCRIPT_VERSION="v0.2.21"
+readonly SCRIPT_VERSION="v0.2.22"
 readonly SCRIPT_NAME="bitkey_build.sh"
 readonly APP_ID="world.bitkey.app"
 readonly REPO_URL="https://github.com/proto-at-block/bitkey.git"
@@ -896,6 +896,18 @@ container_aapt_version() {
                     | head -n1
                 exit 0
             fi
+            tmpdir=$(mktemp -d)
+            if apktool d -f -s -o "$tmpdir/out" "/apk/'"${apk_name}"'" >/dev/null 2>&1; then
+                case "'"${field}"'" in
+                    versionName)
+                        sed -n "s/^[[:space:]]*versionName:[[:space:]]*//p" \
+                            "$tmpdir/out/apktool.yml" | head -n1 ;;
+                    versionCode)
+                        sed -n "s/^[[:space:]]*versionCode:[[:space:]]*'"'"'\([^'"'"']*\)'"'"'/\1/p" \
+                            "$tmpdir/out/apktool.yml" | head -n1 ;;
+                esac
+            fi
+            rm -rf "$tmpdir"
         ' 2>/dev/null || true
 }
 
