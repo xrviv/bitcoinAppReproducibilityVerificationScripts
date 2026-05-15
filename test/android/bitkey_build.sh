@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitkey_build.sh - Bitkey Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.25
+# Version:       v0.2.26
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-05-15 (v0.2.25)
+# Last Modified: 2026-05-15 (v0.2.26)
 # Project:       https://github.com/proto-at-block/bitkey
 # ==============================================================================
 # LICENSE: MIT License
@@ -33,7 +33,7 @@ CYAN='\033[1;36m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-readonly SCRIPT_VERSION="v0.2.25"
+readonly SCRIPT_VERSION="v0.2.26"
 readonly SCRIPT_NAME="bitkey_build.sh"
 readonly APP_ID="world.bitkey.app"
 readonly REPO_URL="https://github.com/proto-at-block/bitkey.git"
@@ -59,7 +59,6 @@ CONTAINER_CMD=""
 CONTAINER_RUN_EXTRA=""
 VOLUME_RO=":ro"
 VOLUME_RW=""
-TEMP_BASE_IMAGE=""
 EXACT_BASE_IMAGE=""
 EXACT_BUILD_IMAGE=""
 RESULT_DONE=false
@@ -336,9 +335,6 @@ cleanup_on_exit() {
     { exec 1>&5 2>&6; } 2>/dev/null || true
     if [[ "${exit_code}" -ne 0 && -n "${LOG_DIR:-}" && -d "${LOG_DIR}" ]]; then
         generate_filtered_build_log || true
-    fi
-    if [[ -n "${TEMP_BASE_IMAGE}" ]]; then
-        ${CONTAINER_CMD:-docker} image rm -f "${TEMP_BASE_IMAGE}" >/dev/null 2>&1 || true
     fi
     if [[ -n "${EXACT_BASE_IMAGE}" ]]; then
         ${CONTAINER_CMD:-docker} image rm -f "${EXACT_BASE_IMAGE}" >/dev/null 2>&1 || true
@@ -838,27 +834,6 @@ ensure_work_dir_named_for_version() {
     WORK_DIR="${final_dir}"
 }
 
-resolve_version_with_temp_helper() {
-    local apk_path
-    if [[ "${SINGLE_APK_MODE}" == "true" ]]; then
-        apk_path="$(official_single_apk || true)"
-    else
-        apk_path="$(official_base_apk || true)"
-    fi
-    if [[ -z "${apk_path}" ]]; then
-        log_fail "Could not find APK to read version from. Verify the input is a valid Bitkey APK."
-        emit_failure_and_exit "Could not find APK in the provided official input to read versionName." "${EXIT_INVALID}"
-    fi
-    local apk_rel="${apk_path#"${WORK_DIR}/"}"
-    VERSION="$(extract_apk_field "${TEMP_BASE_IMAGE}" "${apk_rel}" versionName)"
-    if [[ -z "${VERSION}" ]]; then
-        log_fail "Could not determine versionName from APK. Verify the input is a valid Bitkey APK."
-        emit_failure_and_exit "Could not determine versionName from APK. Verify the input is a valid Bitkey APK." "${EXIT_INVALID}"
-    fi
-    # Strip Play Store build number suffix e.g. "2026.7.0 (2)" → "2026.7.0".
-    VERSION="${VERSION%% (*}"
-    log_info "Version derived from APK metadata: ${VERSION}"
-}
 
 host_aapt_version() {
     local apk_path="$1"
@@ -1003,7 +978,6 @@ detect_apk_metadata_field() {
 detect_version_from_binary() {
     local tmp_dir
     tmp_dir="$(mktemp -d)"
-    trap 'rm -rf "${tmp_dir}"' RETURN
 
     local base_apk=""
     if [[ -f "${APK_INPUT}" ]]; then
@@ -1033,6 +1007,7 @@ detect_version_from_binary() {
     fi
 
     if [[ -z "${base_apk}" ]]; then
+        rm -rf "${tmp_dir}"
         log_fail "Could not locate base.apk in --binary input to read versionName. Verify the input is a valid Bitkey APK."
         emit_failure_and_exit "Could not find APK to detect version." "${EXIT_INVALID}"
     fi
@@ -1040,6 +1015,7 @@ detect_version_from_binary() {
     log_info "Detecting version from: $(basename "${base_apk}")"
     local ver
     ver="$(detect_apk_metadata_field "${base_apk}" "versionName" || true)"
+    rm -rf "${tmp_dir}"
     if [[ -z "${ver}" ]]; then
         log_fail "Could not read versionName from APK. Verify the input contains a valid Bitkey base.apk."
         emit_failure_and_exit "Could not determine versionName from APK." "${EXIT_INVALID}"
