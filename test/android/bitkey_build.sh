@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitkey_build.sh - Bitkey Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.22
+# Version:       v0.2.23
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-05-15 (v0.2.22)
+# Last Modified: 2026-05-15 (v0.2.23)
 # Project:       https://github.com/proto-at-block/bitkey
 # ==============================================================================
 # LICENSE: MIT License
@@ -33,7 +33,7 @@ CYAN='\033[1;36m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-readonly SCRIPT_VERSION="v0.2.22"
+readonly SCRIPT_VERSION="v0.2.23"
 readonly SCRIPT_NAME="bitkey_build.sh"
 readonly APP_ID="world.bitkey.app"
 readonly REPO_URL="https://github.com/proto-at-block/bitkey.git"
@@ -363,13 +363,14 @@ trap 'cleanup_on_exit' EXIT
 usage() {
     cat <<EOF
 Usage:
-  ${SCRIPT_NAME} --version <version> --binary <file|dir|zip> [OPTIONS]
-  ${SCRIPT_NAME} --binary <file|dir|zip> [OPTIONS]
+  ${SCRIPT_NAME} --version <version> --binary <file|dir|zip|tar.gz> [OPTIONS]
+  ${SCRIPT_NAME} --binary <file|dir|zip|tar.gz> [OPTIONS]
 
 Inputs:
   --binary <path>     Official Bitkey APK input. Accepts:
                         - directory containing *.apk files (base.apk + config splits)
                         - .apks or .zip archive containing the full split set
+                        - .tar.gz or .tar archive containing the full split set
                         - single .apk file (GitHub release emergency APK)
                       Alias: --apk
 
@@ -911,6 +912,75 @@ container_aapt_version() {
         ' 2>/dev/null || true
 }
 
+python_parse_version() {
+    local apk_path="$1"
+    local field="$2"
+    [[ "${field}" != "versionName" ]] && return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "${apk_path}" <<'PYEOF'
+import sys, struct, zipfile
+
+def r16(d, o): return struct.unpack_from('<H', d, o)[0]
+def r32(d, o): return struct.unpack_from('<I', d, o)[0]
+
+def get_strings(d, sp):
+    sh = r16(d, sp + 2)
+    sc = r32(d, sp + 8)
+    fl = r32(d, sp + 16)
+    ss = r32(d, sp + 20)
+    utf8 = bool(fl & 0x100)
+    res = []
+    for i in range(sc):
+        sr = r32(d, sp + sh + i * 4)
+        a = sp + ss + sr
+        if utf8:
+            cc = d[a]; a += 2 if cc & 0x80 else 1
+            bc = d[a]
+            if bc & 0x80: nb = (bc & 0x7f) << 8 | d[a + 1]; a += 2
+            else: nb = bc; a += 1
+            res.append(d[a:a + nb].decode('utf-8', 'replace'))
+        else:
+            cc = r16(d, a)
+            if cc & 0x8000: nc = ((cc & 0x7fff) << 16) | r16(d, a + 2); a += 4
+            else: nc = cc; a += 2
+            res.append(d[a:a + nc * 2].decode('utf-16-le', 'replace'))
+    return res
+
+try:
+    with zipfile.ZipFile(sys.argv[1]) as z:
+        data = z.read('AndroidManifest.xml')
+    strings = get_strings(data, 8)
+    pos = 8 + r32(data, 12)
+    while pos < len(data) - 8:
+        ct = r16(data, pos)
+        cs = r32(data, pos + 4)
+        if cs <= 0: break
+        if ct == 0x0102:  # RES_XML_START_ELEMENT_TYPE
+            ni = r32(data, pos + 20)
+            ac = r16(data, pos + 28)
+            ao = pos + r16(data, pos + 24)
+            if ni < len(strings) and strings[ni] == 'manifest':
+                for a in range(ac):
+                    af = ao + a * 20
+                    an = r32(data, af + 4)
+                    rv = r32(data, af + 8)
+                    if an < len(strings) and strings[an] == 'versionName':
+                        val = ''
+                        if rv != 0xFFFFFFFF and rv < len(strings):
+                            val = strings[rv]
+                        if not val:
+                            td = r32(data, af + 16)
+                            if td < len(strings): val = strings[td]
+                        if val:
+                            print(val)
+                            sys.exit(0)
+        pos += cs
+    sys.exit(1)
+except Exception:
+    sys.exit(1)
+PYEOF
+}
+
 detect_apk_metadata_field() {
     local apk_path="$1"
     local field="$2"
@@ -920,7 +990,12 @@ detect_apk_metadata_field() {
         printf '%s\n' "${detected}"
         return 0
     fi
-    container_aapt_version "${apk_path}" "${field}" || true
+    detected="$(container_aapt_version "${apk_path}" "${field}" || true)"
+    if [[ -n "${detected}" ]]; then
+        printf '%s\n' "${detected}"
+        return 0
+    fi
+    python_parse_version "${apk_path}" "${field}" || true
 }
 
 detect_version_from_binary() {
@@ -1575,8 +1650,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "${APK_INPUT}" ]]; then
-    log_fail "--binary <file|dir|zip> is required."
-    emit_failure_and_exit "--binary <file|dir|zip> is required." "${EXIT_INVALID}"
+    log_fail "--binary <file|dir|zip|tar.gz> is required."
+    emit_failure_and_exit "--binary <file|dir|zip|tar.gz> is required." "${EXIT_INVALID}"
 fi
 
 APK_INPUT="$(realpath "${APK_INPUT}")"
