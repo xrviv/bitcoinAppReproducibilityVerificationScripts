@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitkey_build.sh - Bitkey Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.23
+# Version:       v0.2.24
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-05-15 (v0.2.23)
+# Last Modified: 2026-05-15 (v0.2.24)
 # Project:       https://github.com/proto-at-block/bitkey
 # ==============================================================================
 # LICENSE: MIT License
@@ -33,7 +33,7 @@ CYAN='\033[1;36m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-readonly SCRIPT_VERSION="v0.2.23"
+readonly SCRIPT_VERSION="v0.2.24"
 readonly SCRIPT_NAME="bitkey_build.sh"
 readonly APP_ID="world.bitkey.app"
 readonly REPO_URL="https://github.com/proto-at-block/bitkey.git"
@@ -846,14 +846,14 @@ resolve_version_with_temp_helper() {
         apk_path="$(official_base_apk || true)"
     fi
     if [[ -z "${apk_path}" ]]; then
-        log_fail "Could not find APK to read version from. Provide --version explicitly."
+        log_fail "Could not find APK to read version from. Verify the input is a valid Bitkey APK."
         emit_failure_and_exit "Could not find APK in the provided official input to read versionName." "${EXIT_INVALID}"
     fi
     local apk_rel="${apk_path#"${WORK_DIR}/"}"
     VERSION="$(extract_apk_field "${TEMP_BASE_IMAGE}" "${apk_rel}" versionName)"
     if [[ -z "${VERSION}" ]]; then
-        log_fail "Could not determine versionName from APK. Provide --version explicitly."
-        emit_failure_and_exit "Could not determine versionName from APK. Provide --version explicitly." "${EXIT_INVALID}"
+        log_fail "Could not determine versionName from APK. Verify the input is a valid Bitkey APK."
+        emit_failure_and_exit "Could not determine versionName from APK. Verify the input is a valid Bitkey APK." "${EXIT_INVALID}"
     fi
     # Strip Play Store build number suffix e.g. "2026.7.0 (2)" → "2026.7.0".
     VERSION="${VERSION%% (*}"
@@ -881,9 +881,56 @@ host_aapt_version() {
 container_aapt_version() {
     local apk_path="$1"
     local field="$2"
-    local apk_dir apk_name
+    local apk_dir apk_name _perl_b64
     apk_dir="$(dirname "${apk_path}")"
     apk_name="$(basename "${apk_path}")"
+    # Perl AXML parser: reads versionName directly from the binary AndroidManifest.xml
+    # inside the APK ZIP without needing aapt/apktool. Base64-encoded to avoid quoting
+    # issues when embedded in the sh -c '...' block below.
+    _perl_b64="$(base64 -w0 <<'PLEOF'
+use strict;
+my $apk=shift;my $d='';
+open(my $p,'-|','unzip','-p',$apk,'AndroidManifest.xml') or exit 1;
+{local $/;$d=<$p>}close $p;
+exit 1 if length($d)<8;
+sub r16{unpack('v',substr($d,$_[0],2))}
+sub r32{unpack('V',substr($d,$_[0],4))}
+my($sph,$spc,$spf,$sps)=(r16(10),r32(16),r32(24),r32(28));
+my $u8=$spf&256;my @s;
+for my $i(0..$spc-1){
+ my $o=r32(8+$sph+$i*4);my $a=8+$sps+$o;
+ if($u8){
+  my $c=ord(substr($d,$a,1));$a+=($c&128)?2:1;
+  my $b=ord(substr($d,$a,1));
+  my($nb,$sk)=($b&128)?(($b&127)<<8|ord(substr($d,$a+1,1)),2):($b,1);
+  $a+=$sk;push @s,substr($d,$a,$nb);
+ }else{
+  my $c=r16($a);
+  if($c&0x8000){my $n=(($c&0x7fff)<<16)|r16($a+2);$a+=4;push @s,join('',map{chr(r16($a+$_*2))}0..$n-1);}
+  else{$a+=2;push @s,join('',map{chr(r16($a+$_*2))}0..$c-1);}
+ }
+}
+my $pos=8+r32(12);
+while($pos<length($d)-8){
+ my $ct=r16($pos);my $cs=r32($pos+4);last if $cs<=0;
+ if($ct==0x0102){
+  my $ni=r32($pos+20);my $ac=r16($pos+28);my $ao=$pos+r16($pos+2);
+  if($ni<@s&&$s[$ni] eq 'manifest'){
+   for my $a(0..$ac-1){
+    my $af=$ao+$a*20;my $an=r32($af+4);my $rv=r32($af+8);
+    if($an<@s&&$s[$an] eq 'versionName'){
+     my $v=($rv!=4294967295&&$rv<@s)?$s[$rv]:'';
+     if(!$v){my $td=r32($af+16);$v=$s[$td] if $td<@s;}
+     if($v){print "$v\n";exit 0;}
+    }
+   }
+  }
+ }
+ $pos+=$cs;
+}
+exit 1;
+PLEOF
+)"
     ${CONTAINER_CMD} run --rm \
         ${CONTAINER_RUN_EXTRA} \
         -v "${apk_dir}:/apk${VOLUME_RO}" \
@@ -902,13 +949,18 @@ container_aapt_version() {
                 case "'"${field}"'" in
                     versionName)
                         sed -n "s/^[[:space:]]*versionName:[[:space:]]*//p" \
-                            "$tmpdir/out/apktool.yml" | head -n1 ;;
+                            "$tmpdir/out/apktool.yml" | head -n1
+                        rm -rf "$tmpdir"; exit 0 ;;
                     versionCode)
                         sed -n "s/^[[:space:]]*versionCode:[[:space:]]*'"'"'\([^'"'"']*\)'"'"'/\1/p" \
-                            "$tmpdir/out/apktool.yml" | head -n1 ;;
+                            "$tmpdir/out/apktool.yml" | head -n1
+                        rm -rf "$tmpdir"; exit 0 ;;
                 esac
             fi
             rm -rf "$tmpdir"
+            if [ '"${field}"' = versionName ]; then
+                printf "%s" '"${_perl_b64}"' | base64 -d | perl - /apk/'"${apk_name}"'
+            fi
         ' 2>/dev/null || true
 }
 
@@ -958,7 +1010,7 @@ try:
         if ct == 0x0102:  # RES_XML_START_ELEMENT_TYPE
             ni = r32(data, pos + 20)
             ac = r16(data, pos + 28)
-            ao = pos + r16(data, pos + 24)
+            ao = pos + r16(data, pos + 2)
             if ni < len(strings) and strings[ni] == 'manifest':
                 for a in range(ac):
                     af = ao + a * 20
@@ -1031,7 +1083,7 @@ detect_version_from_binary() {
     fi
 
     if [[ -z "${base_apk}" ]]; then
-        log_fail "Could not locate base.apk in --binary input to read versionName. Provide --version explicitly."
+        log_fail "Could not locate base.apk in --binary input to read versionName. Verify the input is a valid Bitkey APK."
         emit_failure_and_exit "Could not find APK to detect version." "${EXIT_INVALID}"
     fi
 
@@ -1039,7 +1091,7 @@ detect_version_from_binary() {
     local ver
     ver="$(detect_apk_metadata_field "${base_apk}" "versionName" || true)"
     if [[ -z "${ver}" ]]; then
-        log_fail "Could not read versionName from APK. Provide --version explicitly."
+        log_fail "Could not read versionName from APK. Verify the input contains a valid Bitkey base.apk."
         emit_failure_and_exit "Could not determine versionName from APK." "${EXIT_INVALID}"
     fi
     VERSION="${ver%% (*}"
