@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitkey_build.sh - Bitkey Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.19
+# Version:       v0.2.20
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-05-02 (v0.2.19)
+# Last Modified: 2026-05-02 (v0.2.20)
 # Project:       https://github.com/proto-at-block/bitkey
 # ==============================================================================
 # LICENSE: MIT License
@@ -33,7 +33,7 @@ CYAN='\033[1;36m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-readonly SCRIPT_VERSION="v0.2.19"
+readonly SCRIPT_VERSION="v0.2.20"
 readonly SCRIPT_NAME="bitkey_build.sh"
 readonly APP_ID="world.bitkey.app"
 readonly REPO_URL="https://github.com/proto-at-block/bitkey.git"
@@ -726,9 +726,19 @@ prepare_official_inputs() {
         log_info "Copying official APKs from directory input"
         copy_input_apks_from_dir "${APK_INPUT}" "${src_dir}"
     elif [[ -f "${APK_INPUT}" ]]; then
+        # Detect archive type by content first — ABS may save any format as _downloaded.apk
+        local _content_type="unknown"
+        if file "${APK_INPUT}" | grep -q "Zip archive" && \
+           unzip -l "${APK_INPUT}" 2>/dev/null | grep -q "\.apk"; then
+            _content_type="zip"
+        elif file "${APK_INPUT}" | grep -qE "gzip compressed|POSIX tar archive|tar archive" && \
+             tar -tf "${APK_INPUT}" 2>/dev/null | grep -q "\.apk"; then
+            _content_type="tar"
+        fi
+
         case "${APK_INPUT}" in
             *.apks|*.zip)
-                log_info "Extracting official APKs from archive input"
+                log_info "Extracting official APKs from zip archive input"
                 cp "${APK_INPUT}" "${WORK_DIR}/input/official-input.zip"
                 container_exec "${image}" "
                     set -euo pipefail
@@ -738,16 +748,49 @@ prepare_official_inputs() {
                     find extracted-official -type f -name '*.apk' -exec cp {} official/source/ \\;
                 "
                 ;;
+            *.tar.gz|*.tgz|*.tar)
+                log_info "Extracting official APKs from tar archive input"
+                cp "${APK_INPUT}" "${WORK_DIR}/input/official-input.tar"
+                container_exec "${image}" "
+                    set -euo pipefail
+                    rm -rf extracted-official
+                    mkdir -p extracted-official official/source
+                    tar -xf input/official-input.tar -C extracted-official
+                    find extracted-official -type f -name '*.apk' -exec cp {} official/source/ \\;
+                "
+                ;;
             *.apk)
-                log_info "Single .apk file input detected — checking APK type."
-                local single_dest="${src_dir}/$(basename "${APK_INPUT}")"
-                cp "${APK_INPUT}" "${single_dest}"
-                detect_single_apk_type "${image}" "${single_dest}"
-                SINGLE_APK_MODE=true
-                SINGLE_APK_PATH="${single_dest}"
+                if [[ "${_content_type}" == "tar" ]]; then
+                    log_info "Detected tar/tar.gz archive saved with .apk extension — extracting as archive"
+                    cp "${APK_INPUT}" "${WORK_DIR}/input/official-input.tar"
+                    container_exec "${image}" "
+                        set -euo pipefail
+                        rm -rf extracted-official
+                        mkdir -p extracted-official official/source
+                        tar -xf input/official-input.tar -C extracted-official
+                        find extracted-official -type f -name '*.apk' -exec cp {} official/source/ \\;
+                    "
+                elif [[ "${_content_type}" == "zip" ]]; then
+                    log_info "Detected zip archive saved with .apk extension — extracting as archive"
+                    cp "${APK_INPUT}" "${WORK_DIR}/input/official-input.zip"
+                    container_exec "${image}" "
+                        set -euo pipefail
+                        rm -rf extracted-official
+                        mkdir -p extracted-official official/source
+                        unzip -qq -o input/official-input.zip -d extracted-official
+                        find extracted-official -type f -name '*.apk' -exec cp {} official/source/ \\;
+                    "
+                else
+                    log_info "Single .apk file input detected — checking APK type."
+                    local single_dest="${src_dir}/$(basename "${APK_INPUT}")"
+                    cp "${APK_INPUT}" "${single_dest}"
+                    detect_single_apk_type "${image}" "${single_dest}"
+                    SINGLE_APK_MODE=true
+                    SINGLE_APK_PATH="${single_dest}"
+                fi
                 ;;
             *)
-                log_fail "--binary must be a directory, .apks, or .zip file."
+                log_fail "--binary must be a directory, .apks, .zip, .tar.gz, or .tar file."
                 emit_failure_and_exit "Unsupported --binary input: ${APK_INPUT}" "${EXIT_INVALID}"
                 ;;
         esac
