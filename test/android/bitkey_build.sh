@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitkey_build.sh - Bitkey Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.20
+# Version:       v0.2.21
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-05-02 (v0.2.20)
+# Last Modified: 2026-05-15 (v0.2.21)
 # Project:       https://github.com/proto-at-block/bitkey
 # ==============================================================================
 # LICENSE: MIT License
