@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitkey_build.sh - Bitkey Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.24
+# Version:       v0.2.25
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-05-15 (v0.2.24)
+# Last Modified: 2026-05-15 (v0.2.25)
 # Project:       https://github.com/proto-at-block/bitkey
 # ==============================================================================
 # LICENSE: MIT License
@@ -33,7 +33,7 @@ CYAN='\033[1;36m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-readonly SCRIPT_VERSION="v0.2.24"
+readonly SCRIPT_VERSION="v0.2.25"
 readonly SCRIPT_NAME="bitkey_build.sh"
 readonly APP_ID="world.bitkey.app"
 readonly REPO_URL="https://github.com/proto-at-block/bitkey.git"
@@ -881,56 +881,9 @@ host_aapt_version() {
 container_aapt_version() {
     local apk_path="$1"
     local field="$2"
-    local apk_dir apk_name _perl_b64
+    local apk_dir apk_name
     apk_dir="$(dirname "${apk_path}")"
     apk_name="$(basename "${apk_path}")"
-    # Perl AXML parser: reads versionName directly from the binary AndroidManifest.xml
-    # inside the APK ZIP without needing aapt/apktool. Base64-encoded to avoid quoting
-    # issues when embedded in the sh -c '...' block below.
-    _perl_b64="$(base64 -w0 <<'PLEOF'
-use strict;
-my $apk=shift;my $d='';
-open(my $p,'-|','unzip','-p',$apk,'AndroidManifest.xml') or exit 1;
-{local $/;$d=<$p>}close $p;
-exit 1 if length($d)<8;
-sub r16{unpack('v',substr($d,$_[0],2))}
-sub r32{unpack('V',substr($d,$_[0],4))}
-my($sph,$spc,$spf,$sps)=(r16(10),r32(16),r32(24),r32(28));
-my $u8=$spf&256;my @s;
-for my $i(0..$spc-1){
- my $o=r32(8+$sph+$i*4);my $a=8+$sps+$o;
- if($u8){
-  my $c=ord(substr($d,$a,1));$a+=($c&128)?2:1;
-  my $b=ord(substr($d,$a,1));
-  my($nb,$sk)=($b&128)?(($b&127)<<8|ord(substr($d,$a+1,1)),2):($b,1);
-  $a+=$sk;push @s,substr($d,$a,$nb);
- }else{
-  my $c=r16($a);
-  if($c&0x8000){my $n=(($c&0x7fff)<<16)|r16($a+2);$a+=4;push @s,join('',map{chr(r16($a+$_*2))}0..$n-1);}
-  else{$a+=2;push @s,join('',map{chr(r16($a+$_*2))}0..$c-1);}
- }
-}
-my $pos=8+r32(12);
-while($pos<length($d)-8){
- my $ct=r16($pos);my $cs=r32($pos+4);last if $cs<=0;
- if($ct==0x0102){
-  my $ni=r32($pos+20);my $ac=r16($pos+28);my $ao=$pos+r16($pos+2);
-  if($ni<@s&&$s[$ni] eq 'manifest'){
-   for my $a(0..$ac-1){
-    my $af=$ao+$a*20;my $an=r32($af+4);my $rv=r32($af+8);
-    if($an<@s&&$s[$an] eq 'versionName'){
-     my $v=($rv!=4294967295&&$rv<@s)?$s[$rv]:'';
-     if(!$v){my $td=r32($af+16);$v=$s[$td] if $td<@s;}
-     if($v){print "$v\n";exit 0;}
-    }
-   }
-  }
- }
- $pos+=$cs;
-}
-exit 1;
-PLEOF
-)"
     ${CONTAINER_CMD} run --rm \
         ${CONTAINER_RUN_EXTRA} \
         -v "${apk_dir}:/apk${VOLUME_RO}" \
@@ -958,9 +911,6 @@ PLEOF
                 esac
             fi
             rm -rf "$tmpdir"
-            if [ '"${field}"' = versionName ]; then
-                printf "%s" '"${_perl_b64}"' | base64 -d | perl - /apk/'"${apk_name}"'
-            fi
         ' 2>/dev/null || true
 }
 
