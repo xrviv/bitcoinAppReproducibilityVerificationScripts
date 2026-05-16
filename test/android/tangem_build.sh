@@ -1,56 +1,12 @@
 #!/bin/bash
-# ==============================================================================
 # tangem_build.sh - Tangem Wallet Android Reproducible Build Verification
-# ==============================================================================
-# Version:       v0.3.0
-# Organization:  WalletScrutiny.com
-# Last Modified: 2026-03-27
-# Project:       https://github.com/tangem/tangem-app-android
-# ==============================================================================
-# LICENSE: MIT License
-#
-# IMPORTANT: Changelog maintained separately at:
-# ~/work/ws-notes/script-notes/android/com.tangem.wallet/changelog.md
-# ==============================================================================
-#
-# TECHNICAL DISCLAIMER:
-# This script is provided for technical analysis and reproducible build verification
-# purposes only. No warranty is provided regarding security, functionality, or
-# fitness for any particular purpose. Users assume all risks associated with
-# running this script and analyzing the software.
-#
-# LEGAL DISCLAIMER:
-# This script is designed for legitimate security research and reproducible build
-# verification. Users are responsible for ensuring compliance with all applicable
-# laws and regulations. The developers assume no liability for any misuse or legal
-# consequences arising from use. By using this script, you acknowledge these
-# disclaimers and accept full responsibility.
-#
-# NOTE — DexProtector:
-# Tangem release APKs are post-processed with DexProtector (commercial bytecode
-# obfuscation by Licel). A source build produces unprotected DEX and native libs.
-# Differences in these files are expected and are not a tooling mismatch — they
-# result from DexProtector running as a CI post-build step using a paid license
-# not present in the public repository. This script provides diff evidence only;
-# a human reviewer interprets the verdict in a WS report.
-#
-# SCRIPT SUMMARY:
-# Two operating modes, selected by arguments:
-#
-#   split mode (--binary <split.apk>):
-#     Accepts a single official split APK from Google Play (1 of N splits installed
-#     on device). Builds an AAB from source in a container, extracts split APKs
-#     using bundletool + device-spec.json, finds the matching built split, and
-#     runs a content diff. Generates COMPARISON_RESULTS.yaml with verdict.
-#
-#   github mode (--version <ver>, no --binary):
-#     Downloads the official universal APK from Tangem GitHub releases. Builds a
-#     universal APK via assembleGoogleRelease. Runs a content diff. Generates
-#     COMPARISON_RESULTS.yaml with verdict. (GitHub release APK only — not the
-#     Play Store artifact.)
-#
-# Both modes require GITHUB_TOKEN (read:packages scope) for Tangem SDK deps on
-# GitHub Package Registry.
+# Version: v0.4.1 | Organization: WalletScrutiny.com | Last Modified: 2026-05-16
+# Project: https://github.com/tangem/tangem-app-android
+# Changelog: ~/work/ws-notes/script-notes/android/com.tangem.wallet/changelog.md
+# LICENSE: MIT | For research use only. No warranty.
+# Outputs build and diff evidence only; root-cause analysis belongs in the WS report.
+# Two modes: split (--binary <apk|zip>) and github (--version, no --binary).
+# Both require GITHUB_TOKEN (read:packages). Zip detected by content, not extension.
 
 set -euo pipefail
 
@@ -59,10 +15,8 @@ EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
 readonly WORK_DIR_PREFIX="workdir"
 
-# ------------------------------------------------------------------------------
 # Script metadata
-# ------------------------------------------------------------------------------
-readonly SCRIPT_VERSION="v0.3.0"
+readonly SCRIPT_VERSION="v0.4.1"
 readonly SCRIPT_NAME="tangem_build.sh"
 readonly APP_ID="com.tangem.wallet"
 readonly REPO_URL="https://github.com/tangem/tangem-app-android.git"
@@ -73,10 +27,9 @@ readonly TANGEM_BUILD_IMAGE_BASE="tangem_build_env"
 readonly EXIT_SUCCESS=0
 readonly EXIT_FAILED=1
 readonly EXIT_INVALID=2
+readonly DEFAULT_ARCH="arm64-v8a"
 
-# ------------------------------------------------------------------------------
 # Global state (set by argument parsing)
-# ------------------------------------------------------------------------------
 VERSION=""
 ARCH=""
 TYPE=""
@@ -91,6 +44,7 @@ VOLUME_RW=""
 github_token=""
 github_user=""
 should_cleanup=false
+REQUESTED_TAG=""
 
 # set during prepare/build
 BUILD_MODE=""        # "split" | "github"
@@ -102,10 +56,9 @@ TARGET_SPLIT_NAME="" # canonical split filename being compared in split mode
 BUILT_AAB=""
 RESULT_DONE=false    # set true by result() after writing COMPARISON_RESULTS.yaml
 TOTAL_DIFFS=1        # default to "failed" until compare_split_apks() runs
+RESOLVED_GIT_REF=""
 
-# ------------------------------------------------------------------------------
 # Logging
-# ------------------------------------------------------------------------------
 log_info()  { echo "[INFO] $*"; }
 log_pass()  { echo "[PASS] $*"; }
 log_fail()  { echo "[FAIL] $*"; }
@@ -129,9 +82,81 @@ safe_grep_count() {
     [[ -n "${grep_output}" ]] && printf '%s\n' "${grep_output}" || printf '0\n'
 }
 
-# ------------------------------------------------------------------------------
+normalize_detected_arch() {
+    local raw="$1"
+    case "${raw}" in
+        arm64-v8a|arm64_v8a) echo "arm64-v8a" ;;
+        armeabi-v7a|armeabi_v7a) echo "armeabi-v7a" ;;
+        x86_64) echo "x86_64" ;;
+        x86) echo "x86" ;;
+        *) echo "" ;;
+    esac
+}
+
+extract_arch_tokens_from_text() {
+    local input="$1"
+    printf '%s\n' "${input}" \
+        | grep -Eoi 'arm64[-_]?v8a|armeabi[-_]?v7a|x86_64|x86' \
+        | sed 's/-/_/g' \
+        | sort -u || true
+}
+
+auto_detect_arch_from_binary_input() {
+    local binary_path="$1"
+    local is_zip="$2"
+    local collected="" token normalized unique_count
+
+    collected="$(extract_arch_tokens_from_text "$(basename "${binary_path}")")"
+
+    if [[ "${is_zip}" == "true" ]]; then
+        local zip_entries
+        zip_entries="$(unzip -Z1 "${binary_path}" 2>/dev/null || true)"
+        if [[ -n "${zip_entries}" ]]; then
+            collected="$(printf '%s\n%s\n' "${collected}" "$(extract_arch_tokens_from_text "${zip_entries}")" \
+                | sed '/^$/d' | sort -u)"
+        fi
+    else
+        local apk_entries
+        apk_entries="$(unzip -Z1 "${binary_path}" 2>/dev/null || true)"
+        if [[ -n "${apk_entries}" ]]; then
+            collected="$(printf '%s\n%s\n' "${collected}" "$(extract_arch_tokens_from_text "${apk_entries}")" \
+                | sed '/^$/d' | sort -u)"
+        fi
+
+        local sibling_dir sibling_listing
+        sibling_dir="$(dirname "${binary_path}")"
+        sibling_listing="$(ls -1 "${sibling_dir}" 2>/dev/null || true)"
+        if [[ -n "${sibling_listing}" ]]; then
+            collected="$(printf '%s\n%s\n' "${collected}" "$(extract_arch_tokens_from_text "${sibling_listing}")" \
+                | sed '/^$/d' | sort -u)"
+        fi
+    fi
+
+    collected="$(printf '%s\n' "${collected}" | sed '/^$/d' | sort -u)"
+    unique_count="$(printf '%s\n' "${collected}" | sed '/^$/d' | wc -l | tr -d ' ')"
+
+    if [[ "${unique_count}" -eq 1 ]]; then
+        token="$(printf '%s\n' "${collected}" | head -1)"
+        normalized="$(normalize_detected_arch "${token}")"
+        printf '%s\n' "${normalized}"
+        return
+    fi
+
+    if [[ "${unique_count}" -gt 1 ]]; then
+        if printf '%s\n' "${collected}" | grep -q '^arm64_v8a$'; then
+            printf '%s\n' "arm64-v8a"
+            return
+        fi
+        token="$(printf '%s\n' "${collected}" | head -1)"
+        normalized="$(normalize_detected_arch "${token}")"
+        printf '%s\n' "${normalized}"
+        return
+    fi
+
+    printf '%s\n' ""
+}
+
 # YAML output helpers
-# ------------------------------------------------------------------------------
 write_yaml_outputs() {
     local content="$1"
     printf '%s\n' "$content" > "${EXEC_DIR}/COMPARISON_RESULTS.yaml"
@@ -156,9 +181,7 @@ notes: |
     log_info "Generated COMPARISON_RESULTS.yaml (verdict: ${verdict})"
 }
 
-# ------------------------------------------------------------------------------
 # Error handling
-# ------------------------------------------------------------------------------
 on_error() {
     local exit_code=$?
     local line_no=$1
@@ -173,8 +196,6 @@ on_error() {
 
 cleanup_on_error() {
     local exit_code=$?
-    # Only write YAML if we got past argument parsing (WORK_DIR is set).
-    # Parameter/config errors (exit 2) before prepare() don't need a YAML artifact.
     if [[ "${exit_code}" -ne 0 && "${RESULT_DONE}" != "true" && -n "${WORK_DIR:-}" ]]; then
         log_warn "Script failed with exit code: ${exit_code}"
         log_warn "Work directory preserved: ${WORK_DIR}"
@@ -185,9 +206,7 @@ cleanup_on_error() {
 trap 'on_error $LINENO' ERR
 trap 'cleanup_on_error'  EXIT
 
-# ------------------------------------------------------------------------------
 # Container runtime detection
-# ------------------------------------------------------------------------------
 detect_container_runtime() {
     if command -v podman >/dev/null 2>&1; then
         CONTAINER_CMD="podman"
@@ -202,7 +221,6 @@ detect_container_runtime() {
         CONTAINER_RUN_EXTRA="--user $(id -u):$(id -g)"
         log_info "Using docker as container runtime"
     else
-        # Cannot call generate_error_yaml yet (WORK_DIR not set); write manually
         cat > "${EXEC_DIR}/COMPARISON_RESULTS.yaml" <<EOF
 script_version: ${SCRIPT_VERSION}
 verdict: ftbfs
@@ -215,9 +233,7 @@ EOF
     fi
 }
 
-# ------------------------------------------------------------------------------
 # Container helpers
-# ------------------------------------------------------------------------------
 
 # Run a command inside WORK_DIR mounted at /work
 container_exec() {
@@ -281,9 +297,7 @@ container_aapt_version() {
         ' 2>/dev/null || true
 }
 
-# ------------------------------------------------------------------------------
 # Split APK name helpers (MetaMask pattern)
-# ------------------------------------------------------------------------------
 canonicalize_split_apk_name() {
     local apk_name="$1"
     case "$apk_name" in
@@ -313,84 +327,20 @@ resolve_built_split_apk() {
     return 1
 }
 
-# ------------------------------------------------------------------------------
 # Usage
-# ------------------------------------------------------------------------------
 usage() {
     cat <<EOF
-NAME
-       ${SCRIPT_NAME} - Tangem Wallet Android reproducible build verification
-
-SYNOPSIS
-       ${SCRIPT_NAME} --binary <split.apk> [--version <version>] [OPTIONS]
-       ${SCRIPT_NAME} --version <version> [OPTIONS]
-       ${SCRIPT_NAME} --help
-
-DESCRIPTION
-       Builds Tangem Wallet from source in a container and compares against an
-       official artifact. Two modes are supported:
-
-       split mode (--binary <file>):
-         Accepts one official split APK from Google Play (e.g. base.apk or
-         split_config.arm64_v8a.apk). Builds an AAB via bundleGoogleRelease,
-         extracts splits with bundletool, and compares the matching split.
-         Version is auto-detected from the provided APK unless --version is given.
-
-         NOTE: Tangem releases are post-processed with DexProtector. Differences
-         in DEX files and native libs are expected in the comparison output.
-
-       github mode (--version <ver>, no --binary):
-         Downloads the official universal APK from Tangem GitHub releases.
-         Builds a universal APK via assembleGoogleRelease and runs a content diff.
-         This compares the GitHub release artifact, NOT the Play Store artifact.
-
-       GITHUB_TOKEN is required in both modes (read:packages scope) for Tangem
-       SDK dependencies on GitHub Package Registry.
-
-OPTIONS
-       --binary <file>            Path to one official Play Store split APK.
-                                  Alias: --apk.
-       --version <version>        Version to verify (e.g. 5.34.1). Required in
-                                  github mode; optional in split mode (auto-detect).
-       --arch <arch>              Target architecture for device-spec.json used
-                                  by bundletool in split mode.
-                                  Supported: arm64-v8a, armeabi-v7a, x86_64, x86.
-                                  Default: arm64-v8a.
-       --type <type>              Accepted for build server compatibility; unused.
-       --tag <ref>                Override git tag (default: v<version>).
-       --github-token <token>     GitHub PAT with read:packages scope.
-                                  Overrides GITHUB_TOKEN env var.
-       --github-user <user>       GitHub username for GPR auth.
-                                  Default: walletscrutiny. Overrides GITHUB_USER.
-       --cleanup                  Remove temporary files after completion.
-       --script-version           Print script version and exit.
-       --help                     Show this help and exit.
-
-EXIT CODES
-       0    Reproducible (only META-INF differences, or identical)
-       1    Differences found or build failure
-       2    Invalid parameters
-
-ENVIRONMENT
-       GITHUB_TOKEN     GitHub PAT with read:packages scope (required)
-       GITHUB_USER      GitHub username (optional, default: walletscrutiny)
-
-EXAMPLES
-       # Split mode — one split from Play Store:
-       export GITHUB_TOKEN="ghp_yourtoken"
-       ${SCRIPT_NAME} --binary ~/apks/base.apk
-
-       # Split mode — explicit version + arch:
-       ${SCRIPT_NAME} --binary ~/apks/split_config.arm64_v8a.apk --version 5.34.1 --arch arm64-v8a
-
-       # GitHub mode — download and compare GitHub release APK:
-       ${SCRIPT_NAME} --version 5.34.1
+Usage: ${SCRIPT_NAME} --binary <split.apk|zip> [--version <ver>] [--arch <arch>] [OPTIONS]
+       ${SCRIPT_NAME} --version <ver> [OPTIONS]
+Options: --github-token <tok>, --github-user <user>, --tag <ref>, --cleanup, --script-version
+Split mode (--binary): bundleGoogleRelease -> bundletool splits -> content diff. GITHUB_TOKEN required.
+GitHub mode (--version, no --binary): downloads universal APK, assembleGoogleRelease, content diff.
+Arch auto-detected from --binary when --arch is omitted. Supported: arm64-v8a armeabi-v7a x86_64 x86.
+Exit: 0=reproducible, 1=differences/failure, 2=invalid params. Env: GITHUB_TOKEN, GITHUB_USER.
 EOF
 }
 
-# ------------------------------------------------------------------------------
 # Argument parsing
-# ------------------------------------------------------------------------------
 parse_arguments() {
     while [[ "$#" -gt 0 ]]; do
         case "$1" in
@@ -431,12 +381,14 @@ parse_arguments() {
     # Determine mode
     if [[ -n "${APK_INPUT}" ]]; then
         BUILD_MODE="split"
-        # Resolve relative path before existence check
         [[ "${APK_INPUT}" != /* ]] && APK_INPUT="${EXEC_DIR}/${APK_INPUT}"
         if [[ -f "${APK_INPUT}" ]]; then
-            if [[ "${APK_INPUT}" == *.zip ]]; then
+            # Detect zip by content, not extension — the build server may save
+            # a zip as _downloaded.apk when the Nostr asset has no file-name tag.
+            if file "${APK_INPUT}" | grep -q "Zip archive" && \
+               unzip -l "${APK_INPUT}" 2>/dev/null | grep -q "\.apk"; then
                 INPUT_IS_ZIP=true
-                log_info "--binary is a zip; will extract APKs before comparison."
+                log_info "--binary is a zip archive containing APKs; will extract before comparison."
             fi
         else
             echo "[ERROR] --binary file not found: ${APK_INPUT}"
@@ -444,10 +396,18 @@ parse_arguments() {
             echo "Exit code: ${EXIT_INVALID}"
             exit "${EXIT_INVALID}"
         fi
-        ARCH="${ARCH:-arm64-v8a}"
+        if [[ -z "${ARCH}" ]]; then
+            ARCH="$(auto_detect_arch_from_binary_input "${APK_INPUT}" "${INPUT_IS_ZIP}")"
+            if [[ -n "${ARCH}" ]]; then
+                log_info "Auto-detected architecture from --binary: ${ARCH}"
+            else
+                ARCH="${DEFAULT_ARCH}"
+                log_warn "Could not auto-detect architecture from --binary; defaulting to ${ARCH}. Pass --arch to override."
+            fi
+        fi
     elif [[ -n "${VERSION}" ]]; then
         BUILD_MODE="github"
-        ARCH="${ARCH:-arm64-v8a}"
+        ARCH="${ARCH:-${DEFAULT_ARCH}}"
     else
         echo "[ERROR] Provide --binary <split.apk> (split mode) or --version <version> (github mode)."
         echo "Exit code: ${EXIT_INVALID}"
@@ -472,13 +432,7 @@ parse_arguments() {
     log_info "Work directory: ${WORK_DIR}"
 }
 
-# ------------------------------------------------------------------------------
-# google-services.json injection
-# The repo ships a stub that covers .debug / .internal / .external / .release
-# but not com.tangem.wallet (the production Google flavor package name).
-# We append a stub entry for com.tangem.wallet so processGoogleReleaseGoogleServices
-# finds a matching client. The stub values are non-functional but satisfy the build.
-# ------------------------------------------------------------------------------
+# google-services.json injection: stub for com.tangem.wallet (prod flavor not in repo stub)
 inject_google_services_json() {
     local target="$1"
     cat > "${target}" <<'GSERVICES_EOF'
@@ -540,11 +494,9 @@ GSERVICES_EOF
     log_info "Injected google-services.json with com.tangem.wallet entry."
 }
 
-# ------------------------------------------------------------------------------
 # Build environment image
 # Inline Dockerfile: Ubuntu 22.04, OpenJDK 17, Android SDK 35, NDK 25.1.8937393
 # Built once, reused across runs via tag tangem_build_env:1.
-# ------------------------------------------------------------------------------
 ensure_build_image() {
     if ${CONTAINER_CMD} image inspect "${TANGEM_BUILD_IMAGE_BASE}:1" >/dev/null 2>&1; then
         log_info "Reusing existing build environment image: ${TANGEM_BUILD_IMAGE_BASE}:1"
@@ -592,9 +544,7 @@ DOCKERFILE_EOF
     log_info "Build environment image ready."
 }
 
-# ------------------------------------------------------------------------------
 # device-spec.json for bundletool
-# ------------------------------------------------------------------------------
 create_device_spec() {
     local spec_path="$1"
     local arch="$2"
@@ -609,10 +559,8 @@ DEVICESPEC_EOF
     log_info "Created device-spec.json for arch: ${arch}"
 }
 
-# ------------------------------------------------------------------------------
 # bundletool split extraction
 # Runs inside the build image (which has Java). Downloads bundletool if absent.
-# ------------------------------------------------------------------------------
 extract_split_apks_from_aab() {
     local aab_path="$1"
     local output_dir="$2"
@@ -640,21 +588,17 @@ extract_split_apks_from_aab() {
             --overwrite
         mkdir -p \"${output_rel}\"
         unzip -o built.apks -d \"${output_rel}\"
-        # Move splits/ subdir contents up if bundletool used it
         if [[ -d \"${output_rel}/splits\" ]]; then
             mv \"${output_rel}/splits\"/*.apk \"${output_rel}/\" 2>/dev/null || true
             rmdir \"${output_rel}/splits\" 2>/dev/null || true
         fi
-        # Normalize base-master.apk -> base.apk
         if [[ -f \"${output_rel}/base-master.apk\" ]]; then
             mv \"${output_rel}/base-master.apk\" \"${output_rel}/base.apk\"
         fi
-        # Move standalones/standalone.apk -> base.apk if present
         if [[ -f \"${output_rel}/standalones/standalone.apk\" ]]; then
             mv \"${output_rel}/standalones/standalone.apk\" \"${output_rel}/base.apk\"
             rmdir \"${output_rel}/standalones\" 2>/dev/null || true
         fi
-        # Normalize base-<suffix>.apk -> split_config.<suffix>.apk
         for split_apk in \"${output_rel}\"/base-*.apk; do
             split_name=\$(basename \"\$split_apk\")
             [[ \"\$split_name\" == 'base-master.apk' ]] && continue
@@ -667,9 +611,7 @@ extract_split_apks_from_aab() {
     container_exec "ls -la \"${output_rel}\"/*.apk || ls -la \"${output_rel}\""
 }
 
-# ------------------------------------------------------------------------------
 # Unzip an APK into a directory, inside the build container
-# ------------------------------------------------------------------------------
 unzip_apk_in_container() {
     local apk_path="$1"
     local dest_dir="$2"
@@ -691,11 +633,9 @@ unzip_apk_in_container() {
         "
 }
 
-# ------------------------------------------------------------------------------
 # Split-by-split comparison (MetaMask pattern)
 # Counts non-META-INF differences using Leo's precise per-path regex.
 # Sets TOTAL_DIFFS and TOTAL_META_ONLY.
-# ------------------------------------------------------------------------------
 compare_split_apks() {
     local official_dir="$1"
     local built_dir="$2"
@@ -727,13 +667,11 @@ compare_split_apks() {
         log_info "  Official ${apk_name}: ${official_hash}"
         log_info "  Built    ${comparison_name}: ${built_hash}"
 
-        # Unzip both into results_dir for diff
         local official_unzip="${results_dir}/official_${comparison_name%.apk}"
         local built_unzip="${results_dir}/built_${comparison_name%.apk}"
         unzip_apk_in_container "${official_apk}"  "${official_unzip}"
         unzip_apk_in_container "${built_apk}"     "${built_unzip}"
 
-        # Diff inside container; save full diff to file
         local diff_file="${results_dir}/diff_${comparison_name%.apk}.txt"
         local official_rel built_rel diff_rel
         official_rel="${official_unzip#"${WORK_DIR}/"}"
@@ -742,8 +680,6 @@ compare_split_apks() {
         container_exec "diff -r \"${official_rel}\" \"${built_rel}\" 2>&1 \
             > \"${diff_rel}\" 2>&1 || true"
 
-        # Count non-META-INF diffs using Leo's precise regex
-        # Filters only root-level META-INF; nested META-INF still counts
         local non_meta_diffs=0
         if [[ -s "${diff_file}" ]]; then
             non_meta_diffs="$(safe_grep_count grep -cvE \
@@ -767,10 +703,8 @@ compare_split_apks() {
     done
 }
 
-# ------------------------------------------------------------------------------
 # Simple unzip diff (github mode: universal APK vs universal APK)
 # Sets TOTAL_DIFFS.
-# ------------------------------------------------------------------------------
 compare_universal_apks() {
     local official_apk="$1"
     local built_apk="$2"
@@ -817,18 +751,17 @@ compare_universal_apks() {
     fi
 }
 
-# ------------------------------------------------------------------------------
 # Print results block (terminal output)
-# ------------------------------------------------------------------------------
 print_results_block() {
     local verdict="$1"
-    local version_name version_code signer official_hash commit_hash
+    local version_name version_code signer official_hash commit_hash git_ref_display
 
     version_name="$(container_aapt_version "${OFFICIAL_BASE_APK}" "versionName" || true)"
     version_code="$(container_aapt_version "${OFFICIAL_BASE_APK}" "versionCode" || true)"
     signer="$(container_signer "${OFFICIAL_BASE_APK}" || true)"
     official_hash="$(container_sha256 "${OFFICIAL_BASE_APK}")"
     commit_hash="$(cat "${WORK_DIR}/built-aab/commit.txt" 2>/dev/null || echo "unknown")"
+    git_ref_display="${RESOLVED_GIT_REF:-${REQUESTED_TAG:-v${VERSION:-unknown}}}"
 
     # Tag verification output
     local tag_verify_output tag_type tag_status
@@ -894,7 +827,7 @@ print_results_block() {
     fi
 
     echo "Revision, tag (and its signature):"
-    echo "Tag: ${git_ref} (${tag_type})"
+    echo "Tag: ${git_ref_display} (${tag_type})"
     echo "${tag_status}"
     echo "${tag_verify_output}" | grep -v '^TAG_TYPE=' | grep -v '^---COMMIT---' || true
     echo ""
@@ -908,9 +841,7 @@ print_results_block() {
     echo "===== End Results ====="
 }
 
-# ------------------------------------------------------------------------------
 # Phase 1: Prepare
-# ------------------------------------------------------------------------------
 prepare() {
     log_info "=== PREPARATION PHASE ==="
 
@@ -922,8 +853,6 @@ prepare() {
     chmod 777 "${WORK_DIR}/built-aab"
 
     if [[ "${BUILD_MODE}" == "split" ]]; then
-        # If --binary is a zip (WalletScrutiny Android Blossom upload), extract it
-        # first and copy all contained APKs into official-split-apks/.
         if [[ "${INPUT_IS_ZIP}" == "true" ]]; then
             log_info "Extracting zip: $(basename "${APK_INPUT}")"
             local zip_extract_dir="${WORK_DIR}/zip-extracted"
@@ -934,7 +863,7 @@ prepare() {
             apk_count="$(find "${zip_extract_dir}" -name "*.apk" 2>/dev/null | wc -l)"
             if [[ "${apk_count}" -eq 0 ]]; then
                 log_fail "No APK files found inside zip: ${APK_INPUT}"
-                generate_error_yaml "ftbfs" "No APK files found inside the provided zip."
+                generate_error_yaml "ftbfs"
                 RESULT_DONE=true
                 exit "${EXIT_FAILED}"
             fi
@@ -955,7 +884,6 @@ prepare() {
             OFFICIAL_APK="${WORK_DIR}/official-split-apks/base.apk"
             OFFICIAL_BASE_APK="${OFFICIAL_APK}"
         else
-        # Single split APK — normalize and copy
         local original_name canonical_name
         original_name="$(basename "${APK_INPUT}")"
         canonical_name="$(canonicalize_split_apk_name "${original_name}")"
@@ -969,7 +897,6 @@ prepare() {
         OFFICIAL_BASE_APK="${OFFICIAL_APK}"
         fi
 
-        # Auto-detect version from APK content if not provided
         if [[ -z "${VERSION}" ]]; then
             log_info "Auto-detecting version from APK content..."
             VERSION="$(container_aapt_version "${OFFICIAL_APK}" "versionName" || true)"
@@ -984,7 +911,6 @@ prepare() {
         create_device_spec "${WORK_DIR}/device-spec.json" "${ARCH}"
 
     else
-        # github mode: download universal APK from GitHub releases
         log_info "Downloading official APK from GitHub releases (v${VERSION})..."
         local api_url="https://api.github.com/repos/tangem/tangem-app-android/releases/tags/v${VERSION}"
 
@@ -1033,23 +959,21 @@ prepare() {
     log_pass "Preparation complete."
 }
 
-# ------------------------------------------------------------------------------
 # Phase 2: Build
-# ------------------------------------------------------------------------------
 build() {
     log_info "=== BUILD PHASE ==="
 
     ensure_build_image
 
-    local git_ref="${REQUESTED_TAG:-v${VERSION}}"
-    log_info "Cloning ${REPO_URL} at ${git_ref}..."
+    RESOLVED_GIT_REF="${REQUESTED_TAG:-v${VERSION}}"
+    log_info "Cloning ${REPO_URL} at ${RESOLVED_GIT_REF}..."
 
     ${CONTAINER_CMD} run --rm \
         ${CONTAINER_RUN_EXTRA} \
         -v "${WORK_DIR}/built-aab:/workspace${VOLUME_RW}" \
         -w /workspace \
         "${TANGEM_BUILD_IMAGE_BASE}:1" \
-        sh -c "git clone --depth 1 --branch '${git_ref}' '${REPO_URL}' app"
+        sh -c "git clone --depth 1 --branch '${RESOLVED_GIT_REF}' '${REPO_URL}' app"
 
     local commit_hash
     commit_hash="$(${CONTAINER_CMD} run --rm \
@@ -1057,7 +981,7 @@ build() {
         -w /workspace \
         "${TANGEM_BUILD_IMAGE_BASE}:1" \
         sh -c "git rev-parse HEAD")"
-    log_info "Checked out ${git_ref} at ${commit_hash}"
+    log_info "Checked out ${RESOLVED_GIT_REF} at ${commit_hash}"
     echo "${commit_hash}" > "${WORK_DIR}/built-aab/commit.txt"
 
     # Tag and signature verification (best-effort; gnupg not in image so sigs show as unverified)
@@ -1066,10 +990,10 @@ build() {
         -w /workspace \
         "${TANGEM_BUILD_IMAGE_BASE}:1" \
         sh -c "
-            tag_type=\$(git cat-file -t 'refs/tags/${git_ref}' 2>/dev/null || echo 'missing')
+            tag_type=\$(git cat-file -t 'refs/tags/${RESOLVED_GIT_REF}' 2>/dev/null || echo 'missing')
             printf 'TAG_TYPE=%s\n' \"\${tag_type}\" > /workspace/tag_verify.txt
             if [ \"\${tag_type}\" = 'tag' ]; then
-                git tag -v '${git_ref}' >> /workspace/tag_verify.txt 2>&1 || true
+                git tag -v '${RESOLVED_GIT_REF}' >> /workspace/tag_verify.txt 2>&1 || true
             elif [ \"\${tag_type}\" = 'commit' ]; then
                 printf 'LIGHTWEIGHT_TAG\n' >> /workspace/tag_verify.txt
             else
@@ -1095,6 +1019,7 @@ build() {
 
     ${CONTAINER_CMD} run --rm \
         ${CONTAINER_RUN_EXTRA} \
+        --memory=20g \
         -v "${WORK_DIR}/built-aab/app:/workspace${VOLUME_RW}" \
         -w /workspace \
         -e "GITHUB_TOKEN=${github_token}" \
@@ -1105,18 +1030,22 @@ build() {
         -e "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" \
         "${TANGEM_BUILD_IMAGE_BASE}:1" \
         bash -c "set -euo pipefail
+            export GRADLE_OPTS='-Xmx12g -XX:MaxMetaspaceSize=512m'
+            export KOTLIN_DAEMON_JVM_OPTIONS='-Xmx4g -XX:MaxMetaspaceSize=512m'
             echo 'sdk.dir=/opt/android-sdk'    >  local.properties
             echo 'gpr.user=${github_user}'     >> local.properties
             echo 'gpr.key=${github_token}'     >> local.properties
             chmod +x gradlew
+            echo '[DIAG] Memory before ${gradle_task}:' && free -m
             ./gradlew ${gradle_task} \
                 --no-daemon \
+                --no-build-cache \
                 --stacktrace \
-                -Dorg.gradle.jvmargs='-Xmx8g -Xms2g -XX:MaxMetaspaceSize=512m'
+                --max-workers=4
+            echo '[DIAG] Memory after ${gradle_task}:' && free -m
         "
 
     if [[ "${BUILD_MODE}" == "split" ]]; then
-        # Find the built AAB
         local aab_path
         aab_path="$(find "${WORK_DIR}/built-aab/app" -type f -name "*.aab" \
             -path "*/outputs/bundle/*" \
@@ -1129,7 +1058,6 @@ build() {
         log_info "Built AAB: ${aab_path}"
         BUILT_AAB="${aab_path}"
     else
-        # Find the built universal APK
         local built_apk_path
         built_apk_path="${WORK_DIR}/built-aab/app/app/build/outputs/apk/google/release/app-google-release.apk"
         if [[ ! -f "${built_apk_path}" ]]; then
@@ -1148,9 +1076,7 @@ build() {
     log_pass "Build complete."
 }
 
-# ------------------------------------------------------------------------------
 # Phase 3: Extract splits and compare
-# ------------------------------------------------------------------------------
 extract_and_compare() {
     log_info "=== EXTRACTION AND COMPARISON PHASE ==="
 
@@ -1172,9 +1098,7 @@ extract_and_compare() {
     fi
 }
 
-# ------------------------------------------------------------------------------
 # Phase 4: Result
-# ------------------------------------------------------------------------------
 result() {
     log_info "=== RESULTS ==="
 
@@ -1199,16 +1123,15 @@ result() {
   Mode: split (--binary ${TARGET_SPLIT_NAME}).
   Build: ./gradlew bundleGoogleRelease -> bundletool split extraction (device-spec: ${ARCH}).
   Environment: Ubuntu 22.04, OpenJDK 17, Android SDK 35, NDK 25.1.8937393.
-  NOTE: Official APK is post-processed with DexProtector (commercial obfuscation).
-  DEX and native lib differences are expected and are not a tooling mismatch.
-  This is not reproducible in the strict sense due to DexProtector."
+  Diff handling: script stores full evidence in comparison/diff_*.txt.
+  Root-cause attribution is done in the verification report."
     else
         notes="Tangem Wallet Android GitHub release APK verification.
   Mode: github (universal APK v${VERSION}).
   Build: ./gradlew assembleGoogleRelease.
   Environment: Ubuntu 22.04, OpenJDK 17, Android SDK 35, NDK 25.1.8937393.
-  NOTE: Official APK is post-processed with DexProtector (commercial obfuscation).
-  DEX and native lib differences are expected and are not a tooling mismatch."
+  Diff handling: script stores full evidence in comparison/diff_full.txt.
+  Root-cause attribution is done in the verification report."
     fi
 
     generate_comparison_yaml "${yaml_verdict}" "${notes}"
@@ -1227,9 +1150,7 @@ result() {
     return "${exit_code}"
 }
 
-# ------------------------------------------------------------------------------
 # Main
-# ------------------------------------------------------------------------------
 main() {
     log_info "Starting ${SCRIPT_NAME} ${SCRIPT_VERSION}"
     log_warn "This script is provided as-is. Review before running. Use at your own risk."
