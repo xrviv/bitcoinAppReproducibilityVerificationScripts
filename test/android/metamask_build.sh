@@ -2,9 +2,9 @@
 # ==============================================================================
 # metamask_build.sh - MetaMask Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.1.42
+# Version:       v0.1.46
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-03-17
+# Last Modified: 2026-03-17 (v0.1.46)
 # Project:       https://github.com/MetaMask/metamask-mobile
 # ==============================================================================
 # LICENSE: MIT License
@@ -33,8 +33,12 @@
 
 set -euo pipefail
 
+# Capture execution directory before anything can change CWD
+EXEC_DIR="$(pwd)"
+readonly EXEC_DIR
+
 # Script metadata
-readonly SCRIPT_VERSION="v0.1.42"
+readonly SCRIPT_VERSION="v0.1.46"
 readonly SCRIPT_NAME="metamask_build.sh"
 readonly APP_ID="io.metamask"
 readonly REPO_URL="https://github.com/MetaMask/metamask-mobile"
@@ -68,6 +72,7 @@ AGGREGATED_DIFFS=""
 BUILD_MODE=""  # "split" (--binary provided: compare vs Google Play splits)
                # "aab"   (--version only: download official AAB, extract splits, compare)
 TARGET_SPLIT_APK=""
+RESULT_DONE=false  # set to true by result() after writing the comparison YAML
 
 ###############################################################################
 # Helper Functions
@@ -550,8 +555,8 @@ cleanup_on_error() {
     if [[ $exit_code -ne 0 ]]; then
         log_warn "Script failed with exit code: $exit_code"
         log_warn "Work directory preserved for debugging: $WORK_DIR"
-        if [[ -n "${WORK_DIR:-}" && ! -f "${WORK_DIR}/COMPARISON_RESULTS.yaml" ]]; then
-            generate_error_yaml "ftbfs" 2>/dev/null || true
+        if [[ "${RESULT_DONE:-false}" != "true" ]]; then
+            generate_error_yaml "ftbfs" || true
         fi
     fi
 }
@@ -561,8 +566,8 @@ on_error() {
     local line_no=$1
     set +e
     log_fail "Script failed at line ${line_no} (exit code ${exit_code})"
-    if [[ -n "${WORK_DIR:-}" ]]; then
-        generate_error_yaml "ftbfs" 2>/dev/null || true
+    if [[ -n "${WORK_DIR:-}" && "${RESULT_DONE:-false}" != "true" ]]; then
+        generate_error_yaml "ftbfs" || true
         if [[ -n "${IMAGE_NAME:-}" ]]; then
             ${CONTAINER_RUNTIME} rmi "${IMAGE_NAME}" >/dev/null 2>&1 || true
         fi
@@ -1293,17 +1298,22 @@ compare_split_apks() {
 # Generate COMPARISON_RESULTS.yaml (minimal 3-field format per Luis 2026-03-12)
 ###############################################################################
 
+write_yaml_outputs() {
+    local yaml_content="$1"
+
+    printf '%s\n' "$yaml_content" > "${EXEC_DIR}/COMPARISON_RESULTS.yaml"
+    if [[ -n "${WORK_DIR:-}" ]]; then
+        mkdir -p "${WORK_DIR}" 2>/dev/null || true
+        printf '%s\n' "$yaml_content" > "${WORK_DIR}/COMPARISON_RESULTS.yaml"
+    fi
+}
+
 generate_error_yaml() {
     local status="$1"
     local yaml_content
     yaml_content="script_version: ${SCRIPT_VERSION}
 verdict: ${status}"
-    if [[ -n "$WORK_DIR" ]]; then
-        echo "$yaml_content" > "${WORK_DIR}/COMPARISON_RESULTS.yaml"
-        cp "${WORK_DIR}/COMPARISON_RESULTS.yaml" ./COMPARISON_RESULTS.yaml 2>/dev/null || true
-    else
-        echo "$yaml_content" > ./COMPARISON_RESULTS.yaml
-    fi
+    write_yaml_outputs "$yaml_content"
 }
 
 generate_comparison_yaml() {
@@ -1314,12 +1324,7 @@ generate_comparison_yaml() {
 verdict: ${verdict}
 notes: |
   ${notes}"
-    if [[ -n "$WORK_DIR" ]]; then
-        echo "$yaml_content" > "${WORK_DIR}/COMPARISON_RESULTS.yaml"
-        cp "${WORK_DIR}/COMPARISON_RESULTS.yaml" ./COMPARISON_RESULTS.yaml
-    else
-        echo "$yaml_content" > ./COMPARISON_RESULTS.yaml
-    fi
+    write_yaml_outputs "$yaml_content"
     log_info "Generated COMPARISON_RESULTS.yaml"
 }
 
@@ -1579,6 +1584,7 @@ result() {
     local yaml_notes="Build environment: node:20-bookworm, JDK 17, Yarn 4.10.3, Android SDK 35, NDK 26.1.10909125. Architecture: ${ARCH}. Split APK comparison via bundletool. ${yaml_scope}"
 
     generate_comparison_yaml "${yaml_verdict}" "${yaml_notes}"
+    RESULT_DONE=true
 
     print_results_block "${verdict_label}"
 
