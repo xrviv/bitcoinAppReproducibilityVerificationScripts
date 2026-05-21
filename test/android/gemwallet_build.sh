@@ -13,15 +13,15 @@
 # not_reproducible. This script does not apply that patch.
 #
 # Input: --binary accepts a single split APK or a tar.gz of split APKs.
-# When a tar.gz is given all APKs are extracted; the arch-specific split
-# (split_config.<arch>.apk) is used for comparison, base.apk for metadata.
+# When a tar.gz is given all contained APKs are compared against their built
+# counterparts; base.apk is also used for version metadata.
 
 set -euo pipefail
 
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
 readonly WORK_DIR_PREFIX="workdir"
-readonly SCRIPT_VERSION="v0.2.0"
+readonly SCRIPT_VERSION="v0.2.1"
 readonly SCRIPT_NAME="gemwallet_build.sh"
 readonly APP_ID="com.gemwallet.android"
 readonly REPO_URL="https://github.com/gemwalletcom/wallet.git"
@@ -53,6 +53,7 @@ BUILT_AAB=""
 GIT_TAG=""
 RESULT_DONE=false
 TOTAL_DIFFS=1
+RESOURCES_ARSC_NOTES=""
 
 log_info()  { echo "[INFO] $*"; }
 log_pass()  { echo "[PASS] $*"; }
@@ -438,6 +439,49 @@ compare_split_apks() {
               '^Only in [^/:]+: META-INF$|^Only in [^/:]+/META-INF:|^Files [^/]+/META-INF/' \
             || echo 0)"
     fi
+    # resources.arsc semantic check (WS policy §5.2.1)
+    if grep -q "resources.arsc" "${diff_file}" 2>/dev/null; then
+        log_info "  resources.arsc in diff — running apktool semantic check..."
+        local decoded_official="${results_dir}/decoded_official_${split_label}"
+        local decoded_built="${results_dir}/decoded_built_${split_label}"
+        local decoded_diff="${results_dir}/diff_resources_decoded_${split_label}.txt"
+        local off_rel built_rel dec_off_rel dec_built_rel dec_diff_rel
+        off_rel="${official_apk#"${WORK_DIR}/"}"
+        built_rel="${built_apk#"${WORK_DIR}/"}"
+        dec_off_rel="${decoded_official#"${WORK_DIR}/"}"
+        dec_built_rel="${decoded_built#"${WORK_DIR}/"}"
+        dec_diff_rel="${decoded_diff#"${WORK_DIR}/"}"
+        ws_exec "apktool d -f --no-src --no-debug-info '${off_rel}' \
+                     -o '${dec_off_rel}' 2>/dev/null && \
+                 apktool d -f --no-src --no-debug-info '${built_rel}' \
+                     -o '${dec_built_rel}' 2>/dev/null || true"
+        ws_exec "diff -r '${dec_off_rel}/res' '${dec_built_rel}/res' \
+                     > '${dec_diff_rel}' 2>/dev/null || true"
+        local decoded_content change_lines non_crashlytics
+        decoded_content="$(cat "${decoded_diff}" 2>/dev/null || true)"
+        if [[ -z "$(printf '%s' "${decoded_content}" | tr -d '\n\r')" ]]; then
+            log_info "  resources.arsc: decoded content IDENTICAL — non-semantic binary diff"
+            non_meta_count=$(( non_meta_count - 1 ))
+            [[ "${non_meta_count}" -lt 0 ]] && non_meta_count=0
+            RESOURCES_ARSC_NOTES="${RESOURCES_ARSC_NOTES}${split_label}: resources.arsc binary differs, decoded res/ identical. "
+        else
+            change_lines="$(printf '%s' "${decoded_content}" | grep -E '^[<>]' || true)"
+            non_crashlytics="$(printf '%s' "${change_lines}" \
+                | grep -v 'com.google.firebase.crashlytics.mapping_file_id' \
+                | tr -d '\n\r' || true)"
+            if [[ -n "${change_lines}" && -z "${non_crashlytics}" ]]; then
+                log_info "  resources.arsc: sole decoded diff is Crashlytics mapping_file_id — acceptable"
+                non_meta_count=$(( non_meta_count - 1 ))
+                [[ "${non_meta_count}" -lt 0 ]] && non_meta_count=0
+                RESOURCES_ARSC_NOTES="${RESOURCES_ARSC_NOTES}${split_label}: resources.arsc sole diff is Crashlytics mapping_file_id (acceptable). "
+            else
+                local dec_lines
+                dec_lines="$(wc -l < "${decoded_diff}" || echo 0)"
+                RESOURCES_ARSC_NOTES="${RESOURCES_ARSC_NOTES}${split_label}: resources.arsc decoded content DIFFERS (${dec_lines} lines — see $(basename "${decoded_diff}")). "
+            fi
+        fi
+    fi
+
     TOTAL_DIFFS=$(( TOTAL_DIFFS + non_meta_count ))
     log_info "  ${split_label}: ${non_meta_count} non-META-INF diff(s) (${total_lines} total lines)"
     if [[ -s "${diff_file}" ]]; then
@@ -647,17 +691,24 @@ extract_and_compare() {
     local built_splits_dir="${WORK_DIR}/built-split-apks"
     extract_split_apks_from_aab \
         "${BUILT_AAB}" "${WORK_DIR}/device-spec.json" "${built_splits_dir}"
-    local built_split
-    built_split="$(resolve_built_split_apk "${OFFICIAL_APK}" "${built_splits_dir}/splits")" || {
-        log_fail "No matching built split for: $(basename "${OFFICIAL_APK}")"
-        find "${built_splits_dir}" -name "*.apk" 2>/dev/null | while IFS= read -r f; do echo "  ${f}"; done
+    local compared=0
+    while IFS= read -r official_apk; do
+        local split_label built_split
+        split_label="$(basename "${official_apk}" .apk)"
+        if ! built_split="$(resolve_built_split_apk "${official_apk}" "${built_splits_dir}/splits")"; then
+            log_warn "No matching built split for: $(basename "${official_apk}") — counting as diff"
+            TOTAL_DIFFS=$(( TOTAL_DIFFS + 1 ))
+            continue
+        fi
+        log_info "Official: $(basename "${official_apk}")"
+        log_info "Built:    $(basename "${built_split}")"
+        compare_split_apks "${official_apk}" "${built_split}" "${split_label}"
+        compared=$(( compared + 1 ))
+    done < <(find "${WORK_DIR}/official-split-apks" -name "*.apk" | sort)
+    if [[ "${compared}" -eq 0 ]]; then
+        log_fail "No splits were compared"
         exit "${EXIT_FAILED}"
-    }
-    log_info "Official: $(basename "${OFFICIAL_APK}")"
-    log_info "Built:    $(basename "${built_split}")"
-    local split_label
-    split_label="$(basename "${OFFICIAL_APK}" .apk)"
-    compare_split_apks "${OFFICIAL_APK}" "${built_split}" "${split_label}"
+    fi
 }
 
 result() {
@@ -669,17 +720,17 @@ result() {
         verdict="not_reproducible"
         log_warn "VERDICT: NOT REPRODUCIBLE (${TOTAL_DIFFS} non-META-INF difference(s))"
     fi
-    local split_name diff_path notes
-    split_name="$(basename "${OFFICIAL_APK:-base.apk}")"
-    diff_path="${WORK_DIR}/comparison/diff_$(basename "${OFFICIAL_APK:-base.apk}" .apk).txt"
-    notes="Split: ${split_name} vs built split from AAB (tag: ${GIT_TAG}).
+    local notes
+    notes="Splits compared vs built AAB (tag: ${GIT_TAG}).
   Build: SKIP_SIGN=true ./gradlew :app:bundleGoogleRelease --no-daemon.
   Non-META-INF diffs: ${TOTAL_DIFFS}.
   AGP 9.2.x R8 caveat: diffs in classes*.dex/baseline.prof may be pg-map-id
   non-determinism — see android/reproducible/ in gemwalletcom/wallet before
   concluding not_reproducible. GPR token required (trustwallet/wallet-core on GPR only)."
+    [[ -n "${RESOURCES_ARSC_NOTES}" ]] && notes="${notes}
+  resources.arsc: ${RESOURCES_ARSC_NOTES}"
     [[ "${verdict}" == "not_reproducible" ]] && notes="${notes}
-  Diff: ${diff_path}"
+  Diffs: ${WORK_DIR}/comparison/"
     generate_comparison_yaml "${verdict}" "${notes}"
     print_results_block "${verdict}"
     RESULT_DONE=true
