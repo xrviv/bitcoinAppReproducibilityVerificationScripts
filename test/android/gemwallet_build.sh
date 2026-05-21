@@ -1,5 +1,5 @@
 #!/bin/bash
-# gemwallet_build.sh v0.2.0 — Gem Wallet Android reproducible build verification
+# gemwallet_build.sh v0.2.2 — Gem Wallet Android reproducible build verification
 # Organization: WalletScrutiny.com
 # App: com.gemwallet.android — https://github.com/gemwalletcom/wallet
 # License: MIT. No warranty. Security research use only.
@@ -21,7 +21,7 @@ set -euo pipefail
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
 readonly WORK_DIR_PREFIX="workdir"
-readonly SCRIPT_VERSION="v0.2.1"
+readonly SCRIPT_VERSION="v0.2.2"
 readonly SCRIPT_NAME="gemwallet_build.sh"
 readonly APP_ID="com.gemwallet.android"
 readonly REPO_URL="https://github.com/gemwalletcom/wallet.git"
@@ -434,10 +434,13 @@ compare_split_apks() {
     local non_meta_count=0 total_lines=0
     if [[ -s "${diff_file}" ]]; then
         total_lines="$(wc -l < "${diff_file}")"
-        non_meta_count="$(grep -E '^Only in |^Files ' "${diff_file}" \
-            | grep -cvE \
-              '^Only in [^/:]+: META-INF$|^Only in [^/:]+/META-INF:|^Files [^/]+/META-INF/' \
-            || echo 0)"
+        while IFS= read -r _line; do
+            [[ "${_line}" =~ ^('Only in '|'Files ') ]] || continue
+            [[ "${_line}" =~ ^'Only in '[^/:]+': META-INF'$ ]] && continue
+            [[ "${_line}" =~ ^'Only in '[^/:]+'/META-INF:' ]] && continue
+            [[ "${_line}" =~ ^'Files '[^/]+'/META-INF/' ]] && continue
+            non_meta_count=$(( non_meta_count + 1 ))
+        done < "${diff_file}"
     fi
     # resources.arsc semantic check (WS policy §5.2.1)
     if grep -q "resources.arsc" "${diff_file}" 2>/dev/null; then
@@ -457,6 +460,11 @@ compare_split_apks() {
                      -o '${dec_built_rel}' 2>/dev/null || true"
         ws_exec "diff -r '${dec_off_rel}/res' '${dec_built_rel}/res' \
                      > '${dec_diff_rel}' 2>/dev/null || true"
+        # Guard: if apktool failed to produce res/ dirs, do not trust empty diff
+        if [[ ! -d "${decoded_official}/res" || ! -d "${decoded_built}/res" ]]; then
+            log_warn "  resources.arsc: apktool decode failed — conservative, not excluded"
+            RESOURCES_ARSC_NOTES="${RESOURCES_ARSC_NOTES}${split_label}: resources.arsc apktool decode failed — treated as genuine diff. "
+        else
         local decoded_content change_lines non_crashlytics
         decoded_content="$(cat "${decoded_diff}" 2>/dev/null || true)"
         if [[ -z "$(printf '%s' "${decoded_content}" | tr -d '\n\r')" ]]; then
@@ -480,6 +488,7 @@ compare_split_apks() {
                 RESOURCES_ARSC_NOTES="${RESOURCES_ARSC_NOTES}${split_label}: resources.arsc decoded content DIFFERS (${dec_lines} lines — see $(basename "${decoded_diff}")). "
             fi
         fi
+        fi  # end apktool guard
     fi
 
     TOTAL_DIFFS=$(( TOTAL_DIFFS + non_meta_count ))
@@ -523,9 +532,7 @@ print_results_block() {
             split_label="$(basename "${diff_file}" .txt)"
             if [[ -s "${diff_file}" ]]; then
                 total_lines="$(wc -l < "${diff_file}")"
-                echo "  ${split_label} (first 5 lines — full diff: ${diff_file}):"
-                head -5 "${diff_file}" | while IFS= read -r line; do echo "    ${line}"; done
-                [[ "${total_lines}" -gt 5 ]] && echo "    ... (${total_lines} lines total)"
+                echo "  ${split_label}: ${total_lines} line(s) — ${diff_file}"
             else
                 echo "  ${split_label}: no differences"
             fi
