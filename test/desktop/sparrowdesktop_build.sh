@@ -34,7 +34,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.15.0"
+SCRIPT_VERSION="v0.15.1"
 
 EXIT_SUCCESS=0
 EXIT_BUILD_FAILED=1
@@ -712,7 +712,7 @@ RUN mkdir -p /built && \
         cp "$RPM_FILE" /built/ && \
         mkdir -p /tmp/rpm_extract_built && \
         (cd /tmp/rpm_extract_built && rpm2cpio /built/$(basename "$RPM_FILE") | cpio -idmv 2>/dev/null) && \
-        SPARROW_DIR=$(find /tmp/rpm_extract_built/opt -mindepth 1 -maxdepth 1 -type d | head -1) && \
+        SPARROW_DIR=$(find /tmp/rpm_extract_built -maxdepth 6 -type d \( -name 'Sparrow' -o -name 'sparrow' -o -name 'sparrowwallet' \) | head -1) && \
         if [ -z "$SPARROW_DIR" ]; then \
             echo "ERROR: Could not find Sparrow directory in built rpm" && exit 1; \
         fi && \
@@ -758,7 +758,7 @@ RUN if [ "${BUILD_TYPE}" = "deb" ]; then \
         fi && \
         mkdir -p /tmp/rpm_extract_official && \
         (cd /tmp/rpm_extract_official && rpm2cpio /official/sparrowwallet-${SPARROW_VERSION}-1.x86_64.rpm | cpio -idmv 2>/dev/null) && \
-        SPARROW_DIR=$(find /tmp/rpm_extract_official/opt -mindepth 1 -maxdepth 1 -type d | head -1) && \
+        SPARROW_DIR=$(find /tmp/rpm_extract_official -maxdepth 6 -type d \( -name 'Sparrow' -o -name 'sparrow' -o -name 'sparrowwallet' \) | head -1) && \
         if [ -z "$SPARROW_DIR" ]; then \
             echo "ERROR: Could not find Sparrow directory in official rpm" && exit 1; \
         fi && \
