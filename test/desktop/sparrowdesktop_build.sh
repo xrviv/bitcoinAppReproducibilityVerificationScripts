@@ -2,7 +2,7 @@
 #
 # sparrowdesktop_build.sh - Sparrow Desktop Reproducible Build Verifier
 #
-# Version: v0.15.0
+# Version: v0.15.1
 #
 # Description:
 #   Fully containerized reproducible build verification for Sparrow Desktop.
