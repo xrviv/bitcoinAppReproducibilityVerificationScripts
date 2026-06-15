@@ -42,7 +42,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.0"
+SCRIPT_VERSION="v0.1.1"
 APP_ID="liana"
 PLATFORM="desktop"
 PAGE_URL="https://walletscrutiny.com/desktop/liana/"
@@ -124,6 +124,16 @@ command -v curl >/dev/null 2>&1 || die "curl required"
 V="${APP_VERSION}"
 # Liana release tags carry a 'v' prefix (e.g. v14.0) — unlike Sparrow.
 DL_BASE="https://github.com/${RELEASES_REPO}/releases/download/v${V}"
+
+# ---- preflight: confirm the release tag exists (one clear error beats N per-asset 404s) ----
+# Liana versions are MAJOR.MINOR (e.g. 14.0, 13.1) — a bare '14' has no matching tag/assets.
+if ! curl -fsSL "https://api.github.com/repos/${RELEASES_REPO}/releases/tags/v${V}" >/dev/null 2>&1; then
+    warn "No Liana release found for tag 'v${V}'."
+    avail="$(curl -fsSL "https://api.github.com/repos/${RELEASES_REPO}/releases?per_page=12" 2>/dev/null \
+        | grep -oE '"tag_name": *"v[0-9][^"]*"' | sed -E 's/^.*"(v[0-9][^"]*)"$/\1/' | tr '\n' ' ')"
+    [[ -n "${avail}" ]] && warn "Available release tags: ${avail}"
+    die "Pass an exact released version WITHOUT the leading 'v' (e.g. --version 14.0, not 14)."
+fi
 
 # ---- artifact catalogue: type -> filename | mime ----
 declare -A ART_FILE ART_MIME
