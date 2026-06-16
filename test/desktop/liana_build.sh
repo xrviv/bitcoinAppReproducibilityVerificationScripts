@@ -2,7 +2,7 @@
 # ==============================================================================
 # liana_build.sh - Liana Desktop Wallet Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.1.10
+# Version:       v0.1.11
 # Organization:  WalletScrutiny.com
 # Project:       https://github.com/wizardsardine/liana
 # ==============================================================================
@@ -21,26 +21,18 @@
 # misuse or legal consequences arising from use of this script.
 #
 # SCRIPT SUMMARY:
-# - Clones the Liana source repository at the specified release tag
-# - Performs a containerized reproducible build using GNU Guix inside Docker
-#   (Alpine + Guix 1.4.0, following the fanquake/core-review approach)
-# - Runs the official ./contrib/reproducible/guix/guix-build.sh inside the
-#   Guix-enabled container (byte-identical to the official release process)
-# - Downloads official release binaries from GitHub (or uses --binary)
-# - Compares SHA256 of each built binary against the official release
-# - Generates COMPARISON_RESULTS.yaml for build server automation
+# - Clones Liana at the release tag, builds via the official guix-build.sh in an
+#   Alpine+Guix container, compares SHA256 vs the official release (or --binary),
+#   and writes COMPARISON_RESULTS.yaml for build server automation.
 #
-# CREDITS:
-# The Alpine+Guix container approach is adapted from Michael Ford's (fanquake)
-# work on reproducible builds: https://github.com/fanquake/core-review
-# and the bitcoincore_build.sh script by WalletScrutiny.com.
+# CREDITS: Alpine+Guix approach adapted from fanquake/core-review and WS bitcoincore_build.sh.
 
 set -euo pipefail
 
 # ==============================================================================
 # Metadata
 # ==============================================================================
-SCRIPT_VERSION="v0.1.10"
+SCRIPT_VERSION="v0.1.11"
 SCRIPT_NAME="liana_build.sh"
 APP_NAME="Liana"
 APP_ID="liana"
@@ -278,9 +270,10 @@ RUN for i in $(seq -w 1 ${builder_count}); do       \
               "guixbuilder${i}" ;                    \
     done
 
-RUN guix archive --authorize < ~root/.config/guix/current/share/guix/ci.guix.gnu.org.pub
+RUN for k in bordeaux.guix.gnu.org ci.guix.gnu.org; do guix archive --authorize < ~root/.config/guix/current/share/guix/$k.pub; done
 
-CMD ["/root/.config/guix/current/bin/guix-daemon","--build-users-group=guixbuild"]
+# Daemon started by start_container with the chosen substitute server.
+CMD ["sleep","infinity"]
 DOCKERFILE
 
     log_success "Imagefile created: $imagefile_path"
@@ -318,7 +311,16 @@ start_container() {
         exit 1
     fi
 
-    sleep 2
+    # ci.guix flaky; if down, log it (non-fatal) and use bordeaux.
+    local sub_urls="https://ci.guix.gnu.org https://bordeaux.guix.gnu.org"
+    if ! curl -fsS -o /dev/null --max-time 15 https://ci.guix.gnu.org/ 2>/dev/null; then
+        log_error "ci.guix.gnu.org unreachable — falling back to bordeaux.guix.gnu.org substitutes"
+        sub_urls="https://bordeaux.guix.gnu.org"
+    fi
+    ${container_cmd} exec -d "$CONTAINER_NAME" /root/.config/guix/current/bin/guix-daemon \
+        --build-users-group=guixbuild --substitute-urls="${sub_urls}"
+
+    sleep 3
     log_success "Container started: ${CONTAINER_NAME}"
 }
 
@@ -358,7 +360,7 @@ prepare_liana_build() {
 
 # ==============================================================================
 # Execute the official Guix build inside the container
-# guix-build.sh handles: cargo vendor, guix time-machine, cargo zigbuild, patchelf
+# guix-build.sh: cargo vendor, time-machine, zigbuild, patchelf
 # First run downloads Guix packages from substitutes — may take 60-180 minutes
 # ==============================================================================
 execute_guix_build() {
@@ -557,7 +559,7 @@ prepare_official_binaries() {
             "curl -fsSL -o ${container_dir}/${shasums_name} ${base_url}/${shasums_name}"
 
         log_info "Verifying official download integrity inside container..."
-        # Use grep to isolate the relevant line — avoids busybox sha256sum --ignore-missing portability issues
+        # grep-isolate the line — avoids busybox sha256sum --ignore-missing issues
         if ${container_cmd} exec "$CONTAINER_NAME" bash -c "
             expected=\$(grep '${tarball_name}' '${container_dir}/${shasums_name}' | cut -d' ' -f1)
             actual=\$(sha256sum '${container_dir}/${tarball_name}' | cut -d' ' -f1)
@@ -632,7 +634,7 @@ verify_checksums() {
         local host_built_path="${built_dir}/${bin}"
         local host_official_path="${official_dir}/${bin}"
         local raw_built raw_official built_hash official_hash built_size official_size
-        # Hash and measure inside the container — no host sha256sum/stat/awk required
+        # Hash/measure inside the container — no host tools required
         raw_built=$(${container_cmd} exec "$CONTAINER_NAME" sha256sum "${CONTAINER_BUILT_RELEASE_PATH}/${bin}")
         raw_official=$(${container_cmd} exec "$CONTAINER_NAME" sha256sum "${CONTAINER_OFFICIAL_PATH}/${bin}")
         built_hash="${raw_built%% *}"
@@ -738,7 +740,7 @@ DOCKERFILE
 
 # ==============================================================================
 # EXE: Compare liana-gui.exe built vs official (single binary, Nix/MinGW labels)
-# Does NOT touch verify_checksums or the Linux trio — isolated to exe path only.
+# Isolated to the exe path; does not touch the Linux trio.
 # ==============================================================================
 _verify_exe_checksums() {
     local version="$1"
