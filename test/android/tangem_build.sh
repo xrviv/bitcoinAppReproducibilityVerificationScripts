@@ -1,5 +1,5 @@
 #!/bin/bash
-# Version: v0.4.12 | Organization: WalletScrutiny.com | Last Modified: 2026-06-20
+# Version: v0.5.0 | Organization: WalletScrutiny.com | Last Modified: 2026-06-20
 
 set -euo pipefail
 
@@ -7,12 +7,14 @@ EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
 readonly WORK_DIR_PREFIX="workdir"
 
-readonly SCRIPT_VERSION="v0.4.12"
+readonly SCRIPT_VERSION="v0.5.0"
 readonly SCRIPT_NAME="tangem_build.sh"
 readonly APP_ID="com.tangem.wallet"
 readonly REPO_URL="https://github.com/tangem/tangem-app-android.git"
 readonly WS_CONTAINER="docker.io/walletscrutiny/android:5"
-readonly TANGEM_BUILD_IMAGE_BASE="tangem_build_env2"
+readonly TANGEM_BUILD_IMAGE_BASE="tangem_build_env"
+# Tag versioned with the script so a Dockerfile change never reuses a stale image.
+readonly BUILD_IMAGE="${TANGEM_BUILD_IMAGE_BASE}:v0.5.0"
 
 readonly EXIT_SUCCESS=0
 readonly EXIT_FAILED=1
@@ -62,13 +64,6 @@ work_dir_path() {
         "${APP_ID}" \
         "${version_part}" \
         "${arch_part}"
-}
-
-safe_grep_count() {
-    local grep_output
-    grep_output="$("$@" 2>/dev/null || true)"
-    grep_output="${grep_output//$'\n'/}"
-    [[ -n "${grep_output}" ]] && printf '%s\n' "${grep_output}" || printf '0\n'
 }
 
 normalize_detected_arch() {
@@ -160,46 +155,6 @@ auto_detect_arch_from_binary_input() {
     printf '%s\n' ""
 }
 
-python_parse_version() {
-    local apk_path="$1"
-    command -v python3 >/dev/null 2>&1 || return 1
-    python3 - "${apk_path}" <<'PYEOF'
-import sys,struct,zipfile
-def r16(d,o):return struct.unpack_from('<H',d,o)[0]
-def r32(d,o):return struct.unpack_from('<I',d,o)[0]
-try:
-    with zipfile.ZipFile(sys.argv[1]) as z:d=z.read('AndroidManifest.xml')
-    sp=8;sh=r16(d,sp+2);sc=r32(d,sp+8);fl=r32(d,sp+16);ss=r32(d,sp+20);utf8=bool(fl&0x100)
-    strs=[]
-    for i in range(sc):
-        sr=r32(d,sp+sh+i*4);a=sp+ss+sr
-        if utf8:
-            cc=d[a];a+=2 if cc&0x80 else 1;bc=d[a];nb=(bc&0x7f)<<8|d[a+1] if bc&0x80 else bc
-            a+=2 if bc&0x80 else 1;strs.append(d[a:a+nb].decode('utf-8','replace'))
-        else:
-            cc=r16(d,a);nc=((cc&0x7fff)<<16)|r16(d,a+2) if cc&0x8000 else cc
-            a+=4 if cc&0x8000 else 2;strs.append(d[a:a+nc*2].decode('utf-16-le','replace'))
-    pos=8+r32(d,12)
-    while pos<len(d)-8:
-        ct=r16(d,pos);cs=r32(d,pos+4)
-        if cs<=0:break
-        if ct==0x0102:
-            ni=r32(d,pos+20);ac=r16(d,pos+28);ao=pos+r16(d,pos+2)
-            if ni<len(strs) and strs[ni]=='manifest':
-                for i in range(ac):
-                    af=ao+i*20;an=r32(d,af+4);rv=r32(d,af+8)
-                    if an<len(strs) and strs[an]=='versionName':
-                        val=strs[rv] if rv!=0xFFFFFFFF and rv<len(strs) else ''
-                        if not val:
-                            td=r32(d,af+16)
-                            if td<len(strs):val=strs[td]
-                        if val:print(val);sys.exit(0)
-        pos+=cs
-    sys.exit(1)
-except:sys.exit(1)
-PYEOF
-}
-
 detect_apk_metadata_field() {
     local apk_path="$1" field="$2" detected tool out
     for tool in aapt2 aapt; do
@@ -209,9 +164,7 @@ detect_apk_metadata_field() {
         detected="$(printf '%s\n' "${out}" | sed -n "s/.*${field}='\([^']*\)'.*/\1/p" | head -n1)"
         [[ -n "${detected}" ]] && { printf '%s\n' "${detected}"; return 0; }
     done
-    detected="$(container_aapt_version "${apk_path}" "${field}" || true)"
-    [[ -n "${detected}" ]] && { printf '%s\n' "${detected}"; return 0; }
-    [[ "${field}" == "versionName" ]] && python_parse_version "${apk_path}" || true
+    container_aapt_version "${apk_path}" "${field}" || true
 }
 
 write_yaml_outputs() {
@@ -294,7 +247,7 @@ container_exec() {
         ${CONTAINER_RUN_EXTRA} \
         -v "${WORK_DIR}:/work${VOLUME_RW}" \
         -w /work \
-        "${TANGEM_BUILD_IMAGE_BASE}:1" \
+        "${BUILD_IMAGE}" \
         bash -c "$cmd"
 }
 
@@ -351,21 +304,28 @@ container_aapt_version() {
 container_package_name() {
     local d n
     d="$(dirname "$1")"; n="$(basename "$1")"
+    # aapt2 first: WS_CONTAINER is version-pinned (:5), so the badging tool is pinned.
     ${CONTAINER_CMD} run --rm -v "${d}:/apk${VOLUME_RO}" "${WS_CONTAINER}" \
-        sh -c "aapt dump badging \"/apk/${n}\" 2>/dev/null || aapt2 dump badging \"/apk/${n}\" 2>/dev/null" 2>/dev/null \
+        sh -c "aapt2 dump badging \"/apk/${n}\" 2>/dev/null || aapt dump badging \"/apk/${n}\" 2>/dev/null" 2>/dev/null \
         | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n1 || true
 }
 
 assert_package_name() {
-    local pkg
+    local pkg  # fail closed: unreadable package is a hard error
     pkg="$(container_package_name "${OFFICIAL_BASE_APK}" | tr -d '\r')"
-    if [[ -n "${pkg}" && "${pkg}" != "${APP_ID}" ]]; then
+    if [[ -z "${pkg}" ]]; then
+        log_fail "Could not read package name from ${OFFICIAL_BASE_APK##*/} (aapt2/aapt). Refusing to continue."
+        generate_error_yaml "ftbfs"
+        echo "Exit code: ${EXIT_INVALID}"
+        exit "${EXIT_INVALID}"
+    fi
+    if [[ "${pkg}" != "${APP_ID}" ]]; then
         log_fail "Package name mismatch: expected ${APP_ID}, got ${pkg}. Wrong APK provided."
         generate_error_yaml "ftbfs"
         echo "Exit code: ${EXIT_INVALID}"
         exit "${EXIT_INVALID}"
     fi
-    log_info "Package name verified: ${pkg:-<unreadable, skipped>}"
+    log_info "Package name verified: ${pkg}"
 }
 
 canonicalize_split_apk_name() {
@@ -514,68 +474,27 @@ parse_arguments() {
 
 inject_google_services_json() {
     local target="$1"
-    cat > "${target}" <<'GSERVICES_EOF'
-{
-  "project_info": {
-    "project_number": "000000000000",
-    "project_id": "___STUB___"
-  },
-  "client": [
+    local first=1 pair pkg aid
     {
-      "client_info": {
-        "mobilesdk_app_id": "1:123456789012:android:abcdef123456",
-        "android_client_info": { "package_name": "com.tangem.wallet.debug" }
-      },
-      "oauth_client": [],
-      "api_key": [{ "current_key": "AIzaSystubstubstubstubstubstubstubstubs" }],
-      "services": { "appinvite_service": { "other_platform_oauth_client": [] } }
-    },
-    {
-      "client_info": {
-        "mobilesdk_app_id": "1:123456789012:android:abcdef123457",
-        "android_client_info": { "package_name": "com.tangem.wallet.internal" }
-      },
-      "oauth_client": [],
-      "api_key": [{ "current_key": "AIzaSystubstubstubstubstubstubstubstubs" }],
-      "services": { "appinvite_service": { "other_platform_oauth_client": [] } }
-    },
-    {
-      "client_info": {
-        "mobilesdk_app_id": "1:123456789012:android:abcdef123458",
-        "android_client_info": { "package_name": "com.tangem.wallet.external" }
-      },
-      "oauth_client": [],
-      "api_key": [{ "current_key": "AIzaSystubstubstubstubstubstubstubstubs" }],
-      "services": { "appinvite_service": { "other_platform_oauth_client": [] } }
-    },
-    {
-      "client_info": {
-        "mobilesdk_app_id": "1:123456789012:android:abcdef123459",
-        "android_client_info": { "package_name": "com.tangem.wallet.release" }
-      },
-      "oauth_client": [],
-      "api_key": [{ "current_key": "AIzaSystubstubstubstubstubstubstubstubs" }],
-      "services": { "appinvite_service": { "other_platform_oauth_client": [] } }
-    },
-    {
-      "client_info": {
-        "mobilesdk_app_id": "1:123456789012:android:abcdef12345a",
-        "android_client_info": { "package_name": "com.tangem.wallet" }
-      },
-      "oauth_client": [],
-      "api_key": [{ "current_key": "AIzaSystubstubstubstubstubstubstubstubs" }],
-      "services": { "appinvite_service": { "other_platform_oauth_client": [] } }
-    }
-  ],
-  "configuration_version": "1"
-}
-GSERVICES_EOF
-    log_info "Injected google-services.json with com.tangem.wallet entry."
+        printf '{"project_info":{"project_number":"000000000000","project_id":"___STUB___"},"client":['
+        for pair in com.tangem.wallet.debug:abcdef123456 \
+                    com.tangem.wallet.internal:abcdef123457 \
+                    com.tangem.wallet.external:abcdef123458 \
+                    com.tangem.wallet.release:abcdef123459 \
+                    com.tangem.wallet:abcdef12345a; do
+            pkg="${pair%:*}"; aid="${pair#*:}"
+            [[ "${first}" -eq 1 ]] || printf ','
+            first=0
+            printf '{"client_info":{"mobilesdk_app_id":"1:123456789012:android:%s","android_client_info":{"package_name":"%s"}},"oauth_client":[],"api_key":[{"current_key":"AIzaSystubstubstubstubstubstubstubstubs"}],"services":{"appinvite_service":{"other_platform_oauth_client":[]}}}' "${aid}" "${pkg}"
+        done
+        printf '],"configuration_version":"1"}\n'
+    } > "${target}"
+    log_info "Injected google-services.json (com.tangem.wallet + variants)."
 }
 
 ensure_build_image() {
-    if ${CONTAINER_CMD} image inspect "${TANGEM_BUILD_IMAGE_BASE}:1" >/dev/null 2>&1; then
-        log_info "Reusing existing build environment image: ${TANGEM_BUILD_IMAGE_BASE}:1"
+    if ${CONTAINER_CMD} image inspect "${BUILD_IMAGE}" >/dev/null 2>&1; then
+        log_info "Reusing existing build environment image: ${BUILD_IMAGE}"
         return
     fi
 
@@ -616,7 +535,7 @@ RUN mkdir -p /workspace && chmod 777 /workspace
 WORKDIR /workspace
 DOCKERFILE_EOF
 
-    ${CONTAINER_CMD} build --tag "${TANGEM_BUILD_IMAGE_BASE}:1" "${dockerfile_dir}"
+    ${CONTAINER_CMD} build --tag "${BUILD_IMAGE}" "${dockerfile_dir}"
     log_info "Build environment image ready."
 }
 
@@ -697,7 +616,7 @@ unzip_apk_in_container() {
         ${CONTAINER_RUN_EXTRA} \
         -v "${apk_dir}:/apk${VOLUME_RO}" \
         -v "${dest_parent}:/out${VOLUME_RW}" \
-        "${TANGEM_BUILD_IMAGE_BASE}:1" \
+        "${BUILD_IMAGE}" \
         bash -c "set -euo pipefail
             rm -rf \"/out/${dest_base}\"
             mkdir -p \"/out/${dest_base}\"
@@ -705,116 +624,129 @@ unzip_apk_in_container() {
         "
 }
 
+ws_exec_args() {  # run in WS_CONTAINER; args after script become $1.. inside it
+    local script="$1"; shift
+    ${CONTAINER_CMD} run --rm \
+        ${CONTAINER_RUN_EXTRA} \
+        -v "${WORK_DIR}:/work${VOLUME_RW}" \
+        -w /work \
+        "${WS_CONTAINER}" \
+        sh -c "${script}" _ "$@"
+}
+
+# Comparison engine: per-file sha256 manifests (Codex #5/#6/#7/#8/#9). See changelog.
+read -r -d '' DIFF_PAIR_SCRIPT <<'CMP' || true
+set -eu
+O="$1"; B="$2"; OD="$3"; BD="$4"; LBL="$5"; RD="$6"
+mani(){ ( cd "$1" 2>/dev/null && find . -type f 2>/dev/null | sed 's|^\./||' | LC_ALL=C sort | while IFS= read -r f; do case "$f" in META-INF/*|stamp-cert-sha256) continue;; esac; printf '%s %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"; done ); }
+mani "$OD" > /tmp/mo
+mani "$BD" > /tmp/mb
+awk 'NR==FNR{k=substr($0,66);o[k]=substr($0,1,64);so[k]=1;next}{k=substr($0,66);b[k]=substr($0,1,64);sb[k]=1}END{for(p in so){if(!(p in sb))print "O "p; else if(o[p]!=b[p])print "C "p} for(p in sb){if(!(p in so))print "B "p}}' /tmp/mo /tmp/mb | LC_ALL=C sort > /tmp/delta
+grep -vE ' (resources\.arsc|AndroidManifest\.xml)$' /tmp/delta > /tmp/other || true
+real=0
+if [ -s /tmp/other ]; then real=$(wc -l < /tmp/other); fi
+RA=""; AM=""
+if grep -q ' resources\.arsc$' /tmp/delta; then
+  RF="$RD/diff_resources_$LBL.txt"
+  if apktool d -f --no-src --no-debug-info "$O" -o /tmp/od >/dev/null 2>&1 && [ -d /tmp/od/res ] && apktool d -f --no-src --no-debug-info "$B" -o /tmp/bd >/dev/null 2>&1 && [ -d /tmp/bd/res ]; then
+    diff -r /tmp/od/res /tmp/bd/res > "$RF" 2>&1 || true
+  else
+    aapt2 dump resources "$O" > /tmp/ora 2>/dev/null || true; aapt2 dump resources "$B" > /tmp/bra 2>/dev/null || true
+    if [ ! -s /tmp/ora ] || [ ! -s /tmp/bra ]; then printf 'resources decode unavailable\n' > "$RF"; else diff /tmp/ora /tmp/bra > "$RF" 2>&1 || true; fi
+  fi
+  if [ ! -s "$RF" ]; then RA="benign (decoded resources identical; binary-only arsc diff)"; rm -f "$RF"
+  elif grep -q 'decode unavailable' "$RF"; then RA="REAL (resources decode unavailable)"; real=$((real+1))
+  else
+    rem=$(grep -E '^([<>]|Only in )' "$RF" | grep -v 'com.google.firebase.crashlytics.mapping_file_id' || true)
+    if [ -z "$rem" ]; then RA="benign (only crashlytics mapping_file_id differs)"; else RA="REAL (decoded resources differ)"; real=$((real+1)); fi
+  fi
+fi
+if grep -q ' AndroidManifest\.xml$' /tmp/delta; then
+  aapt2 dump xmltree "$O" --file AndroidManifest.xml > /tmp/oam 2>/dev/null || true; aapt2 dump xmltree "$B" --file AndroidManifest.xml > /tmp/bam 2>/dev/null || true
+  if [ ! -s /tmp/oam ] || [ ! -s /tmp/bam ]; then AM="REAL (manifest decode unavailable)"; real=$((real+1)); elif diff -q /tmp/oam /tmp/bam >/dev/null 2>&1; then AM="benign (decoded manifest identical; binary-only diff)"; else AM="REAL (decoded manifest differs)"; diff /tmp/oam /tmp/bam > "$RD/diff_manifest_$LBL.txt" 2>&1 || true; real=$((real+1)); fi
+fi
+{
+  echo "=== $LBL ==="
+  awk '$1=="O"{$1="";print "[REAL] only in official:"$0} $1=="B"{$1="";print "[REAL] only in built:"$0} $1=="C"{$1="";print "[REAL] changed:"$0}' /tmp/other
+  if [ -n "$RA" ]; then echo "resources.arsc: $RA"; fi
+  if [ -n "$AM" ]; then echo "AndroidManifest.xml: $AM"; fi
+  echo "REAL_DIFFS=$real"
+} > "$RD/diff_$LBL.txt"
+CMP
+
+diff_pair() {  # compare one pair via DIFF_PAIR_SCRIPT; echoes REAL diff count
+    local oa="$1" ba="$2" lbl="$3" rd="$4"
+    local ou="${rd}/official_${lbl}" bu="${rd}/built_${lbl}"
+    unzip_apk_in_container "${oa}" "${ou}"
+    unzip_apk_in_container "${ba}" "${bu}"
+    local oa_r ba_r ou_r bu_r rd_r
+    oa_r="${oa#"${WORK_DIR}/"}"; ba_r="${ba#"${WORK_DIR}/"}"
+    ou_r="${ou#"${WORK_DIR}/"}"; bu_r="${bu#"${WORK_DIR}/"}"; rd_r="${rd#"${WORK_DIR}/"}"
+    ws_exec_args "${DIFF_PAIR_SCRIPT}" "${oa_r}" "${ba_r}" "${ou_r}" "${bu_r}" "${lbl}" "${rd_r}"
+    local real
+    real="$(grep -m1 '^REAL_DIFFS=' "${rd}/diff_${lbl}.txt" 2>/dev/null | cut -d= -f2 || true)"
+    [[ -z "${real}" ]] && real=1   # fail safe
+    echo "${real}"
+}
+
 compare_split_apks() {
-    local official_dir="$1"
-    local built_dir="$2"
-    local results_dir="$3"
-
-    log_info "Comparing split APKs..."
+    local official_dir="$1" built_dir="$2" results_dir="$3"
+    log_info "Comparing split APKs (per-file hashes; signing artifacts excluded)..."
     mkdir -p "${results_dir}"
-
     TOTAL_DIFFS=0
-    TOTAL_META_ONLY=0
 
     for official_apk in "${official_dir}"/*.apk; do
-        [[ ! -f "${official_apk}" ]] && continue
-
-        local apk_name built_apk comparison_name
+        [[ -f "${official_apk}" ]] || continue
+        local apk_name built_apk lbl real
         apk_name="$(basename "${official_apk}")"
+        lbl="${apk_name%.apk}"
         built_apk="$(resolve_built_split_apk "${official_apk}" "${built_dir}" || true)"
-
         if [[ -z "${built_apk}" || ! -f "${built_apk}" ]]; then
-            log_warn "No matching built split for official: ${apk_name}"
+            log_warn "${apk_name}: no matching built split (decisive difference)"
+            printf '=== %s ===\n[REAL] missing from built output: %s\nREAL_DIFFS=1\n' \
+                "${lbl}" "${apk_name}" > "${results_dir}/diff_${lbl}.txt"
             (( TOTAL_DIFFS++ )) || true
             continue
         fi
-
-        comparison_name="$(basename "${built_apk}")"
-        local official_hash built_hash
-        official_hash="$(container_sha256 "${official_apk}")"
-        built_hash="$(container_sha256 "${built_apk}")"
-        log_info "  Official ${apk_name}: ${official_hash}"
-        log_info "  Built    ${comparison_name}: ${built_hash}"
-
-        local official_unzip="${results_dir}/official_${comparison_name%.apk}"
-        local built_unzip="${results_dir}/built_${comparison_name%.apk}"
-        unzip_apk_in_container "${official_apk}"  "${official_unzip}"
-        unzip_apk_in_container "${built_apk}"     "${built_unzip}"
-
-        local diff_file="${results_dir}/diff_${comparison_name%.apk}.txt"
-        local official_rel built_rel diff_rel
-        official_rel="${official_unzip#"${WORK_DIR}/"}"
-        built_rel="${built_unzip#"${WORK_DIR}/"}"
-        diff_rel="${diff_file#"${WORK_DIR}/"}"
-        container_exec "diff -r \"${official_rel}\" \"${built_rel}\" 2>&1 \
-            > \"${diff_rel}\" 2>&1 || true"
-
-        local non_meta_diffs=0
-        if [[ -s "${diff_file}" ]]; then
-            non_meta_diffs="$(safe_grep_count grep -cvE \
-                '^Only in [^/:]+: META-INF$|^Only in [^/:]+/META-INF:|^Files [^/]+/META-INF/' \
-                "${diff_file}")"
-            local blank_lines
-            blank_lines="$(safe_grep_count grep -c '^$' "${diff_file}")"
-            non_meta_diffs=$(( non_meta_diffs - blank_lines ))
-            [[ "${non_meta_diffs}" -lt 0 ]] && non_meta_diffs=0
-        fi
-
-        if [[ "${official_hash}" == "${built_hash}" ]]; then
-            log_pass "${comparison_name}: IDENTICAL"
-        elif [[ "${non_meta_diffs}" -eq 0 ]]; then
-            log_pass "${comparison_name}: Only META-INF differences (expected)"
-            (( TOTAL_META_ONLY++ )) || true
+        log_info "  Official ${apk_name}: $(container_sha256 "${official_apk}")"
+        log_info "  Built    $(basename "${built_apk}"): $(container_sha256 "${built_apk}")"
+        real="$(diff_pair "${official_apk}" "${built_apk}" "${lbl}" "${results_dir}")"
+        if [[ "${real}" -eq 0 ]]; then
+            log_pass "${apk_name}: reproducible (signing/benign-encoding diffs excluded)"
         else
-            log_warn "${comparison_name}: ${non_meta_diffs} non-META-INF differences"
+            log_warn "${apk_name}: ${real} real difference(s)"
+            (( TOTAL_DIFFS++ )) || true
+        fi
+    done
+
+    # built-only splits are a real difference too
+    for built_apk in "${built_dir}"/*.apk; do
+        [[ -f "${built_apk}" ]] || continue
+        local bname bcanon
+        bname="$(basename "${built_apk}")"
+        bcanon="$(canonicalize_split_apk_name "${bname}")"
+        if [[ ! -f "${official_dir}/${bcanon}" && ! -f "${official_dir}/${bname}" ]]; then
+            log_warn "${bname}: present in built output but not official (decisive difference)"
+            printf '=== builtonly_%s ===\n[REAL] only in built output: %s\nREAL_DIFFS=1\n' \
+                "${bcanon%.apk}" "${bname}" > "${results_dir}/diff_builtonly_${bcanon%.apk}.txt"
             (( TOTAL_DIFFS++ )) || true
         fi
     done
 }
 
 compare_universal_apks() {
-    local official_apk="$1"
-    local built_apk="$2"
-    local results_dir="$3"
-
-    log_info "Comparing universal APKs..."
+    local official_apk="$1" built_apk="$2" results_dir="$3"
+    log_info "Comparing universal APKs (per-file hashes; signing artifacts excluded)..."
     mkdir -p "${results_dir}"
-
-    local official_unzip="${results_dir}/official_unzipped"
-    local built_unzip="${results_dir}/built_unzipped"
-
-    unzip_apk_in_container "${official_apk}" "${official_unzip}"
-    unzip_apk_in_container "${built_apk}"    "${built_unzip}"
-
-    local diff_file="${results_dir}/diff_full.txt"
-    local official_rel built_rel diff_rel
-    official_rel="${official_unzip#"${WORK_DIR}/"}"
-    built_rel="${built_unzip#"${WORK_DIR}/"}"
-    diff_rel="${diff_file#"${WORK_DIR}/"}"
-    container_exec "diff -r \"${official_rel}\" \"${built_rel}\" \
-        > \"${diff_rel}\" 2>&1 || true"
-
-    TOTAL_DIFFS=0
-    if [[ -s "${diff_file}" ]]; then
-        local non_meta_diffs
-        non_meta_diffs="$(safe_grep_count grep -cvE \
-            '^Only in [^/:]+: META-INF$|^Only in [^/:]+/META-INF:|^Files [^/]+/META-INF/' \
-            "${diff_file}")"
-        local blank_lines
-        blank_lines="$(safe_grep_count grep -c '^$' "${diff_file}")"
-        non_meta_diffs=$(( non_meta_diffs - blank_lines ))
-        [[ "${non_meta_diffs}" -lt 0 ]] && non_meta_diffs=0
-        TOTAL_DIFFS="${non_meta_diffs}"
-
-        local total_lines
-        total_lines="$(wc -l < "${diff_file}" || echo 0)"
-        log_info "Diff: ${TOTAL_DIFFS} non-META-INF differences (${total_lines} total lines)"
-        log_info "Full diff: ${diff_file}"
-        echo "Diff preview (first 5 lines):"
-        head -5 "${diff_file}"
-        [[ "${total_lines}" -gt 5 ]] && echo "... (${total_lines} lines — see $(basename "${diff_file}"))"
+    log_info "  Official: $(container_sha256 "${official_apk}")"
+    log_info "  Built:    $(container_sha256 "${built_apk}")"
+    local real
+    real="$(diff_pair "${official_apk}" "${built_apk}" "full" "${results_dir}")"
+    TOTAL_DIFFS="${real}"
+    if [[ "${real}" -eq 0 ]]; then
+        log_pass "No real differences (signing/benign-encoding diffs excluded)."
     else
-        log_pass "No differences in unzipped content."
+        log_warn "${real} real difference(s); see ${results_dir}/diff_full.txt"
     fi
 }
 
@@ -931,14 +863,29 @@ prepare() {
             find "${extract_dir}" -name "*.apk" | sort | while IFS= read -r f; do
                 echo "  $(basename "${f}")"
             done
+            local base_count=0
             while IFS= read -r apk; do
-                local apk_name apk_canonical
+                local apk_name apk_canonical dest
                 apk_name="$(basename "${apk}")"
                 apk_canonical="$(canonicalize_split_apk_name "${apk_name}")"
-                cp "${apk}" "${WORK_DIR}/official-split-apks/${apk_canonical}"
+                dest="${WORK_DIR}/official-split-apks/${apk_canonical}"
+                if [[ -e "${dest}" ]]; then  # Codex #4: no silent overwrite
+                    log_fail "Duplicate canonical split name '${apk_canonical}' (from '${apk_name}'). Refusing to overwrite an already-collected APK."
+                    generate_error_yaml "ftbfs"
+                    exit "${EXIT_INVALID}"
+                fi
+                [[ "${apk_canonical}" == "base.apk" ]] && (( base_count++ )) || true
+                cp "${apk}" "${dest}"
                 [[ "${apk_name}" != "${apk_canonical}" ]] && \
                     log_info "Normalized: ${apk_name} -> ${apk_canonical}"
             done < <(find "${extract_dir}" -name "*.apk" | sort)
+            # Codex #4: exactly one base APK must be present.
+            if [[ "${base_count}" -ne 1 ]]; then
+                log_fail "Expected exactly one base APK in ${label}, found ${base_count}."
+                find "${WORK_DIR}/official-split-apks" -maxdepth 1 -type f -name "*.apk" -printf '  %f\n' | sort
+                generate_error_yaml "ftbfs"
+                exit "${EXIT_INVALID}"
+            fi
             TARGET_SPLIT_NAME="${label} ($(find "${WORK_DIR}/official-split-apks" -name "*.apk" | wc -l) splits)"
             OFFICIAL_APK="$(find_official_base_apk || true)"
             if [[ -z "${OFFICIAL_APK}" || ! -f "${OFFICIAL_APK}" ]]; then
@@ -1056,22 +1003,23 @@ build() {
         ${CONTAINER_RUN_EXTRA} \
         -v "${WORK_DIR}/built-aab:/workspace${VOLUME_RW}" \
         -w /workspace \
-        "${TANGEM_BUILD_IMAGE_BASE}:1" \
+        "${BUILD_IMAGE}" \
         sh -c "git clone --depth 1 --branch '${RESOLVED_GIT_REF}' '${REPO_URL}' app"
 
     local commit_hash
     commit_hash="$(${CONTAINER_CMD} run --rm \
         -v "${WORK_DIR}/built-aab/app:/workspace${VOLUME_RO}" \
         -w /workspace \
-        "${TANGEM_BUILD_IMAGE_BASE}:1" \
+        "${BUILD_IMAGE}" \
         sh -c "git rev-parse HEAD")"
     log_info "Checked out ${RESOLVED_GIT_REF} at ${commit_hash}"
     echo "${commit_hash}" > "${WORK_DIR}/built-aab/commit.txt"
 
     ${CONTAINER_CMD} run --rm \
-        -v "${WORK_DIR}/built-aab/app:/workspace${VOLUME_RO}" \
+        ${CONTAINER_RUN_EXTRA} \
+        -v "${WORK_DIR}/built-aab/app:/workspace${VOLUME_RW}" \
         -w /workspace \
-        "${TANGEM_BUILD_IMAGE_BASE}:1" \
+        "${BUILD_IMAGE}" \
         sh -c "
             tag_type=\$(git cat-file -t 'refs/tags/${RESOLVED_GIT_REF}' 2>/dev/null || echo 'missing')
             printf 'TAG_TYPE=%s\n' \"\${tag_type}\" > /workspace/tag_verify.txt
@@ -1108,7 +1056,7 @@ build() {
         -e "HOME=/tmp" \
         -e "GRADLE_USER_HOME=/tmp/.gradle" \
         -e "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" \
-        "${TANGEM_BUILD_IMAGE_BASE}:1" \
+        "${BUILD_IMAGE}" \
         bash -c "set -euo pipefail
             export GRADLE_OPTS='-Xmx12g -XX:MaxMetaspaceSize=512m'
             export KOTLIN_DAEMON_JVM_OPTIONS='-Xmx4g -XX:MaxMetaspaceSize=512m'
@@ -1118,7 +1066,7 @@ build() {
             chmod +x gradlew
             echo '[DIAG] Memory before ${gradle_task}:' && free -m
             ./gradlew ${gradle_task} \
-                -x verifyDesignTokens \
+                -x :core:ui:verifyDesignTokens \
                 --no-daemon \
                 --no-build-cache \
                 --stacktrace \
@@ -1204,8 +1152,8 @@ result() {
     fi
     notes="Tangem Wallet Android verification.
   Mode: ${mode_desc}.
-  Environment: Ubuntu 22.04, OpenJDK 17, Android SDK 35, NDK 25.1.8937393.
-  Diff handling: full evidence in comparison/diff_*.txt; root-cause in the WS report."
+  Environment: Ubuntu 22.04, OpenJDK 17, SDK 35, NDK 25.1.8937393.
+  Per-file hash compare; signing artifacts excluded; evidence in comparison/diff_*.txt."
 
     generate_comparison_yaml "${yaml_verdict}" "${notes}"
     RESULT_DONE=true
