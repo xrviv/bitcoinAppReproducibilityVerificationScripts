@@ -1,5 +1,5 @@
 #!/bin/bash
-# Version: v0.5.0 | Organization: WalletScrutiny.com | Last Modified: 2026-06-20
+# Version: v0.5.1 | Organization: WalletScrutiny.com | Last Modified: 2026-06-20
 
 set -euo pipefail
 
@@ -7,13 +7,15 @@ EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
 readonly WORK_DIR_PREFIX="workdir"
 
-readonly SCRIPT_VERSION="v0.5.0"
+readonly SCRIPT_VERSION="v0.5.1"
 readonly SCRIPT_NAME="tangem_build.sh"
 readonly APP_ID="com.tangem.wallet"
 readonly REPO_URL="https://github.com/tangem/tangem-app-android.git"
 readonly WS_CONTAINER="docker.io/walletscrutiny/android:5"
 readonly TANGEM_BUILD_IMAGE_BASE="tangem_build_env"
 # Tag versioned with the script so a Dockerfile change never reuses a stale image.
+# Held at v0.5.0 in v0.5.1: that fix touches only WS_CONTAINER tooling (aapt2 PATH),
+# not this gradle build image's Dockerfile, so no rebuild is needed.
 readonly BUILD_IMAGE="${TANGEM_BUILD_IMAGE_BASE}:v0.5.0"
 
 readonly EXIT_SUCCESS=0
@@ -278,6 +280,7 @@ container_aapt_version() {
         -v "${apk_dir}:/apk${VOLUME_RO}" \
         "${WS_CONTAINER}" \
         sh -c '
+            export PATH="$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -n1):$PATH"
             out="$({ aapt dump badging "/apk/'"${apk_name}"'" 2>/dev/null \
                   || aapt2 dump badging "/apk/'"${apk_name}"'" 2>/dev/null; } || true)"
             if [ -n "$out" ]; then
@@ -306,7 +309,7 @@ container_package_name() {
     d="$(dirname "$1")"; n="$(basename "$1")"
     # aapt2 first: WS_CONTAINER is version-pinned (:5), so the badging tool is pinned.
     ${CONTAINER_CMD} run --rm -v "${d}:/apk${VOLUME_RO}" "${WS_CONTAINER}" \
-        sh -c "aapt2 dump badging \"/apk/${n}\" 2>/dev/null || aapt dump badging \"/apk/${n}\" 2>/dev/null" 2>/dev/null \
+        sh -c 'export PATH="$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -n1):$PATH"; aapt2 dump badging "/apk/'"${n}"'" 2>/dev/null || aapt dump badging "/apk/'"${n}"'" 2>/dev/null' 2>/dev/null \
         | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n1 || true
 }
 
@@ -637,6 +640,9 @@ ws_exec_args() {  # run in WS_CONTAINER; args after script become $1.. inside it
 # Comparison engine: per-file sha256 manifests (Codex #5/#6/#7/#8/#9). See changelog.
 read -r -d '' DIFF_PAIR_SCRIPT <<'CMP' || true
 set -eu
+# aapt2/aapt are not on PATH in walletscrutiny/android:5; they live in
+# $ANDROID_HOME/build-tools/<ver>/. Prepend the newest build-tools dir.
+export PATH="$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -n1):$PATH"
 O="$1"; B="$2"; OD="$3"; BD="$4"; LBL="$5"; RD="$6"
 mani(){ ( cd "$1" 2>/dev/null && find . -type f 2>/dev/null | sed 's|^\./||' | LC_ALL=C sort | while IFS= read -r f; do case "$f" in META-INF/*|stamp-cert-sha256) continue;; esac; printf '%s %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"; done ); }
 mani "$OD" > /tmp/mo
