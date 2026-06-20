@@ -1,5 +1,5 @@
 #!/bin/bash
-# Version: v0.5.1 | Organization: WalletScrutiny.com | Last Modified: 2026-06-20
+# Version: v0.5.2 | Organization: WalletScrutiny.com | Last Modified: 2026-06-20
 
 set -euo pipefail
 
@@ -7,15 +7,14 @@ EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
 readonly WORK_DIR_PREFIX="workdir"
 
-readonly SCRIPT_VERSION="v0.5.1"
+readonly SCRIPT_VERSION="v0.5.2"
 readonly SCRIPT_NAME="tangem_build.sh"
 readonly APP_ID="com.tangem.wallet"
 readonly REPO_URL="https://github.com/tangem/tangem-app-android.git"
 readonly WS_CONTAINER="docker.io/walletscrutiny/android:5"
 readonly TANGEM_BUILD_IMAGE_BASE="tangem_build_env"
 # Tag versioned with the script so a Dockerfile change never reuses a stale image.
-# Held at v0.5.0 in v0.5.1: that fix touches only WS_CONTAINER tooling (aapt2 PATH),
-# not this gradle build image's Dockerfile, so no rebuild is needed.
+# Held at v0.5.0: v0.5.1+ fixes touch only WS_CONTAINER tooling, not this Dockerfile.
 readonly BUILD_IMAGE="${TANGEM_BUILD_IMAGE_BASE}:v0.5.0"
 
 readonly EXIT_SUCCESS=0
@@ -307,7 +306,6 @@ container_aapt_version() {
 container_package_name() {
     local d n
     d="$(dirname "$1")"; n="$(basename "$1")"
-    # aapt2 first: WS_CONTAINER is version-pinned (:5), so the badging tool is pinned.
     ${CONTAINER_CMD} run --rm -v "${d}:/apk${VOLUME_RO}" "${WS_CONTAINER}" \
         sh -c 'export PATH="$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -n1):$PATH"; aapt2 dump badging "/apk/'"${n}"'" 2>/dev/null || aapt dump badging "/apk/'"${n}"'" 2>/dev/null' 2>/dev/null \
         | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n1 || true
@@ -367,10 +365,8 @@ usage() {
 Usage: ${SCRIPT_NAME} --binary <split.apk|zip|tar.gz|dir> [--version <ver>] [--arch <arch>] [OPTIONS]
        ${SCRIPT_NAME} --version <ver> [OPTIONS]
 Options: --github-token <tok>, --github-user <user>, --tag <ref>, --cleanup, --script-version
-Split mode (--binary): bundleGoogleRelease -> bundletool splits -> content diff. GITHUB_TOKEN required.
-GitHub mode (--version, no --binary): downloads universal APK, assembleGoogleRelease, content diff.
-Arch auto-detected from --binary when --arch is omitted. Supported: arm64-v8a armeabi-v7a x86_64 x86.
-Exit: 0=reproducible, 1=differences/failure, 2=invalid params. Env: GITHUB_TOKEN, GITHUB_USER.
+Split (--binary): bundleGoogleRelease -> bundletool splits -> diff. GitHub (--version): universal APK.
+Arch auto-detected from --binary. Exit: 0=reproducible, 1=diff/fail, 2=invalid. Env: GITHUB_TOKEN/USER.
 EOF
 }
 
@@ -637,11 +633,10 @@ ws_exec_args() {  # run in WS_CONTAINER; args after script become $1.. inside it
         sh -c "${script}" _ "$@"
 }
 
-# Comparison engine: per-file sha256 manifests (Codex #5/#6/#7/#8/#9). See changelog.
+# Comparison engine: per-file sha256 manifests. See changelog.
 read -r -d '' DIFF_PAIR_SCRIPT <<'CMP' || true
 set -eu
-# aapt2/aapt are not on PATH in walletscrutiny/android:5; they live in
-# $ANDROID_HOME/build-tools/<ver>/. Prepend the newest build-tools dir.
+# aapt2/aapt live in $ANDROID_HOME/build-tools/<ver>/, not on PATH in the WS image.
 export PATH="$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -n1):$PATH"
 O="$1"; B="$2"; OD="$3"; BD="$4"; LBL="$5"; RD="$6"
 mani(){ ( cd "$1" 2>/dev/null && find . -type f 2>/dev/null | sed 's|^\./||' | LC_ALL=C sort | while IFS= read -r f; do case "$f" in META-INF/*|stamp-cert-sha256) continue;; esac; printf '%s %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"; done ); }
@@ -799,19 +794,19 @@ print_results_block() {
 
     echo "Diff:"
     if [[ "${BUILD_MODE}" == "split" ]]; then
+        # Preview only primary per-split diffs (skip evidence; each carries its heading).
         for diff_file in "${WORK_DIR}/comparison"/diff_*.txt; do
             [[ -f "${diff_file}" ]] || continue
             local split_label lines
-            split_label="$(basename "${diff_file}" .txt)"
-            split_label="${split_label#diff_}"
-            echo "=== ${split_label} ==="
+            split_label="$(basename "${diff_file}" .txt)"; split_label="${split_label#diff_}"
+            case "${split_label}" in manifest_*|resources_*) continue;; esac
             if [[ -s "${diff_file}" ]]; then
                 head -5 "${diff_file}"
                 lines="$(wc -l < "${diff_file}")"
                 [[ "${lines}" -gt 5 ]] && \
                     echo "... (${lines} lines total — full diff: ${diff_file})"
             else
-                echo "(no differences)"
+                echo "=== ${split_label} === (no differences)"
             fi
             echo ""
         done
@@ -1046,6 +1041,16 @@ build() {
     else
         gradle_task="assembleGoogleRelease"
     fi
+    # Supply the official version as gradle props; Tangem else defaults to 1 / git-branch
+    # name, causing spurious manifest diffs from a detached tag. See changelog v0.5.2.
+    local off_vcode off_vname gradle_version_args=""
+    off_vcode="$(detect_apk_metadata_field "${OFFICIAL_BASE_APK}" versionCode || true)"
+    off_vname="$(detect_apk_metadata_field "${OFFICIAL_BASE_APK}" versionName || true)"
+    [[ -z "${off_vname}" ]] && off_vname="${VERSION}"
+    [[ -n "${off_vcode}" ]] && gradle_version_args+=" -PversionCode=${off_vcode}"
+    [[ -n "${off_vname}" ]] && gradle_version_args+=" -PversionName=${off_vname}"
+    log_info "Injecting build version: code=${off_vcode:-?} name=${off_vname:-?}"
+
     log_info "Running ./gradlew ${gradle_task} in container..."
     log_info "This may take 20-40 minutes on first dependency download."
 
@@ -1070,14 +1075,9 @@ build() {
             echo 'gpr.user=${github_user}'     >> local.properties
             echo 'gpr.key=${github_token}'     >> local.properties
             chmod +x gradlew
-            echo '[DIAG] Memory before ${gradle_task}:' && free -m
-            ./gradlew ${gradle_task} \
+            ./gradlew ${gradle_task}${gradle_version_args} \
                 -x :core:ui:verifyDesignTokens \
-                --no-daemon \
-                --no-build-cache \
-                --stacktrace \
-                --max-workers=4
-            echo '[DIAG] Memory after ${gradle_task}:' && free -m
+                --no-daemon --no-build-cache --stacktrace --max-workers=4
         "
 
     if [[ "${BUILD_MODE}" == "split" ]]; then
