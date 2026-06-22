@@ -2,9 +2,9 @@
 # ==============================================================================
 # bisq1desktop_build.sh - Bisq 1 Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.3.5
+# Version:       v0.5.0
 # Organization:  WalletScrutiny.com
-# Last Modified: 2025-12-18
+# Last Modified: 2026-06-20
 # Project:       https://github.com/bisq-network/bisq
 # ==============================================================================
 # LICENSE: MIT License
@@ -13,786 +13,446 @@
 # Maintain changelog in separate file: ~/work/ws-notes/script-notes/desktop/bisq1/changelog.md
 # ==============================================================================
 #
-# TECHNICAL DISCLAIMER:
-# This script is provided for technical analysis and reproducible build verification purposes only.
-# No warranty is provided regarding the security, functionality, or fitness for any particular purpose.
-# Users assume all risks associated with running this script and analyzing the software.
-# This script performs automated builds and package comparisons - review all operations before execution.
+# SCRIPT SUMMARY (v0.5.0 - Bisq 1.10.0+ toolchain):
+#   Drives Bisq's first-party reproducible-build framework per docs/reproducible-builds/linux.md:
+#     1. Clone the release tag TWICE on the host (clean A and B checkouts) + init submodules (required).
+#     2. Build the pinned release-builder image FROM the cloned repo's own
+#        docker/release-builder/linux/Dockerfile (azul/zulu-openjdk:21.0.6, JDK 21,
+#        SOURCE_DATE_EPOCH=0, TZ=UTC, apt-snapshot pinned). No hand-copied Dockerfile -> no drift.
+#     3. Run ./gradlew clean verifyReleaseBuild verifyInstallerEvidenceBundle in BOTH worktrees
+#        (always-on A/B determinism check; mirrors upstream's Linux Release Builder workflow).
+#     4. VERDICT IS MECHANICAL on the outer-file sha256 (WS policy is mechanical; see
+#        review-notes/reproducibility-heuristics-packaged-artifacts.md). reproducible only if the
+#        rebuilt installer is byte-identical to the official AND the two rebuilds (A,B) agree.
+#     5. EVIDENCE for human classification (NOT a verdict input): extract official + rebuilt with
+#        dpkg-deb -R (control fields, maintainer scripts, payload, modes, symlinks) and split the
+#        diff into payload-vs-packaging so the report can apply reproducible_with_packaging_noise.
+#   Rebuilt installers + upstream release/installer evidence bundles are copied to ./artifacts/.
+#   Emits minimal COMPARISON_RESULTS.yaml (script_version, verdict, notes).
 #
-# LEGAL DISCLAIMER:
-# This script is designed for legitimate security research and reproducible build verification.
-# Users are responsible for ensuring compliance with all applicable laws and regulations.
-# The developers assume no liability for any misuse or legal consequences arising from use.
-# By using this script, you acknowledge these disclaimers and accept full responsibility.
-#
-# SCRIPT SUMMARY:
-# - Downloads official Bisq .deb or .rpm releases from GitHub
-# - Clones source code repository and checks out the exact release tag
-# - Performs containerized reproducible build using Gradle + jpackage
-# - Extracts and compares .class file hashes between official and built packages
-# - Generates COMPARISON_RESULTS.yaml for build server automation
-# - Documents differences and generates detailed reproducibility assessment
+# SCOPE: 1.10.x toolchain only. The pre-1.10 JDK 11/17 script is retained for reference as
+#   bisq1desktop_build.sh.v0.3.5.bak (legacy multi-field YAML + missing-`v` tag bug; not ABS-current).
+# ==============================================================================
 
 set -euo pipefail
 
-# Script metadata
-SCRIPT_VERSION="v0.3.5"
+SCRIPT_VERSION="v0.5.0"
 SCRIPT_NAME="bisq1desktop_build.sh"
 APP_NAME="Bisq 1"
 APP_ID="bisq1"
 REPO_URL="https://github.com/bisq-network/bisq"
-DEFAULT_VERSION="1.9.21"
+DEFAULT_VERSION="1.10.0"
 
-# Exit codes (BSA compliant)
 EXIT_SUCCESS=0
 EXIT_BUILD_FAILED=1
 EXIT_INVALID_PARAMS=2
 
-# Parameters
 BISQ_VERSION=""
 BISQ_ARCH=""
 BISQ_TYPE=""
+OFFICIAL_BINARY=""
+NO_CACHE=false
+KEEP_CONTAINER=false
 
-# Directories
-WORK_DIR=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORK_DIR=""
 
-# Docker
 IMAGE_NAME=""
-CONTAINER_ID=""
+CONTAINER_A=""; CONTAINER_B=""; CONTAINER_CMP=""
 
-# Styling
-NC="\033[0m"
-GREEN="\033[1;32m"
-YELLOW="\033[1;33m"
-RED="\033[1;31m"
-BLUE="\033[1;34m"
-CYAN="\033[1;36m"
-
-# Logging functions
-log_info() { echo -e "${BLUE}[INFO]${NC} $*"; }
+NC="\033[0m"; GREEN="\033[1;32m"; YELLOW="\033[1;33m"; RED="\033[1;31m"; BLUE="\033[1;34m"; CYAN="\033[1;36m"
+log_info()    { echo -e "${BLUE}[INFO]${NC} $*"; }
 log_success() { echo -e "${GREEN}[OK]${NC} $*"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+log_warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
+log_error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+die() { local m="$1"; local c="${2:-$EXIT_BUILD_FAILED}"; log_error "$m"; exit "$c"; }
 
-# Die function
-die() {
-    local message="$1"
-    local exit_code="${2:-$EXIT_BUILD_FAILED}"
-    log_error "$message"
-    exit "$exit_code"
-}
-
-# Cleanup function
+VERIFY_SCRIPT=""
 cleanup_on_exit() {
-    # Use CONTAINER_NAME (the actual variable that gets assigned)
-    if [[ -n "${CONTAINER_NAME:-}" ]]; then
-        docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
-        docker rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    if [[ "$KEEP_CONTAINER" != "true" ]]; then
+        for c in "$CONTAINER_A" "$CONTAINER_B" "$CONTAINER_CMP"; do
+            [[ -n "$c" ]] && docker rm -f "$c" >/dev/null 2>&1 || true
+        done
     fi
-
-    # Clean temporary Dockerfile
-    rm -f "$SCRIPT_DIR/.dockerfile-bisq-temp" "$SCRIPT_DIR/verify-container-bisq.sh" 2>/dev/null || true
+    [[ -n "${VERIFY_SCRIPT:-}" ]] && rm -f "$VERIFY_SCRIPT" 2>/dev/null || true
 }
-
 trap cleanup_on_exit EXIT INT TERM
 
-# Sanitize component for Docker names
 sanitize_component() {
     local input="$1"
     input=$(echo "$input" | tr '[:upper:]' '[:lower:]')
     input=$(echo "$input" | sed -E 's/[^a-z0-9]+/-/g')
-    input="${input##-}"
-    input="${input%%-}"
+    input="${input##-}"; input="${input%%-}"
     [[ -z "$input" ]] && input="na"
     echo "$input"
 }
 
-# Usage
+write_yaml() {  # out verdict notes
+    local out="$1" verdict="$2" notes="${3:-}"
+    if [[ -n "$notes" ]]; then
+        { printf 'script_version: %s\n' "$SCRIPT_VERSION"
+          printf 'verdict: %s\n' "$verdict"
+          printf 'notes: |\n'
+          printf '%s\n' "$notes" | sed 's/^/  /'; } > "$out"
+    else
+        printf 'script_version: %s\nverdict: %s\n' "$SCRIPT_VERSION" "$verdict" > "$out"
+    fi
+}
+
 usage() {
     cat << EOF
-Bisq 1 Desktop Reproducible Build Verification Script
+Bisq 1 Desktop Reproducible Build Verification Script (${SCRIPT_VERSION}, Bisq 1.10.0+ toolchain)
 
 Usage:
-  $(basename "$0") --version <version> --arch <arch> --type <type>
+  $(basename "$0") --version <version> --arch <arch> --type <type> [--binary <file|dir>]
 
-Required Parameters:
-  --version <version>    Bisq version to verify (e.g., 1.9.21, 1.9.20)
-  --arch <arch>          Target architecture
-                         Supported: x86_64-linux, x86_64-linux-gnu
-  --type <type>          Package type
-                         Supported: deb, rpm
+Parameters:
+  --version <version>    Bisq version (e.g., 1.10.0). Default: ${DEFAULT_VERSION}
+  --arch <arch>          x86_64-linux | x86_64-linux-gnu
+  --type <type>          deb | rpm
+  --binary <file|dir>    Use this local official installer (file, or dir containing it).
+  --apk <file|dir>       Alias for --binary.
+  --no-cache             Force fresh Docker image build.
+  --keep-container       Keep build/compare containers afterwards (for inspection).
+  --help                 Show this help.
 
-Optional Parameters:
-  --help                 Show this help message
-  --no-cache             Force fresh Docker build (no cache)
-  --keep-container       Keep container after build for inspection
-
-Examples:
-  $(basename "$0") --version 1.9.21 --arch x86_64-linux --type deb
-  $(basename "$0") --version 1.9.21 --arch x86_64-linux --type rpm
-  $(basename "$0") --version 1.9.20 --arch x86_64-linux-gnu --type deb --no-cache
-
-Requirements:
-  - Docker installed and running
-  - Internet connection for downloading sources and official releases
-  - Approximately 4GB disk space for build
-  - 20-40 minutes build time
+Builds the release tag TWICE (A/B determinism, always-on). Verdict is MECHANICAL on the outer-file
+sha256. Full dpkg-deb -R evidence (payload vs packaging split) is written for human classification.
 
 Output:
-  - Exit code 0: Build is reproducible
-  - Exit code 1: Build differs or verification failed
-  - Exit code 2: Invalid parameters
-  - COMPARISON_RESULTS.yaml: Machine-readable comparison results
+  - Exit 0: reproducible | Exit 1: differs/failed | Exit 2: invalid params
+  - COMPARISON_RESULTS.yaml (script_version, verdict, notes)
+  - artifacts/  (rebuilt installers A+B + upstream evidence bundles)
+  - comparison-detail.txt (determinism + full extracted-tree evidence)
 
-Version: ${SCRIPT_VERSION}
 Organization: WalletScrutiny.com
 EOF
 }
 
-# Parse parameters
-NO_CACHE=false
-KEEP_CONTAINER=false
-
+# ---- Parse (unknown args non-fatal: warn + continue, Luis 2026-03-11) ----
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --help|-h)
-            usage
-            exit 0
-            ;;
-        --version)
-            [[ -z "${2:-}" ]] && die "Error: --version requires an argument" "$EXIT_INVALID_PARAMS"
-            BISQ_VERSION="$2"
-            shift 2
-            ;;
-        --arch)
-            [[ -z "${2:-}" ]] && die "Error: --arch requires an argument" "$EXIT_INVALID_PARAMS"
-            BISQ_ARCH="$2"
-            shift 2
-            ;;
-        --type)
-            [[ -z "${2:-}" ]] && die "Error: --type requires an argument" "$EXIT_INVALID_PARAMS"
-            BISQ_TYPE="$2"
-            shift 2
-            ;;
-        --no-cache)
-            NO_CACHE=true
-            shift
-            ;;
-        --keep-container)
-            KEEP_CONTAINER=true
-            shift
-            ;;
-        *)
-            log_error "Unknown parameter: $1"
-            usage
-            exit "$EXIT_INVALID_PARAMS"
-            ;;
+        --help|-h) usage; exit 0 ;;
+        --version) [[ -z "${2:-}" ]] && die "--version requires an argument" "$EXIT_INVALID_PARAMS"; BISQ_VERSION="$2"; shift 2 ;;
+        --arch)    [[ -z "${2:-}" ]] && die "--arch requires an argument" "$EXIT_INVALID_PARAMS"; BISQ_ARCH="$2"; shift 2 ;;
+        --type)    [[ -z "${2:-}" ]] && die "--type requires an argument" "$EXIT_INVALID_PARAMS"; BISQ_TYPE="$2"; shift 2 ;;
+        --binary|--apk) [[ -z "${2:-}" ]] && die "$1 requires a file/dir argument" "$EXIT_INVALID_PARAMS"; OFFICIAL_BINARY="$2"; shift 2 ;;
+        --no-cache) NO_CACHE=true; shift ;;
+        --keep-container) KEEP_CONTAINER=true; shift ;;
+        *) log_warn "ignoring unknown argument: $1"; shift ;;
     esac
 done
 
-# Validate required parameters
-if [[ -z "$BISQ_VERSION" ]] || [[ -z "$BISQ_ARCH" ]] || [[ -z "$BISQ_TYPE" ]]; then
-    log_error "Missing required parameters"
-    usage
-    exit "$EXIT_INVALID_PARAMS"
-fi
-
-# Validate architecture (accept both x86_64-linux and x86_64-linux-gnu)
+[[ -z "$BISQ_VERSION" ]] && BISQ_VERSION="$DEFAULT_VERSION"
+[[ -z "$BISQ_ARCH" ]] && BISQ_ARCH="x86_64-linux-gnu"
+[[ -z "$BISQ_TYPE" ]] && BISQ_TYPE="deb"
 case "$BISQ_ARCH" in
-    x86_64-linux|x86_64-linux-gnu)
-        # Normalize to x86_64-linux-gnu internally
-        BISQ_ARCH="x86_64-linux-gnu"
-        ;;
-    *)
-        die "Unsupported architecture: $BISQ_ARCH (supported: x86_64-linux, x86_64-linux-gnu)" "$EXIT_INVALID_PARAMS"
-        ;;
+    x86_64-linux|x86_64-linux-gnu) BISQ_ARCH="x86_64-linux-gnu" ;;
+    *) die "Unsupported architecture: $BISQ_ARCH" "$EXIT_INVALID_PARAMS" ;;
 esac
+case "$BISQ_TYPE" in deb|rpm) ;; *) die "Unsupported type: $BISQ_TYPE (deb|rpm)" "$EXIT_INVALID_PARAMS" ;; esac
+[[ "$BISQ_VERSION" =~ ^v ]] || BISQ_VERSION="v$BISQ_VERSION"
 
-# Validate type (accept deb or rpm)
-case "$BISQ_TYPE" in
-    deb|rpm)
-        # Valid type
-        ;;
-    *)
-        die "Unsupported package type: $BISQ_TYPE (supported: deb, rpm)" "$EXIT_INVALID_PARAMS"
-        ;;
-esac
+OFFICIAL_PKG_NAME="Bisq-64bit-${BISQ_VERSION#v}.${BISQ_TYPE}"
 
-# Ensure version has 'v' prefix
-if [[ ! "$BISQ_VERSION" =~ ^v ]]; then
-    BISQ_VERSION="v$BISQ_VERSION"
+if [[ -n "$OFFICIAL_BINARY" ]]; then
+    if [[ -d "$OFFICIAL_BINARY" ]]; then
+        cand="$OFFICIAL_BINARY/$OFFICIAL_PKG_NAME"
+        [[ -f "$cand" ]] || cand="$(find "$OFFICIAL_BINARY" -maxdepth 1 -type f -name "*.${BISQ_TYPE}" | head -1)"
+        [[ -n "$cand" && -f "$cand" ]] || die "--binary dir has no .${BISQ_TYPE} installer: $OFFICIAL_BINARY" "$EXIT_INVALID_PARAMS"
+        OFFICIAL_BINARY="$cand"
+    fi
+    [[ -f "$OFFICIAL_BINARY" ]] || die "--binary file not found: $OFFICIAL_BINARY" "$EXIT_INVALID_PARAMS"
+    OFFICIAL_BINARY="$(realpath "$OFFICIAL_BINARY")"
 fi
 
-# Set unique Docker names
-VERSION_COMPONENT=$(sanitize_component "$BISQ_VERSION")
-ARCH_COMPONENT=$(sanitize_component "$BISQ_ARCH")
-TYPE_COMPONENT=$(sanitize_component "$BISQ_TYPE")
+VC=$(sanitize_component "$BISQ_VERSION"); AC=$(sanitize_component "$BISQ_ARCH"); TC=$(sanitize_component "$BISQ_TYPE")
 SUFFIX=$(sanitize_component "$(date +%s)-$$")
+IMAGE_NAME="bisq-release-builder-linux:java-21.0.6"
+CONTAINER_A="bisq1-build-a-${VC}-${TC}-${SUFFIX}"
+CONTAINER_B="bisq1-build-b-${VC}-${TC}-${SUFFIX}"
+CONTAINER_CMP="bisq1-cmp-${VC}-${TC}-${SUFFIX}"
 
-IMAGE_NAME="bisq1-verifier-${VERSION_COMPONENT}-${ARCH_COMPONENT}-${TYPE_COMPONENT}-${SUFFIX}"
-CONTAINER_NAME="bisq1-verify-${VERSION_COMPONENT}-${ARCH_COMPONENT}-${TYPE_COMPONENT}-${SUFFIX}"
-
-# Set work directory
-WORK_DIR="${SCRIPT_DIR}/bisq1_desktop_${VERSION_COMPONENT}_${ARCH_COMPONENT}_${TYPE_COMPONENT}_$$"
-mkdir -p "$WORK_DIR"
-cd "$WORK_DIR"
-chmod 777 "$WORK_DIR" >/dev/null 2>&1 || true
-
-# Save execution directory for YAML handoff to build server
+WORK_DIR="${SCRIPT_DIR}/bisq1_desktop_${VC}_${AC}_${TC}_$$"
+mkdir -p "$WORK_DIR"; cd "$WORK_DIR"; chmod 777 "$WORK_DIR" >/dev/null 2>&1 || true
 execution_dir="$(pwd)"
+SRC_A="${WORK_DIR}/src-a"
+SRC_B="${WORK_DIR}/src-b"
+ARTIFACTS_DIR="${execution_dir}/artifacts"; mkdir -p "$ARTIFACTS_DIR"
 
 log_info "========================================================"
-log_info "Bisq 1 Desktop Reproducible Build Verification"
+log_info "Bisq 1 Desktop Reproducible Build Verification (${SCRIPT_VERSION})"
 log_info "========================================================"
-log_info "Version:      $BISQ_VERSION"
-log_info "Architecture: $BISQ_ARCH"
-log_info "Type:         $BISQ_TYPE"
-log_info "Work Dir:     $WORK_DIR"
-log_info "Script:       $SCRIPT_VERSION"
+log_info "Version: $BISQ_VERSION | Arch: $BISQ_ARCH | Type: $BISQ_TYPE"
+log_info "Toolchain: pinned release-builder (azul/zulu-openjdk:21.0.6)"
+log_info "Mode: A/B determinism (2 clean builds) + mechanical outer-hash verdict"
+log_info "Work Dir: $WORK_DIR"
 log_info ""
 
-# Generate error YAML
-generate_error_yaml() {
-    local output_file="$1"
-    local error_message="$2"
-    local status="${3:-not_reproducible}"
-
-    cat > "$output_file" << EOF
-date: $(date -u +"%Y-%m-%dT%H:%M:%S+0000")
-script_version: ${SCRIPT_VERSION}
-build_type: ${BISQ_TYPE}
-results:
-  - architecture: ${BISQ_ARCH}
-    status: ${status}
-    files:
-      - filename: bisq_${BISQ_VERSION#v}-1_amd64.deb
-        hash: ""
-        match: false
-        official_hash: ""
-        notes: "Error: ${error_message}"
-EOF
-}
-
-# Check Docker
-log_info "Checking Docker..."
-if ! command -v docker >/dev/null 2>&1; then
-    generate_error_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" "Docker not found" "ftbfs"
-    die "Docker not found" "$EXIT_BUILD_FAILED"
-fi
-
-if ! docker info >/dev/null 2>&1; then
-    generate_error_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" "Docker daemon not running" "ftbfs"
-    die "Docker daemon not running" "$EXIT_BUILD_FAILED"
-fi
+# ---- Docker preflight ----
+command -v docker >/dev/null 2>&1 || { write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "Docker not found on host."; die "Docker not found"; }
+docker info >/dev/null 2>&1 || { write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "Docker daemon not running."; die "Docker daemon not running"; }
 log_success "Docker OK"
 
-# Clean Docker environment
-log_info "Cleaning Docker environment..."
-docker ps -q --filter ancestor="$IMAGE_NAME" 2>/dev/null | xargs -r docker stop 2>/dev/null || true
-docker ps -aq --filter ancestor="$IMAGE_NAME" 2>/dev/null | xargs -r docker rm 2>/dev/null || true
-if docker images -q "$IMAGE_NAME" >/dev/null 2>&1; then
-    docker rmi "$IMAGE_NAME" >/dev/null 2>&1 || true
+# ---- Stage official installer ----
+if [[ -n "$OFFICIAL_BINARY" ]]; then
+    log_info "Using provided official installer: $OFFICIAL_BINARY"
+    cp "$OFFICIAL_BINARY" "${execution_dir}/${OFFICIAL_PKG_NAME}"
+else
+    log_info "Downloading official release: ${OFFICIAL_PKG_NAME}"
+    curl -fL --progress-bar -o "${execution_dir}/${OFFICIAL_PKG_NAME}" \
+        "https://github.com/bisq-network/bisq/releases/download/${BISQ_VERSION}/${OFFICIAL_PKG_NAME}" \
+      || { write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "Failed to download official ${OFFICIAL_PKG_NAME}."; die "download failed"; }
 fi
+OFFICIAL_HASH="$(sha256sum "${execution_dir}/${OFFICIAL_PKG_NAME}" | cut -d' ' -f1)"
+log_success "Official staged: ${OFFICIAL_PKG_NAME} (sha256=${OFFICIAL_HASH})"
 
-# Create Dockerfile
-log_info "Creating Dockerfile..."
-cat > "$SCRIPT_DIR/.dockerfile-bisq-temp" << 'DOCKERFILE'
-FROM ubuntu:22.04
-
-ENV DEBIAN_FRONTEND=noninteractive
-
-RUN apt-get update && apt-get install -y \
-    git wget curl unzip tar xz-utils zstd binutils cpio \
-    ca-certificates ca-certificates-java fakeroot dpkg-dev \
-    build-essential debhelper rpm gnupg software-properties-common \
-    && wget -q https://cdn.azul.com/zulu/bin/zulu-repo_1.0.0-3_all.deb \
-    && dpkg -i zulu-repo_1.0.0-3_all.deb \
-    && apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 0xB1998361219BD9C9 \
-    && apt-get update \
-    && apt-get install -y zulu11-jdk zulu17-jdk \
-    && rm -rf /var/lib/apt/lists/* zulu-repo_1.0.0-3_all.deb \
-    && update-ca-certificates \
-    && mkdir -p /usr/lib/jvm/zulu11/lib/security \
-    && touch /usr/lib/jvm/zulu11/lib/security/blacklisted.certs \
-    && useradd -m -s /bin/bash bisq
-
-ENV JAVA_HOME=/usr/lib/jvm/zulu11
-ENV JAVA_17_HOME=/usr/lib/jvm/zulu17
-ENV PATH=$JAVA_HOME/bin:$PATH
-ENV GRADLE_OPTS="-Xmx4g -Dorg.gradle.daemon=false"
-
-USER bisq
-WORKDIR /home/bisq
-
-COPY --chown=bisq:bisq verify-container-bisq.sh /home/bisq/
-RUN chmod +x /home/bisq/verify-container-bisq.sh
-
-CMD ["/home/bisq/verify-container-bisq.sh"]
-DOCKERFILE
-
-# Create container verification script
-log_info "Creating container script..."
-cat > "$SCRIPT_DIR/verify-container-bisq.sh" << 'CONTAINER_SCRIPT'
-#!/bin/bash
-set -uo pipefail
-# Note: -e removed to allow script to continue and generate YAML even on errors
-
-echo "=== Bisq Container Verification ==="
-echo "Version: ${BISQ_VERSION:-v1.9.21}"
-echo "Architecture: ${BISQ_ARCH:-x86_64-linux-gnu}"
-echo "Type: ${BISQ_TYPE:-deb}"
-echo ""
-
-BISQ_VERSION=${BISQ_VERSION:-v1.9.21}
-WORK_DIR="/home/bisq/work"
-RESULTS_DIR="/home/bisq/build-results"
-
-mkdir -p "$WORK_DIR" "$RESULTS_DIR"
-cd "$WORK_DIR"
-
-# Helper function to generate error YAML and exit
-generate_error_and_exit() {
-    local error_msg="$1"
-    echo "ERROR: $error_msg"
-    mkdir -p /output
-    cat > /output/COMPARISON_RESULTS.yaml << ERRYAML
-date: $(date -u +"%Y-%m-%dT%H:%M:%S+0000")
-script_version: ${SCRIPT_VERSION:-v0.3.5}
-build_type: ${BISQ_TYPE:-deb}
-results:
-  - architecture: ${BISQ_ARCH:-x86_64-linux-gnu}
-    status: ftbfs
-    files:
-      - filename: unknown
-        hash: ""
-        match: false
-        official_hash: ""
-        notes: "$error_msg"
-ERRYAML
-    exit 1
+# ---- Two clean clones + submodules (REQUIRED) ----
+clone_checkout() {  # dest label
+    local dest="$1" label="$2"
+    log_info "[$label] cloning + checkout ${BISQ_VERSION}..."
+    git clone --quiet "$REPO_URL" "$dest" \
+      || { write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "git clone failed ($label)."; die "git clone failed ($label)"; }
+    git -C "$dest" checkout --quiet "$BISQ_VERSION" \
+      || { write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "git checkout ${BISQ_VERSION} failed ($label)."; die "git checkout failed ($label)"; }
+    git -C "$dest" submodule update --init --recursive --quiet \
+      || { write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "Submodule init failed ($label); upstream requires submodules."; die "submodule init failed ($label)"; }
+    log_success "[$label] $(git -C "$dest" describe --tags 2>/dev/null || echo "$BISQ_VERSION") + submodules"
 }
+clone_checkout "$SRC_A" "A"
+clone_checkout "$SRC_B" "B"
 
-echo "Cloning repository..."
-if ! git clone --progress https://github.com/bisq-network/bisq.git; then
-    generate_error_and_exit "Failed to clone Bisq repository"
+UPSTREAM_DOCKERDIR="${SRC_A}/docker/release-builder/linux"
+if [[ ! -f "${UPSTREAM_DOCKERDIR}/Dockerfile" ]]; then
+    write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "No docker/release-builder/linux/Dockerfile at ${BISQ_VERSION} (pre-1.10? use v0.3.5 script)."
+    die "release-builder Dockerfile absent at ${BISQ_VERSION}"
 fi
 
-cd bisq || generate_error_and_exit "Failed to enter bisq directory"
-
-echo "Checking out version $BISQ_VERSION..."
-if ! git checkout "$BISQ_VERSION"; then
-    generate_error_and_exit "Failed to checkout version $BISQ_VERSION"
-fi
-echo "Checkout complete: $(git describe --tags)"
-
-echo "Downloading official release..."
-cd "$WORK_DIR" || generate_error_and_exit "Failed to change to work directory"
-
-# Set official package name based on type
-if [[ "$BISQ_TYPE" == "deb" ]]; then
-    OFFICIAL_PKG="Bisq-64bit-${BISQ_VERSION#v}.deb"
-elif [[ "$BISQ_TYPE" == "rpm" ]]; then
-    OFFICIAL_PKG="Bisq-64bit-${BISQ_VERSION#v}.rpm"
+if [[ -f "${SRC_A}/gradle/wrapper/gradle-wrapper.sha256" ]]; then
+    ( cd "$SRC_A" && sha256sum -c gradle/wrapper/gradle-wrapper.sha256 ) \
+        && log_success "gradle-wrapper.sha256 verified" \
+        || log_warn "gradle-wrapper.sha256 check reported issues (continuing; note for report)"
 fi
 
-if ! wget --progress=bar:force "https://github.com/bisq-network/bisq/releases/download/${BISQ_VERSION}/${OFFICIAL_PKG}"; then
-    generate_error_and_exit "Failed to download official release $OFFICIAL_PKG"
-fi
-echo "Download complete"
-
-echo "Building (20-30 min)..."
-cd bisq || generate_error_and_exit "Failed to enter bisq directory for build"
-if ! ./gradlew clean build -x test; then
-    generate_error_and_exit "Gradle build failed"
-fi
-
-echo "Creating package..."
-echo "Using Java 17 for jpackage..."
-export JAVA_HOME=$JAVA_17_HOME
-export PATH=$JAVA_17_HOME/bin:$PATH
-if ! ./gradlew desktop:generateInstallers --rerun-tasks; then
-    generate_error_and_exit "Gradle generateInstallers failed"
-fi
-echo "Build complete"
-
-# Find built package based on type
-if [[ "$BISQ_TYPE" == "deb" ]]; then
-    LOCAL_PKG=$(find desktop/build/packaging/jpackage/packages -name "bisq_*-1_amd64.deb" 2>/dev/null | head -1)
-    PKG_PATTERN="bisq_*-1_amd64.deb"
-elif [[ "$BISQ_TYPE" == "rpm" ]]; then
-    LOCAL_PKG=$(find desktop/build/packaging/jpackage/packages -name "bisq-*.x86_64.rpm" 2>/dev/null | head -1)
-    PKG_PATTERN="bisq-*.x86_64.rpm"
-fi
-
-if [[ -z "$LOCAL_PKG" ]]; then
-    echo "ERROR: Built .$BISQ_TYPE file not found"
-    mkdir -p /output
-    cat > /output/COMPARISON_RESULTS.yaml << ERRYAML
-date: $(date -u +"%Y-%m-%dT%H:%M:%S+0000")
-script_version: ${SCRIPT_VERSION:-v0.3.5}
-build_type: ${BISQ_TYPE}
-results:
-  - architecture: ${BISQ_ARCH:-x86_64-linux-gnu}
-    status: ftbfs
-    files:
-      - filename: unknown
-        hash: ""
-        match: false
-        official_hash: ""
-        notes: "Build failed: .$BISQ_TYPE file not found in desktop/build/packaging/jpackage/packages (pattern: $PKG_PATTERN)"
-ERRYAML
-    exit 1
-fi
-LOCAL_PKG=$(realpath "$LOCAL_PKG")
-
-OFFICIAL_PKG="$WORK_DIR/${OFFICIAL_PKG}"
-
-echo ""
-echo "Comparing packages..."
-echo "  Official: $(basename "$OFFICIAL_PKG")"
-echo "  Built:    $(basename "$LOCAL_PKG")"
-echo ""
-
-# Extract packages
-EXTRACT_DIR="$WORK_DIR/extract"
-mkdir -p "$EXTRACT_DIR"/{official,local,jars/{official,local}}
-
-echo "Extracting official package..."
-cd "$EXTRACT_DIR/official"
-if [[ "$BISQ_TYPE" == "deb" ]]; then
-    ar -x "$OFFICIAL_PKG"
-    tar -xJf data.tar.xz 2>/dev/null || tar --zstd -xf data.tar.zst 2>/dev/null || tar -xzf data.tar.gz
-elif [[ "$BISQ_TYPE" == "rpm" ]]; then
-    rpm2cpio "$OFFICIAL_PKG" | cpio -idmv 2>&1 | tail -20
-fi
-
-echo "Extracting built package..."
-cd "$EXTRACT_DIR/local"
-if [[ "$BISQ_TYPE" == "deb" ]]; then
-    ar -x "$LOCAL_PKG"
-    tar -xJf data.tar.xz 2>/dev/null || tar --zstd -xf data.tar.zst 2>/dev/null || tar -xzf data.tar.gz
-elif [[ "$BISQ_TYPE" == "rpm" ]]; then
-    rpm2cpio "$LOCAL_PKG" | cpio -idmv 2>&1 | tail -20
-fi
-
-# Debug: Show what was extracted
-echo "DEBUG: Contents of official extract dir:"
-find "$EXTRACT_DIR/official" -type f -name "*.jar" 2>/dev/null | head -10
-echo "DEBUG: Contents of local extract dir:"
-find "$EXTRACT_DIR/local" -type f -name "*.jar" 2>/dev/null | head -10
-
-echo "Finding desktop.jar files..."
-OFFICIAL_JAR=$(find "$EXTRACT_DIR/official" -name "desktop.jar" | head -1)
-LOCAL_JAR=$(find "$EXTRACT_DIR/local" -name "desktop.jar" | head -1)
-
-if [[ -z "$OFFICIAL_JAR" ]] || [[ -z "$LOCAL_JAR" ]]; then
-    echo "ERROR: Could not find desktop.jar files"
-    mkdir -p /output
-    cat > /output/COMPARISON_RESULTS.yaml << ERRYAML
-date: $(date -u +"%Y-%m-%dT%H:%M:%S+0000")
-script_version: ${SCRIPT_VERSION:-v0.3.5}
-build_type: ${BISQ_TYPE:-deb}
-results:
-  - architecture: ${BISQ_ARCH:-x86_64-linux-gnu}
-    status: ftbfs
-    files:
-      - filename: unknown
-        hash: ""
-        match: false
-        official_hash: ""
-        notes: "Comparison failed: desktop.jar not found in extracted packages"
-ERRYAML
-    exit 1
-fi
-
-echo "  Official JAR: $OFFICIAL_JAR"
-echo "  Local JAR:    $LOCAL_JAR"
-
-echo "Extracting JARs..."
-if ! (cd "$EXTRACT_DIR/jars/official" && jar -xf "$OFFICIAL_JAR"); then
-    generate_error_and_exit "Failed to extract official JAR: $OFFICIAL_JAR"
-fi
-if ! (cd "$EXTRACT_DIR/jars/local" && jar -xf "$LOCAL_JAR"); then
-    generate_error_and_exit "Failed to extract local JAR: $LOCAL_JAR"
-fi
-
-echo "Generating hashes..."
-cd "$WORK_DIR"
-
-# Generate hashes using a subshell to avoid pipefail issues
-(
-    find "$EXTRACT_DIR/jars/official" -name "*.class" -type f | sort | while read -r file; do
-        hash=$(sha256sum "$file" | cut -d' ' -f1)
-        relpath=$(echo "$file" | sed "s|$EXTRACT_DIR/jars/official/||")
-        echo "$hash $relpath"
-    done
-) > official-hashes.txt || true
-
-(
-    find "$EXTRACT_DIR/jars/local" -name "*.class" -type f | sort | while read -r file; do
-        hash=$(sha256sum "$file" | cut -d' ' -f1)
-        relpath=$(echo "$file" | sed "s|$EXTRACT_DIR/jars/local/||")
-        echo "$hash $relpath"
-    done
-) > local-hashes.txt || true
-
-OFFICIAL_COUNT=$(wc -l < official-hashes.txt 2>/dev/null || echo "0")
-LOCAL_COUNT=$(wc -l < local-hashes.txt 2>/dev/null || echo "0")
-
-echo "Comparing hashes..."
-echo "  Official class files: $OFFICIAL_COUNT"
-echo "  Built class files:    $LOCAL_COUNT"
-
-# comm requires fully sorted inputs; use temp files to avoid subshell issues
-LC_ALL=C sort official-hashes.txt > official-sorted.txt 2>/dev/null || true
-LC_ALL=C sort local-hashes.txt > local-sorted.txt 2>/dev/null || true
-
-# Compare and capture differences
-# comm -3 outputs:
-#   - Lines only in file1 (official): no leading tab, path in $1
-#   - Lines only in file2 (local): leading tab, path in $2
-# We need to capture BOTH to get all differing files
-
-# Get files only in official (missing from local build)
-OFFICIAL_ONLY=$(comm -23 official-sorted.txt local-sorted.txt 2>/dev/null || true)
-# Get files only in local (extra in local build)  
-LOCAL_ONLY=$(comm -13 official-sorted.txt local-sorted.txt 2>/dev/null || true)
-# Get files in both but with different hashes (hash differs)
-# This requires comparing just the file paths that exist in both
-DIFF_OUTPUT=$(comm -3 official-sorted.txt local-sorted.txt 2>/dev/null || true)
-
-DIFF_COUNT=0
-if [[ -n "$DIFF_OUTPUT" ]]; then
-    DIFF_COUNT=$(echo "$DIFF_OUTPUT" | awk 'NF {count++} END {print count+0}')
-fi
-[[ -z "$DIFF_COUNT" ]] && DIFF_COUNT=0
-
-# Extract differing file paths for module analysis
-# Capture paths from both columns (official-only and local-only/different)
-if [[ $DIFF_COUNT -gt 0 ]]; then
-    {
-        # Files only in official (column 1, no tab prefix) - extract path (field 2 of hash+path)
-        echo "$OFFICIAL_ONLY" | awk 'NF {print $2}'
-        # Files only in local or with different hash (column 2, tab prefix) - extract path
-        echo "$LOCAL_ONLY" | awk 'NF {print $2}'
-    } | sort -u > differing-files.txt
-else
-    touch differing-files.txt
-fi
-
-# Module breakdown - use grep and wc for reliable counting
-CORE_DIFFS=$(grep "bisq/core/" differing-files.txt 2>/dev/null | wc -l | tr -d ' ')
-[ -z "$CORE_DIFFS" ] && CORE_DIFFS=0
-P2P_DIFFS=$(grep "bisq/p2p/" differing-files.txt 2>/dev/null | wc -l | tr -d ' ')
-[ -z "$P2P_DIFFS" ] && P2P_DIFFS=0
-DESKTOP_DIFFS=$(grep "bisq/desktop/" differing-files.txt 2>/dev/null | wc -l | tr -d ' ')
-[ -z "$DESKTOP_DIFFS" ] && DESKTOP_DIFFS=0
-COMMON_DIFFS=$(grep "bisq/common/" differing-files.txt 2>/dev/null | wc -l | tr -d ' ')
-[ -z "$COMMON_DIFFS" ] && COMMON_DIFFS=0
-PROTO_DIFFS=$(grep "bisq/proto/" differing-files.txt 2>/dev/null | wc -l | tr -d ' ')
-[ -z "$PROTO_DIFFS" ] && PROTO_DIFFS=0
-OTHER_DIFFS=$(( ${DIFF_COUNT:-0} - ${CORE_DIFFS:-0} - ${P2P_DIFFS:-0} - ${DESKTOP_DIFFS:-0} - ${COMMON_DIFFS:-0} - ${PROTO_DIFFS:-0} ))
-[[ $OTHER_DIFFS -lt 0 ]] && OTHER_DIFFS=0
-
-# Security assessment
-SECURITY_CRITICAL_DIFFS=$(( ${CORE_DIFFS:-0} + ${P2P_DIFFS:-0} + ${PROTO_DIFFS:-0} ))
-
-echo ""
-echo "---"
-echo "RESULTS"
-echo "---"
-echo "Official files: $OFFICIAL_COUNT"
-echo "Local files:    $LOCAL_COUNT"
-echo "Differences:    $DIFF_COUNT"
-echo ""
-
-if [[ $DIFF_COUNT -gt 0 ]]; then
-    echo "  ✗ Deep inspection: $DIFF_COUNT class files differ"
-    echo ""
-    echo "  Differences by module:"
-    echo "    Core (crypto/protocol):  $CORE_DIFFS files"
-    echo "    P2P (networking):        $P2P_DIFFS files"
-    echo "    Desktop (UI):            $DESKTOP_DIFFS files"
-    echo "    Common (utilities):      $COMMON_DIFFS files"
-    echo "    Proto (messages):        $PROTO_DIFFS files"
-    [[ $OTHER_DIFFS -gt 0 ]] && echo "    Other:                   $OTHER_DIFFS files"
-    echo ""
-
-    if [[ $SECURITY_CRITICAL_DIFFS -eq 0 ]]; then
-        echo "  ✓ SECURITY-CRITICAL MODULES ARE IDENTICAL"
-        echo "    All differences are in UI/utility layers (non-security-critical)"
-        echo ""
-    else
-        echo "  ⚠ SECURITY-CRITICAL CODE DIFFERS"
-        echo "    $SECURITY_CRITICAL_DIFFS security-critical file(s) differ"
-        echo ""
-    fi
-
-    echo "  Differing files (all $DIFF_COUNT):"
-    while read -r path; do
-        echo "    - $path"
-    done < differing-files.txt
-    echo ""
-else
-    echo "  ✓ Deep inspection: All $OFFICIAL_COUNT class files IDENTICAL"
-    echo ""
-fi
-
-# Calculate package hashes
-OFFICIAL_HASH=$(sha256sum "$OFFICIAL_PKG" 2>/dev/null | cut -d' ' -f1 || echo "unknown")
-LOCAL_HASH=$(sha256sum "$LOCAL_PKG" 2>/dev/null | cut -d' ' -f1 || echo "unknown")
-
-# Determine status with security consideration
-if [[ $DIFF_COUNT -eq 0 ]] && [[ $OFFICIAL_COUNT -eq $LOCAL_COUNT ]] && [[ $OFFICIAL_COUNT -gt 0 ]]; then
-    STATUS="reproducible"
-    MATCH="true"
-    VERDICT="FULLY REPRODUCIBLE"
-    echo "$VERDICT"
-elif [[ $SECURITY_CRITICAL_DIFFS -eq 0 ]] && [[ $DIFF_COUNT -gt 0 ]]; then
-    STATUS="not_reproducible"
-    MATCH="false"
-    VERDICT="FUNCTIONALLY REPRODUCIBLE (security-critical code identical, UI differences only)"
-    echo "$VERDICT"
-else
-    STATUS="not_reproducible"
-    MATCH="false"
-    VERDICT="NOT REPRODUCIBLE (security-critical code differs)"
-    echo "$VERDICT"
-fi
-
-# Generate YAML
-mkdir -p /output
-cat > /output/COMPARISON_RESULTS.yaml << EOF
-date: $(date -u +"%Y-%m-%dT%H:%M:%S+0000")
-script_version: ${SCRIPT_VERSION:-v0.3.5}
-build_type: ${BISQ_TYPE}
-results:
-  - architecture: ${BISQ_ARCH:-x86_64-linux-gnu}
-    status: ${STATUS:-not_reproducible}
-    files:
-      - filename: $(basename "${LOCAL_PKG:-unknown}")
-        hash: ${LOCAL_HASH:-unknown}
-        match: ${MATCH:-false}
-        official_hash: ${OFFICIAL_HASH:-unknown}
-        notes: "Compared ${OFFICIAL_COUNT:-0} .class files from ${BISQ_TYPE}, ${DIFF_COUNT:-0} differences. Modules: core=${CORE_DIFFS:-0}, p2p=${P2P_DIFFS:-0}, desktop=${DESKTOP_DIFFS:-0}, common=${COMMON_DIFFS:-0}, proto=${PROTO_DIFFS:-0}. Security-critical: ${SECURITY_CRITICAL_DIFFS:-0} diffs"
-        verdict: "${VERDICT:-unknown}"
-EOF
-
-echo ""
-echo "Status: $STATUS"
-echo "Complete"
-exit 0
-CONTAINER_SCRIPT
-
-# Build Docker image
-log_info "Building Docker image..."
-CACHE_FLAG=""
-[[ "$NO_CACHE" == "true" ]] && CACHE_FLAG="--no-cache"
-
-if ! docker build $CACHE_FLAG -t "$IMAGE_NAME" -f "$SCRIPT_DIR/.dockerfile-bisq-temp" "$SCRIPT_DIR" 2>&1 | tee build.log; then
-    generate_error_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" "Docker image build failed" "ftbfs"
-    die "Docker image build failed" "$EXIT_BUILD_FAILED"
+# ---- Build pinned image from the cloned repo's own Dockerfile (no drift) ----
+log_info "Building release-builder image from upstream Dockerfile..."
+CACHE_FLAG=""; [[ "$NO_CACHE" == "true" ]] && CACHE_FLAG="--no-cache"
+if ! docker build $CACHE_FLAG --pull=false --platform linux/amd64 \
+        -t "$IMAGE_NAME" "$UPSTREAM_DOCKERDIR" 2>&1 | tee "${execution_dir}/build-image.log"; then
+    write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "release-builder image build failed (see build-image.log)."
+    die "image build failed"
 fi
 log_success "Image built: $IMAGE_NAME"
 
-# Run container (capture exit code but don't fail immediately)
-log_info "Starting container build..."
+# ---- Run one clean build inside the image ----
+gradle_build() {  # srcdir containername logfile label
+    local src="$1" cname="$2" logf="$3" label="$4"
+    local rmflag="--rm"; [[ "$KEEP_CONTAINER" == "true" ]] && rmflag=""
+    log_info "[$label] building (clean verifyReleaseBuild verifyInstallerEvidenceBundle; 8-15 min)..."
+    set +e
+    docker run $rmflag --platform linux/amd64 --user "$(id -u):$(id -g)" \
+        -v "${src}":/workspace -w /workspace \
+        --name "$cname" \
+        "$IMAGE_NAME" \
+        ./gradlew --no-daemon clean verifyReleaseBuild verifyInstallerEvidenceBundle 2>&1 | tee "$logf"
+    local rc=${PIPESTATUS[0]}
+    set -e
+    return $rc
+}
+
+if ! gradle_build "$SRC_A" "$CONTAINER_A" "${execution_dir}/build-a.log" "A"; then
+    write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "Build A failed (see build-a.log)."
+    die "build A failed"
+fi
+log_success "Build A complete"
+if ! gradle_build "$SRC_B" "$CONTAINER_B" "${execution_dir}/build-b.log" "B"; then
+    write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "Build B failed (see build-b.log)."
+    die "build B failed"
+fi
+log_success "Build B complete"
+
+# ---- Locate rebuilt installers (host side; volumes are host-owned) ----
+find_pkg() {  # srcdir
+    if [[ "$BISQ_TYPE" == "deb" ]]; then
+        find "$1/desktop/build/packaging/jpackage/packages" -name "bisq_*_amd64.deb" 2>/dev/null | head -1
+    else
+        find "$1/desktop/build/packaging/jpackage/packages" -name "bisq-*.x86_64.rpm" 2>/dev/null | head -1
+    fi
+}
+A_PKG="$(find_pkg "$SRC_A")"; B_PKG="$(find_pkg "$SRC_B")"
+[[ -n "$A_PKG" && -n "$B_PKG" ]] || { write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "rebuilt .${BISQ_TYPE} not found in one or both builds."; die "rebuilt installer missing"; }
+
+# Preserve artifacts + upstream evidence bundles (for inspection + the report)
+mkdir -p "$ARTIFACTS_DIR/build-a" "$ARTIFACTS_DIR/build-b"
+cp -f "$A_PKG" "$ARTIFACTS_DIR/build-a/" 2>/dev/null || true
+cp -f "$B_PKG" "$ARTIFACTS_DIR/build-b/" 2>/dev/null || true
+for side in a b; do
+    src="SRC_${side^^}"; srcdir="${!src}"
+    for ev in release-evidence.zip installer-evidence.zip release-manifest.tsv installer-manifest.tsv \
+              SHA256SUMS INSTALLER-SHA256SUMS build-info.json installer-build-info.json \
+              installer-structure-report.tsv installer-structure-summary.txt; do
+        f="${srcdir}/build/reports/release/${ev}"
+        [[ -f "$f" ]] && cp -f "$f" "$ARTIFACTS_DIR/build-${side}/" 2>/dev/null || true
+    done
+done
+
+# ---- Comparison + evidence (in-container: image has dpkg-deb/rpm/etc.) ----
+VERIFY_SCRIPT="${WORK_DIR}/verify-compare.sh"
+cat > "$VERIFY_SCRIPT" << 'COMPARE'
+#!/bin/bash
+set -uo pipefail
+BISQ_TYPE="${BISQ_TYPE:-deb}"
+BISQ_VERSION="${BISQ_VERSION:-}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-v0.5.0}"
+OFFICIAL_PKG_NAME="${OFFICIAL_PKG_NAME:?}"
+OUT="/output"
+OFFICIAL="$OUT/$OFFICIAL_PKG_NAME"
+A_PKG="/a"   # mounted file
+B_PKG="/b"   # mounted file
+DETAIL="$OUT/comparison-detail.txt"
+
+emit_yaml() { local verdict="$1" notes="${2:-}"
+    { printf 'script_version: %s\n' "$SCRIPT_VERSION"
+      printf 'verdict: %s\n' "$verdict"
+      if [[ -n "$notes" ]]; then printf 'notes: |\n'; printf '%s\n' "$notes" | sed 's/^/  /'; fi
+    } > "$OUT/COMPARISON_RESULTS.yaml"; }
+ftbfs() { echo "FTBFS: $1"; emit_yaml ftbfs "$1"; exit 1; }
+
+for f in "$OFFICIAL" "$A_PKG" "$B_PKG"; do [[ -f "$f" ]] || ftbfs "missing input: $f"; done
+
+OFF_H=$(sha256sum "$OFFICIAL" | cut -d' ' -f1)
+A_H=$(sha256sum "$A_PKG" | cut -d' ' -f1)
+B_H=$(sha256sum "$B_PKG" | cut -d' ' -f1)
+
+# Determinism (A vs B) and reproducibility (A vs official), both on the OUTER file hash.
+DETERMINISTIC=no; [[ "$A_H" == "$B_H" ]] && DETERMINISTIC=yes
+MATCHES_OFFICIAL=no; [[ "$A_H" == "$OFF_H" ]] && MATCHES_OFFICIAL=yes
+
+{
+  echo "=== Bisq 1 ${BISQ_VERSION} ${BISQ_TYPE} comparison (${SCRIPT_VERSION}) ==="
+  echo "official_sha256=$OFF_H"
+  echo "build_a_sha256 =$A_H"
+  echo "build_b_sha256 =$B_H"
+  echo "deterministic (A==B): $DETERMINISTIC"
+  echo "matches_official (A==official): $MATCHES_OFFICIAL"
+  echo ""
+} > "$DETAIL"
+
+# ---- Evidence extraction (NOT a verdict input): full dpkg-deb -R / rpm payload+meta ----
+PAYLOAD_DIFF=unknown
+EXO=/tmp/ex/official; EXB=/tmp/ex/built
+rm -rf /tmp/ex; mkdir -p "$EXO" "$EXB"
+
+if [[ "$BISQ_TYPE" == "deb" ]]; then
+    # dpkg-deb -R: DEBIAN/ holds control+md5sums+maintainer scripts; rest is payload tree.
+    if dpkg-deb -R "$OFFICIAL" "$EXO" 2>>"$DETAIL" && dpkg-deb -R "$A_PKG" "$EXB" 2>>"$DETAIL"; then
+        {
+          echo "--- control/maintainer diff (DEBIAN/) ---"
+          diff -ru "$EXO/DEBIAN" "$EXB/DEBIAN" 2>&1 || true
+          echo ""
+          echo "--- payload content diff (excluding DEBIAN/) ---"
+          diff -ru -x DEBIAN "$EXO" "$EXB" 2>&1 || true
+          echo ""
+          echo "--- payload mode/type/symlink listing diff ---"
+          ( cd "$EXO" && find . -path ./DEBIAN -prune -o \( -type f -o -type l -o -type d \) -printf '%y %M %p -> %l\n' | LC_ALL=C sort ) > /tmp/o.list
+          ( cd "$EXB" && find . -path ./DEBIAN -prune -o \( -type f -o -type l -o -type d \) -printf '%y %M %p -> %l\n' | LC_ALL=C sort ) > /tmp/b.list
+          diff /tmp/o.list /tmp/b.list 2>&1 || true
+        } >> "$DETAIL"
+        # Classification hint: any difference in the payload tree (content OR mode/type/symlink)?
+        if diff -rq -x DEBIAN "$EXO" "$EXB" >/dev/null 2>&1 && diff -q /tmp/o.list /tmp/b.list >/dev/null 2>&1; then
+            PAYLOAD_DIFF=none
+        else
+            PAYLOAD_DIFF=present
+        fi
+    else
+        echo "WARN: dpkg-deb -R extraction failed; payload classification unavailable" >> "$DETAIL"
+    fi
+else
+    # RPM: payload via rpm2cpio; metadata via rpm queries.
+    if ( cd "$EXO" && rpm2cpio "$OFFICIAL" | cpio -idm 2>/dev/null ) && ( cd "$EXB" && rpm2cpio "$A_PKG" | cpio -idm 2>/dev/null ); then
+        {
+          echo "--- rpm metadata (official then built) ---"
+          rpm -qp --qf '%{NAME} %{VERSION} %{RELEASE} %{ARCH}\nBUILDHOST=%{BUILDHOST}\nBUILDTIME=%{BUILDTIME}\n' "$OFFICIAL" 2>&1 || true
+          rpm -qp --qf '%{NAME} %{VERSION} %{RELEASE} %{ARCH}\nBUILDHOST=%{BUILDHOST}\nBUILDTIME=%{BUILDTIME}\n' "$A_PKG" 2>&1 || true
+          echo ""
+          echo "--- payload content diff ---"
+          diff -ru "$EXO" "$EXB" 2>&1 || true
+          echo ""
+          echo "--- payload mode/type/symlink listing diff ---"
+          ( cd "$EXO" && find . \( -type f -o -type l -o -type d \) -printf '%y %M %p -> %l\n' | LC_ALL=C sort ) > /tmp/o.list
+          ( cd "$EXB" && find . \( -type f -o -type l -o -type d \) -printf '%y %M %p -> %l\n' | LC_ALL=C sort ) > /tmp/b.list
+          diff /tmp/o.list /tmp/b.list 2>&1 || true
+        } >> "$DETAIL"
+        if diff -rq "$EXO" "$EXB" >/dev/null 2>&1 && diff -q /tmp/o.list /tmp/b.list >/dev/null 2>&1; then
+            PAYLOAD_DIFF=none
+        else
+            PAYLOAD_DIFF=present
+        fi
+    else
+        echo "WARN: rpm payload extraction failed; payload classification unavailable" >> "$DETAIL"
+    fi
+fi
+
+echo "" >> "$DETAIL"
+echo "payload_diff_vs_official: $PAYLOAD_DIFF" >> "$DETAIL"
+
+# ---- MECHANICAL verdict: outer hash only (WS policy). reproducible iff A==official AND A==B. ----
+DET_NOTE="A/B determinism: $([[ "$DETERMINISTIC" == yes ]] && echo "build is deterministic (A==B)" || echo "BUILD IS NON-DETERMINISTIC (A!=B)")."
+if [[ "$BISQ_TYPE" == deb ]]; then HINT_TOOL="dpkg-deb -R"; else HINT_TOOL="rpm2cpio"; fi
+case "$PAYLOAD_DIFF" in
+  none)    CLASS_HINT="CLASSIFICATION HINT: extracted payload + modes/symlinks are IDENTICAL to official ($HINT_TOOL); the only differences are ${BISQ_TYPE} packaging/compression metadata. Candidate for human label 'reproducible_with_packaging_noise' per review-notes/reproducibility-heuristics-packaged-artifacts.md." ;;
+  present) CLASS_HINT="CLASSIFICATION HINT: real payload differences vs official exist (see comparison-detail.txt). Genuine non-reproducibility." ;;
+  *)       CLASS_HINT="CLASSIFICATION HINT: payload classification unavailable (extraction failed); see comparison-detail.txt." ;;
+esac
+
+COMMON_NOTE="Bisq 1 ${BISQ_VERSION} ${BISQ_TYPE} built with the pinned 1.10.0 release-builder (azul/zulu-openjdk:21.0.6) via 'clean verifyReleaseBuild verifyInstallerEvidenceBundle'.
+official_sha256=${OFF_H} build_a_sha256=${A_H} build_b_sha256=${B_H}.
+${DET_NOTE}"
+
+if [[ "$MATCHES_OFFICIAL" == yes && "$DETERMINISTIC" == yes ]]; then
+    emit_yaml reproducible "${COMMON_NOTE}
+Rebuilt installer is byte-for-byte identical to the official release."
+    echo "VERDICT: reproducible"; exit 0
+else
+    emit_yaml not_reproducible "${COMMON_NOTE}
+Outer-file sha256 differs from official (mechanical verdict: not_reproducible).
+${CLASS_HINT}"
+    echo "VERDICT: not_reproducible (payload_diff=${PAYLOAD_DIFF})"; exit 1
+fi
+COMPARE
+chmod +x "$VERIFY_SCRIPT"
+
+log_info "Comparing (A vs B determinism, A vs official + dpkg-deb -R evidence)..."
+RM_FLAG="--rm"; [[ "$KEEP_CONTAINER" == "true" ]] && RM_FLAG=""
 set +e
-docker run \
-    -e BISQ_VERSION="$BISQ_VERSION" \
-    -e BISQ_ARCH="$BISQ_ARCH" \
-    -e BISQ_TYPE="$BISQ_TYPE" \
-    -e SCRIPT_VERSION="$SCRIPT_VERSION" \
+docker run $RM_FLAG --platform linux/amd64 --user "$(id -u):$(id -g)" \
+    -e BISQ_VERSION="$BISQ_VERSION" -e BISQ_TYPE="$BISQ_TYPE" \
+    -e SCRIPT_VERSION="$SCRIPT_VERSION" -e OFFICIAL_PKG_NAME="$OFFICIAL_PKG_NAME" \
     -v "${execution_dir}":/output \
-    --name "$CONTAINER_NAME" \
-    "$IMAGE_NAME" 2>&1 | tee container.log
-CONTAINER_EXIT_CODE=${PIPESTATUS[0]}
+    -v "${A_PKG}":/a:ro -v "${B_PKG}":/b:ro \
+    -v "${VERIFY_SCRIPT}":/verify/verify-compare.sh:ro \
+    --name "$CONTAINER_CMP" \
+    "$IMAGE_NAME" bash /verify/verify-compare.sh 2>&1 | tee "${execution_dir}/container.log"
+CMP_EXIT=${PIPESTATUS[0]}
 set -e
 
-# Check if YAML was generated (indicates successful completion)
+# ---- Results ----
 if [[ ! -f "${execution_dir}/COMPARISON_RESULTS.yaml" ]]; then
-    # No YAML = real failure (build crashed, script error, etc.)
-    generate_error_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" "Container execution failed (no YAML output)" "ftbfs"
-    die "Container execution failed - no COMPARISON_RESULTS.yaml generated" "$EXIT_BUILD_FAILED"
+    write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "Comparison produced no COMPARISON_RESULTS.yaml."
+    die "no YAML produced"
 fi
-
-# YAML exists = script completed successfully (reproducible or not)
-# Exit code 0 = reproducible, 1 = not reproducible (both are valid outcomes)
-
-# Cleanup container unless --keep-container was specified
-if [[ "$KEEP_CONTAINER" != "true" ]]; then
-    docker rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
-fi
-
-# Display results
 log_info ""
 log_info "======================================================"
-log_info "RESULTS"
+log_info "RESULTS (${execution_dir}/COMPARISON_RESULTS.yaml)"
 log_info "======================================================"
 cat "${execution_dir}/COMPARISON_RESULTS.yaml"
 log_info ""
+log_info "Evidence:  ${execution_dir}/comparison-detail.txt"
+log_info "Artifacts: ${ARTIFACTS_DIR} (build-a/, build-b/)"
 
-# Emit standardized verification summary
-RESULT_FILE="${execution_dir}/COMPARISON_RESULTS.yaml"
-STATUS=$(grep "^[[:space:]]*status:" "$RESULT_FILE" | head -1 | awk '{print $2}')
-BUILT_HASH=$(awk '/^[[:space:]]+hash:[[:space:]]/ {print $2; exit}' "$RESULT_FILE")
-OFFICIAL_HASH=$(awk '/official_hash:[[:space:]]/ {print $2; exit}' "$RESULT_FILE")
-NOTES_LINE=$(awk -F': ' '/notes:[[:space:]]/ {sub(/^"/,"",$2); sub(/"$/,"",$2); print $2; exit}' "$RESULT_FILE")
-VERSION_NO_PREFIX="${BISQ_VERSION#v}"
-[[ -z "$BUILT_HASH" ]] && BUILT_HASH="(unknown)"
-[[ -z "$OFFICIAL_HASH" ]] && OFFICIAL_HASH="(unknown)"
-[[ -z "$NOTES_LINE" ]] && NOTES_LINE="See COMPARISON_RESULTS.yaml for detailed context."
-
-if [[ "$STATUS" == "reproducible" ]]; then
-    VERDICT_TEXT="reproducible"
-else
-    VERDICT_TEXT="differences found"
-fi
-
-cat <<EOF
-===== Begin Results =====
-appId:          $APP_ID
-signer:         N/A
-apkVersionName: ${VERSION_NO_PREFIX}
-apkVersionCode: ${VERSION_NO_PREFIX}
-verdict:        $VERDICT_TEXT
-appHash:        $OFFICIAL_HASH
-commit:         $BISQ_VERSION
-
-Diff:
-$NOTES_LINE
-
-Revision, tag (and its signature):
-(Not captured; rerun gpg --verify on upstream tag $BISQ_VERSION)
-
-Signature Summary:
-Tag type: unknown
-[WARNING] Signature status not captured in automated run
-
-Keys used:
-N/A
-
-===== End Results =====
-
-Run a full
-diffoscope "<official .deb>" "<local .deb>"
-meld "<official desktop.jar>" "<local desktop.jar>"
-or
-diff --recursive /home/bisq/work/extract/official /home/bisq/work/extract/local
-for more details.
-EOF
-
-# Final verdict (both outcomes are successful completions)
-log_info ""
-log_info "======================================================"
-if [[ "$STATUS" == "reproducible" ]]; then
-    log_success "VERIFICATION COMPLETE: REPRODUCIBLE"
-    log_info "Exit code: $EXIT_SUCCESS"
-    exit "$EXIT_SUCCESS"
-else
-    log_success "VERIFICATION COMPLETE: NOT REPRODUCIBLE"
-    log_info "Result: Build completed successfully, artifacts differ"
-    log_info "Exit code: $EXIT_BUILD_FAILED (indicates non-reproducible, not failure)"
-    exit "$EXIT_BUILD_FAILED"
-fi
+VERDICT=$(awk -F': ' '/^verdict:/{print $2; exit}' "${execution_dir}/COMPARISON_RESULTS.yaml")
+case "$VERDICT" in
+    reproducible)     log_success "VERIFICATION COMPLETE: reproducible";     exit "$EXIT_SUCCESS" ;;
+    not_reproducible) log_warn    "VERIFICATION COMPLETE: not_reproducible"; exit "$EXIT_BUILD_FAILED" ;;
+    *)                log_warn    "VERIFICATION COMPLETE: ${VERDICT:-ftbfs}"; exit "$EXIT_BUILD_FAILED" ;;
+esac
