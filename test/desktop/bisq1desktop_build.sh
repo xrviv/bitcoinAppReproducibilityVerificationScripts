@@ -2,7 +2,7 @@
 # ==============================================================================
 # bisq1desktop_build.sh - Bisq 1 Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.7.0
+# Version:       v0.7.1
 # Organization:  WalletScrutiny.com
 # Last Modified: 2026-06-22
 # Project:       https://github.com/bisq-network/bisq
@@ -13,7 +13,7 @@
 # Maintain changelog in separate file: ~/work/ws-notes/script-notes/desktop/bisq1/changelog.md
 # ==============================================================================
 #
-# SCRIPT SUMMARY (v0.7.0 - Bisq 1.10.0+ toolchain; deb/rpm self-build + Windows EXE via GH Actions):
+# SCRIPT SUMMARY (v0.7.1 - Bisq 1.10.0+ toolchain; deb/rpm self-build + Windows EXE via GH Actions):
 #   Drives Bisq's first-party reproducible-build framework per docs/reproducible-builds/linux.md:
 #     1. Clone the release tag TWICE on the host (clean A and B checkouts) + init submodules (required).
 #     2. Build the pinned release-builder image FROM the cloned repo's own
@@ -33,7 +33,7 @@
 # SCOPE: 1.10.x toolchain only. The pre-1.10 JDK 11/17 script is retained for reference as
 #   bisq1desktop_build.sh.v0.3.5.bak (legacy multi-field YAML + missing-`v` tag bug; not ABS-current).
 #
-# WINDOWS EXE (v0.7.0, --type exe --arch x86_64-windows): FULLY ISOLATED from deb/rpm. The Windows
+# WINDOWS EXE (v0.7.1, --type exe --arch x86_64-windows): FULLY ISOLATED from deb/rpm. The Windows
 #   installer is jpackage+WiX and CANNOT be built on this Linux host (no cross-build, no
 #   docker/release-builder/windows/). By DEFAULT the script AUTO-TRIGGERS the GitHub Actions workflow
 #   walletScrutinyCom/.github/workflows/bisq1-windows-build.yml (windows-2025, Zulu 21.0.6, pinned WiX
@@ -48,7 +48,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.7.0"
+SCRIPT_VERSION="v0.7.1"
 SCRIPT_NAME="bisq1desktop_build.sh"
 APP_NAME="Bisq 1"
 APP_ID="bisq1"
@@ -199,7 +199,11 @@ acquire_built_exes_via_ci() {
     log_info "Run ID ${run_id}; watching to completion (build ~20-30 min)..."
     gh_c run watch "$run_id" --repo "$GH_REPO" --exit-status \
         || { write_yaml "$yaml" ftbfs "GitHub Actions run ${run_id} failed."; die "workflow run ${run_id} failed" "$EXIT_BUILD_FAILED"; }
-    gh_c run view "$run_id" --repo "$GH_REPO" --log > "${artdir}/gh-run-${run_id}.log" 2>/dev/null || log_warn "could not fetch run log"
+    # Stream the full GH Actions build log to the terminal (and into the cast) as verification
+    # evidence, while also saving it to a file. Large, but it is the Windows build output.
+    log_info "===== GitHub Actions build log (run ${run_id}) ====="
+    gh_c run view "$run_id" --repo "$GH_REPO" --log 2>/dev/null | tee "${artdir}/gh-run-${run_id}.log" || log_warn "could not fetch run log"
+    log_info "===== end GitHub Actions build log ====="
 
     log_info "Downloading built EXE artifacts (A and B)..."
     local label
@@ -214,12 +218,44 @@ acquire_built_exes_via_ci() {
         || log_warn "provenance artifact not downloaded (non-fatal)"
 }
 
+# Diagnostic-only extracted diff of two installer files -> outfile. VERDICT-NEUTRAL (never changes the
+# verdict). Used for both A-vs-B (build non-determinism) and official-vs-built. Full diff retained.
+diag_extract_diff() {
+    local f1="$1" f2="$2" l1="$3" l2="$4" outfile="$5" detail="$6"
+    rm -f "$outfile"
+    if ! command -v 7z >/dev/null 2>&1; then
+        echo "DIAGNOSTIC UNAVAILABLE: 7z not installed; $(basename "$outfile") skipped." >> "$detail"
+        return 0
+    fi
+    local d1 d2 rc1=0 rc2=0; d1="$(mktemp -d)"; d2="$(mktemp -d)"
+    7z x -y -o"$d1" "$f1" >/dev/null 2>&1 || rc1=$?
+    7z x -y -o"$d2" "$f2" >/dev/null 2>&1 || rc2=$?
+    if [[ "$rc1" -ne 0 || "$rc2" -ne 0 ]]; then
+        echo "DIAGNOSTIC UNAVAILABLE: 7z extraction failed (${l1} rc=$rc1, ${l2} rc=$rc2); $(basename "$outfile") empty." \
+            | tee "$outfile" >> "$detail"
+    else
+        echo "=== DIAGNOSTIC ONLY (verdict-neutral): diff -r ${l1} vs ${l2} ===" > "$outfile"
+        local dstat=0
+        diff -r "$d1" "$d2" >> "$outfile" 2>&1 || dstat=$?
+        if [[ "$dstat" -le 1 ]]; then
+            echo "Diagnostic FULL diff -> $(basename "$outfile") (diff status ${dstat}; preview below)" >> "$detail"
+            head -5 "$outfile" >> "$detail"
+        else
+            echo "DIAGNOSTIC: diff errored (status ${dstat}); partial output in $(basename "$outfile")." >> "$detail"
+        fi
+    fi
+    rm -rf "$d1" "$d2"
+}
+
 verify_windows_exe() {
     local execution_dir; execution_dir="$(pwd)"
     local yaml="${execution_dir}/COMPARISON_RESULTS.yaml"
     local detail="${execution_dir}/comparison-detail.txt"
     local ver="${BISQ_VERSION#v}"
     local official_name="Bisq-64bit-${ver}.exe"
+
+    # Remove stale diagnostics from a prior run so they can't be mistaken for current evidence.
+    rm -f "${execution_dir}/diff_exe.txt" "${execution_dir}/diff_exe_AvsB.txt" "$detail"
 
     # Acquire the official EXE (use --binary if given, else download from the GitHub release).
     local official="$OFFICIAL_BINARY"
@@ -278,50 +314,30 @@ Each must come from a DISTINCT artifact (bisq1-${ver}-win-exe-A and -B, version 
         echo "  present (auto-trigger mode), it has the runner image, JDK+WiX versions, upstream commit,"
         echo "  and A/B hashes; in --built offline mode provenance is whatever the operator supplied."
         echo "This script reports a MECHANICAL outer-sha256 verdict only. Interpreting any differences"
-        echo "  (root cause, acceptability) is the human reviewer's job — see diff_exe.txt and the WS"
-        echo "  report. Do not treat any narrative here as the script's conclusion."
+        echo "  (root cause, acceptability) is the human reviewer's job — see the diff_exe*.txt file(s)"
+        echo "  and the WS report. Do not treat any narrative here as the script's conclusion."
     } > "$detail"
 
     local verdict notes
     if [[ "$hA" != "$hB" ]]; then
         verdict="not_reproducible"
-        notes="Windows EXE non-deterministic: build A != build B (A=$hA B=$hB). See comparison-detail.txt."
+        notes="Windows EXE NON-DETERMINISTIC: build A != build B from the same source+toolchain (A=$hA B=$hB). The build itself is not reproducible. See diff_exe_AvsB.txt (extracted A-vs-B diff)."
     elif [[ "$hA" != "$hO" ]]; then
         verdict="not_reproducible"
-        notes="Windows EXE differs from official (built=$hA official=$hO). Outer-sha256 mechanical verdict; extracted diff is diagnostic-only. See comparison-detail.txt / diff_exe.txt."
+        notes="Windows EXE deterministic (A==B) but differs from official (built=$hA official=$hO). Outer-sha256 mechanical verdict; extracted diff diagnostic-only. See diff_exe.txt."
     else
         verdict="reproducible"
         notes="Windows EXE reproducible: A==B==official ($hO)."
     fi
 
-    # Diagnostic-only extracted comparison (NEVER changes the mechanical verdict).
-    if [[ "$verdict" == "not_reproducible" && "$hA" == "$hB" ]]; then
-        if command -v 7z >/dev/null 2>&1; then
-            local od bd; od="$(mktemp -d)"; bd="$(mktemp -d)"
-            local rcO=0 rcB=0
-            7z x -y -o"$od" "$official"   >/dev/null 2>&1 || rcO=$?
-            7z x -y -o"$bd" "${built[0]}" >/dev/null 2>&1 || rcB=$?
-            if [[ "$rcO" -ne 0 || "$rcB" -ne 0 ]]; then
-                echo "DIAGNOSTIC UNAVAILABLE: 7z extraction failed (official rc=$rcO, built rc=$rcB); no payload diff produced." \
-                    | tee "${execution_dir}/diff_exe.txt" >> "$detail"
-            else
-                # diff exit: 0=identical, 1=differences (NORMAL), >1=actual error. Capture status without
-                # aborting under set -e (|| guard). The FULL diff is retained in diff_exe.txt (not truncated);
-                # only the terminal preview is short, per the WS large-diff guideline.
-                echo "=== DIAGNOSTIC ONLY (does not affect verdict): diff -r official vs built ===" > "${execution_dir}/diff_exe.txt"
-                local dstat=0
-                diff -r "$od" "$bd" >> "${execution_dir}/diff_exe.txt" 2>&1 || dstat=$?
-                if [[ "$dstat" -le 1 ]]; then
-                    echo "Diagnostic FULL extracted diff -> diff_exe.txt (diff status ${dstat}; preview below, diagnostic-only)" >> "$detail"
-                    head -5 "${execution_dir}/diff_exe.txt" >> "$detail"
-                else
-                    echo "DIAGNOSTIC: diff errored (status ${dstat}); partial output retained in diff_exe.txt." >> "$detail"
-                fi
-            fi
-            rm -rf "$od" "$bd"
-        else
-            echo "DIAGNOSTIC UNAVAILABLE: 7z not installed; extracted diff skipped." >> "$detail"
-        fi
+    # Diagnostics (VERDICT-NEUTRAL; never change the verdict above).
+    #   A != B            -> diff build A vs build B (characterize the build non-determinism).
+    #   A == B != official -> diff official vs build A (how the deterministic build differs from official).
+    #   reproducible       -> nothing to diff.
+    if [[ "$hA" != "$hB" ]]; then
+        diag_extract_diff "${built[0]}" "${built[1]}" "build-A" "build-B" "${execution_dir}/diff_exe_AvsB.txt" "$detail"
+    elif [[ "$hA" != "$hO" ]]; then
+        diag_extract_diff "$official" "${built[0]}" "official" "build-A" "${execution_dir}/diff_exe.txt" "$detail"
     fi
 
     write_yaml "$yaml" "$verdict" "$notes"
