@@ -2,7 +2,7 @@
 # ==============================================================================
 # bisq1desktop_build.sh - Bisq 1 Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.7.1
+# Version:       v0.7.2
 # Organization:  WalletScrutiny.com
 # Last Modified: 2026-06-22
 # Project:       https://github.com/bisq-network/bisq
@@ -13,7 +13,7 @@
 # Maintain changelog in separate file: ~/work/ws-notes/script-notes/desktop/bisq1/changelog.md
 # ==============================================================================
 #
-# SCRIPT SUMMARY (v0.7.1 - Bisq 1.10.0+ toolchain; deb/rpm self-build + Windows EXE via GH Actions):
+# SCRIPT SUMMARY (v0.7.2 - Bisq 1.10.0+ toolchain; deb/rpm self-build + Windows EXE via GH Actions):
 #   Drives Bisq's first-party reproducible-build framework per docs/reproducible-builds/linux.md:
 #     1. Clone the release tag TWICE on the host (clean A and B checkouts) + init submodules (required).
 #     2. Build the pinned release-builder image FROM the cloned repo's own
@@ -33,7 +33,7 @@
 # SCOPE: 1.10.x toolchain only. The pre-1.10 JDK 11/17 script is retained for reference as
 #   bisq1desktop_build.sh.v0.3.5.bak (legacy multi-field YAML + missing-`v` tag bug; not ABS-current).
 #
-# WINDOWS EXE (v0.7.1, --type exe --arch x86_64-windows): FULLY ISOLATED from deb/rpm. The Windows
+# WINDOWS EXE (v0.7.2, --type exe --arch x86_64-windows): FULLY ISOLATED from deb/rpm. The Windows
 #   installer is jpackage+WiX and CANNOT be built on this Linux host (no cross-build, no
 #   docker/release-builder/windows/). By DEFAULT the script AUTO-TRIGGERS the GitHub Actions workflow
 #   walletScrutinyCom/.github/workflows/bisq1-windows-build.yml (windows-2025, Zulu 21.0.6, pinned WiX
@@ -48,7 +48,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.7.1"
+SCRIPT_VERSION="v0.7.2"
 SCRIPT_NAME="bisq1desktop_build.sh"
 APP_NAME="Bisq 1"
 APP_ID="bisq1"
@@ -127,15 +127,17 @@ write_yaml() {  # out verdict notes
 GH_REPO="${GH_REPO:-xrviv/WalletScrutinyCom}"
 GH_WORKFLOW="bisq1-windows-build.yml"
 GH_WORKFLOW_REF="${GH_WORKFLOW_REF:-master}"
-GH_HELPER_IMAGE="bisq1-gh-helper"
+# Tag is content-versioned: bump it whenever the Dockerfile changes so a stale cached image is never
+# reused (:2 added p7zip-full + diffutils for the in-container A/B extraction diff — no host 7z needed).
+GH_HELPER_IMAGE="bisq1-gh-helper:2"
 GH_MOUNT_DIR=""
 
 build_gh_helper() {
-    log_info "Building gh helper container (debian:bookworm-slim + gh CLI)..."
+    log_info "Building gh helper container (debian:bookworm-slim + gh CLI + p7zip)..."
     docker build -t "$GH_HELPER_IMAGE" - <<'GHEOF'
 FROM debian:bookworm-slim
 RUN apt-get update -qq \
- && apt-get install -y --no-install-recommends curl ca-certificates gnupg jq unzip \
+ && apt-get install -y --no-install-recommends curl ca-certificates gnupg jq unzip p7zip-full diffutils \
  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
  && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
@@ -219,32 +221,53 @@ acquire_built_exes_via_ci() {
 }
 
 # Diagnostic-only extracted diff of two installer files -> outfile. VERDICT-NEUTRAL (never changes the
-# verdict). Used for both A-vs-B (build non-determinism) and official-vs-built. Full diff retained.
+# verdict). Runs 7z extraction + diff INSIDE the gh helper container (has p7zip + diffutils) so it does
+# NOT depend on a host 7z — only docker. Used for A-vs-B and official-vs-built. Full diff retained.
 diag_extract_diff() {
     local f1="$1" f2="$2" l1="$3" l2="$4" outfile="$5" detail="$6"
     rm -f "$outfile"
-    if ! command -v 7z >/dev/null 2>&1; then
-        echo "DIAGNOSTIC UNAVAILABLE: 7z not installed; $(basename "$outfile") skipped." >> "$detail"
+    # docker -v mount sources MUST be absolute (find can return relative paths under --built).
+    f1="$(realpath "$f1")"; f2="$(realpath "$f2")"
+    if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+        echo "DIAGNOSTIC UNAVAILABLE: docker not available; $(basename "$outfile") skipped." >> "$detail"
         return 0
     fi
-    local d1 d2 rc1=0 rc2=0; d1="$(mktemp -d)"; d2="$(mktemp -d)"
-    7z x -y -o"$d1" "$f1" >/dev/null 2>&1 || rc1=$?
-    7z x -y -o"$d2" "$f2" >/dev/null 2>&1 || rc2=$?
-    if [[ "$rc1" -ne 0 || "$rc2" -ne 0 ]]; then
-        echo "DIAGNOSTIC UNAVAILABLE: 7z extraction failed (${l1} rc=$rc1, ${l2} rc=$rc2); $(basename "$outfile") empty." \
+    docker image inspect "$GH_HELPER_IMAGE" >/dev/null 2>&1 || build_gh_helper \
+        || { echo "DIAGNOSTIC UNAVAILABLE: helper image unavailable; $(basename "$outfile") skipped." >> "$detail"; return 0; }
+
+    # Extract both files + diff inside the container; write full diff + a meta line to the mounted work dir.
+    local wd; wd="$(mktemp -d)"
+    local rc=0
+    docker run --rm --user "$(id -u):$(id -g)" \
+        -v "$f1":/in/f1:ro -v "$f2":/in/f2:ro -v "$wd":/work -w /work \
+        "$GH_HELPER_IMAGE" bash -c '
+            set +e
+            mkdir -p e1 e2
+            7z x -y -oe1 /in/f1 >/dev/null 2>&1; r1=$?
+            7z x -y -oe2 /in/f2 >/dev/null 2>&1; r2=$?
+            if [ "$r1" -ne 0 ] || [ "$r2" -ne 0 ]; then
+                echo "meta extract_failed r1=$r1 r2=$r2" > meta.txt; exit 0
+            fi
+            diff -r e1 e2 > diff.txt 2>&1; echo "meta diff_status=$?" > meta.txt
+        ' >/dev/null 2>&1 || rc=$?
+
+    if [[ "$rc" -ne 0 ]]; then
+        echo "DIAGNOSTIC UNAVAILABLE: container extraction errored (rc=$rc); $(basename "$outfile") skipped." >> "$detail"
+    elif grep -q 'extract_failed' "$wd/meta.txt" 2>/dev/null; then
+        echo "DIAGNOSTIC UNAVAILABLE: 7z extraction failed in container ($(cat "$wd/meta.txt" 2>/dev/null)); $(basename "$outfile") empty." \
             | tee "$outfile" >> "$detail"
     else
-        echo "=== DIAGNOSTIC ONLY (verdict-neutral): diff -r ${l1} vs ${l2} ===" > "$outfile"
-        local dstat=0
-        diff -r "$d1" "$d2" >> "$outfile" 2>&1 || dstat=$?
+        local dstat; dstat=$(sed -n 's/^meta diff_status=//p' "$wd/meta.txt" 2>/dev/null); dstat="${dstat:-9}"
+        { echo "=== DIAGNOSTIC ONLY (verdict-neutral): diff -r ${l1} vs ${l2} (diff status ${dstat}) ==="
+          cat "$wd/diff.txt" 2>/dev/null; } > "$outfile"
         if [[ "$dstat" -le 1 ]]; then
             echo "Diagnostic FULL diff -> $(basename "$outfile") (diff status ${dstat}; preview below)" >> "$detail"
             head -5 "$outfile" >> "$detail"
         else
-            echo "DIAGNOSTIC: diff errored (status ${dstat}); partial output in $(basename "$outfile")." >> "$detail"
+            echo "DIAGNOSTIC: diff errored (status ${dstat}); output in $(basename "$outfile")." >> "$detail"
         fi
     fi
-    rm -rf "$d1" "$d2"
+    rm -rf "$wd"
 }
 
 verify_windows_exe() {
