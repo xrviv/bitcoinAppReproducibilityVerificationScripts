@@ -1,32 +1,22 @@
 #!/bin/bash
-# gemwallet_build.sh v0.2.2 — Gem Wallet Android reproducible build verification
-# Organization: WalletScrutiny.com
-# App: com.gemwallet.android — https://github.com/gemwalletcom/wallet
-# License: MIT. No warranty. Security research use only.
-#
-# GPR token required: trustwallet/wallet-core is on maven.pkg.github.com only.
-# Pass --github-token <PAT> or set GITHUB_TOKEN env var (read:packages scope).
-#
-# R8 map-id caveat (AGP 9.2.x): diffs limited to classes*.dex and
-# assets/dexopt/baseline.prof may be caused by non-deterministic pg-map-id.
-# See android/reproducible/ in the gemwalletcom/wallet repo before concluding
-# not_reproducible. This script does not apply that patch.
-#
-# Input: --binary accepts a single split APK or a tar.gz of split APKs.
-# When a tar.gz is given all contained APKs are compared against their built
-# counterparts; base.apk is also used for version metadata.
+# gemwallet_build.sh v0.2.23 — Gem Wallet Android reproducible build verification
+# Organization: WalletScrutiny.com | App: com.gemwallet.android
+# Repo: https://github.com/gemwalletcom/wallet | License: MIT. No warranty.
+# --github-token optional; TrustWallet wallet-core GPR dependency remains.
+# R8 caveat: classes*.dex/baseline.prof diffs may be non-deterministic pg-map-id.
+# --binary: single split APK or tar.gz of all splits.
 
 set -euo pipefail
 
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
 readonly WORK_DIR_PREFIX="workdir"
-readonly SCRIPT_VERSION="v0.2.2"
+readonly SCRIPT_VERSION="v0.2.24"
 readonly SCRIPT_NAME="gemwallet_build.sh"
 readonly APP_ID="com.gemwallet.android"
 readonly REPO_URL="https://github.com/gemwalletcom/wallet.git"
 readonly WS_CONTAINER="docker.io/walletscrutiny/android:5"
-readonly GEMWALLET_BUILD_IMAGE="gemwallet_build_env:2"
+readonly GEMWALLET_BUILD_IMAGE="gemwallet_build_env:8"
 readonly BUNDLETOOL_VERSION="1.17.2"
 readonly EXIT_SUCCESS=0
 readonly EXIT_FAILED=1
@@ -52,8 +42,10 @@ OFFICIAL_BASE_APK=""
 BUILT_AAB=""
 GIT_TAG=""
 RESULT_DONE=false
-TOTAL_DIFFS=1
+TOTAL_DIFFS=0
 RESOURCES_ARSC_NOTES=""
+DEVICE_SPEC_INPUT=""
+DEVICE_SDK_INPUT=""
 
 log_info()  { echo "[INFO] $*"; }
 log_pass()  { echo "[PASS] $*"; }
@@ -73,16 +65,11 @@ write_yaml_outputs() {
 }
 
 generate_error_yaml() {
-    local status="$1" notes="${2:-}"
-    if [[ -n "${notes}" ]]; then
-        write_yaml_outputs "script_version: ${SCRIPT_VERSION}
+    local status="$1" notes="${2:-(no details)}"
+    write_yaml_outputs "script_version: ${SCRIPT_VERSION}
 verdict: ${status}
 notes: |
   ${notes}"
-    else
-        write_yaml_outputs "script_version: ${SCRIPT_VERSION}
-verdict: ${status}"
-    fi
 }
 
 generate_comparison_yaml() {
@@ -106,8 +93,7 @@ on_error() {
 cleanup_on_error() {
     local exit_code=$?
     if [[ "${exit_code}" -ne 0 && "${RESULT_DONE}" != "true" && -n "${WORK_DIR:-}" ]]; then
-        log_warn "Script failed with exit code: ${exit_code}"
-        log_warn "Work directory preserved: ${WORK_DIR}"
+        log_warn "Failed (${exit_code}); work dir preserved: ${WORK_DIR}"
         generate_error_yaml "ftbfs" || true
     fi
 }
@@ -129,12 +115,7 @@ detect_container_runtime() {
         CONTAINER_RUN_EXTRA="--user $(id -u):$(id -g)"
         log_info "Using docker"
     else
-        cat > "${EXEC_DIR}/COMPARISON_RESULTS.yaml" <<EOF
-script_version: ${SCRIPT_VERSION}
-verdict: ftbfs
-notes: |
-  Neither podman nor docker found on host.
-EOF
+        generate_error_yaml "ftbfs" "Neither podman nor docker found."
         echo "[ERROR] Neither podman nor docker is available."
         echo "Exit code: ${EXIT_FAILED}"
         exit "${EXIT_FAILED}"
@@ -188,7 +169,7 @@ container_aapt_version() {
             if apktool d -f -s -o "$tmpdir/out" "/apk/'"${apk_name}"'" >/dev/null 2>&1; then
                 case "'"${field}"'" in
                     versionName)
-                        sed -n "s/^[[:space:]]*versionName:[[:space:]]*//p" \
+                        sed -n "s/^[[:space:]]*versionName:[[:space:]]*'"'"'\([^'"'"']*\)'"'"'/\1/p" \
                             "$tmpdir/out/apktool.yml" | head -n1 ;;
                     versionCode)
                         sed -n "s/^[[:space:]]*versionCode:[[:space:]]*'"'"'\([^'"'"']*\)'"'"'/\1/p" \
@@ -225,13 +206,15 @@ Usage: ${SCRIPT_NAME} --binary <split.apk|splits.tar.gz> [OPTIONS]
 
 Required:
   --binary <file>       Official split APK or tar.gz of split APKs (alias: --apk)
-  --github-token <tok>  GitHub PAT (read:packages) — or set GITHUB_TOKEN env var
 
 Options:
   --version <ver>       App version (auto-detected from APK if omitted)
   --arch <abi>          Target ABI for bundletool (default: arm64-v8a)
   --type <type>         Accepted for ABS compatibility; unused
-  --github-user <user>  GPR username (default: walletscrutiny; or GITHUB_USER)
+  --device-sdk <api>   Device API level for bundletool (inferred from SDK splits or 32)
+  --device-spec <json>  Override bundletool device spec JSON; default: derived from splits
+  --github-token <tok>  GitHub PAT (read:packages) — optional for this monorepo
+  --github-user <user>  GPR username (default: walletscrutiny; or GITHUB_USER env)
   --tag <ref>           Override git tag resolution
   --cleanup             Remove work directory after completion
   --script-version      Print version and exit
@@ -241,65 +224,75 @@ Exit codes: 0=reproducible  1=not_reproducible/ftbfs  2=invalid params
 EOF
 }
 
+die_invalid() { generate_error_yaml "ftbfs" "$1"; RESULT_DONE=true; echo "[ERROR] $1"; echo "Exit code: ${EXIT_INVALID}"; exit "${EXIT_INVALID}"; }
+
+require_arg() {
+    local opt="$1" value="${2-}"
+    [[ -z "${value}" || "${value}" == --* ]] && die_invalid "${opt} requires a value" || true
+}
+
+handle_early_exit_args() {
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            --script-version) echo "${SCRIPT_NAME} ${SCRIPT_VERSION}"; exit "${EXIT_SUCCESS}" ;;
+            --help|-h) usage; exit "${EXIT_SUCCESS}" ;;
+        esac
+        shift
+    done
+}
+
 parse_arguments() {
     while [[ "$#" -gt 0 ]]; do
         case "$1" in
-            --version)    VERSION="${2:-}"; shift ;;
-            --apk|--binary) APK_INPUT="${2:-}"; shift ;;
-            --arch)       ARCH="${2:-}"; shift ;;
-            --type)       TYPE="${2:-}"; shift; log_warn "--type '${TYPE}' accepted but unused" ;;
-            --github-token) github_token="${2:-}"; shift ;;
-            --github-user)  github_user="${2:-}"; shift ;;
-            --tag)        REQUESTED_TAG="${2:-}"; shift ;;
-            --cleanup)    should_cleanup=true ;;
+            --version)      require_arg "$1" "${2-}"; VERSION="$2"; shift ;;
+            --apk|--binary) require_arg "$1" "${2-}"; APK_INPUT="$2"; shift ;;
+            --arch)         require_arg "$1" "${2-}"; ARCH="$2"; shift ;;
+            --type)         require_arg "$1" "${2-}"; TYPE="$2"; shift; log_warn "--type '${TYPE}' accepted but unused" ;;
+            --github-token) require_arg "$1" "${2-}"; github_token="$2"; shift ;;
+            --device-sdk)   require_arg "$1" "${2-}"; DEVICE_SDK_INPUT="$2"; shift ;;
+            --github-user)  require_arg "$1" "${2-}"; github_user="$2"; shift ;;
+            --device-spec)  require_arg "$1" "${2-}"; DEVICE_SPEC_INPUT="$2"; shift ;;
+            --tag)          require_arg "$1" "${2-}"; REQUESTED_TAG="$2"; shift ;;
+            --cleanup)      should_cleanup=true ;;
             --script-version) echo "${SCRIPT_NAME} ${SCRIPT_VERSION}"; exit "${EXIT_SUCCESS}" ;;
-            --help|-h)    usage; exit "${EXIT_SUCCESS}" ;;
-            *)            log_warn "Ignoring unknown argument: $1" ;;
+            --help|-h)      usage; exit "${EXIT_SUCCESS}" ;;
+            *)              log_warn "Ignoring unknown argument: $1" ;;
         esac
         shift
     done
 
-    if [[ "$(id -u)" -eq 0 ]]; then
-        echo "[ERROR] Do not run as root."; echo "Exit code: ${EXIT_INVALID}"
-        exit "${EXIT_INVALID}"
-    fi
+    [[ "$(id -u)" -eq 0 ]] && die_invalid "Do not run as root"
 
     [[ -z "${github_token}" && -n "${GITHUB_TOKEN:-}" ]] && github_token="${GITHUB_TOKEN}"
     [[ "${github_user}" == "walletscrutiny" && -n "${GITHUB_USER:-}" ]] && github_user="${GITHUB_USER}"
 
-    if [[ -z "${APK_INPUT}" ]]; then
-        echo "[ERROR] --binary <split.apk|splits.tar.gz> is required."
-        echo "Exit code: ${EXIT_INVALID}"; exit "${EXIT_INVALID}"
-    fi
-    if [[ ! -f "${APK_INPUT}" ]]; then
-        echo "[ERROR] --binary file not found: ${APK_INPUT}"
-        echo "Exit code: ${EXIT_INVALID}"; exit "${EXIT_INVALID}"
-    fi
+    [[ -z "${APK_INPUT}" ]] && die_invalid "--binary <split.apk|splits.tar.gz> is required"
+    [[ ! -f "${APK_INPUT}" ]] && die_invalid "--binary file not found: ${APK_INPUT}"
     [[ "${APK_INPUT}" != /* ]] && APK_INPUT="${EXEC_DIR}/${APK_INPUT}"
 
     ARCH="${ARCH:-arm64-v8a}"
     case "${ARCH}" in
+
         arm64-v8a|armeabi-v7a|x86_64|x86) ;;
         *) log_warn "Unrecognized arch '${ARCH}'; defaulting to arm64-v8a"; ARCH="arm64-v8a" ;;
     esac
 
     if [[ -z "${github_token}" ]]; then
-        cat > "${EXEC_DIR}/COMPARISON_RESULTS.yaml" <<EOF
-script_version: ${SCRIPT_VERSION}
-verdict: ftbfs
-notes: |
-  GitHub token not provided. Gem Wallet depends on trustwallet/wallet-core
-  from maven.pkg.github.com/trustwallet/wallet-core (private GitHub Package).
-  Pass --github-token <PAT> or set GITHUB_TOKEN (read:packages scope).
-EOF
-        RESULT_DONE=true
-        echo "[ERROR] GITHUB_TOKEN required."; echo "Exit code: ${EXIT_FAILED}"
-        exit "${EXIT_FAILED}"
+        log_warn "GITHUB_TOKEN not set; TrustWallet wallet-core GPR dependency remains — pass --github-token if Gradle fails."
     fi
 
     VERSION_SAFE="${VERSION:-provided}"
     ARCH_SAFE="${ARCH//-/_}"
     WORK_DIR="$(work_dir_path "${VERSION_SAFE}" "${ARCH_SAFE}")"
+
+    if [[ -n "${DEVICE_SPEC_INPUT}" ]]; then
+        [[ "${DEVICE_SPEC_INPUT}" != /* ]] && DEVICE_SPEC_INPUT="${EXEC_DIR}/${DEVICE_SPEC_INPUT}"
+        [[ ! -f "${DEVICE_SPEC_INPUT}" ]] && die_invalid "--device-spec file not found: ${DEVICE_SPEC_INPUT}"
+    fi
+    [[ -n "${DEVICE_SDK_INPUT}" && ! "${DEVICE_SDK_INPUT}" =~ ^[0-9]+$ ]] && die_invalid "--device-sdk must be an integer: ${DEVICE_SDK_INPUT}"
+    if [[ -n "${DEVICE_SPEC_INPUT}" && -n "${DEVICE_SDK_INPUT}" ]]; then
+        log_warn "--device-sdk ignored because --device-spec was provided"
+    fi
     log_info "Work directory: ${WORK_DIR}"
     log_info "Arch: ${ARCH}"
     log_info "APK input: ${APK_INPUT}"
@@ -318,16 +311,24 @@ USER root
 ENV DEBIAN_FRONTEND=noninteractive
 ENV ANDROID_HOME=/opt/android-sdk
 ENV ANDROID_SDK_ROOT=/opt/android-sdk
+ENV ANDROID_NDK_HOME=/opt/android-sdk/ndk/28.1.13356709
+ENV ANDROID_NDK_ROOT=/opt/android-sdk/ndk/28.1.13356709
 ENV PATH=${ANDROID_HOME}/cmdline-tools/bin:${ANDROID_HOME}/platform-tools:${PATH}
 RUN apt-get update -q && \
     apt-get install -y --no-install-recommends \
         git curl wget unzip ca-certificates python3 apktool \
+        build-essential \
     && rm -rf /var/lib/apt/lists/*
 RUN curl -fL \
-        "https://github.com/casey/just/releases/download/1.45.0/just-1.45.0-x86_64-unknown-linux-musl.tar.gz" \
+        "https://github.com/casey/just/releases/download/1.50.0/just-1.50.0-x86_64-unknown-linux-musl.tar.gz" \
         -o /tmp/just.tar.gz && \
     tar -xzf /tmp/just.tar.gz -C /tmp just && \
     mv /tmp/just /usr/local/bin/just && rm -f /tmp/just.tar.gz
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain 1.94.1 --no-modify-path
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+RUN cargo install cargo-ndk@4.1.2 --locked
 RUN mkdir -p "${ANDROID_HOME}" /root/.android && \
     curl -fL \
         "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" \
@@ -337,8 +338,15 @@ RUN yes | ${ANDROID_HOME}/cmdline-tools/bin/sdkmanager \
         --sdk_root=${ANDROID_HOME} --licenses > /dev/null 2>&1 && \
     ${ANDROID_HOME}/cmdline-tools/bin/sdkmanager \
         --sdk_root=${ANDROID_HOME} \
-        "platform-tools" "platforms;android-35" "platforms;android-37" \
-        "build-tools;35.0.0" "ndk;28.1.13356709"
+        "platform-tools" "platforms;android-35" \
+        "build-tools;35.0.0" "ndk;28.1.13356709" \
+        "cmdline-tools;latest"
+RUN yes | ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager \
+        --sdk_root=${ANDROID_HOME} --licenses > /dev/null 2>&1 && \
+    ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager \
+        --sdk_root=${ANDROID_HOME} --channel=3 \
+        "platforms;android-CinnamonBun" "build-tools;37.0.0" || \
+    { echo "[ERROR] platforms;android-CinnamonBun or build-tools;37.0.0 not available"; exit 1; }
 RUN wget -q \
         "https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar" \
         -O /usr/local/lib/bundletool.jar && \
@@ -352,28 +360,89 @@ DOCKERFILE_END
 }
 
 resolve_git_tag() {
-    local version="$1"
+    local version="$1" output
     log_info "Resolving git tag for ${version}..."
     for candidate in "${version}" "v${version}"; do
-        if ${CONTAINER_CMD} run --rm "${WS_CONTAINER}" \
-                git ls-remote --tags --exit-code "${REPO_URL}" \
-                "refs/tags/${candidate}" >/dev/null 2>&1; then
+        output=$(${CONTAINER_CMD} run --rm "${GEMWALLET_BUILD_IMAGE}" \
+            git ls-remote --tags --exit-code "${REPO_URL}" \
+            "refs/tags/${candidate}" 2>&1) && {
             log_info "Found tag: ${candidate}"
             GIT_TAG="${candidate}"; return 0
-        fi
+        }
     done
-    log_fail "No tag found for ${version}"; return 1
+    log_fail "No tag found for ${version}. Last resolver output:"
+    printf '%s\n' "${output}" >&2
+    return 1
 }
 
-create_device_spec() {
-    cat > "$1" <<EOF
+derive_device_spec() {
+    local spec_path="$1" arch="$2"
+    local splits_dir="${WORK_DIR}/official-split-apks"
+
+    local sdk_ver="${DEVICE_SDK_INPUT:-}"
+    if [[ -n "${sdk_ver}" ]]; then
+        log_info "Device spec: sdkVersion=${sdk_ver} (from --device-sdk)"
+    else
+        local sdk_split sdk_name
+        sdk_split="$(find "${splits_dir}" -name "split_config.sdk*.apk" 2>/dev/null | sort | head -1 || true)"
+        if [[ -n "${sdk_split}" ]]; then
+            sdk_name="${sdk_split##*/split_config.}"; sdk_name="${sdk_name%.apk}"
+            if [[ "${sdk_name}" =~ ^sdk[_-]?([0-9]+)$ ]]; then
+                sdk_ver="${BASH_REMATCH[1]}"
+                log_info "Device spec: sdkVersion=${sdk_ver} (from official SDK split ${sdk_name})"
+            fi
+        fi
+    fi
+    if [[ -z "${sdk_ver}" ]]; then
+        sdk_ver=32
+        log_warn "Device spec: sdkVersion not inferred — using default ${sdk_ver}; pass --device-sdk or --device-spec"
+    fi
+
+    local locales=()
+    while IFS= read -r f; do
+        local name="${f##*/split_config.}"; name="${name%.apk}"
+        [[ "${name}" =~ ^(arm64_v8a|armeabi_v7a|x86_64|x86)$ ]] && continue
+        [[ "${name}" =~ ^sdk[_-]?[0-9]+$ ]] && continue
+        [[ "${name}" =~ ^([0-9]+dpi|ldpi|mdpi|hdpi|xhdpi|xxhdpi|xxxhdpi|nodpi|tvdpi|anydpi)$ ]] && continue
+        locales+=("\"${name}\"")
+    done < <(find "${splits_dir}" -name "split_config.*.apk" 2>/dev/null | sort)
+    local locales_json
+    if [[ "${#locales[@]}" -gt 0 ]]; then
+        locales_json="$(printf '%s,' "${locales[@]}" | sed 's/,$//')"
+        log_info "Device spec: locales=[${locales_json}]"
+    else
+        locales_json='"en"'
+        log_warn "Device spec: no locale splits found — using [\"en\"]"
+    fi
+
+    local density=480
+    local density_split
+    density_split="$(find "${splits_dir}" -name "split_config.*dpi*.apk" 2>/dev/null | head -1 || true)"
+    if [[ -n "${density_split}" ]]; then
+        local dname="${density_split##*/split_config.}"; dname="${dname%.apk}"
+        case "${dname}" in
+            ldpi)    density=120 ;;
+            mdpi)    density=160 ;;
+            hdpi)    density=240 ;;
+            xhdpi)   density=320 ;;
+            xxhdpi)  density=480 ;;
+            xxxhdpi) density=640 ;;
+            *dpi)    local n="${dname%dpi}"; [[ "${n}" =~ ^[0-9]+$ ]] && density="${n}" || density=480 ;;
+        esac
+        log_info "Device spec: density=${density} (from ${dname})"
+    else
+        log_warn "Device spec: no density split — using default ${density}"
+    fi
+
+    cat > "${spec_path}" <<EOF
 {
-  "supportedAbis": ["$2"],
-  "supportedLocales": ["en"],
-  "screenDensity": 480,
-  "sdkVersion": 31
+  "supportedAbis": ["${arch}"],
+  "supportedLocales": [${locales_json}],
+  "screenDensity": ${density},
+  "sdkVersion": ${sdk_ver}
 }
 EOF
+    log_info "Device spec written: ${spec_path}"
 }
 
 extract_split_apks_from_aab() {
@@ -393,7 +462,10 @@ extract_split_apks_from_aab() {
                 --bundle='${aab_rel}' --output='${apks_rel}' \
                 --device-spec='${device_spec_rel}' --mode=default --overwrite 2>&1
             mkdir -p '${output_rel}'
-            unzip -qq -o '${apks_rel}' -d '${output_rel}' 2>&1 || true
+            if ! unzip -qq -o '${apks_rel}' -d '${output_rel}' 2>&1; then
+                echo 'ERROR: Failed to unzip bundletool output archive: ${apks_rel}' >&2
+                exit 1
+            fi
             chmod -R a+rwX '${output_rel}' 2>/dev/null || true
         "
     local splits_subdir="${output_dir}/splits"
@@ -407,6 +479,10 @@ extract_split_apks_from_aab() {
     done < <(find "${splits_subdir}" -maxdepth 1 -name "base-*.apk" 2>/dev/null || true)
     local split_count
     split_count="$(find "${output_dir}" -name "*.apk" 2>/dev/null | wc -l)"
+    if [[ "${split_count}" -eq 0 ]]; then
+        log_fail "bundletool extraction produced no split APKs"
+        exit "${EXIT_FAILED}"
+    fi
     log_info "Extracted ${split_count} split APK(s)"
 }
 
@@ -414,92 +490,214 @@ unzip_apk_in_container() {
     local apk_rel out_rel
     apk_rel="${1#"${WORK_DIR}/"}"
     out_rel="${2#"${WORK_DIR}/"}"
-    ws_exec "mkdir -p '${out_rel}' && unzip -qq '${apk_rel}' -d '${out_rel}' 2>/dev/null || true && chmod -R a+rwX '${out_rel}' 2>/dev/null || true"
+    ws_exec "mkdir -p '${out_rel}' && { unzip -qq '${apk_rel}' -d '${out_rel}' 2>/dev/null; rc=\$?; [ \$rc -le 1 ] || exit \$rc; }; chmod -R a+rwX '${out_rel}' 2>/dev/null || true"
+    local file_count
+    file_count="$(find "${WORK_DIR}/${out_rel}" -type f 2>/dev/null | wc -l)"
+    if [[ "${file_count}" -eq 0 ]]; then
+        log_fail "APK extraction produced no files: ${1}"
+        exit "${EXIT_FAILED}"
+    fi
+}
+
+# _semantic_verdict name off_sz built_sz diff_lines filtered_log ok_msg
+# Modifies caller's non_meta_count (bash scope). Returns: 0=filtered 1=empty 2=counted.
+_semantic_verdict() {
+    local _n="$1" _os="$2" _bs="$3" _dl="$4" _fl="$5" _ok="$6"
+    if [[ "${_os}" -eq 0 || "${_bs}" -eq 0 ]]; then
+        log_warn "  ${_n}: dump empty — counting conservatively"
+        echo "COUNTED [${_n} dump empty — conservative]: ${split_label}" >> "${_fl}"
+        non_meta_count=$(( non_meta_count + 1 ))
+        return 1
+    fi
+    if [[ "${_dl}" -eq 0 ]]; then
+        log_info "  ${_n}: ${_ok} — filter confirmed"
+        echo "FILTERED [${_ok} — ${_n}]: ${split_label}" >> "${_fl}"
+        return 0
+    fi
+    log_warn "  ${_n}: ${_dl}-line diff — real diff"
+    echo "COUNTED [${_n} ${_dl} semantic diff lines]: ${split_label}" >> "${_fl}"
+    non_meta_count=$(( non_meta_count + 1 ))
+    return 2
 }
 
 compare_split_apks() {
     local official_apk="$1" built_apk="$2" split_label="$3"
     local results_dir="${WORK_DIR}/comparison"
     mkdir -p "${results_dir}"
+    local off_apk_rel built_apk_rel
+    off_apk_rel="${official_apk#"${WORK_DIR}/"}"
+    built_apk_rel="${built_apk#"${WORK_DIR}/"}"
+    cat > "${results_dir}/play_strip.awk" << 'AWKEOF'
+BEGIN{s="normal"}
+/E: meta-data/{m=$0;s="got_meta";next}
+s=="got_meta"{if(/com\.android\.stamp\.|com\.android\.vending\.derived\./){s="skip_value"}else{print m;print;s="normal"};next}
+s=="skip_value"{s="normal";next}
+{s="normal";print}
+AWKEOF
     log_info "Comparing split: ${split_label}"
     local official_unzip="${results_dir}/official_${split_label}"
     local built_unzip="${results_dir}/built_${split_label}"
     local diff_file="${results_dir}/diff_${split_label}.txt"
+    local filtered_log="${results_dir}/filtered_${split_label}.txt"
     unzip_apk_in_container "${official_apk}" "${official_unzip}"
     unzip_apk_in_container "${built_apk}"    "${built_unzip}"
     local official_rel="${official_unzip#"${WORK_DIR}/"}"
     local built_rel="${built_unzip#"${WORK_DIR}/"}"
     local diff_rel="${diff_file#"${WORK_DIR}/"}"
-    ws_exec "diff -r '${official_rel}' '${built_rel}' > '${diff_rel}' 2>&1 || true"
+    ws_exec "diff -r '${official_rel}' '${built_rel}' > '${diff_rel}' 2>&1; rc=\$?; [ \$rc -le 1 ] || exit \$rc"
+
     local non_meta_count=0 total_lines=0
+    local manifest_filtered=false resources_arsc_found=false splits0_found=false
+    local so_off_paths=() so_built_paths=() so_names=()
+    > "${filtered_log}"
+
     if [[ -s "${diff_file}" ]]; then
         total_lines="$(wc -l < "${diff_file}")"
         while IFS= read -r _line; do
-            [[ "${_line}" =~ ^('Only in '|'Files ') ]] || continue
-            [[ "${_line}" =~ ^'Only in '[^/:]+': META-INF'$ ]] && continue
-            [[ "${_line}" =~ ^'Only in '[^/:]+'/META-INF:' ]] && continue
-            [[ "${_line}" =~ ^'Files '[^/]+'/META-INF/' ]] && continue
+            case "${_line}" in
+                *stamp-cert-sha256*)
+                    echo "FILTERED [stamp-cert-sha256 Play artifact]: ${_line}" >> "${filtered_log}"
+                    log_info "  Filtered: stamp-cert-sha256"
+                    continue ;;
+                'diff -r '*)
+                    [[ "${_line}" == *"/META-INF/"* ]] && continue
+                    ;;
+                'Only in '*)
+                    [[ "${_line}" == *": META-INF" ]] && continue
+                    [[ "${_line}" == *"/META-INF:"* ]] && continue
+                    [[ "${_line}" == *"/META-INF/"* ]] && continue
+                    ;;
+                'Files '*)
+                    [[ "${_line}" == *"/META-INF/"* ]] && continue
+                    ;;
+                'Binary files '*)
+                    [[ "${_line}" =~ '/META-INF/' ]] && continue
+                    if [[ "${_line}" =~ '/AndroidManifest.xml' ]]; then
+                        echo "DEFERRED [AndroidManifest.xml semantic check pending]: ${_line}" >> "${filtered_log}"
+                        log_info "  Deferred: AndroidManifest.xml (Play stamp + bundletool metadata)"
+                        manifest_filtered=true
+                        continue
+                    fi
+                    if [[ "${_line}" =~ '/res/xml/splits0.xml' ]]; then
+                        splits0_found=true
+                        continue
+                    fi
+                    if [[ "${_line}" =~ '/resources.arsc' ]]; then
+                        resources_arsc_found=true
+                        continue
+                    fi
+                    if [[ "${_line}" == *'.so and '* ]]; then
+                        local _off_so _built_so
+                        _off_so="$(echo "${_line}" | awk '{print $3}')"
+                        _built_so="$(echo "${_line}" | awk '{print $5}')"
+                        so_off_paths+=("${WORK_DIR}/${_off_so}")
+                        so_built_paths+=("${WORK_DIR}/${_built_so}")
+                        so_names+=("$(basename "${_off_so}")")
+                    fi
+                    ;;
+                *) continue ;;
+            esac
+            echo "COUNTED [raw diff]: ${_line}" >> "${filtered_log}"
             non_meta_count=$(( non_meta_count + 1 ))
         done < "${diff_file}"
     fi
-    # resources.arsc semantic check (WS policy §5.2.1)
-    if grep -q "resources.arsc" "${diff_file}" 2>/dev/null; then
-        log_info "  resources.arsc in diff — running apktool semantic check..."
-        local decoded_official="${results_dir}/decoded_official_${split_label}"
-        local decoded_built="${results_dir}/decoded_built_${split_label}"
-        local decoded_diff="${results_dir}/diff_resources_decoded_${split_label}.txt"
-        local off_rel built_rel dec_off_rel dec_built_rel dec_diff_rel
-        off_rel="${official_apk#"${WORK_DIR}/"}"
-        built_rel="${built_apk#"${WORK_DIR}/"}"
-        dec_off_rel="${decoded_official#"${WORK_DIR}/"}"
-        dec_built_rel="${decoded_built#"${WORK_DIR}/"}"
-        dec_diff_rel="${decoded_diff#"${WORK_DIR}/"}"
-        ws_exec "apktool d -f --no-src --no-debug-info '${off_rel}' \
-                     -o '${dec_off_rel}' 2>/dev/null && \
-                 apktool d -f --no-src --no-debug-info '${built_rel}' \
-                     -o '${dec_built_rel}' 2>/dev/null || true"
-        ws_exec "diff -r '${dec_off_rel}/res' '${dec_built_rel}/res' \
-                     > '${dec_diff_rel}' 2>/dev/null || true"
-        # Guard: if apktool failed to produce res/ dirs, do not trust empty diff
-        if [[ ! -d "${decoded_official}/res" || ! -d "${decoded_built}/res" ]]; then
-            log_warn "  resources.arsc: apktool decode failed — conservative, not excluded"
-            RESOURCES_ARSC_NOTES="${RESOURCES_ARSC_NOTES}${split_label}: resources.arsc apktool decode failed — treated as genuine diff. "
-        else
-        local decoded_content change_lines non_crashlytics
-        decoded_content="$(cat "${decoded_diff}" 2>/dev/null || true)"
-        if [[ -z "$(printf '%s' "${decoded_content}" | tr -d '\n\r')" ]]; then
-            log_info "  resources.arsc: decoded content IDENTICAL — non-semantic binary diff"
-            non_meta_count=$(( non_meta_count - 1 ))
-            [[ "${non_meta_count}" -lt 0 ]] && non_meta_count=0
-            RESOURCES_ARSC_NOTES="${RESOURCES_ARSC_NOTES}${split_label}: resources.arsc binary differs, decoded res/ identical. "
-        else
-            change_lines="$(printf '%s' "${decoded_content}" | grep -E '^[<>]' || true)"
-            non_crashlytics="$(printf '%s' "${change_lines}" \
-                | grep -v 'com.google.firebase.crashlytics.mapping_file_id' \
-                | tr -d '\n\r' || true)"
-            if [[ -n "${change_lines}" && -z "${non_crashlytics}" ]]; then
-                log_info "  resources.arsc: sole decoded diff is Crashlytics mapping_file_id — acceptable"
-                non_meta_count=$(( non_meta_count - 1 ))
-                [[ "${non_meta_count}" -lt 0 ]] && non_meta_count=0
-                RESOURCES_ARSC_NOTES="${RESOURCES_ARSC_NOTES}${split_label}: resources.arsc sole diff is Crashlytics mapping_file_id (acceptable). "
-            else
-                local dec_lines
-                dec_lines="$(wc -l < "${decoded_diff}" || echo 0)"
-                RESOURCES_ARSC_NOTES="${RESOURCES_ARSC_NOTES}${split_label}: resources.arsc decoded content DIFFERS (${dec_lines} lines — see $(basename "${decoded_diff}")). "
-            fi
+
+    if [[ "${resources_arsc_found}" == "true" ]]; then
+        log_info "  resources.arsc in diff — running aapt2 semantic check..."
+        local res_rel="${results_dir#"${WORK_DIR}/"}"
+        local aapt2_off_rel="${res_rel}/aapt2_off_${split_label}.txt"
+        local aapt2_built_rel="${res_rel}/aapt2_built_${split_label}.txt"
+        local aapt2_diff_rel="${res_rel}/aapt2_diff_resources_${split_label}.txt"
+        ws_exec "aapt2 dump resources '${off_apk_rel}' > '${aapt2_off_rel}' 2>/dev/null || aapt dump resources '${off_apk_rel}' > '${aapt2_off_rel}' 2>/dev/null || true"
+        ws_exec "aapt2 dump resources '${built_apk_rel}' > '${aapt2_built_rel}' 2>/dev/null || aapt dump resources '${built_apk_rel}' > '${aapt2_built_rel}' 2>/dev/null || true"
+        local aapt2_off_sz aapt2_built_sz aapt2_diff_lines=0
+        aapt2_off_sz="$(wc -c < "${WORK_DIR}/${aapt2_off_rel}" 2>/dev/null || echo 0)"
+        aapt2_built_sz="$(wc -c < "${WORK_DIR}/${aapt2_built_rel}" 2>/dev/null || echo 0)"
+        if [[ "${aapt2_off_sz}" -gt 0 && "${aapt2_built_sz}" -gt 0 ]]; then
+            ws_exec "diff '${aapt2_off_rel}' '${aapt2_built_rel}' > '${aapt2_diff_rel}' 2>/dev/null || true"
+            aapt2_diff_lines="$(wc -l < "${WORK_DIR}/${aapt2_diff_rel}" 2>/dev/null || echo 1)"
         fi
-        fi  # end apktool guard
+        local _rc=0
+        _semantic_verdict "resources.arsc" "${aapt2_off_sz}" "${aapt2_built_sz}" "${aapt2_diff_lines}" "${filtered_log}" "aapt2 semantic identical" || _rc=$?
+        case ${_rc} in
+            0) RESOURCES_ARSC_NOTES+="${split_label}: binary differs, aapt2 identical. " ;;
+            1) RESOURCES_ARSC_NOTES+="${split_label}: aapt2 dump empty; counted. " ;;
+            2) RESOURCES_ARSC_NOTES+="${split_label}: aapt2 diff ${aapt2_diff_lines} lines. " ;;
+        esac
     fi
 
+    if [[ "${splits0_found}" == "true" ]]; then
+        log_info "  res/xml/splits0.xml in diff — verifying locale alias canonicalization..."
+        local s0_rel="${results_dir#"${WORK_DIR}/"}"
+        local s0_off="${s0_rel}/splits0_off_${split_label}.txt"
+        local s0_built="${s0_rel}/splits0_built_${split_label}.txt"
+        local s0_norm_off="${s0_rel}/splits0_norm_off_${split_label}.txt"
+        local s0_norm_built="${s0_rel}/splits0_norm_built_${split_label}.txt"
+        local s0_diff="${s0_rel}/splits0_diff_${split_label}.txt"
+        ws_exec "
+            aapt dump xmltree '${off_apk_rel}' res/xml/splits0.xml > '${s0_off}' 2>/dev/null || true
+            aapt dump xmltree '${built_apk_rel}' res/xml/splits0.xml > '${s0_built}' 2>/dev/null || true
+            sed 's/config\.in/config.LOCALE_IN_ID/g; s/config\.id/config.LOCALE_IN_ID/g; s/config\.iw/config.LOCALE_IW_HE/g; s/config\.he/config.LOCALE_IW_HE/g' '${s0_off}' > '${s0_norm_off}' 2>/dev/null || true
+            sed 's/config\.in/config.LOCALE_IN_ID/g; s/config\.id/config.LOCALE_IN_ID/g; s/config\.iw/config.LOCALE_IW_HE/g; s/config\.he/config.LOCALE_IW_HE/g' '${s0_built}' > '${s0_norm_built}' 2>/dev/null || true
+            diff '${s0_norm_off}' '${s0_norm_built}' > '${s0_diff}' 2>/dev/null || true
+        "
+        local s0_off_sz s0_built_sz s0_diff_lines
+        s0_off_sz="$(wc -c < "${WORK_DIR}/${s0_off}" 2>/dev/null || echo 0)"
+        s0_built_sz="$(wc -c < "${WORK_DIR}/${s0_built}" 2>/dev/null || echo 0)"
+        s0_diff_lines="$(wc -l < "${WORK_DIR}/${s0_diff}" 2>/dev/null || echo 1)"
+        _semantic_verdict "splits0.xml" "${s0_off_sz}" "${s0_built_sz}" "${s0_diff_lines}" "${filtered_log}" "locale alias canonicalization (in→id, iw→he)" || true
+        log_info "  splits0.xml normalized diff: ${WORK_DIR}/${s0_diff}"
+    fi
+
+    if [[ "${manifest_filtered}" == "true" ]]; then
+        local mf_rel="${results_dir#"${WORK_DIR}/"}"
+        local awk_rel="${mf_rel}/play_strip.awk"
+        local xmltree_off_rel="${mf_rel}/xmltree_off_${split_label}.txt"
+        local xmltree_built_rel="${mf_rel}/xmltree_built_${split_label}.txt"
+        local xmltree_diff_rel="${mf_rel}/xmltree_diff_${split_label}.txt"
+        ws_exec "
+            aapt dump xmltree '${off_apk_rel}' AndroidManifest.xml 2>/dev/null | awk -f '${awk_rel}' > '${xmltree_off_rel}' || true
+            aapt dump xmltree '${built_apk_rel}' AndroidManifest.xml 2>/dev/null | awk -f '${awk_rel}' > '${xmltree_built_rel}' || true
+            diff '${xmltree_off_rel}' '${xmltree_built_rel}' > '${xmltree_diff_rel}' 2>/dev/null || true
+        "
+        local xmltree_off_sz xmltree_built_sz xmltree_diff_lines
+        xmltree_off_sz="$(wc -c < "${WORK_DIR}/${xmltree_off_rel}" 2>/dev/null || echo 0)"
+        xmltree_built_sz="$(wc -c < "${WORK_DIR}/${xmltree_built_rel}" 2>/dev/null || echo 0)"
+        xmltree_diff_lines="$(wc -l < "${WORK_DIR}/${xmltree_diff_rel}" 2>/dev/null || echo 1)"
+        _semantic_verdict "AndroidManifest.xml" "${xmltree_off_sz}" "${xmltree_built_sz}" "${xmltree_diff_lines}" "${filtered_log}" "Play stamp/bundletool metadata only" || true
+        log_info "  Manifest xmltree diff: ${WORK_DIR}/${xmltree_diff_rel}"
+    fi
+
+    local i
+    for i in "${!so_off_paths[@]}"; do
+        local off_so="${so_off_paths[$i]}" built_so="${so_built_paths[$i]}" so_name="${so_names[$i]}"
+        local elf_log="${results_dir}/elf_${so_name}_${split_label}.txt"
+        local elf_rel="${elf_log#"${WORK_DIR}/"}"
+        local off_so_rel="${off_so#"${WORK_DIR}/"}"
+        local built_so_rel="${built_so#"${WORK_DIR}/"}"
+        ws_exec "{
+            printf '=== ELF: %s (%s) ===\nofficial: %s\nbuilt:    %s\n\n-- sizes --\n' '${so_name}' '${split_label}' '${off_so_rel}' '${built_so_rel}'
+            wc -c '${off_so_rel}' '${built_so_rel}' 2>&1 || true
+            printf '\n-- readelf sections official --\n'; readelf --wide --sections '${off_so_rel}' 2>&1 || true
+            printf '\n-- readelf sections built --\n'; readelf --wide --sections '${built_so_rel}' 2>&1 || true
+            printf '\n-- nm -D official --\n'; nm -D '${off_so_rel}' 2>/dev/null | awk '{print \$2, \$3}' | sort || true
+            printf '\n-- nm -D built --\n'; nm -D '${built_so_rel}' 2>/dev/null | awk '{print \$2, \$3}' | sort || true
+        } > '${elf_rel}' 2>&1"
+        log_info "  ELF analysis: ${elf_log}"
+    done
+
     TOTAL_DIFFS=$(( TOTAL_DIFFS + non_meta_count ))
-    log_info "  ${split_label}: ${non_meta_count} non-META-INF diff(s) (${total_lines} total lines)"
+    log_info "  ${split_label}: ${non_meta_count} counted diff(s) of ${total_lines} raw lines"
     if [[ -s "${diff_file}" ]]; then
-        log_info "  First 5 lines (full diff: ${diff_file}):"
+        log_info "  First 5 lines of raw diff (full: ${diff_file}):"
         head -5 "${diff_file}" | while IFS= read -r line; do echo "    ${line}"; done
-        [[ "${total_lines}" -gt 5 ]] && log_info "    ... (${total_lines} total)"
+        if [[ "${total_lines}" -gt 5 ]]; then
+            log_info "    ... (${total_lines} total)"
+        fi
     else
         log_pass "  ${split_label}: no differences"
     fi
+    return 0
 }
 
 print_results_block() {
@@ -520,6 +718,7 @@ print_results_block() {
     echo "apkVersionName: ${version_name:-${VERSION_SAFE}}"
     echo "apkVersionCode: ${version_code:-unknown}"
     echo "verdict:        ${verdict}"
+    echo "counted diffs:  ${TOTAL_DIFFS}"
     echo "appHash:        ${app_hash:-unknown}"
     echo "commit:         ${commit:-unknown}"
     echo ""
@@ -528,17 +727,31 @@ print_results_block() {
     if [[ -d "${results_dir}" ]]; then
         for diff_file in "${results_dir}"/diff_*.txt; do
             [[ -f "${diff_file}" ]] || continue
-            local split_label total_lines
-            split_label="$(basename "${diff_file}" .txt)"
+            local split_label apk_label total_lines
+            split_label="$(basename "${diff_file}" .txt)"; apk_label="${split_label#diff_}.apk"
             if [[ -s "${diff_file}" ]]; then
                 total_lines="$(wc -l < "${diff_file}")"
-                echo "  ${split_label}: ${total_lines} line(s) — ${diff_file}"
+                echo ""; echo "diffs on ${apk_label} (${total_lines} raw line(s))"; echo "  raw: ${diff_file}"
+                awk '
+                    function rel(p){sub(/^.*\/(official|built)_[^\/]+\/?/,"",p);return p}
+                    /META-INF|stamp-cert-sha256/{next}
+                    /^Missing built split: /{sub(/^Missing built split: /,"");print "  - "$0" missing from built APKs";next}
+                    /^Only in /{s=$0;sub(/^Only in /,"",s);split(s,a,": ");p=rel(a[1]);f=(p?p"/":"")a[2];side=(a[1]~/official_/ ? "official" : "built");print "  - "f" only in "side" APK";next}
+                    /^Binary files /{s=$0;sub(/^Binary files /,"",s);sub(/ and .*/,"",s);print "  - "rel(s)" differs";next}
+                    /^Files /{s=$0;sub(/^Files /,"",s);sub(/ and .*/,"",s);print "  - "rel(s)" differs";next}
+                    /^diff -r /{s=$3;print "  - "rel(s)" differs";next}
+                ' "${diff_file}" | head -12
             else
-                echo "  ${split_label}: no differences"
+                echo ""; echo "diffs on ${apk_label}"; echo "  raw: ${diff_file}"; echo "  - no differences"
             fi
             shown=$(( shown + 1 ))
         done
     fi
+    echo ""
+    echo "Analysis files (comparison/):"
+    local af=0
+    while IFS= read -r _f; do echo "  $(basename "${_f}")"; af=1; done < <(find "${results_dir}" -maxdepth 1 -name "*.txt" ! -name "diff_*.txt" 2>/dev/null | sort)
+    [[ "${af}" -eq 0 ]] && echo "  (none)"
     [[ "${shown}" -eq 0 ]] && echo "  (no diff files found)"
     echo ""
     echo "Revision, tag (and its signature):"
@@ -550,8 +763,15 @@ print_results_block() {
         echo "Diff files:     ${WORK_DIR}/comparison/"
         echo ""
         echo "For deeper analysis:"
-        echo "  diffoscope '${WORK_DIR}/official-split-apks/$(basename "${OFFICIAL_APK:-base.apk}")' \\"
-        echo "             '${WORK_DIR}/built-split-apks/splits/$(basename "${OFFICIAL_APK:-base.apk}")'"
+        local official_diff_apk built_diff_apk built_splits_dir
+        official_diff_apk="${OFFICIAL_APK:-${OFFICIAL_BASE_APK:-${WORK_DIR}/official-split-apks/base.apk}}"
+        built_splits_dir="${WORK_DIR}/built-split-apks/splits"
+        if built_diff_apk="$(resolve_built_split_apk "${official_diff_apk}" "${built_splits_dir}" 2>/dev/null)"; then
+            echo "  diffoscope '${official_diff_apk}' \\"
+            echo "             '${built_diff_apk}'"
+        else
+            echo "  (built split not resolved; see ${WORK_DIR}/built-split-apks/)"
+        fi
     fi
 }
 
@@ -562,7 +782,6 @@ prepare() {
     mkdir -p "${WORK_DIR}/official-split-apks" "${WORK_DIR}/built-output"
     chmod 777 "${WORK_DIR}/built-output"
 
-    # Detect tar.gz by magic bytes (1f 8b) so extension doesn't matter
     local magic
     magic="$(od -An -N2 -tx1 "${APK_INPUT}" 2>/dev/null | tr -d ' \n')"
     if [[ "${magic}" == "1f8b" ]]; then
@@ -602,9 +821,25 @@ prepare() {
         OFFICIAL_BASE_APK="${OFFICIAL_APK}"
     fi
 
+    local detected_pkg base_apk_name
+    base_apk_name="$(basename "${OFFICIAL_BASE_APK}")"
+    detected_pkg="$(${CONTAINER_CMD} run --rm \
+        -v "$(dirname "${OFFICIAL_BASE_APK}"):/apk${VOLUME_RO}" \
+        "${WS_CONTAINER}" \
+        sh -c "aapt dump badging \"/apk/${base_apk_name}\" 2>/dev/null | grep '^package:' | sed \"s/.*name='\\([^']*\\)'.*/\\1/\" | head -n1" \
+        2>/dev/null || true)"
+    if [[ -n "${detected_pkg}" && "${detected_pkg}" != "${APP_ID}" ]]; then
+        generate_error_yaml "ftbfs" \
+            "Package name mismatch: APK contains '${detected_pkg}', expected '${APP_ID}'."
+        RESULT_DONE=true; echo "Exit code: ${EXIT_INVALID}"; exit "${EXIT_INVALID}"
+    fi
+    [[ -z "${detected_pkg}" ]] && log_warn "Could not verify APK package name (aapt returned empty)"
+
     if [[ -z "${VERSION}" ]]; then
         log_info "Auto-detecting version from APK metadata..."
         VERSION="$(container_aapt_version "${OFFICIAL_BASE_APK}" "versionName" || true)"
+        VERSION="${VERSION//\'/}"
+        VERSION="${VERSION//\"/}"
         if [[ -z "${VERSION}" || "${VERSION}" == "null" ]]; then
             generate_error_yaml "ftbfs" \
                 "Could not auto-detect versionName. Pass --version explicitly."
@@ -615,7 +850,11 @@ prepare() {
         local new_work_dir
         new_work_dir="$(work_dir_path "${VERSION_SAFE}" "${ARCH_SAFE}")"
         if [[ "${new_work_dir}" != "${WORK_DIR}" ]]; then
-            rm -rf "${new_work_dir}"
+            if [[ -d "${new_work_dir}" ]]; then
+                rm -rf "${new_work_dir}" 2>/dev/null || \
+                    "${CONTAINER_CMD}" unshare rm -rf "${new_work_dir}" 2>/dev/null || \
+                    { log_warn "Cannot remove ${new_work_dir} (root-owned files). Remove manually: podman unshare rm -rf ${new_work_dir}"; exit "${EXIT_FAILED}"; }
+            fi
             mv "${WORK_DIR}" "${new_work_dir}"
             WORK_DIR="${new_work_dir}"
             OFFICIAL_APK="${WORK_DIR}/official-split-apks/$(basename "${OFFICIAL_APK}")"
@@ -624,7 +863,12 @@ prepare() {
         fi
     fi
 
-    create_device_spec "${WORK_DIR}/device-spec.json" "${ARCH}"
+    if [[ -n "${DEVICE_SPEC_INPUT}" ]]; then
+        cp "${DEVICE_SPEC_INPUT}" "${WORK_DIR}/device-spec.json"
+        log_info "Device spec: using provided ${DEVICE_SPEC_INPUT}"
+    else
+        derive_device_spec "${WORK_DIR}/device-spec.json" "${ARCH}"
+    fi
     log_pass "Preparation complete: ${WORK_DIR}"
 }
 
@@ -656,6 +900,7 @@ build() {
         -e "ANDROID_SDK_ROOT=/opt/android-sdk" \
         "${GEMWALLET_BUILD_IMAGE}" \
         bash -c "set -euo pipefail
+            trap 'chmod -R a+rwX /workspace 2>/dev/null || true' EXIT
             git clone --depth 1 --recursive --branch '${GIT_TAG}' '${REPO_URL}' /workspace/app
             cd /workspace/app
             git rev-parse HEAD > /workspace/commit.txt
@@ -677,7 +922,7 @@ build() {
             SKIP_SIGN=true ./gradlew :app:bundleGoogleRelease \
                 --no-daemon --stacktrace -Dorg.gradle.workers.max=4
             chmod -R a+rwX /workspace 2>/dev/null || true
-        "
+        " 2>&1 | tee "${WORK_DIR}/build.log"
     chmod -R a+rwX "${WORK_DIR}" 2>/dev/null || true
     local aab_path
     aab_path="$(find "${WORK_DIR}/built-output/app/android" \
@@ -693,29 +938,33 @@ build() {
 }
 
 extract_and_compare() {
-    log_info "=== EXTRACT AND COMPARE ==="
-    TOTAL_DIFFS=0
-    local built_splits_dir="${WORK_DIR}/built-split-apks"
-    extract_split_apks_from_aab \
-        "${BUILT_AAB}" "${WORK_DIR}/device-spec.json" "${built_splits_dir}"
-    local compared=0
+    log_info "=== EXTRACT AND COMPARE ==="; TOTAL_DIFFS=0
+    local built_splits_dir="${WORK_DIR}/built-split-apks" compared=0
+    extract_split_apks_from_aab "${BUILT_AAB}" "${WORK_DIR}/device-spec.json" "${built_splits_dir}"
+    local sha256_log="${WORK_DIR}/comparison/sha256_splits.txt"
+    mkdir -p "${WORK_DIR}/comparison"
+    printf '%-8s  %-64s  %s\n%s\n' "side" "sha256" "file" "$(printf '%0.s-' {1..80})" > "${sha256_log}"
     while IFS= read -r official_apk; do
-        local split_label built_split
+        local split_label built_split off_hash built_hash
         split_label="$(basename "${official_apk}" .apk)"
         if ! built_split="$(resolve_built_split_apk "${official_apk}" "${built_splits_dir}/splits")"; then
             log_warn "No matching built split for: $(basename "${official_apk}") — counting as diff"
             TOTAL_DIFFS=$(( TOTAL_DIFFS + 1 ))
+            printf 'Missing built split: %s\n' "$(basename "${official_apk}")" > "${WORK_DIR}/comparison/diff_${split_label}.txt"
+            printf '%-8s  %-64s  %s\n' "MISSING" "(no built counterpart)" "$(basename "${official_apk}")" >> "${sha256_log}"
             continue
         fi
-        log_info "Official: $(basename "${official_apk}")"
-        log_info "Built:    $(basename "${built_split}")"
+        off_hash="$(sha256sum "${official_apk}" | awk '{print $1}')"
+        built_hash="$(sha256sum "${built_split}"  | awk '{print $1}')"
+        printf '%-8s  %s  %s\n%-8s  %s  %s\n' "official" "${off_hash}" "$(basename "${official_apk}")" "built" "${built_hash}" "$(basename "${built_split}")" >> "${sha256_log}"
+        [[ "${off_hash}" == "${built_hash}" ]] && printf '          ^^^ IDENTICAL\n\n' >> "${sha256_log}" || printf '          ^^^ DIFFER\n\n' >> "${sha256_log}"
+        log_info "Official: $(basename "${official_apk}") [${off_hash:0:12}...]"
+        log_info "Built:    $(basename "${built_split}") [${built_hash:0:12}...]"
         compare_split_apks "${official_apk}" "${built_split}" "${split_label}"
         compared=$(( compared + 1 ))
     done < <(find "${WORK_DIR}/official-split-apks" -name "*.apk" | sort)
-    if [[ "${compared}" -eq 0 ]]; then
-        log_fail "No splits were compared"
-        exit "${EXIT_FAILED}"
-    fi
+    [[ "${compared}" -eq 0 ]] && { log_fail "No splits were compared"; exit "${EXIT_FAILED}"; }
+    log_info "SHA256 log: ${sha256_log}"
 }
 
 result() {
@@ -728,12 +977,10 @@ result() {
         log_warn "VERDICT: NOT REPRODUCIBLE (${TOTAL_DIFFS} non-META-INF difference(s))"
     fi
     local notes
-    notes="Splits compared vs built AAB (tag: ${GIT_TAG}).
-  Build: SKIP_SIGN=true ./gradlew :app:bundleGoogleRelease --no-daemon.
+    notes="Splits vs AAB (tag: ${GIT_TAG}). SKIP_SIGN=true gradlew :app:bundleGoogleRelease.
   Non-META-INF diffs: ${TOTAL_DIFFS}.
-  AGP 9.2.x R8 caveat: diffs in classes*.dex/baseline.prof may be pg-map-id
-  non-determinism — see android/reproducible/ in gemwalletcom/wallet before
-  concluding not_reproducible. GPR token required (trustwallet/wallet-core on GPR only)."
+  R8 caveat: classes*.dex/baseline.prof diffs may be non-deterministic pg-map-id.
+  --github-token optional; wallet-core GPR dep removed in monorepo migration."
     [[ -n "${RESOURCES_ARSC_NOTES}" ]] && notes="${notes}
   resources.arsc: ${RESOURCES_ARSC_NOTES}"
     [[ "${verdict}" == "not_reproducible" ]] && notes="${notes}
@@ -754,6 +1001,7 @@ result() {
 main() {
     log_info "Starting ${SCRIPT_NAME} ${SCRIPT_VERSION}"
     log_warn "Provided as-is. Review before running."
+    handle_early_exit_args "$@"
     detect_container_runtime
     parse_arguments "$@"
     prepare
