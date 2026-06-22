@@ -2,9 +2,9 @@
 # ==============================================================================
 # bisq1desktop_build.sh - Bisq 1 Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.5.0
+# Version:       v0.6.0
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-06-20
+# Last Modified: 2026-06-22
 # Project:       https://github.com/bisq-network/bisq
 # ==============================================================================
 # LICENSE: MIT License
@@ -13,7 +13,7 @@
 # Maintain changelog in separate file: ~/work/ws-notes/script-notes/desktop/bisq1/changelog.md
 # ==============================================================================
 #
-# SCRIPT SUMMARY (v0.5.0 - Bisq 1.10.0+ toolchain):
+# SCRIPT SUMMARY (v0.6.0 - Bisq 1.10.0+ toolchain; deb/rpm self-build + Windows EXE comparison):
 #   Drives Bisq's first-party reproducible-build framework per docs/reproducible-builds/linux.md:
 #     1. Clone the release tag TWICE on the host (clean A and B checkouts) + init submodules (required).
 #     2. Build the pinned release-builder image FROM the cloned repo's own
@@ -32,11 +32,21 @@
 #
 # SCOPE: 1.10.x toolchain only. The pre-1.10 JDK 11/17 script is retained for reference as
 #   bisq1desktop_build.sh.v0.3.5.bak (legacy multi-field YAML + missing-`v` tag bug; not ABS-current).
+#
+# WINDOWS EXE (v0.6.0, --type exe --arch x86_64-windows): FULLY ISOLATED from deb/rpm. The Windows
+#   installer is jpackage+WiX and CANNOT be built on this Linux host (no cross-build, no
+#   docker/release-builder/windows/). It is built on a Windows runner by the GitHub Actions workflow
+#   walletScrutinyCom/.github/workflows/bisq1-windows-build.yml (windows-2025, Zulu 21.0.6, pinned WiX
+#   v3, A/B isolated worktrees, uploads both EXEs). This script's exe path is COMPARISON-ONLY: it takes
+#   the two built EXEs (--built <dir>) + the official EXE and applies the same mechanical outer-sha256
+#   verdict (A==B && A==official). Extraction diff is diagnostic-only. The exe branch returns before any
+#   docker/release-builder code runs, so deb/rpm logic is never touched.
+#   Findings: ws-notes/build-notes/desktop/bisq/bisq1_v1.10.0-exe-findings-2026-06-22.md
 # ==============================================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.5.0"
+SCRIPT_VERSION="v0.6.0"
 SCRIPT_NAME="bisq1desktop_build.sh"
 APP_NAME="Bisq 1"
 APP_ID="bisq1"
@@ -51,6 +61,7 @@ BISQ_VERSION=""
 BISQ_ARCH=""
 BISQ_TYPE=""
 OFFICIAL_BINARY=""
+BUILT_DIR=""
 NO_CACHE=false
 KEEP_CONTAINER=false
 
@@ -99,6 +110,127 @@ write_yaml() {  # out verdict notes
     fi
 }
 
+# ============================================================================
+# WINDOWS EXE PATH (fully isolated; never enters the deb/rpm docker logic).
+# Build happens on a Windows runner via walletScrutinyCom/.github/workflows/
+# bisq1-windows-build.yml. This function is COMPARISON-ONLY.
+# ============================================================================
+verify_windows_exe() {
+    local execution_dir; execution_dir="$(pwd)"
+    local yaml="${execution_dir}/COMPARISON_RESULTS.yaml"
+    local detail="${execution_dir}/comparison-detail.txt"
+    local ver="${BISQ_VERSION#v}"
+    local official_name="Bisq-64bit-${ver}.exe"
+
+    # --built is required for the exe path (the build is the CI workflow, not this host).
+    if [[ -z "$BUILT_DIR" ]]; then
+        log_error "--type exe requires --built <dir> with the two EXEs from bisq1-windows-build.yml (A and B)."
+        log_error "Run the workflow (windows-2025, Zulu 21.0.6, pinned WiX), download both"
+        log_error "'bisq1-${ver}-win-exe-A' and '-B' artifacts into a dir, then re-run with --built <dir>."
+        die "--type exe requires --built <dir>" "$EXIT_INVALID_PARAMS"
+    fi
+    [[ -d "$BUILT_DIR" ]] || die "--built dir not found: $BUILT_DIR" "$EXIT_INVALID_PARAMS"
+
+    # Acquire the official EXE (use --binary if given, else download from the GitHub release).
+    local official="$OFFICIAL_BINARY"
+    if [[ -z "$official" ]]; then
+        official="${execution_dir}/${official_name}"
+        log_info "Downloading official ${official_name} ..."
+        curl -fL --progress-bar -o "$official" \
+            "${REPO_URL}/releases/download/${BISQ_VERSION}/${official_name}" \
+            || { write_yaml "$yaml" "ftbfs" "Failed to download official ${official_name}."; die "download failed"; }
+    fi
+    [[ -f "$official" ]] || die "official EXE not found: $official" "$EXIT_INVALID_PARAMS"
+
+    # Collect the two built EXEs. MUST be version-specific (Bisq-64bit-<ver>.exe) so a stale/wrong
+    # version artifact can never be mistaken for this run (order-independent: we require A==B and A==official).
+    mapfile -t built < <(find "$BUILT_DIR" -type f -name "${official_name}" | sort)
+    if [[ "${#built[@]}" -ne 2 ]]; then
+        write_yaml "$yaml" "ftbfs" \
+"Expected exactly 2 built '${official_name}' files (A and B) under --built, found ${#built[@]}.
+Each must come from a DISTINCT artifact dir. Download both 'bisq1-${ver}-win-exe-A' and '-B' from
+bisq1-windows-build.yml (which builds for version ${ver} only)."
+        die "need exactly 2 '${official_name}' under --built (found ${#built[@]})" "$EXIT_INVALID_PARAMS"
+    fi
+    # Reject the degenerate case of both entries being the SAME underlying file (no real A/B isolation).
+    # Compare device:inode so hardlinks (distinct paths, distinct realpaths, same inode) are caught too.
+    if [[ "$(stat -c '%d:%i' "${built[0]}")" == "$(stat -c '%d:%i' "${built[1]}")" ]]; then
+        die "the two built EXEs are the same underlying file (same device:inode / hardlink); A and B must be distinct artifacts" "$EXIT_INVALID_PARAMS"
+    fi
+
+    local hO hA hB
+    hO=$(sha256sum "$official"     | cut -d' ' -f1)
+    hA=$(sha256sum "${built[0]}"   | cut -d' ' -f1)
+    hB=$(sha256sum "${built[1]}"   | cut -d' ' -f1)
+
+    {
+        echo "=== Bisq 1 ${BISQ_VERSION} Windows EXE comparison (${SCRIPT_VERSION}) ==="
+        echo "official : $official"
+        echo "  sha256 : $hO"
+        echo "built A  : ${built[0]}"
+        echo "  sha256 : $hA"
+        echo "built B  : ${built[1]}"
+        echo "  sha256 : $hB"
+        echo
+        echo "Build provenance: built on a Windows runner via bisq1-windows-build.yml (jpackage+WiX)."
+        echo "EXPECTED DIFFERENCE (primary): the official EXE bundles Azul OpenJDK 21.0.11, while the"
+        echo "  repo (gradle.properties) pins 21.0.6 and the build fails on a mismatch, so the rebuilt"
+        echo "  EXE bundles a 21.0.6 JRE -> genuine payload difference vs official. Same root cause as"
+        echo "  the deb/rpm not_reproducible verdict (2026-06-20)."
+        echo "KNOWN LIMITATION (secondary): installer embeds 'Copyright 2013-<build year>'"
+        echo "  (PackageFactory.kt:70, Year.now(), not SOURCE_DATE_EPOCH). Official embeds 2013-2026, so"
+        echo "  a rebuild outside 2026 adds a copyright-year difference on top. Diagnostic, not a verdict override."
+    } > "$detail"
+
+    local verdict notes
+    if [[ "$hA" != "$hB" ]]; then
+        verdict="not_reproducible"
+        notes="Windows EXE non-deterministic: build A != build B (A=$hA B=$hB). See comparison-detail.txt."
+    elif [[ "$hA" != "$hO" ]]; then
+        verdict="not_reproducible"
+        notes="Windows EXE differs from official (built=$hA official=$hO). Outer-sha256 mechanical verdict; extracted diff is diagnostic-only. See comparison-detail.txt / diff_exe.txt."
+    else
+        verdict="reproducible"
+        notes="Windows EXE reproducible: A==B==official ($hO)."
+    fi
+
+    # Diagnostic-only extracted comparison (NEVER changes the mechanical verdict).
+    if [[ "$verdict" == "not_reproducible" && "$hA" == "$hB" ]]; then
+        if command -v 7z >/dev/null 2>&1; then
+            local od bd; od="$(mktemp -d)"; bd="$(mktemp -d)"
+            local rcO=0 rcB=0
+            7z x -y -o"$od" "$official"   >/dev/null 2>&1 || rcO=$?
+            7z x -y -o"$bd" "${built[0]}" >/dev/null 2>&1 || rcB=$?
+            if [[ "$rcO" -ne 0 || "$rcB" -ne 0 ]]; then
+                echo "DIAGNOSTIC UNAVAILABLE: 7z extraction failed (official rc=$rcO, built rc=$rcB); no payload diff produced." \
+                    | tee "${execution_dir}/diff_exe.txt" >> "$detail"
+            else
+                # diff exit: 0=identical, 1=differences (NORMAL — expected for the 21.0.6/21.0.11 payloads),
+                # >1=actual error. Capture status without aborting under set -e (|| guard); write to a raw
+                # file first to avoid a pipefail abort from `diff | head`.
+                local draw="${execution_dir}/diff_exe.raw" dstat=0
+                diff -r "$od" "$bd" > "$draw" 2>&1 || dstat=$?
+                if [[ "$dstat" -le 1 ]]; then
+                    { echo "=== DIAGNOSTIC ONLY (does not affect verdict): diff -r official vs built (status ${dstat}) ==="
+                      head -2000 "$draw"; } > "${execution_dir}/diff_exe.txt"
+                    echo "Diagnostic extracted diff -> diff_exe.txt (diff status ${dstat}, diagnostic-only)" >> "$detail"
+                else
+                    echo "DIAGNOSTIC UNAVAILABLE: diff errored (status ${dstat})." | tee "${execution_dir}/diff_exe.txt" >> "$detail"
+                fi
+                rm -f "$draw"
+            fi
+            rm -rf "$od" "$bd"
+        else
+            echo "DIAGNOSTIC UNAVAILABLE: 7z not installed; extracted diff skipped." >> "$detail"
+        fi
+    fi
+
+    write_yaml "$yaml" "$verdict" "$notes"
+    cat "$detail"
+    log_info "Wrote ${yaml} (verdict: ${verdict})"
+    [[ "$verdict" == "reproducible" ]] && return "$EXIT_SUCCESS" || return "$EXIT_BUILD_FAILED"
+}
+
 usage() {
     cat << EOF
 Bisq 1 Desktop Reproducible Build Verification Script (${SCRIPT_VERSION}, Bisq 1.10.0+ toolchain)
@@ -108,16 +240,24 @@ Usage:
 
 Parameters:
   --version <version>    Bisq version (e.g., 1.10.0). Default: ${DEFAULT_VERSION}
-  --arch <arch>          x86_64-linux | x86_64-linux-gnu
-  --type <type>          deb | rpm
+  --arch <arch>          x86_64-linux | x86_64-linux-gnu (deb/rpm) | x86_64-windows (exe)
+  --type <type>          deb | rpm | exe
   --binary <file|dir>    Use this local official installer (file, or dir containing it).
   --apk <file|dir>       Alias for --binary.
-  --no-cache             Force fresh Docker image build.
-  --keep-container       Keep build/compare containers afterwards (for inspection).
+  --built <dir>          (exe only) Dir with the TWO built EXEs (A and B) from
+                         bisq1-windows-build.yml. Required for --type exe.
+  --no-cache             Force fresh Docker image build (deb/rpm only).
+  --keep-container       Keep build/compare containers afterwards (deb/rpm only).
   --help                 Show this help.
 
-Builds the release tag TWICE (A/B determinism, always-on). Verdict is MECHANICAL on the outer-file
-sha256. Full dpkg-deb -R evidence (payload vs packaging split) is written for human classification.
+deb/rpm: builds the release tag TWICE on this host (A/B determinism, always-on) in the pinned
+  release-builder container. Verdict is MECHANICAL on the outer-file sha256. Full dpkg-deb -R evidence
+  (payload vs packaging split) is written for human classification.
+exe (x86_64-windows): the Windows installer (jpackage+WiX) CANNOT be built on Linux. It is built on a
+  Windows runner by walletScrutinyCom/.github/workflows/bisq1-windows-build.yml (windows-2025, Zulu
+  21.0.6, pinned WiX v3, A/B isolated). This script's exe path is COMPARISON-ONLY: supply the two built
+  EXEs via --built; verdict is mechanical (A==B && A==official by sha256); extracted diff is diagnostic.
+  NOTE: installer embeds the build year (Year.now()), so verify v1.10.0 within 2026 (official=2026).
 
 Output:
   - Exit 0: reproducible | Exit 1: differs/failed | Exit 2: invalid params
@@ -137,6 +277,7 @@ while [[ $# -gt 0 ]]; do
         --arch)    [[ -z "${2:-}" ]] && die "--arch requires an argument" "$EXIT_INVALID_PARAMS"; BISQ_ARCH="$2"; shift 2 ;;
         --type)    [[ -z "${2:-}" ]] && die "--type requires an argument" "$EXIT_INVALID_PARAMS"; BISQ_TYPE="$2"; shift 2 ;;
         --binary|--apk) [[ -z "${2:-}" ]] && die "$1 requires a file/dir argument" "$EXIT_INVALID_PARAMS"; OFFICIAL_BINARY="$2"; shift 2 ;;
+        --built) [[ -z "${2:-}" ]] && die "--built requires a dir argument" "$EXIT_INVALID_PARAMS"; BUILT_DIR="$2"; shift 2 ;;
         --no-cache) NO_CACHE=true; shift ;;
         --keep-container) KEEP_CONTAINER=true; shift ;;
         *) log_warn "ignoring unknown argument: $1"; shift ;;
@@ -144,13 +285,22 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -z "$BISQ_VERSION" ]] && BISQ_VERSION="$DEFAULT_VERSION"
-[[ -z "$BISQ_ARCH" ]] && BISQ_ARCH="x86_64-linux-gnu"
 [[ -z "$BISQ_TYPE" ]] && BISQ_TYPE="deb"
+# Default arch depends on type: exe -> windows, deb/rpm -> linux.
+if [[ -z "$BISQ_ARCH" ]]; then
+    case "$BISQ_TYPE" in exe) BISQ_ARCH="x86_64-windows" ;; *) BISQ_ARCH="x86_64-linux-gnu" ;; esac
+fi
 case "$BISQ_ARCH" in
     x86_64-linux|x86_64-linux-gnu) BISQ_ARCH="x86_64-linux-gnu" ;;
+    x86_64-windows|x86_64-win)     BISQ_ARCH="x86_64-windows" ;;
     *) die "Unsupported architecture: $BISQ_ARCH" "$EXIT_INVALID_PARAMS" ;;
 esac
-case "$BISQ_TYPE" in deb|rpm) ;; *) die "Unsupported type: $BISQ_TYPE (deb|rpm)" "$EXIT_INVALID_PARAMS" ;; esac
+case "$BISQ_TYPE" in deb|rpm|exe) ;; *) die "Unsupported type: $BISQ_TYPE (deb|rpm|exe)" "$EXIT_INVALID_PARAMS" ;; esac
+# Type/arch must be consistent (reject mismatched combinations).
+case "$BISQ_TYPE" in
+    deb|rpm) [[ "$BISQ_ARCH" == "x86_64-linux-gnu" ]] || die "--type $BISQ_TYPE requires --arch x86_64-linux (got $BISQ_ARCH)" "$EXIT_INVALID_PARAMS" ;;
+    exe)     [[ "$BISQ_ARCH" == "x86_64-windows" ]]   || die "--type exe requires --arch x86_64-windows (got $BISQ_ARCH)" "$EXIT_INVALID_PARAMS" ;;
+esac
 [[ "$BISQ_VERSION" =~ ^v ]] || BISQ_VERSION="v$BISQ_VERSION"
 
 OFFICIAL_PKG_NAME="Bisq-64bit-${BISQ_VERSION#v}.${BISQ_TYPE}"
@@ -164,6 +314,12 @@ if [[ -n "$OFFICIAL_BINARY" ]]; then
     fi
     [[ -f "$OFFICIAL_BINARY" ]] || die "--binary file not found: $OFFICIAL_BINARY" "$EXIT_INVALID_PARAMS"
     OFFICIAL_BINARY="$(realpath "$OFFICIAL_BINARY")"
+fi
+
+# ---- ISOLATION BOUNDARY: Windows EXE path returns here, before any docker/release-builder logic. ----
+if [[ "$BISQ_TYPE" == "exe" ]]; then
+    verify_windows_exe
+    exit $?
 fi
 
 VC=$(sanitize_component "$BISQ_VERSION"); AC=$(sanitize_component "$BISQ_ARCH"); TC=$(sanitize_component "$BISQ_TYPE")
