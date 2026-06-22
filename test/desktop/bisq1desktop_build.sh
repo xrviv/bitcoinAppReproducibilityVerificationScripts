@@ -2,7 +2,7 @@
 # ==============================================================================
 # bisq1desktop_build.sh - Bisq 1 Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.6.0
+# Version:       v0.7.0
 # Organization:  WalletScrutiny.com
 # Last Modified: 2026-06-22
 # Project:       https://github.com/bisq-network/bisq
@@ -13,7 +13,7 @@
 # Maintain changelog in separate file: ~/work/ws-notes/script-notes/desktop/bisq1/changelog.md
 # ==============================================================================
 #
-# SCRIPT SUMMARY (v0.6.0 - Bisq 1.10.0+ toolchain; deb/rpm self-build + Windows EXE comparison):
+# SCRIPT SUMMARY (v0.7.0 - Bisq 1.10.0+ toolchain; deb/rpm self-build + Windows EXE via GH Actions):
 #   Drives Bisq's first-party reproducible-build framework per docs/reproducible-builds/linux.md:
 #     1. Clone the release tag TWICE on the host (clean A and B checkouts) + init submodules (required).
 #     2. Build the pinned release-builder image FROM the cloned repo's own
@@ -33,20 +33,22 @@
 # SCOPE: 1.10.x toolchain only. The pre-1.10 JDK 11/17 script is retained for reference as
 #   bisq1desktop_build.sh.v0.3.5.bak (legacy multi-field YAML + missing-`v` tag bug; not ABS-current).
 #
-# WINDOWS EXE (v0.6.0, --type exe --arch x86_64-windows): FULLY ISOLATED from deb/rpm. The Windows
+# WINDOWS EXE (v0.7.0, --type exe --arch x86_64-windows): FULLY ISOLATED from deb/rpm. The Windows
 #   installer is jpackage+WiX and CANNOT be built on this Linux host (no cross-build, no
-#   docker/release-builder/windows/). It is built on a Windows runner by the GitHub Actions workflow
+#   docker/release-builder/windows/). By DEFAULT the script AUTO-TRIGGERS the GitHub Actions workflow
 #   walletScrutinyCom/.github/workflows/bisq1-windows-build.yml (windows-2025, Zulu 21.0.6, pinned WiX
-#   v3, A/B isolated worktrees, uploads both EXEs). This script's exe path is COMPARISON-ONLY: it takes
-#   the two built EXEs (--built <dir>) + the official EXE and applies the same mechanical outer-sha256
-#   verdict (A==B && A==official). Extraction diff is diagnostic-only. The exe branch returns before any
-#   docker/release-builder code runs, so deb/rpm logic is never touched.
+#   v3, A/B isolated worktrees, uploads both EXEs), polls/watches it (correlated by a unique request_id
+#   echoed into the run-name), and downloads both built EXEs — same pattern as gingerwallet/sparrow.
+#   It then applies the mechanical outer-sha256 verdict (A==B && A==official); extraction diff is
+#   diagnostic-only. `--built <dir>` is an OPTIONAL offline override (skip CI, reuse downloaded EXEs).
+#   Needs GITHUB_TOKEN/GH_TOKEN (perms TBD after first run) + docker for the gh helper, unless --built.
+#   The exe branch returns before any docker/release-builder BUILD code, so deb/rpm logic is untouched.
 #   Findings: ws-notes/build-notes/desktop/bisq/bisq1_v1.10.0-exe-findings-2026-06-22.md
 # ==============================================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.6.0"
+SCRIPT_VERSION="v0.7.0"
 SCRIPT_NAME="bisq1desktop_build.sh"
 APP_NAME="Bisq 1"
 APP_ID="bisq1"
@@ -112,24 +114,112 @@ write_yaml() {  # out verdict notes
 
 # ============================================================================
 # WINDOWS EXE PATH (fully isolated; never enters the deb/rpm docker logic).
-# Build happens on a Windows runner via walletScrutinyCom/.github/workflows/
-# bisq1-windows-build.yml. This function is COMPARISON-ONLY.
+# The Windows installer (jpackage+WiX) cannot be built on Linux, so the build runs on a Windows
+# GitHub Actions runner (bisq1-windows-build.yml on the fork). By DEFAULT this function TRIGGERS
+# that workflow and DOWNLOADS both built EXEs (A and B) via the gh CLI in a helper container —
+# the same end-to-end pattern as gingerwallet_build.sh / sparrowdesktop_build.sh. `--built <dir>`
+# is an OFFLINE OVERRIDE that skips CI and reuses already-downloaded artifacts. Either way this
+# function only COMPARES (mechanical A==B && A==official); it never builds on this host.
+# Needs GITHUB_TOKEN/GH_TOKEN with permission to dispatch the workflow + read its artifacts
+# (exact token type/permissions to be confirmed after the first real run) unless --built is used.
+# The token is passed only via the container env (-e); it is never logged.
 # ============================================================================
+GH_REPO="${GH_REPO:-xrviv/WalletScrutinyCom}"
+GH_WORKFLOW="bisq1-windows-build.yml"
+GH_WORKFLOW_REF="${GH_WORKFLOW_REF:-master}"
+GH_HELPER_IMAGE="bisq1-gh-helper"
+GH_MOUNT_DIR=""
+
+build_gh_helper() {
+    log_info "Building gh helper container (debian:bookworm-slim + gh CLI)..."
+    docker build -t "$GH_HELPER_IMAGE" - <<'GHEOF'
+FROM debian:bookworm-slim
+RUN apt-get update -qq \
+ && apt-get install -y --no-install-recommends curl ca-certificates gnupg jq unzip \
+ && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+ && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    > /etc/apt/sources.list.d/github-cli.list \
+ && apt-get update -qq \
+ && apt-get install -y --no-install-recommends gh \
+ && rm -rf /var/lib/apt/lists/*
+GHEOF
+}
+
+# Run gh inside the helper container (GH_MOUNT_DIR mounted at /work).
+# - GITHUB_TOKEN is exported and passed by NAME (`-e GITHUB_TOKEN`, no value) so it never enters argv.
+#   (It still lives in the container's env; gh authenticates from it. Not logged by this script.)
+# - Run as the host uid:gid so downloaded artifacts are user-owned (not root). HOME=/work gives gh a
+#   writable config dir inside the mount.
+gh_c() {
+    docker run --rm -e GITHUB_TOKEN -e HOME=/work \
+        --user "$(id -u):$(id -g)" \
+        -v "${GH_MOUNT_DIR}:/work" -w /work "$GH_HELPER_IMAGE" gh "$@"
+}
+
+# Trigger bisq1-windows-build.yml, wait, download both EXE artifacts into <artdir>/A and /B.
+acquire_built_exes_via_ci() {
+    local ver="$1" artdir="$2" yaml="$3"
+    export GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+    # Missing token / docker = infrastructure unavailable -> ftbfs + exit 1 (EXIT_BUILD_FAILED), same
+    # class as the deb/rpm 'docker not found' path (exit 2 is reserved for invalid CLI parameters).
+    [[ -n "$GITHUB_TOKEN" ]] || { write_yaml "$yaml" ftbfs "GITHUB_TOKEN/GH_TOKEN required to dispatch CI + read artifacts; or pass --built <dir>."; die "GITHUB_TOKEN/GH_TOKEN (dispatch+artifact-read perms) required for --type exe (or use --built <dir>)" "$EXIT_BUILD_FAILED"; }
+    command -v docker >/dev/null 2>&1 || { write_yaml "$yaml" ftbfs "docker required for the gh helper container."; die "docker not found" "$EXIT_BUILD_FAILED"; }
+    docker info >/dev/null 2>&1 || { write_yaml "$yaml" ftbfs "docker daemon not running."; die "docker daemon not running" "$EXIT_BUILD_FAILED"; }
+    GH_MOUNT_DIR="$artdir"; mkdir -p "$artdir"
+    # gh helper image is a shared cached tooling image (debian base + apt pkgs unpinned; same shared
+    # rationale as the release-builder image — rebuilt only when absent).
+    if ! docker image inspect "$GH_HELPER_IMAGE" >/dev/null 2>&1; then
+        build_gh_helper || { write_yaml "$yaml" ftbfs "gh helper image build failed (see output)."; die "gh helper image build failed" "$EXIT_BUILD_FAILED"; }
+    fi
+
+    # Unique correlation ID echoed into the workflow run-name so we attach to OUR run exactly,
+    # not a concurrent one (timestamp/pre-ID heuristics can mis-select). Not a secret.
+    local request_id; request_id="wsreq-${ver}-$(date -u +%Y%m%d%H%M%S)-${RANDOM}${RANDOM}"
+    log_info "Triggering ${GH_WORKFLOW} on ${GH_REPO}@${GH_WORKFLOW_REF} (version=${ver}, request_id=${request_id})..."
+    gh_c workflow run "$GH_WORKFLOW" --repo "$GH_REPO" --ref "$GH_WORKFLOW_REF" -f version="$ver" -f request_id="$request_id" \
+        || { write_yaml "$yaml" ftbfs "Failed to trigger ${GH_WORKFLOW}."; die "workflow trigger failed" "$EXIT_BUILD_FAILED"; }
+
+    log_info "Waiting for the run (correlating by request_id)..."
+    local run_id="" i c
+    for i in $(seq 1 30); do
+        sleep 10
+        # Match strictly on our request_id in the run name (displayTitle) — race-proof.
+        local cand; mapfile -t cand < <(gh_c run list --repo "$GH_REPO" --workflow "$GH_WORKFLOW" --limit 30 \
+            --json databaseId,displayTitle --jq "[.[] | select(.displayTitle | contains(\"${request_id}\"))] | .[].databaseId" 2>/dev/null || true)
+        for c in "${cand[@]:-}"; do
+            [[ -z "$c" || "$c" == "null" ]] && continue
+            run_id="$c"; break
+        done
+        [[ -n "$run_id" ]] && break
+        log_info "poll ${i}/30..."
+    done
+    [[ -n "$run_id" && "$run_id" != "null" ]] || { write_yaml "$yaml" ftbfs "Workflow run not found after polling."; die "workflow run not found" "$EXIT_BUILD_FAILED"; }
+    log_info "Run ID ${run_id}; watching to completion (build ~20-30 min)..."
+    gh_c run watch "$run_id" --repo "$GH_REPO" --exit-status \
+        || { write_yaml "$yaml" ftbfs "GitHub Actions run ${run_id} failed."; die "workflow run ${run_id} failed" "$EXIT_BUILD_FAILED"; }
+    gh_c run view "$run_id" --repo "$GH_REPO" --log > "${artdir}/gh-run-${run_id}.log" 2>/dev/null || log_warn "could not fetch run log"
+
+    log_info "Downloading built EXE artifacts (A and B)..."
+    local label
+    for label in A B; do
+        rm -rf "${artdir:?}/${label}"; mkdir -p "${artdir}/${label}"
+        gh_c run download "$run_id" --repo "$GH_REPO" --name "bisq1-${ver}-win-exe-${label}" --dir "/work/${label}" \
+            || { write_yaml "$yaml" ftbfs "Failed to download bisq1-${ver}-win-exe-${label}."; die "artifact download failed (${label})" "$EXIT_BUILD_FAILED"; }
+    done
+    # Provenance artifact (workflow/runner/JDK+WiX versions, A/B hashes) — kept for the human report.
+    rm -rf "${artdir:?}/provenance"; mkdir -p "${artdir}/provenance"
+    gh_c run download "$run_id" --repo "$GH_REPO" --name "bisq1-${ver}-win-provenance" --dir "/work/provenance" 2>/dev/null \
+        || log_warn "provenance artifact not downloaded (non-fatal)"
+}
+
 verify_windows_exe() {
     local execution_dir; execution_dir="$(pwd)"
     local yaml="${execution_dir}/COMPARISON_RESULTS.yaml"
     local detail="${execution_dir}/comparison-detail.txt"
     local ver="${BISQ_VERSION#v}"
     local official_name="Bisq-64bit-${ver}.exe"
-
-    # --built is required for the exe path (the build is the CI workflow, not this host).
-    if [[ -z "$BUILT_DIR" ]]; then
-        log_error "--type exe requires --built <dir> with the two EXEs from bisq1-windows-build.yml (A and B)."
-        log_error "Run the workflow (windows-2025, Zulu 21.0.6, pinned WiX), download both"
-        log_error "'bisq1-${ver}-win-exe-A' and '-B' artifacts into a dir, then re-run with --built <dir>."
-        die "--type exe requires --built <dir>" "$EXIT_INVALID_PARAMS"
-    fi
-    [[ -d "$BUILT_DIR" ]] || die "--built dir not found: $BUILT_DIR" "$EXIT_INVALID_PARAMS"
 
     # Acquire the official EXE (use --binary if given, else download from the GitHub release).
     local official="$OFFICIAL_BINARY"
@@ -142,15 +232,27 @@ verify_windows_exe() {
     fi
     [[ -f "$official" ]] || die "official EXE not found: $official" "$EXIT_INVALID_PARAMS"
 
+    # Acquire the two built EXEs: default = trigger CI + download; --built = offline override.
+    local search_dir
+    if [[ -n "$BUILT_DIR" ]]; then
+        [[ -d "$BUILT_DIR" ]] || die "--built dir not found: $BUILT_DIR" "$EXIT_INVALID_PARAMS"
+        log_info "Offline mode: using pre-downloaded artifacts under --built ${BUILT_DIR}"
+        search_dir="$BUILT_DIR"
+    else
+        # Per-run unique work dir (arch/type + PID) so concurrent runs never collide (parallel-safe).
+        local artdir="${execution_dir}/bisq1-${ver}-x86_64-windows-exe-$$"
+        acquire_built_exes_via_ci "$ver" "$artdir" "$yaml"
+        search_dir="$artdir"
+    fi
+
     # Collect the two built EXEs. MUST be version-specific (Bisq-64bit-<ver>.exe) so a stale/wrong
     # version artifact can never be mistaken for this run (order-independent: we require A==B and A==official).
-    mapfile -t built < <(find "$BUILT_DIR" -type f -name "${official_name}" | sort)
+    mapfile -t built < <(find "$search_dir" -type f -name "${official_name}" | sort)
     if [[ "${#built[@]}" -ne 2 ]]; then
         write_yaml "$yaml" "ftbfs" \
-"Expected exactly 2 built '${official_name}' files (A and B) under --built, found ${#built[@]}.
-Each must come from a DISTINCT artifact dir. Download both 'bisq1-${ver}-win-exe-A' and '-B' from
-bisq1-windows-build.yml (which builds for version ${ver} only)."
-        die "need exactly 2 '${official_name}' under --built (found ${#built[@]})" "$EXIT_INVALID_PARAMS"
+"Expected exactly 2 '${official_name}' files (A and B), found ${#built[@]} under ${search_dir}.
+Each must come from a DISTINCT artifact (bisq1-${ver}-win-exe-A and -B, version ${ver} only)."
+        die "need exactly 2 '${official_name}' (found ${#built[@]})" "$EXIT_INVALID_PARAMS"
     fi
     # Reject the degenerate case of both entries being the SAME underlying file (no real A/B isolation).
     # Compare device:inode so hardlinks (distinct paths, distinct realpaths, same inode) are caught too.
@@ -172,14 +274,12 @@ bisq1-windows-build.yml (which builds for version ${ver} only)."
         echo "built B  : ${built[1]}"
         echo "  sha256 : $hB"
         echo
-        echo "Build provenance: built on a Windows runner via bisq1-windows-build.yml (jpackage+WiX)."
-        echo "EXPECTED DIFFERENCE (primary): the official EXE bundles Azul OpenJDK 21.0.11, while the"
-        echo "  repo (gradle.properties) pins 21.0.6 and the build fails on a mismatch, so the rebuilt"
-        echo "  EXE bundles a 21.0.6 JRE -> genuine payload difference vs official. Same root cause as"
-        echo "  the deb/rpm not_reproducible verdict (2026-06-20)."
-        echo "KNOWN LIMITATION (secondary): installer embeds 'Copyright 2013-<build year>'"
-        echo "  (PackageFactory.kt:70, Year.now(), not SOURCE_DATE_EPOCH). Official embeds 2013-2026, so"
-        echo "  a rebuild outside 2026 adds a copyright-year difference on top. Diagnostic, not a verdict override."
+        echo "Build: Windows runner via bisq1-windows-build.yml (jpackage+WiX). If a provenance/ dir is"
+        echo "  present (auto-trigger mode), it has the runner image, JDK+WiX versions, upstream commit,"
+        echo "  and A/B hashes; in --built offline mode provenance is whatever the operator supplied."
+        echo "This script reports a MECHANICAL outer-sha256 verdict only. Interpreting any differences"
+        echo "  (root cause, acceptability) is the human reviewer's job — see diff_exe.txt and the WS"
+        echo "  report. Do not treat any narrative here as the script's conclusion."
     } > "$detail"
 
     local verdict notes
@@ -205,19 +305,18 @@ bisq1-windows-build.yml (which builds for version ${ver} only)."
                 echo "DIAGNOSTIC UNAVAILABLE: 7z extraction failed (official rc=$rcO, built rc=$rcB); no payload diff produced." \
                     | tee "${execution_dir}/diff_exe.txt" >> "$detail"
             else
-                # diff exit: 0=identical, 1=differences (NORMAL — expected for the 21.0.6/21.0.11 payloads),
-                # >1=actual error. Capture status without aborting under set -e (|| guard); write to a raw
-                # file first to avoid a pipefail abort from `diff | head`.
-                local draw="${execution_dir}/diff_exe.raw" dstat=0
-                diff -r "$od" "$bd" > "$draw" 2>&1 || dstat=$?
+                # diff exit: 0=identical, 1=differences (NORMAL), >1=actual error. Capture status without
+                # aborting under set -e (|| guard). The FULL diff is retained in diff_exe.txt (not truncated);
+                # only the terminal preview is short, per the WS large-diff guideline.
+                echo "=== DIAGNOSTIC ONLY (does not affect verdict): diff -r official vs built ===" > "${execution_dir}/diff_exe.txt"
+                local dstat=0
+                diff -r "$od" "$bd" >> "${execution_dir}/diff_exe.txt" 2>&1 || dstat=$?
                 if [[ "$dstat" -le 1 ]]; then
-                    { echo "=== DIAGNOSTIC ONLY (does not affect verdict): diff -r official vs built (status ${dstat}) ==="
-                      head -2000 "$draw"; } > "${execution_dir}/diff_exe.txt"
-                    echo "Diagnostic extracted diff -> diff_exe.txt (diff status ${dstat}, diagnostic-only)" >> "$detail"
+                    echo "Diagnostic FULL extracted diff -> diff_exe.txt (diff status ${dstat}; preview below, diagnostic-only)" >> "$detail"
+                    head -5 "${execution_dir}/diff_exe.txt" >> "$detail"
                 else
-                    echo "DIAGNOSTIC UNAVAILABLE: diff errored (status ${dstat})." | tee "${execution_dir}/diff_exe.txt" >> "$detail"
+                    echo "DIAGNOSTIC: diff errored (status ${dstat}); partial output retained in diff_exe.txt." >> "$detail"
                 fi
-                rm -f "$draw"
             fi
             rm -rf "$od" "$bd"
         else
@@ -244,19 +343,23 @@ Parameters:
   --type <type>          deb | rpm | exe
   --binary <file|dir>    Use this local official installer (file, or dir containing it).
   --apk <file|dir>       Alias for --binary.
-  --built <dir>          (exe only) Dir with the TWO built EXEs (A and B) from
-                         bisq1-windows-build.yml. Required for --type exe.
+  --built <dir>          (exe only, OPTIONAL) Offline override: dir with the two pre-downloaded built
+                         EXEs (A and B). If omitted, the script triggers CI and downloads them itself.
   --no-cache             Force fresh Docker image build (deb/rpm only).
   --keep-container       Keep build/compare containers afterwards (deb/rpm only).
   --help                 Show this help.
 
+ENV (exe only, unless --built): GITHUB_TOKEN or GH_TOKEN with permission to dispatch the workflow and
+  read its artifacts (exact perms TBD after first run); docker is also required for the gh helper.
+
 deb/rpm: builds the release tag TWICE on this host (A/B determinism, always-on) in the pinned
   release-builder container. Verdict is MECHANICAL on the outer-file sha256. Full dpkg-deb -R evidence
   (payload vs packaging split) is written for human classification.
-exe (x86_64-windows): the Windows installer (jpackage+WiX) CANNOT be built on Linux. It is built on a
-  Windows runner by walletScrutinyCom/.github/workflows/bisq1-windows-build.yml (windows-2025, Zulu
-  21.0.6, pinned WiX v3, A/B isolated). This script's exe path is COMPARISON-ONLY: supply the two built
-  EXEs via --built; verdict is mechanical (A==B && A==official by sha256); extracted diff is diagnostic.
+exe (x86_64-windows): the Windows installer (jpackage+WiX) CANNOT be built on Linux. By default the
+  script AUTO-TRIGGERS walletScrutinyCom/.github/workflows/bisq1-windows-build.yml (windows-2025, Zulu
+  21.0.6, pinned WiX v3, A/B isolated), correlates the run by a unique request_id in the run-name,
+  watches it, and downloads both built EXEs (same pattern as gingerwallet/sparrow). Verdict is mechanical
+  (A==B && A==official by sha256); extracted diff is diagnostic. --built skips CI and reuses local EXEs.
   NOTE: installer embeds the build year (Year.now()), so verify v1.10.0 within 2026 (official=2026).
 
 Output:
