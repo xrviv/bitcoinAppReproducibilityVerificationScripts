@@ -51,7 +51,7 @@ set -euo pipefail
 SCRIPT_VERSION="v0.7.2"
 SCRIPT_NAME="bisq1desktop_build.sh"
 APP_NAME="Bisq 1"
-APP_ID="bisq1"
+APP_ID="bisq"
 REPO_URL="https://github.com/bisq-network/bisq"
 DEFAULT_VERSION="1.10.0"
 
