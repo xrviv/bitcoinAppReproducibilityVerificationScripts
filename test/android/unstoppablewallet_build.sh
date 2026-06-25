@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # unstoppablewallet_build.sh - Unstoppable Wallet Reproducible Build Verification
-# Version:       v0.1.14
+# Version:       v0.2.0
 # Organization:  WalletScrutiny.com
 # Project:       https://github.com/horizontalsystems/unstoppable-wallet-android
 # Host deps:     docker or podman only
-# Notes:         Play Store-only; pass APK via --binary.
+# Notes:         Play Store-only; pass the official APK(s) via --binary.
+#                --binary accepts EITHER a single universal APK (legacy) OR a directory
+#                of device-pulled split APKs (base.apk + split_config.*). With a directory
+#                the script builds the AAB (bundleBaseRelease) + bundletool-generates the
+#                matching splits and compares per-split, contents-only (Play re-signs).
 
-SCRIPT_VERSION="v0.1.14"
+SCRIPT_VERSION="v0.2.0"
 echo "Starting unstoppablewallet_build.sh ${SCRIPT_VERSION}"
 
 set -uo pipefail   # no -e: diff/cmp return 1 on differences
@@ -134,15 +138,32 @@ if [[ -z "$apk_file" ]]; then
     exit 2
 fi
 
-if [[ ! -f "$apk_file" ]]; then
+# --binary accepts EITHER a single universal APK (legacy) OR a directory of device-pulled
+# split APKs (base.apk + split_config.*). Detect which, and treat a dir as an artifact set.
+SPLIT_MODE=false
+OFFICIAL_DIR=""
+declare -a OFFICIAL_SPLITS=()
+if [[ -d "$apk_file" ]]; then
+    SPLIT_MODE=true
+    OFFICIAL_DIR=$(realpath "$apk_file")
+    if [[ ! -f "$OFFICIAL_DIR/base.apk" ]]; then
+        log_error "Split mode: base.apk not found in $OFFICIAL_DIR (required)"
+        write_warning_yaml "Split set missing base.apk in ${OFFICIAL_DIR}"
+        echo ""; echo "Exit code: 2"; exit 2
+    fi
+    while IFS= read -r f; do OFFICIAL_SPLITS+=("$f"); done \
+        < <(find "$OFFICIAL_DIR" -maxdepth 1 -name "*.apk" | sort)
+    apk_file="$OFFICIAL_DIR/base.apk"   # base.apk drives Phase 0 metadata + downstream single-file uses
+    log_info "Split mode: ${#OFFICIAL_SPLITS[@]} official split(s) in ${OFFICIAL_DIR}"
+elif [[ ! -f "$apk_file" ]]; then
     log_error "APK file not found: $apk_file"
     write_warning_yaml "APK file not found: ${apk_file}"
     echo ""; echo "Exit code: 2"
     exit 2
+else
+    apk_file=$(realpath "$apk_file")
 fi
-
-apk_file=$(realpath "$apk_file")
-[[ -n "$arch_arg" ]]  && log_info "--arch ${arch_arg} accepted but not used (single universal APK)"
+[[ -n "$arch_arg" ]]  && log_info "--arch ${arch_arg} accepted but not used (configs derived from official splits)"
 [[ -n "$type_arg" ]]  && log_info "--type ${type_arg} accepted but not used"
 [[ -n "$version_arg" ]] && log_info "--version ${version_arg} accepted; actual version derived from APK metadata"
 
@@ -472,6 +493,9 @@ RUN yes | sdkmanager --licenses && \
         "ndk;23.1.7779620" "ndk;25.1.8937393" "ndk;29.0.14033849" \
         "cmake;3.22.1"
 
+# bundletool — regenerates device-matched split APKs from the built AAB (split mode)
+ADD https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar /opt/bundletool.jar
+
 WORKDIR /build
 DOCKERFILE_P3
 
@@ -759,15 +783,47 @@ afterEvaluate {
 MONERO_PUB
 ./gradlew :monerokit:publishToMavenLocal --no-daemon
 
-echo ""; echo "=== Step 6: Build wallet APK === $(date)"
+echo ""; echo "=== Step 6: Build wallet === $(date)"
 cd /build/wallet
 sed -i 's/org\.gradle\.jvmargs=.*/org.gradle.jvmargs=-Xmx4096M -Dkotlin.daemon.jvm.options="-Xmx4096M"/' gradle.properties
 rm -rf ~/.gradle/caches/
-./gradlew :app:assembleBaseRelease --no-daemon --max-workers=2 --info \
-    > /output/wallet-build.log 2>&1
+if [[ "${SPLIT_MODE:-false}" == "true" ]]; then
+    # Build the AAB (source of Play's splits), derive a device-spec from the official
+    # split set, then bundletool-generate the device-matched splits (NOT --mode=universal).
+    ./gradlew :app:bundleBaseRelease --no-daemon --max-workers=2 --info > /output/wallet-build.log 2>&1
+    AAB=$(find app/build/outputs/bundle -name "*.aab" | head -1)
+    cp "$AAB" /output/app-base-release.aab
+    AAPT2=$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort | tail -1)
+    DABIS=(); DDEN=""
+    for f in /official/*.apk; do case "$(basename "$f")" in
+        *config.arm64_v8a*)   DABIS+=("arm64-v8a") ;;
+        *config.armeabi_v7a*) DABIS+=("armeabi-v7a") ;;
+        *config.x86_64*)      DABIS+=("x86_64") ;;
+        *config.x86.apk)      DABIS+=("x86") ;;
+        *config.ldpi*) DDEN=120 ;; *config.mdpi*) DDEN=160 ;; *config.tvdpi*) DDEN=213 ;;
+        *config.hdpi*) DDEN=240 ;; *config.xhdpi*) DDEN=320 ;;
+        *config.xxhdpi*) DDEN=480 ;; *config.xxxhdpi*) DDEN=640 ;;
+    esac; done
+    [[ -z "$DDEN" ]] && DDEN=480
+    DSDK=$("$AAPT2" dump badging /official/base.apk 2>/dev/null | grep -oP "targetSdkVersion:'[0-9]+'" | grep -oP "[0-9]+" | head -1); [[ -z "$DSDK" ]] && DSDK=30
+    DABIJSON=$(printf '"%s",' "${DABIS[@]}"); DABIJSON="[${DABIJSON%,}]"
+    printf '{"supportedAbis":%s,"supportedLocales":["en"],"screenDensity":%s,"sdkVersion":%s}\n' \
+        "$DABIJSON" "$DDEN" "$DSDK" > /tmp/device-spec.json
+    cp /tmp/device-spec.json /output/device-spec.json
+    echo "=== device-spec.json ==="; cat /tmp/device-spec.json
+    java -jar /opt/bundletool.jar build-apks --bundle="$AAB" \
+        --output=/output/built.apks --device-spec=/tmp/device-spec.json \
+        --aapt2="$AAPT2" --overwrite
+    mkdir -p /output/built-splits /output/bt-extract
+    unzip -o /output/built.apks 'splits/*.apk' -d /output/bt-extract
+    cp /output/bt-extract/splits/*.apk /output/built-splits/
+    echo "=== built splits ==="; ls -lh /output/built-splits/
+else
+    ./gradlew :app:assembleBaseRelease --no-daemon --max-workers=2 --info > /output/wallet-build.log 2>&1
+    cp /build/wallet/app/build/outputs/apk/base/release/app-base-release.apk /output/
+fi
 
 echo ""; echo "=== Step 7: Collect outputs === $(date)"
-cp /build/wallet/app/build/outputs/apk/base/release/app-base-release.apk /output/
 
 mkdir -p /output/local-aars
 find ~/.m2/repository/com/github/horizontalsystems -type f \
@@ -790,8 +846,12 @@ else
     echo "Tag __WALLET_VERSION__ is a ${tag_obj_type} (lightweight tag — GPG verification not possible; no signature to verify)" > /output/git-tag-verify.txt
 fi
 
-echo ""; echo "=== Phase 3 APK ==="
-sha256sum /output/app-base-release.apk
+echo ""; echo "=== Phase 3 build output ==="
+if [[ "${SPLIT_MODE:-false}" == "true" ]]; then
+    sha256sum /output/built-splits/*.apk
+else
+    sha256sum /output/app-base-release.apk
+fi
 
 echo ""; echo "=== Phase 3 local AARs ==="
 ls -lh /output/local-aars/
@@ -830,10 +890,13 @@ $CRUN rm -f "$CTR_P3" 2>/dev/null || true
 
 section "Running Phase 3 build container (from source — ~120 min)"
 echo "  Started: $(date)"
+P3_EXTRA=(-e "SPLIT_MODE=${SPLIT_MODE}")
+[[ "$SPLIT_MODE" == "true" ]] && P3_EXTRA+=(-v "${OFFICIAL_DIR}:/official:ro")
 set +e
 $CRUN run \
     --name "$CTR_P3" \
     "${MEM_ARGS[@]}" \
+    "${P3_EXTRA[@]}" \
     -v "$P3_DIR:/output" \
     -v "$p3_ctx/build.sh:/build/build.sh:ro" \
     "$IMG_P3" \
@@ -850,18 +913,30 @@ fi
 $CRUN rm -f "$CTR_P3" 2>/dev/null || true
 
 section "Phase 3 results"
-P3_APK="$P3_DIR/app-base-release.apk"
-if [[ ! -f "$P3_APK" ]]; then
-    log_error "Phase 3 APK not found after successful container exit: $P3_APK"
-    generate_error_yaml "ftbfs" "Phase 3 APK missing after container exit"
-    echo ""; echo "Exit code: 1"
-    exit 1
+if [[ "$SPLIT_MODE" == "true" ]]; then
+    P3_SPLITS_DIR="$P3_DIR/built-splits"
+    P3_NSPLITS=$(find "$P3_SPLITS_DIR" -maxdepth 1 -name "*.apk" 2>/dev/null | wc -l)
+    if [[ "$P3_NSPLITS" -eq 0 ]]; then
+        log_error "Phase 3 produced no built splits in $P3_SPLITS_DIR"
+        generate_error_yaml "ftbfs" "Phase 3 bundletool produced no split APKs"
+        echo ""; echo "Exit code: 1"; exit 1
+    fi
+    echo "  Phase 3 built splits:  $P3_NSPLITS"
+    echo "  Official splits:       ${#OFFICIAL_SPLITS[@]}"
+else
+    P3_APK="$P3_DIR/app-base-release.apk"
+    if [[ ! -f "$P3_APK" ]]; then
+        log_error "Phase 3 APK not found after successful container exit: $P3_APK"
+        generate_error_yaml "ftbfs" "Phase 3 APK missing after container exit"
+        echo ""; echo "Exit code: 1"
+        exit 1
+    fi
+    P3_APK_SHA=$(sha256of "$P3_APK")
+    echo "  Phase 3 APK SHA-256:   $P3_APK_SHA"
+    echo "  Phase 2 APK SHA-256:   $P2_APK_SHA"
+    echo "  Official APK SHA-256:  $app_hash"
+    [[ "$P3_APK_SHA" == "$P2_APK_SHA" ]] && echo "  P3 vs P2:  MATCH" || echo "  P3 vs P2:  DIFFER (expected)"
 fi
-P3_APK_SHA=$(sha256of "$P3_APK")
-echo "  Phase 3 APK SHA-256:   $P3_APK_SHA"
-echo "  Phase 2 APK SHA-256:   $P2_APK_SHA"
-echo "  Official APK SHA-256:  $app_hash"
-[[ "$P3_APK_SHA" == "$P2_APK_SHA" ]] && echo "  P3 vs P2:  MATCH" || echo "  P3 vs P2:  DIFFER (expected)"
 P3_AAR=$(find "$P3_DIR/local-aars" -name "*.aar" 2>/dev/null | wc -l)
 P3_JAR=$(find "$P3_DIR/local-aars" -name "*.jar" 2>/dev/null | wc -l)
 echo "  Built: $P3_AAR AARs + $P3_JAR JARs = $((P3_AAR + P3_JAR)) total"
@@ -1113,6 +1188,65 @@ echo "  MATCH:  $P4_FINAL_MATCH  (SHA-256 identical)"
 echo "  DIFFER: $P4_FINAL_DIFFER  (see deep analysis above for details)"
 echo "  Finished: $(date)"
 
+if [[ "$SPLIT_MODE" == "true" ]]; then
+banner "PHASE 5: PER-SPLIT CONTENTS COMPARISON (PRIMARY VERDICT)"
+echo "  Official split vs built split, paired by config identity; contents-only (signing ignored)."
+echo "  Started: $(date)"
+p5_ctx=$(mktemp -d)
+cat > "$p5_ctx/p5.sh" <<'P5_SPLIT_END'
+#!/bin/bash
+set -uo pipefail
+AAPT2=$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort | tail -1)
+# config identity from the APK manifest: base/master has no split= → "base"; configs → token
+cfg_of() { local s; s=$("$AAPT2" dump badging "$1" 2>/dev/null | sed -n "s/.*split='\([^']*\)'.*/\1/p" | head -1); s="${s#config.}"; [[ -z "$s" ]] && s="base"; printf '%s' "$s"; }
+declare -A OFF BLT
+for f in /official/*.apk; do OFF["$(cfg_of "$f")"]="$f"; done
+for f in /built/*.apk;    do BLT["$(cfg_of "$f")"]="$f"; done
+T=0; M=0; N=0; MISS=0
+: > /out/p5-summary.txt
+for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
+    echo "━━━━ config: $cfg ━━━━"
+    o="${OFF[$cfg]:-}"; b="${BLT[$cfg]:-}"
+    if [[ -z "$o" || -z "$b" ]]; then
+        echo "  MISSING official=$([[ -n $o ]] && echo y || echo N) built=$([[ -n $b ]] && echo y || echo N)"
+        echo "$cfg MISSING" >> /out/p5-summary.txt; MISS=$((MISS + 1)); continue
+    fi
+    rm -rf /tmp/o /tmp/b; mkdir -p /tmp/o /tmp/b
+    unzip -q -o "$o" -d /tmp/o; unzip -q -o "$b" -d /tmp/b
+    draw=$(diff -rq /tmp/o /tmp/b 2>/dev/null)
+    n=$(printf '%s\n' "$draw" | grep -vc '^$'); m=$(printf '%s\n' "$draw" | grep -Ec 'META-INF'); nn=$((n - m))
+    printf '%s\n' "$draw"
+    echo "  diffs: $n total ($m META-INF, $nn non-META-INF)"
+    echo "$cfg $n $m $nn" >> /out/p5-summary.txt
+    T=$((T + n)); M=$((M + m)); N=$((N + nn))
+done
+echo "TOTALS $T $M $N $MISS" >> /out/p5-summary.txt
+echo "=== per-split comparison complete ==="
+P5_SPLIT_END
+$CRUN run --rm \
+    -v "$OFFICIAL_DIR:/official:ro" \
+    -v "$P3_DIR/built-splits:/built:ro" \
+    -v "$P5_DIR:/out" \
+    -v "$p5_ctx/p5.sh:/p5.sh:ro" \
+    "$IMG_P3" bash /p5.sh 2>&1 | tee "$P5_DIR/p5-split.log"
+read -r _ diff_count diff_metainf_count diff_non_metainf_count missing_cfgs \
+    < <(grep '^TOTALS' "$P5_DIR/p5-summary.txt" 2>/dev/null || echo "TOTALS 1 0 1 1")
+diff_count="${diff_count:-1}"; diff_metainf_count="${diff_metainf_count:-0}"
+diff_non_metainf_count="${diff_non_metainf_count:-1}"; missing_cfgs="${missing_cfgs:-1}"
+section "Phase 5: PRIMARY VERDICT (split — judged on non-signature diffs)"
+echo "  Totals: ${diff_count} diff(s) (${diff_metainf_count} META-INF, ${diff_non_metainf_count} non-META-INF), ${missing_cfgs} unmatched config(s)"
+if [[ "$missing_cfgs" -gt 0 ]]; then
+    log_warn "Phase 5 verdict: NOT_REPRODUCIBLE — ${missing_cfgs} config(s) present on only one side (incomplete set)"
+    P5_VERDICT="not_reproducible"; P5_MATCH="false"
+elif [[ "$diff_non_metainf_count" -eq 0 ]]; then
+    log_success "Phase 5 verdict: REPRODUCIBLE (all splits match; 0 non-signature diffs; ${diff_metainf_count} signing-only)"
+    P5_VERDICT="reproducible"; P5_MATCH="true"
+else
+    log_warn "Phase 5 verdict: NOT_REPRODUCIBLE (${diff_non_metainf_count} non-signature diff(s))"
+    P5_VERDICT="not_reproducible"; P5_MATCH="false"
+fi
+echo "  Phase 5b skipped in split mode (Phase 2 universal baseline is shape-incompatible with splits)."
+else
 banner "PHASE 5: APK CONTENTS COMPARISON (PRIMARY VERDICT)"
 echo "  Phase 3 (from-source built) APK vs official Play Store APK."
 echo "  All diffs reported."
@@ -1310,6 +1444,7 @@ else
         [[ "$p2_diff_count" -gt 0 ]] && echo "$p2_diff_raw"
     fi
 fi
+fi   # end split/single Phase 5 branch
 
 echo ""
 echo "===== Begin Results ====="
