@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 # unstoppablewallet_build.sh - Unstoppable Wallet Reproducible Build Verification
-# Version:       v0.2.0
+# Version:       v0.3.0
 # Organization:  WalletScrutiny.com
 # Project:       https://github.com/horizontalsystems/unstoppable-wallet-android
 # Host deps:     docker or podman only
-# Notes:         Play Store-only; pass the official APK(s) via --binary.
-#                --binary accepts EITHER a single universal APK (legacy) OR a directory
-#                of device-pulled split APKs (base.apk + split_config.*). With a directory
-#                the script builds the AAB (bundleBaseRelease) + bundletool-generates the
-#                matching splits and compares per-split, contents-only (Play re-signs).
+# Notes:         Play Store-only, split-only. --binary must be a DIRECTORY of device-pulled
+#                split APKs (base.apk + split_config.*) => AAB + bundletool per-split compare.
+#                Single-APK releases (<= v0.47.x) are NOT supported by v0.3.0 (use an older script).
 
-SCRIPT_VERSION="v0.2.0"
+SCRIPT_VERSION="v0.3.0"
 echo "Starting unstoppablewallet_build.sh ${SCRIPT_VERSION}"
 
 set -uo pipefail   # no -e: diff/cmp return 1 on differences
@@ -71,34 +69,6 @@ if [[ "$EUID" -eq 0 ]]; then
     exit 2
 fi
 
-usage() {
-    cat <<EOF
-Usage: $SCRIPT_NAME --binary <file> [options]
-
-Parameters:
-  --binary <file>      Path to official APK from Google Play (REQUIRED)
-  --apk <file>         Alias for --binary (legacy; accepted for compatibility)
-  --version <ver>      Version string (accepted for ABS compliance; actual
-                       version is auto-read from the APK)
-  --arch <arch>        Accepted but unused (Play Store APK is universal)
-  --type <type>        Accepted but unused
-  -h, --help           Show this help
-
-Examples:
-  $SCRIPT_NAME --binary ~/Downloads/unstoppable.apk
-  $SCRIPT_NAME --version 0.47.0 --binary ~/Downloads/unstoppable.apk
-
-Notes:
-  - HOST requirements: docker or podman only.
-  - Unstoppable Wallet is Play Store-only (no auto-download).
-  - HS dependency versions are derived from wallet app/build.gradle at runtime.
-  - WARNING (v0.48.0+): GitHub releases now ships the F-Droid flavor APK
-    (assembleFdroidRelease), NOT the Play Store flavor (assembleBaseRelease).
-    This script builds assembleBaseRelease. Always pass the Play Store APK
-    obtained via adb pull or an APK extractor app — do NOT use the GitHub
-    releases APK for v0.48.0 and later.
-EOF
-}
 
 version_arg=""
 apk_file=""
@@ -122,7 +92,7 @@ while [[ $# -gt 0 ]]; do
         --apk)      require_arg --apk     "${2:-}"; apk_file="$2";     shift 2 ;;
         --arch)     require_arg --arch    "${2:-}"; arch_arg="$2";     shift 2 ;;
         --type)     require_arg --type    "${2:-}"; type_arg="$2";     shift 2 ;;
-        -h|--help)  usage; echo ""; echo "Exit code: 0"; exit 0 ;;
+        -h|--help)  echo "Usage: $SCRIPT_NAME --binary <official.apk | dir-of-split-apks> [--version v] [--arch a] [--type t]"; echo "Exit code: 0"; exit 0 ;;
         *)
             log_warn "Unknown parameter ignored: $1"
             shift
@@ -138,31 +108,32 @@ if [[ -z "$apk_file" ]]; then
     exit 2
 fi
 
-# --binary accepts EITHER a single universal APK (legacy) OR a directory of device-pulled
-# split APKs (base.apk + split_config.*). Detect which, and treat a dir as an artifact set.
-SPLIT_MODE=false
-OFFICIAL_DIR=""
+# --binary must be a DIRECTORY of device-pulled split APKs (base.apk + split_config.*).
+# Unstoppable ships split-only; the universal single-APK path was removed in v0.3.0.
+SPLIT_MODE=true
 declare -a OFFICIAL_SPLITS=()
-if [[ -d "$apk_file" ]]; then
-    SPLIT_MODE=true
-    OFFICIAL_DIR=$(realpath "$apk_file")
-    if [[ ! -f "$OFFICIAL_DIR/base.apk" ]]; then
-        log_error "Split mode: base.apk not found in $OFFICIAL_DIR (required)"
-        write_warning_yaml "Split set missing base.apk in ${OFFICIAL_DIR}"
-        echo ""; echo "Exit code: 2"; exit 2
-    fi
-    while IFS= read -r f; do OFFICIAL_SPLITS+=("$f"); done \
-        < <(find "$OFFICIAL_DIR" -maxdepth 1 -name "*.apk" | sort)
-    apk_file="$OFFICIAL_DIR/base.apk"   # base.apk drives Phase 0 metadata + downstream single-file uses
-    log_info "Split mode: ${#OFFICIAL_SPLITS[@]} official split(s) in ${OFFICIAL_DIR}"
-elif [[ ! -f "$apk_file" ]]; then
-    log_error "APK file not found: $apk_file"
-    write_warning_yaml "APK file not found: ${apk_file}"
-    echo ""; echo "Exit code: 2"
-    exit 2
-else
-    apk_file=$(realpath "$apk_file")
+if [[ ! -d "$apk_file" ]]; then
+    log_error "--binary must be a DIRECTORY of split APKs (base.apk + split_config.*). Unstoppable is split-only."
+    write_warning_yaml "--binary must be a directory of device-pulled split APKs (base.apk + split_config.*)"
+    echo ""; echo "Exit code: 2"; exit 2
 fi
+OFFICIAL_DIR=$(realpath "$apk_file")
+if [[ ! -f "$OFFICIAL_DIR/base.apk" ]]; then
+    log_error "base.apk not found in $OFFICIAL_DIR (required)"
+    write_warning_yaml "Split set missing base.apk in ${OFFICIAL_DIR}"
+    echo ""; echo "Exit code: 2"; exit 2
+fi
+while IFS= read -r f; do OFFICIAL_SPLITS+=("$f"); done \
+    < <(find "$OFFICIAL_DIR" -maxdepth 1 -name "*.apk" | sort)
+# reject stray/unknown APKs so they can't pollute the official artifact set
+for f in "${OFFICIAL_SPLITS[@]}"; do
+    bn=$(basename "$f")
+    [[ "$bn" == "base.apk" || "$bn" == split_config*.apk ]] || {
+        log_error "Unexpected APK in split dir: $bn (only base.apk + split_config*.apk allowed)"
+        write_warning_yaml "Unexpected APK in split dir: ${bn}"; echo ""; echo "Exit code: 2"; exit 2; }
+done
+apk_file="$OFFICIAL_DIR/base.apk"   # base.apk drives Phase 0 metadata
+log_info "${#OFFICIAL_SPLITS[@]} official split(s) in ${OFFICIAL_DIR}"
 [[ -n "$arch_arg" ]]  && log_info "--arch ${arch_arg} accepted but not used (configs derived from official splits)"
 [[ -n "$type_arg" ]]  && log_info "--type ${type_arg} accepted but not used"
 [[ -n "$version_arg" ]] && log_info "--version ${version_arg} accepted; actual version derived from APK metadata"
@@ -787,8 +758,7 @@ echo ""; echo "=== Step 6: Build wallet === $(date)"
 cd /build/wallet
 sed -i 's/org\.gradle\.jvmargs=.*/org.gradle.jvmargs=-Xmx4096M -Dkotlin.daemon.jvm.options="-Xmx4096M"/' gradle.properties
 rm -rf ~/.gradle/caches/
-if [[ "${SPLIT_MODE:-false}" == "true" ]]; then
-    # Build the AAB (source of Play's splits), derive a device-spec from the official
+# Build the AAB (source of Play's splits), derive a device-spec from the official
     # split set, then bundletool-generate the device-matched splits (NOT --mode=universal).
     ./gradlew :app:bundleBaseRelease --no-daemon --max-workers=2 --info > /output/wallet-build.log 2>&1
     AAB=$(find app/build/outputs/bundle -name "*.aab" | head -1)
@@ -805,7 +775,9 @@ if [[ "${SPLIT_MODE:-false}" == "true" ]]; then
         *config.xxhdpi*) DDEN=480 ;; *config.xxxhdpi*) DDEN=640 ;;
     esac; done
     [[ -z "$DDEN" ]] && DDEN=480
-    DSDK=$("$AAPT2" dump badging /official/base.apk 2>/dev/null | grep -oP "targetSdkVersion:'[0-9]+'" | grep -oP "[0-9]+" | head -1); [[ -z "$DSDK" ]] && DSDK=30
+    # sdkVersion = DEVICE API level (not app targetSdk); locales fixed to en. Both provisional —
+    # a wrong device-spec yields a mismatched split set, which the config set-match guard fails on.
+    DSDK="${WS_DEVICE_SDK:-34}"
     DABIJSON=$(printf '"%s",' "${DABIS[@]}"); DABIJSON="[${DABIJSON%,}]"
     printf '{"supportedAbis":%s,"supportedLocales":["en"],"screenDensity":%s,"sdkVersion":%s}\n' \
         "$DABIJSON" "$DDEN" "$DSDK" > /tmp/device-spec.json
@@ -818,10 +790,6 @@ if [[ "${SPLIT_MODE:-false}" == "true" ]]; then
     unzip -o /output/built.apks 'splits/*.apk' -d /output/bt-extract
     cp /output/bt-extract/splits/*.apk /output/built-splits/
     echo "=== built splits ==="; ls -lh /output/built-splits/
-else
-    ./gradlew :app:assembleBaseRelease --no-daemon --max-workers=2 --info > /output/wallet-build.log 2>&1
-    cp /build/wallet/app/build/outputs/apk/base/release/app-base-release.apk /output/
-fi
 
 echo ""; echo "=== Step 7: Collect outputs === $(date)"
 
@@ -847,11 +815,7 @@ else
 fi
 
 echo ""; echo "=== Phase 3 build output ==="
-if [[ "${SPLIT_MODE:-false}" == "true" ]]; then
-    sha256sum /output/built-splits/*.apk
-else
-    sha256sum /output/app-base-release.apk
-fi
+sha256sum /output/built-splits/*.apk
 
 echo ""; echo "=== Phase 3 local AARs ==="
 ls -lh /output/local-aars/
@@ -913,30 +877,15 @@ fi
 $CRUN rm -f "$CTR_P3" 2>/dev/null || true
 
 section "Phase 3 results"
-if [[ "$SPLIT_MODE" == "true" ]]; then
-    P3_SPLITS_DIR="$P3_DIR/built-splits"
-    P3_NSPLITS=$(find "$P3_SPLITS_DIR" -maxdepth 1 -name "*.apk" 2>/dev/null | wc -l)
-    if [[ "$P3_NSPLITS" -eq 0 ]]; then
-        log_error "Phase 3 produced no built splits in $P3_SPLITS_DIR"
-        generate_error_yaml "ftbfs" "Phase 3 bundletool produced no split APKs"
-        echo ""; echo "Exit code: 1"; exit 1
-    fi
-    echo "  Phase 3 built splits:  $P3_NSPLITS"
-    echo "  Official splits:       ${#OFFICIAL_SPLITS[@]}"
-else
-    P3_APK="$P3_DIR/app-base-release.apk"
-    if [[ ! -f "$P3_APK" ]]; then
-        log_error "Phase 3 APK not found after successful container exit: $P3_APK"
-        generate_error_yaml "ftbfs" "Phase 3 APK missing after container exit"
-        echo ""; echo "Exit code: 1"
-        exit 1
-    fi
-    P3_APK_SHA=$(sha256of "$P3_APK")
-    echo "  Phase 3 APK SHA-256:   $P3_APK_SHA"
-    echo "  Phase 2 APK SHA-256:   $P2_APK_SHA"
-    echo "  Official APK SHA-256:  $app_hash"
-    [[ "$P3_APK_SHA" == "$P2_APK_SHA" ]] && echo "  P3 vs P2:  MATCH" || echo "  P3 vs P2:  DIFFER (expected)"
+P3_SPLITS_DIR="$P3_DIR/built-splits"
+P3_NSPLITS=$(find "$P3_SPLITS_DIR" -maxdepth 1 -name "*.apk" 2>/dev/null | wc -l)
+if [[ "$P3_NSPLITS" -eq 0 ]]; then
+    log_error "Phase 3 produced no built splits in $P3_SPLITS_DIR"
+    generate_error_yaml "ftbfs" "Phase 3 bundletool produced no split APKs"
+    echo ""; echo "Exit code: 1"; exit 1
 fi
+echo "  Phase 3 built splits:  $P3_NSPLITS"
+echo "  Official splits:       ${#OFFICIAL_SPLITS[@]}"
 P3_AAR=$(find "$P3_DIR/local-aars" -name "*.aar" 2>/dev/null | wc -l)
 P3_JAR=$(find "$P3_DIR/local-aars" -name "*.jar" 2>/dev/null | wc -l)
 echo "  Built: $P3_AAR AARs + $P3_JAR JARs = $((P3_AAR + P3_JAR)) total"
@@ -1005,152 +954,7 @@ echo ""
 echo "  MATCH:  $P4_MATCH / ${#PAIRS[@]}"
 echo "  DIFFER: $P4_DIFFER / ${#PAIRS[@]}"
 
-analyze_so() {
-    local so_label="$1" p2so="$2" p3so="$3"
-    echo ""
-    echo "  .so: $so_label"
-    printf "  P2 size: %d bytes\n" "$(wc -c < "$p2so")"
-    printf "  P3 size: %d bytes\n" "$(wc -c < "$p3so")"
-    echo "  >> .comment (compiler/linker):"
-    echo "     [P2]"; readelf -p .comment "$p2so" 2>/dev/null | grep -v "^$" || true
-    echo "     [P3]"; readelf -p .comment "$p3so" 2>/dev/null | grep -v "^$" || true
-    echo "  >> ELF notes (NDK version + build ID):"
-    echo "     [P2]"; readelf -n "$p2so" 2>/dev/null || true
-    echo "     [P3]"; readelf -n "$p3so" 2>/dev/null || true
-    echo "  >> Embedded build paths:"
-    echo "     [P2]"; strings "$p2so" | grep -E "^/(home|build|src|jitpack)" | head -3 || echo "     (none)"
-    echo "     [P3]"; strings "$p3so" | grep -E "^/(home|build|src|jitpack)" | head -3 || echo "     (none)"
-    local ndiff
-    ndiff=$(cmp -l "$p2so" "$p3so" 2>/dev/null | wc -l) || true
-    echo "  >> cmp -l: $ndiff byte(s) differ"
-    if [[ "$ndiff" -le 30 ]]; then
-        cmp -l "$p2so" "$p3so" 2>/dev/null || true
-    else
-        echo "     (first 10 of $ndiff):"
-        cmp -l "$p2so" "$p3so" 2>/dev/null | head -10 || true
-    fi
-}
-
-section "Phase 4: Deep analysis of $P4_DIFFER differing artifact(s)"
-
-for pair in "${P4_DIFFER_PAIRS[@]}"; do
-    p2n="${pair%%|*}"; p3n="${pair##*|}"; label="${p3n%.*}"; ext="${p3n##*.}"
-    p2f="$P2_AARS/$p2n"; p3f="$P3_AARS/$p3n"
-
-    echo ""; echo "━━━━  DIFFER: $label  ━━━━"
-    echo "  P2: $p2f  ($(wc -c < "$p2f") bytes)"
-    echo "  P3: $p3f  ($(wc -c < "$p3f") bytes)"
-    echo "  P2 sha256: $(sha256of "$p2f")"
-    echo "  P3 sha256: $(sha256of "$p3f")"
-
-    d2=$(mktemp -d); d3=$(mktemp -d)
-    unzip -q "$p2f" -d "$d2" 2>/dev/null || true
-    unzip -q "$p3f" -d "$d3" 2>/dev/null || true
-
-    if [[ "$ext" == "jar" ]]; then
-        echo ""
-        echo "  >> diff -r of extracted content:"
-        diff -r "$d2" "$d3" 2>/dev/null || true
-        diff_lines=$(diff -r "$d2" "$d3" 2>/dev/null | wc -l) || true
-        zip_diff_bytes=$(cmp -l "$p2f" "$p3f" 2>/dev/null | wc -l) || true
-        echo ""
-        echo "  >> Summary:"
-        echo "     ZIP file differing bytes:     $zip_diff_bytes"
-        echo "     Extracted content diff lines: $diff_lines"
-        if [[ "$diff_lines" -eq 0 ]]; then
-            echo "     CONCLUSION: ZIP metadata only — extracted content IDENTICAL"
-        else
-            echo "     CONCLUSION: Content differs (see diff above)"
-        fi
-
-    elif [[ -d "$d2/jni" ]] && echo "$label" | grep -qE "dashkit|ton-kit-android|monero-kit-android"; then
-        echo ""
-        echo "  >> Files that differ (brief):"
-        diff -r --brief "$d2" "$d3" 2>/dev/null | head -20 || true
-
-        echo ""
-        echo "  >> arm64-v8a .so analysis:"
-        for so_p2 in $(find "$d2/jni/arm64-v8a" -name "*.so" 2>/dev/null | sort); do
-            so_name="${so_p2##*/}"
-            so_p3="$d3/jni/arm64-v8a/$so_name"
-            [[ -f "$so_p3" ]] && analyze_so "arm64-v8a/$so_name" "$so_p2" "$so_p3"
-        done
-
-        echo ""
-        echo "  >> Byte diff count per ABI:"
-        for abi in arm64-v8a armeabi-v7a x86 x86_64; do
-            for so_p2 in $(find "$d2/jni/$abi" -name "*.so" 2>/dev/null | sort); do
-                so_name="${so_p2##*/}"
-                so_p3="$d3/jni/$abi/$so_name"
-                if [[ -f "$so_p3" ]]; then
-                    n=$(cmp -l "$so_p2" "$so_p3" 2>/dev/null | wc -l) || true
-                    printf "     %-12s %-30s %d differing bytes\n" "$abi" "$so_name" "$n"
-                fi
-            done
-        done
-
-    elif echo "$label" | grep -q "zcash-android-sdk-"; then
-        # zcash-android-sdk AAR: classes.jar diff (Kotlin @Metadata version label analysis)
-        cj2="$d2/classes.jar"; cj3="$d3/classes.jar"
-        echo ""
-        echo "  >> classes.jar SHA-256:"
-        echo "     P2: $(sha256of "$cj2")"
-        echo "     P3: $(sha256of "$cj3")"
-        echo "     P2 size: $(wc -c < "$cj2") bytes"
-        echo "     P3 size: $(wc -c < "$cj3") bytes"
-
-        cj2_dir=$(mktemp -d); cj3_dir=$(mktemp -d)
-        unzip -q "$cj2" -d "$cj2_dir" 2>/dev/null || true
-        unzip -q "$cj3" -d "$cj3_dir" 2>/dev/null || true
-
-        total=$(find "$cj2_dir" -name "*.class" | wc -l)
-        differ_count=$(diff -rq "$cj2_dir" "$cj3_dir" 2>/dev/null | grep -c "^Files" || true)
-        echo ""
-        echo "  >> Class file summary:"
-        echo "     Total .class files: $total"
-        echo "     Differing files:    $differ_count"
-
-        echo ""
-        echo "  >> First 5 differing class files:"
-        diff -rq "$cj2_dir" "$cj3_dir" 2>/dev/null | grep "^Files" | head -5 \
-            | sed "s|Files $cj2_dir/||;s| and.*||" || true
-
-        sample_p2=$(find "$cj2_dir" -name "OpenForTesting.class" | head -1)
-        if [[ -z "$sample_p2" ]]; then
-            sample_p2=$(diff -rq "$cj2_dir" "$cj3_dir" 2>/dev/null \
-                | grep "^Files" | head -1 | awk '{print $2}') || true
-        fi
-
-        if [[ -n "$sample_p2" ]]; then
-            class_rel="${sample_p2#$cj2_dir/}"
-            class_fqn="${class_rel%.class}"; class_fqn="${class_fqn//\//.}"
-            sample_p3="$cj3_dir/$class_rel"
-            echo ""
-            echo "  >> Version label strings in $class_rel:"
-            echo "     [P2]"; strings "$sample_p2" 2>/dev/null | grep -E "_release|zcash_android" | head -5 || true
-            echo "     [P3]"; strings "$sample_p3" 2>/dev/null | grep -E "_release|zcash_android" | head -5 || true
-
-            if command -v javap &>/dev/null; then
-                echo ""
-                echo "  >> javap diff for $class_rel (version labels):"
-                diff \
-                    <(javap -verbose -classpath "$cj2_dir" "$class_fqn" 2>/dev/null) \
-                    <(javap -verbose -classpath "$cj3_dir" "$class_fqn" 2>/dev/null) \
-                    | grep -E "^[<>].*release|^[<>].*zcash_android|^[<>].*Metadata" \
-                    | head -30 || true
-            fi
-        fi
-        rm -rf "$cj2_dir" "$cj3_dir" 2>/dev/null || true
-
-    else
-        echo ""
-        echo "  >> diff -r brief:"
-        diff -r --brief "$d2" "$d3" 2>/dev/null || true
-    fi
-
-    rm -rf "$d2" "$d3" 2>/dev/null || true
-done
-
+# (Per-artifact forensic deep-analysis removed for size; conclusions retained in the summary below.)
 section "Phase 4: Summary Table"
 printf "\n  %-52s  %s\n" "ARTIFACT" "RESULT"
 printf "  %-52s  %s\n"   "--------" "------"
@@ -1214,7 +1018,7 @@ for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
     rm -rf /tmp/o /tmp/b; mkdir -p /tmp/o /tmp/b
     unzip -q -o "$o" -d /tmp/o; unzip -q -o "$b" -d /tmp/b
     draw=$(diff -rq /tmp/o /tmp/b 2>/dev/null)
-    n=$(printf '%s\n' "$draw" | grep -vc '^$'); m=$(printf '%s\n' "$draw" | grep -Ec 'META-INF'); nn=$((n - m))
+    n=$(printf '%s\n' "$draw" | grep -vc '^$'); m=$(printf '%s\n' "$draw" | grep -Ec '\.(SF|RSA|DSA|EC)( |$)|MANIFEST\.MF( |$)'); nn=$((n - m))
     printf '%s\n' "$draw"
     echo "  diffs: $n total ($m META-INF, $nn non-META-INF)"
     echo "$cfg $n $m $nn" >> /out/p5-summary.txt
@@ -1229,8 +1033,14 @@ $CRUN run --rm \
     -v "$P5_DIR:/out" \
     -v "$p5_ctx/p5.sh:/p5.sh:ro" \
     "$IMG_P3" bash /p5.sh 2>&1 | tee "$P5_DIR/p5-split.log"
+P5_EXIT=${PIPESTATUS[0]}
+if [[ $P5_EXIT -ne 0 ]] || ! grep -q '^TOTALS' "$P5_DIR/p5-summary.txt" 2>/dev/null; then
+    log_error "Phase 5 comparison container failed (exit $P5_EXIT) or produced no summary"
+    generate_error_yaml "ftbfs" "Phase 5 per-split comparison container failed (exit ${P5_EXIT})"
+    echo ""; echo "Exit code: 1"; exit 1
+fi
 read -r _ diff_count diff_metainf_count diff_non_metainf_count missing_cfgs \
-    < <(grep '^TOTALS' "$P5_DIR/p5-summary.txt" 2>/dev/null || echo "TOTALS 1 0 1 1")
+    < <(grep '^TOTALS' "$P5_DIR/p5-summary.txt")
 diff_count="${diff_count:-1}"; diff_metainf_count="${diff_metainf_count:-0}"
 diff_non_metainf_count="${diff_non_metainf_count:-1}"; missing_cfgs="${missing_cfgs:-1}"
 section "Phase 5: PRIMARY VERDICT (split — judged on non-signature diffs)"
@@ -1246,205 +1056,7 @@ else
     P5_VERDICT="not_reproducible"; P5_MATCH="false"
 fi
 echo "  Phase 5b skipped in split mode (Phase 2 universal baseline is shape-incompatible with splits)."
-else
-banner "PHASE 5: APK CONTENTS COMPARISON (PRIMARY VERDICT)"
-echo "  Phase 3 (from-source built) APK vs official Play Store APK."
-echo "  All diffs reported."
-echo "  Started: $(date)"
-
-section "Phase 5: Unzipping APKs (inside container — host unzip not required)"
-mkdir -p "$P5_DIR/official-unzipped" "$P5_DIR/built-unzipped"
-
-echo "  Unzipping official APK via container..."
-if ! $CRUN run --rm \
-        -v "${apk_file}:/input/official.apk:ro" \
-        -v "${P5_DIR}/official-unzipped:/output" \
-        "$IMG_P3" \
-        unzip -q /input/official.apk -d /output; then
-    log_error "Failed to unzip official APK: $apk_file"
-    generate_error_yaml "ftbfs" "Failed to unzip official APK — file may be corrupt or not a valid APK"
-    echo ""; echo "Exit code: 1"
-    exit 1
 fi
-echo "  Unzipping Phase 3 (from-source) APK via container..."
-if ! $CRUN run --rm \
-        -v "${P3_APK}:/input/built.apk:ro" \
-        -v "${P5_DIR}/built-unzipped:/output" \
-        "$IMG_P3" \
-        unzip -q /input/built.apk -d /output; then
-    log_error "Failed to unzip Phase 3 APK: $P3_APK"
-    generate_error_yaml "ftbfs" "Failed to unzip Phase 3 built APK"
-    echo ""; echo "Exit code: 1"
-    exit 1
-fi
-
-section "Phase 5: Diff (Phase 3 APK vs Official)"
-set +e
-diff_raw=$($CRUN run --rm \
-    --volume "${P5_DIR}:/p5:ro" \
-    "$IMG_P3" \
-    diff --brief --recursive /p5/official-unzipped/ /p5/built-unzipped/ 2>/dev/null)
-diff_exit=$?
-set +e
-if [[ "$diff_exit" -gt 1 ]]; then
-    log_error "Phase 5 diff failed (exit $diff_exit)"
-    generate_error_yaml "ftbfs" "Phase 5 diff command failed (exit ${diff_exit})"
-    echo ""; echo "Exit code: 1"
-    exit 1
-fi
-
-printf '%s\n' "$diff_raw" > "$P5_DIR/diff-raw.txt"
-diff_count=$(printf '%s\n' "$diff_raw" | grep -vc '^$' 2>/dev/null || true)
-diff_count="${diff_count:-0}"
-
-diff_metainf=$(printf '%s\n' "$diff_raw" | grep -E ': META-INF$|/META-INF[:/]' || true)
-diff_non_metainf=$(printf '%s\n' "$diff_raw" | grep -vE ': META-INF$|/META-INF[:/]' || true)
-diff_metainf_count=$(printf '%s\n' "$diff_metainf" | grep -vc '^$' 2>/dev/null || echo 0)
-diff_non_metainf_count=$(printf '%s\n' "$diff_non_metainf" | grep -vc '^$' 2>/dev/null || echo 0)
-printf '%s\n' "$diff_non_metainf" > "$P5_DIR/diff-non-metainf.txt"
-
-echo "  Total diff lines:        $diff_count  (verdict is based on this count)"
-echo "  META-INF diff lines:     $diff_metainf_count  (signing artifacts — for human review)"
-echo "  Non-META-INF diff lines: $diff_non_metainf_count"
-echo ""
-echo "  Full diff output (all differences):"
-printf '%s\n' "$diff_raw"
-
-dep_for_so() {
-    local so="$1"
-    case "$so" in
-        *dashjbls*|*dashd*|*pthread*)    echo "dashkit (bitcoin-kit-android, NDK r25b, clang 14.0.6)" ;;
-        *libsodium*)                     echo "ton-kit-android (NDK r29, GNU build ID only)" ;;
-        *monerujo*|*monero*|*wallet*crypto*) echo "monero-kit-android (NDK r23b, GNU build ID only)" ;;
-        *)                               echo "unknown dep" ;;
-    esac
-}
-
-if [[ "$diff_count" -gt 0 ]]; then
-    section "Phase 5: Deep analysis of $diff_count differing file(s)"
-
-    while IFS= read -r diff_line; do
-        [[ -z "$diff_line" ]] && continue
-
-        # Parse path from "Files A/path and B/path differ" or "Only in A/dir: file"
-        # Diff runs inside container so paths are /p5/official-unzipped/ and /p5/built-unzipped/
-        if echo "$diff_line" | grep -q "^Files "; then
-            rel_path=$(echo "$diff_line" \
-                | sed "s|^Files /p5/official-unzipped/||;s| and .*||")
-        elif echo "$diff_line" | grep -q "^Only in "; then
-            dir_part=$(echo "$diff_line" | sed 's/^Only in //;s/: .*//')
-            file_part=$(echo "$diff_line" | sed 's/^Only in [^:]*: //')
-            rel_path="${dir_part}/${file_part}"
-            rel_path="${rel_path#/p5/official-unzipped/}"
-            rel_path="${rel_path#/p5/built-unzipped/}"
-        else
-            rel_path="$diff_line"
-        fi
-
-        file_official="$P5_DIR/official-unzipped/${rel_path}"
-        file_built="$P5_DIR/built-unzipped/${rel_path}"
-        ext="${rel_path##*.}"
-
-        echo ""; echo "━━━━  DIFFER: ${rel_path}  ━━━━"
-
-        if [[ -f "$file_official" && -f "$file_built" ]]; then
-            echo "  Official size: $(wc -c < "$file_official") bytes"
-            echo "  Built size:    $(wc -c < "$file_built") bytes"
-
-            case "$ext" in
-                so)
-                    so_basename=$(basename "$rel_path")
-                    dep_src=$(dep_for_so "$so_basename")
-                    echo "  Source dep:    ${dep_src}"
-                    echo "  >> .comment (compiler/linker):"
-                    echo "     [Official]"; readelf -p .comment "$file_official" 2>/dev/null | grep -v "^$" || true
-                    echo "     [Built]";    readelf -p .comment "$file_built"    2>/dev/null | grep -v "^$" || true
-                    echo "  >> ELF notes (NDK version + build ID):"
-                    echo "     [Official]"; readelf -n "$file_official" 2>/dev/null || true
-                    echo "     [Built]";    readelf -n "$file_built"    2>/dev/null || true
-                    echo "  >> Embedded build paths:"
-                    echo "     [Official]"; strings "$file_official" | grep -E "^/(home|build|src|jitpack)" | head -3 || echo "     (none)"
-                    echo "     [Built]";    strings "$file_built"    | grep -E "^/(home|build|src|jitpack)" | head -3 || echo "     (none)"
-                    ndiff=$(cmp -l "$file_official" "$file_built" 2>/dev/null | wc -l) || true
-                    echo "  >> cmp -l: ${ndiff} byte(s) differ"
-                    if [[ "$ndiff" -le 30 ]]; then
-                        cmp -l "$file_official" "$file_built" 2>/dev/null || true
-                    else
-                        echo "     (first 10 of ${ndiff}):"
-                        cmp -l "$file_official" "$file_built" 2>/dev/null | head -10 || true
-                    fi
-                    ;;
-                dex)
-                    ndiff=$(cmp -l "$file_official" "$file_built" 2>/dev/null | wc -l) || true
-                    echo "  >> .dex byte diff count: ${ndiff}"
-                    ;;
-                *)
-                    if file "$file_official" 2>/dev/null | grep -q "text"; then
-                        echo "  >> Text diff (first 50 lines):"
-                        diff "$file_official" "$file_built" 2>/dev/null | head -50 || true
-                    else
-                        ndiff=$(cmp -l "$file_official" "$file_built" 2>/dev/null | wc -l) || true
-                        echo "  >> Binary diff: ${ndiff} byte(s) differ"
-                    fi
-                    ;;
-            esac
-
-        elif [[ -f "$file_official" && ! -f "$file_built" ]]; then
-            echo "  >> Only in official APK (missing from built)"
-        elif [[ ! -f "$file_official" && -f "$file_built" ]]; then
-            echo "  >> Only in built APK (not in official)"
-        else
-            echo "  >> (directory entry or unresolvable diff)"
-        fi
-
-    done < "$P5_DIR/diff-raw.txt"
-fi
-
-section "Phase 5: PRIMARY VERDICT"
-if [[ "$diff_count" -eq 0 ]]; then
-    log_success "Phase 5 verdict: REPRODUCIBLE (0 total differences)"
-    P5_VERDICT="reproducible"
-    P5_MATCH="true"
-else
-    log_warn "Phase 5 verdict: NOT_REPRODUCIBLE ($diff_count total difference(s); META-INF breakdown above)"
-    P5_VERDICT="not_reproducible"
-    P5_MATCH="false"
-fi
-
-section "Phase 5b: REFERENCE — Phase 2 (JitPack) APK vs Official"
-echo "  (Reference only — does not affect the primary verdict)"
-
-mkdir -p "$P5_DIR/p2-unzipped"
-if ! $CRUN run --rm \
-        -v "${P2_APK}:/input/p2.apk:ro" \
-        -v "${P5_DIR}/p2-unzipped:/output" \
-        "$IMG_P3" \
-        unzip -q /input/p2.apk -d /output; then
-    log_warn "Failed to unzip Phase 2 APK — Phase 5b reference comparison skipped"
-    P5B_SKIP=true
-fi
-P5B_SKIP="${P5B_SKIP:-false}"
-
-if [[ "$P5B_SKIP" == "true" ]]; then
-    echo "  Phase 5b skipped (Phase 2 APK unzip failed)."
-else
-    set +e
-    p2_diff_raw=$($CRUN run --rm \
-        --volume "${P5_DIR}:/p5:ro" \
-        "$IMG_P3" \
-        diff --brief --recursive /p5/official-unzipped/ /p5/p2-unzipped/ 2>/dev/null)
-    p2_diff_exit=$?
-    set +e
-    if [[ "$p2_diff_exit" -gt 1 ]]; then
-        log_warn "Phase 5b diff failed (exit $p2_diff_exit); skipping reference comparison"
-    else
-        p2_diff_count=$(printf '%s\n' "$p2_diff_raw" | grep -vc '^$' 2>/dev/null || true)
-        p2_diff_count="${p2_diff_count:-0}"
-        echo "  Phase 2 vs Official total diff count: $p2_diff_count (reference only)"
-        [[ "$p2_diff_count" -gt 0 ]] && echo "$p2_diff_raw"
-    fi
-fi
-fi   # end split/single Phase 5 branch
 
 echo ""
 echo "===== Begin Results ====="
