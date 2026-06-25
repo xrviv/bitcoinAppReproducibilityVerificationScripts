@@ -1,12 +1,20 @@
 #!/bin/bash
 # apkextractor_sync.sh - Extracts APKs from Android device and syncs to server
-# Version: v0.8.0
+# Version: v0.9.1
 # Usage: ./apkextractor_sync.sh <appID> [user@server] [OPTIONS]
 # Options: -b/--both, --no-extract, --remote-dir <path>, -h/--help
 #
+# Changelog v0.9.1:
+#   - Display a prominent "App Version Being Uploaded" banner (versionName +
+#     versionCode) after the APKs are pulled, before upload/save begins
+#
+# Changelog v0.9.0:
+#   - Split APKs now uploaded/saved individually (no tar.gz bundling)
+#     Each split gets its own file; no deterministic tar.gz wrapper
+#   - Removed create_deterministic_targz function
+#
 # Changelog v0.8.0:
 #   - Split APKs now packed into a deterministic .tar.gz before upload/save
-#     (mode 0644, owner 0, group 0, mtime @0, sorted filenames, gzip -n)
 #     Filename: {appID}-split-set.tar.gz
 #   - Single APK upload/save behavior unchanged
 #
@@ -68,7 +76,7 @@ show_help() {
   echo "  ./apkextractor_sync.sh com.example.app user@server --both --no-extract"
   echo "  ./apkextractor_sync.sh com.example.app user@server --remote-dir /data/shared/apks"
   echo ""
-  echo "Version: v0.8.0"
+  echo "Version: v0.9.1"
   exit 0
 }
 
@@ -82,25 +90,6 @@ check_command() {
   fi
 }
 
-create_deterministic_targz() {
-  local source_dir="$1"
-  local output_file="$2"
-  local apk_files=()
-  while IFS= read -r f; do
-    apk_files+=("$f")
-  done < <(find "$source_dir" -maxdepth 1 -name "*.apk" -printf "%f\n" | sort)
-  if [ ${#apk_files[@]} -eq 0 ]; then
-    echo "Error: No APK files found in $source_dir" >&2
-    return 1
-  fi
-  tar --create \
-      --owner=0 --group=0 \
-      --mode=0644 \
-      --mtime='@0' \
-      --sort=name \
-      --directory="$source_dir" \
-      "${apk_files[@]}" | gzip -n > "$output_file"
-}
 
 is_app_installed() {
   local package_name="$1"
@@ -342,6 +331,16 @@ else
   echo "Using versionName for directory: $version"
 fi
 
+# Display the app version prominently before upload/save begins
+appVersionName=$(get_version_name "$tempDir/base.apk")
+appVersionCode=$(get_version_code "$tempDir/base.apk")
+echo ""
+echo -e "\033[1;36m▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮ App Version Being Uploaded ▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮\033[0m"
+echo -e "\033[1;32m  $bundleId\033[0m"
+echo -e "  versionName: \033[1;33m$appVersionName\033[0m"
+echo -e "  versionCode: \033[1;33m$appVersionCode\033[0m"
+echo ""
+
 # Determine if split APKs
 isSplitApk=false
 if echo "$apks" | grep -qE "split_|config."; then
@@ -416,16 +415,15 @@ if [ ! -z "$sshCredentials" ]; then
   # Create the version-specific directory
   ssh $sshCredentials "mkdir -p $uploadDir"
 
-  # Upload APKs (split set as tar.gz, single APK as-is)
+  # Upload APKs (split APKs individually, single APK as-is)
   uploadedFiles=()
   if [ "$isSplitApk" = true ]; then
-    tarFile="$tempDir/${bundleId}-split-set.tar.gz"
-    echo "Packing split APKs into deterministic tar.gz..."
-    create_deterministic_targz "$tempDir" "$tarFile"
-    tarName="${bundleId}-split-set.tar.gz"
-    scp "$tarFile" "$sshCredentials:$uploadDir/$tarName"
-    uploadedFiles+=("$uploadDir/$tarName")
-    echo "Split APK set uploaded as tar.gz."
+    for apk in "$tempDir"/*.apk; do
+      apkName=$(basename "$apk")
+      scp "$apk" "$sshCredentials:$uploadDir/$apkName"
+      uploadedFiles+=("$uploadDir/$apkName")
+    done
+    echo "Split APKs uploaded individually."
   else
     # Check if unzip is available on remote server for single APK extraction
     remoteCanExtract=false
@@ -475,13 +473,7 @@ if [ ! -z "$sshCredentials" ]; then
   aapt dump badging "$tempDir/base.apk" | grep -E "package:|versionCode|versionName|sdkVersion|targetSdkVersion" | sed 's/^/  /'
   echo ""
   echo -e "\033[1;32m▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮ APK Hashes ▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮\033[0m"
-  if [ "$isSplitApk" = true ]; then
-    hash=$(sha256sum "$tempDir/${bundleId}-split-set.tar.gz" | awk '{print $1}')
-    echo "  $hash = ${bundleId}-split-set.tar.gz"
-    echo ""
-    echo "  Individual split APK hashes:"
-  fi
-  for apk in $tempDir/*.apk; do
+  for apk in "$tempDir"/*.apk; do
     hash=$(sha256sum "$apk" | awk '{print $1}')
     apkName=$(basename "$apk")
     echo "  $hash = $apkName"
@@ -557,8 +549,8 @@ if [ -z "$sshCredentials" ] || [ "$saveBoth" = true ]; then
           exit 1
         fi
       else
-        # New save is single APK, check if splits/ directory or tar.gz exists
-        if echo "$existingFiles" | grep -qE "^splits$|-split-set\.tar\.gz$"; then
+        # New save is single APK, check if split APKs exist
+        if echo "$existingFiles" | grep -qE "^splits$|-split-set\.tar\.gz$|^base\.apk$|^split_.*\.apk$"; then
           echo -e "\033[1;31m❌ MISMATCH DETECTED:\033[0m"
           echo "  Current save: Single APK"
           echo "  Existing files: Split APKs (splits/ directory found)"
@@ -585,16 +577,15 @@ if [ -z "$sshCredentials" ] || [ "$saveBoth" = true ]; then
   # Create the version-specific directory
   mkdir -p "$saveDir"
 
-  # Save APKs (split set as tar.gz, single APK as-is)
+  # Save APKs (split APKs individually, single APK as-is)
   savedFiles=()
   if [ "$isSplitApk" = true ]; then
-    tarFile="$tempDir/${bundleId}-split-set.tar.gz"
-    echo "Packing split APKs into deterministic tar.gz..."
-    create_deterministic_targz "$tempDir" "$tarFile"
-    tarName="${bundleId}-split-set.tar.gz"
-    cp "$tarFile" "$saveDir/$tarName"
-    savedFiles+=("$saveDir/$tarName")
-    echo "Split APK set saved as tar.gz to $saveDir"
+    for apk in "$tempDir"/*.apk; do
+      apkName=$(basename "$apk")
+      cp "$apk" "$saveDir/$apkName"
+      savedFiles+=("$saveDir/$apkName")
+    done
+    echo "Split APKs saved individually to $saveDir"
   else
     for apk in $tempDir/*.apk; do
       apkName=$(basename "$apk")
@@ -631,13 +622,7 @@ if [ -z "$sshCredentials" ] || [ "$saveBoth" = true ]; then
   aapt dump badging "$tempDir/base.apk" | grep -E "package:|versionCode|versionName|sdkVersion|targetSdkVersion" | sed 's/^/  /'
   echo ""
   echo -e "\033[1;32m▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮ APK Hashes ▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮\033[0m"
-  if [ "$isSplitApk" = true ]; then
-    hash=$(sha256sum "$tempDir/${bundleId}-split-set.tar.gz" | awk '{print $1}')
-    echo "  $hash = ${bundleId}-split-set.tar.gz"
-    echo ""
-    echo "  Individual split APK hashes:"
-  fi
-  for apk in $tempDir/*.apk; do
+  for apk in "$tempDir"/*.apk; do
     hash=$(sha256sum "$apk" | awk '{print $1}')
     apkName=$(basename "$apk")
     echo "  $hash = $apkName"
