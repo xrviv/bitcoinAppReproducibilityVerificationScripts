@@ -363,7 +363,7 @@ sed -i 's/org\.gradle\.jvmargs=.*/org.gradle.jvmargs=-Xmx4096M -Dkotlin.daemon.j
 
 ./gradlew :app:assembleBaseRelease --no-daemon --max-workers=2
 
-cp app/build/outputs/apk/base/release/app-base-release.apk /output/
+cp "\$(find app/build/outputs/apk/base/release -name '*.apk' | sort | head -1)" /output/app-base-release.apk
 
 CACHE="\${HOME}/.gradle/caches/modules-2/files-2.1"
 mkdir -p /output/jitpack-aars
