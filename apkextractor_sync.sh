@@ -1,8 +1,19 @@
 #!/bin/bash
 # apkextractor_sync.sh - Extracts APKs from Android device and syncs to server
-# Version: v0.9.1
+# Version: v0.10.0
 # Usage: ./apkextractor_sync.sh <appID> [user@server] [OPTIONS]
-# Options: -b/--both, --no-extract, --remote-dir <path>, -h/--help
+# Options: -b/--both, --no-extract, --remote-dir <path>, --ws, -h/--help
+#
+# Changelog v0.10.0:
+#   - Added --ws: upload the pulled split APKs to WalletScrutiny Blossom exactly
+#     like the WS Android app — each split uploaded individually (no tar/zip) via a
+#     nak-signed kind-24242 auth event, then ONE kind-9401 asset-bundle event tags
+#     every split as ["x", sha256, filename]. Description: "{appID}_v{versionName}
+#     by ws android (danny)". Atomic: any failed split aborts before publishing.
+#   - On upload failure the EXACT server error is shown (HTTP status + response body),
+#     mirroring the app's "Upload failed: <code> - <body>".
+#   - --ws alone (no server arg) does Blossom only and skips the default local save.
+#     Reuses the shared WS uploader identity (~/.config/walletscrutiny/uploader.hexkey).
 #
 # Changelog v0.9.1:
 #   - Display a prominent "App Version Being Uploaded" banner (versionName +
@@ -48,6 +59,19 @@ extractApk=true
 saveBoth=false
 remoteBaseDir="/home/danny/apks"
 remoteDirProvided=false
+wsUpload=false
+
+# ---- WalletScrutiny Blossom/Nostr upload config (used by --ws) ----
+# Mirrors the WS Android app: each split is uploaded to Blossom individually (no tar/zip),
+# addressed by its own SHA256; then ONE kind-9401 asset-bundle event references every split.
+# Reuses the shared WS uploader identity (same keyfile the *_uploader.sh tools use).
+NAK="${NAK:-$HOME/go/bin/nak}"
+WS_BLOSSOM_SERVER="${WS_BLOSSOM_SERVER:-https://files.nostr.info}"
+WS_AUTH_TTL="${WS_BLOSSOM_AUTH_TTL:-1800}"
+WS_KEYFILE="${WS_UPLOAD_KEYFILE:-$HOME/.config/walletscrutiny/uploader.hexkey}"
+WS_RELAYS=(wss://relay.nostr.info wss://nostr.mom wss://relay.primal.net wss://relay.damus.io wss://nos.lol)
+# NIP-89 client coordinate the app stamps on its kind-9401 events:
+WS_CLIENT_TAG="WalletScrutiny.com;31990:168b7a2cd8bb9205c3f574de540606d6f4c46717c5164f47373fdcce2b9cd335:7703371760017;wss://relay.nostr.info/"
 
 # Show help function
 show_help() {
@@ -66,6 +90,10 @@ show_help() {
   echo "  -b, --both      Save both locally AND to server (requires server argument)"
   echo "  --no-extract    Do not extract APK contents (default: extracts to 'base/' folder)"
   echo "  --remote-dir    Remote base directory (default: ~/apks)."
+  echo "  --ws            Upload pulled split APKs to WalletScrutiny Blossom (mimics the"
+  echo "                  WS Android app): each split uploaded individually, then one"
+  echo "                  kind-9401 asset-bundle event. Shows the exact server error on"
+  echo "                  failure. --ws alone does Blossom only (skips local save)."
   echo "  -h, --help      Show this help message"
   echo ""
   echo "Examples:"
@@ -75,8 +103,9 @@ show_help() {
   echo "  ./apkextractor_sync.sh com.example.app user@server -b"
   echo "  ./apkextractor_sync.sh com.example.app user@server --both --no-extract"
   echo "  ./apkextractor_sync.sh com.example.app user@server --remote-dir /data/shared/apks"
+  echo "  ./apkextractor_sync.sh com.example.app --ws"
   echo ""
-  echo "Version: v0.9.1"
+  echo "Version: v0.10.0"
   exit 0
 }
 
@@ -159,6 +188,52 @@ determine_naming_convention() {
   fi
 }
 
+# ws_blossom_upload FILE EXPECTED_SHA256
+#   Uploads FILE to the Blossom server (BUD-02 PUT /upload) with a self-built, nak-signed
+#   kind-24242 auth event (expiration = now + WS_AUTH_TTL), base64'd into the Authorization
+#   header. Streams with curl --progress-bar. On failure it prints the EXACT server error
+#   (HTTP status + response body), mirroring the app's "Upload failed: <code> - <body>".
+#   Returns 0 on success, non-zero on failure. Needs SEC_HEX set by the caller.
+ws_blossom_upload() {
+  local file="$1" want="$2" exp authb64 body code curlrc=0
+  exp=$(( $(date -u +%s) + WS_AUTH_TTL ))
+  authb64="$("$NAK" event -k 24242 -t t=upload -t "x=${want}" -t "expiration=${exp}" \
+      -c "Upload $(basename "$file")" --sec "$SEC_HEX" | base64 -w0)"
+  if [ -z "$authb64" ]; then
+    echo -e "  \033[1;31m[WS UPLOAD ERROR]\033[0m $(basename "$file"): could not build the kind-24242 auth event (nak failed)."
+    return 1
+  fi
+  body="$(mktemp)"
+  # --progress-bar -> stderr (visible); http_code -> stdout (captured); body -> $body file.
+  code="$(curl -sS -L --progress-bar -T "$file" \
+      -H "Authorization: Nostr ${authb64}" \
+      -H "Content-Type: application/vnd.android.package-archive" \
+      -o "$body" -w '%{http_code}' \
+      "${WS_BLOSSOM_SERVER}/upload")" || curlrc=$?
+  if [ "$curlrc" -ne 0 ]; then
+    echo -e "  \033[1;31m[WS UPLOAD ERROR]\033[0m $(basename "$file"): curl transport failure (exit $curlrc)."
+    echo "    $(cat "$body" 2>/dev/null)"
+    rm -f "$body"; return 1
+  fi
+  case "$code" in
+    2*)
+      # Confirm the server stored the hash we expect (BUD-02 returns the blob descriptor).
+      local got; got="$(grep -oE '[0-9a-f]{64}' "$body" | head -1 || true)"
+      rm -f "$body"
+      if [ -n "$got" ] && [ "$got" != "$want" ]; then
+        echo -e "  \033[1;31m[WS UPLOAD ERROR]\033[0m $(basename "$file"): server stored sha256 '$got' != expected '$want'."
+        return 1
+      fi
+      return 0
+      ;;
+    *)
+      echo -e "  \033[1;31m[WS UPLOAD ERROR]\033[0m $(basename "$file"): HTTP $code"
+      echo "    Server response: $(cat "$body" 2>/dev/null)"
+      rm -f "$body"; return 1
+      ;;
+  esac
+}
+
 # Parse arguments
 bundleId=""
 sshCredentials=""
@@ -174,6 +249,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     -b|--both)
       saveBoth=true
+      shift
+      ;;
+    --ws)
+      wsUpload=true
       shift
       ;;
     --remote-dir)
@@ -347,6 +426,79 @@ if echo "$apks" | grep -qE "split_|config."; then
   isSplitApk=true
 fi
 
+# ===== WalletScrutiny Blossom upload (--ws): mimics the WS Android app =====
+# Each split (base + config splits) is uploaded to Blossom individually (no tar/zip),
+# addressed by its own SHA256. If every split uploads, ONE kind-9401 asset-bundle event
+# is published referencing all of them. Atomic: if any split fails, nothing is published
+# (like the app's abort-on-partial) and the EXACT server error is shown.
+if [ "$wsUpload" = true ]; then
+  echo ""
+  echo -e "\033[1;35m▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮ WalletScrutiny Blossom upload (--ws) ▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮\033[0m"
+
+  command -v "$NAK" >/dev/null 2>&1 || { echo -e "\033[1;31mError: nak not found at '$NAK' (set NAK=/path/to/nak).\033[0m"; rm -rf "$tempDir"; exit 1; }
+  command -v curl >/dev/null 2>&1 || { echo -e "\033[1;31mError: curl required for --ws.\033[0m"; rm -rf "$tempDir"; exit 1; }
+
+  # Load (or first-time generate) the shared WS uploader identity.
+  if [ -f "$WS_KEYFILE" ]; then
+    SEC_HEX="$(tr -d '[:space:]' < "$WS_KEYFILE")"
+  else
+    mkdir -p "$(dirname "$WS_KEYFILE")"
+    SEC_HEX="$("$NAK" key generate)"
+    printf '%s' "$SEC_HEX" > "$WS_KEYFILE"
+    chmod 600 "$WS_KEYFILE"
+    echo -e "\033[1;33m  Generated a new WS uploader identity at $WS_KEYFILE\033[0m"
+  fi
+  echo "  Blossom server: $WS_BLOSSOM_SERVER"
+  echo "  Uploader pubkey: $("$NAK" key public "$SEC_HEX")"
+  echo ""
+
+  wsXTags=()
+  wsFailed=0
+  for apk in "$tempDir"/*.apk; do
+    apkName=$(basename "$apk")
+    sha=$(sha256sum "$apk" | awk '{print $1}')
+    if "$NAK" blossom --server "$WS_BLOSSOM_SERVER" check "$sha" >/dev/null 2>&1; then
+      echo -e "  \033[1;32m✓\033[0m already on Blossom, skipping upload: $apkName"
+      echo "      $sha"
+    else
+      echo "  Uploading $apkName ($sha) ..."
+      if ws_blossom_upload "$apk" "$sha"; then
+        echo -e "  \033[1;32m✓\033[0m uploaded: $apkName"
+      else
+        wsFailed=$((wsFailed + 1))
+        continue   # exact error already printed by ws_blossom_upload
+      fi
+    fi
+    wsXTags+=( -t "x=${sha};${apkName}" )
+  done
+
+  if [ "$wsFailed" -gt 0 ]; then
+    echo ""
+    echo -e "\033[1;31m❌ WS upload incomplete: $wsFailed APK(s) failed. NOT publishing kind-9401 (atomic, like the app).\033[0m"
+    rm -rf "$tempDir"
+    exit 1
+  fi
+
+  # Publish ONE kind-9401 asset-bundle event referencing every split.
+  wsDescription="${bundleId}_v${appVersionName} by ws android (danny)"
+  echo ""
+  echo -e "\033[1;36m  Publishing kind-9401 asset registration:\033[0m"
+  echo "    content: $wsDescription"
+  if "$NAK" event -k 9401 -c "$wsDescription" \
+      "${wsXTags[@]}" \
+      -t "i=${bundleId}" \
+      -t "version=${appVersionName}" \
+      -t "platform=android" \
+      -t "client=${WS_CLIENT_TAG}" \
+      -t "c=walletscrutiny" \
+      --sec "$SEC_HEX" "${WS_RELAYS[@]}" >/dev/null; then
+    echo -e "  \033[1;32m✓ kind-9401 published to ${#WS_RELAYS[@]} relays.\033[0m"
+  else
+    echo -e "  \033[1;31m⚠ kind-9401 publish failed (splits ARE on Blossom; re-publish the event later).\033[0m"
+  fi
+  echo ""
+fi
+
 # Upload to server if credentials provided
 if [ ! -z "$sshCredentials" ]; then
   isRemote=true
@@ -481,8 +633,8 @@ if [ ! -z "$sshCredentials" ]; then
   echo ""
 fi
 
-# Save locally if no server OR if --both flag is set
-if [ -z "$sshCredentials" ] || [ "$saveBoth" = true ]; then
+# Save locally if no server (and not a --ws-only run) OR if --both flag is set
+if { [ -z "$sshCredentials" ] && [ "$wsUpload" = false ]; } || [ "$saveBoth" = true ]; then
   isRemote=false
 
   echo -e "\033[1;33m▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮ Saving files locally to /var/shared/apk ▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮\033[0m"
