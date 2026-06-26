@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # unstoppablewallet_build.sh - Unstoppable Wallet Reproducible Build Verification
-# Version:       v0.3.0
+# Version:       v0.3.2
 # Organization:  WalletScrutiny.com
 # Project:       https://github.com/horizontalsystems/unstoppable-wallet-android
 # Host deps:     docker or podman only
 # Notes:         Play Store-only, split-only. --binary must be a DIRECTORY of device-pulled
 #                split APKs (base.apk + split_config.*) => AAB + bundletool per-split compare.
 #                Single-APK releases (<= v0.47.x) are NOT supported by v0.3.0 (use an older script).
+#                v0.49.0: zcash de-forked → external cash.z.ecc.android (not built); zano-kit-android
+#                built from source, but its ~290 MB prebuilt .a (Zano/Boost/OpenSSL) are trusted blobs.
 
-SCRIPT_VERSION="v0.3.0"
+SCRIPT_VERSION="v0.3.2"
 echo "Starting unstoppablewallet_build.sh ${SCRIPT_VERSION}"
 
 set -uo pipefail   # no -e: diff/cmp return 1 on differences
@@ -430,7 +432,7 @@ echo "  Finished: $(date)"
 
 # (Ubuntu 24.04, JDK 8 + JDK 17, Android SDK, NDK 23/25/29, CMake)
 banner "PHASE 3: BUILD DEPS FROM SOURCE + BUILD WALLET APK"
-echo "  Building all 11 horizontalsystems deps from source."
+echo "  Building horizontalsystems deps from source (zano: Kotlin/JNI wrapper only — links prebuilt .a blobs)."
 echo "  HS versions are derived from wallet app/build.gradle at runtime."
 echo "  Started: $(date)"
 
@@ -462,6 +464,7 @@ RUN yes | sdkmanager --licenses && \
         "build-tools;30.0.3" "build-tools;34.0.0" \
         "build-tools;35.0.0" "build-tools;36.0.0" \
         "ndk;23.1.7779620" "ndk;25.1.8937393" "ndk;29.0.14033849" \
+        "ndk;27.0.12077973" \
         "cmake;3.22.1"
 
 # bundletool — regenerates device-matched split APKs from the built AAB (split mode)
@@ -576,7 +579,7 @@ FEERATE_VER=$(extract_wallet_hs_version "blockchain-fee-rate-kit-android" "$wall
 MARKET_VER=$(extract_wallet_hs_version "market-kit-android" "$wallet_gradle")
 SOLANA_VER=$(extract_wallet_hs_version "solana-kit-android" "$wallet_gradle")
 TRON_VER=$(extract_wallet_hs_version "tron-kit-android" "$wallet_gradle")
-ZCASH_VER=$(extract_wallet_hs_version "zcash-android-wallet-sdk" "$wallet_gradle")
+ZANO_VER=$(extract_wallet_hs_version "zano-kit-android" "$wallet_gradle")
 
 require_nonempty "monero-kit-android version" "$MONERO_VER"
 require_nonempty "stellar-kit-android version" "$STELLAR_VER"
@@ -587,7 +590,7 @@ require_nonempty "blockchain-fee-rate-kit-android version" "$FEERATE_VER"
 require_nonempty "market-kit-android version" "$MARKET_VER"
 require_nonempty "solana-kit-android version" "$SOLANA_VER"
 require_nonempty "tron-kit-android version" "$TRON_VER"
-require_nonempty "zcash-android-wallet-sdk version" "$ZCASH_VER"
+require_nonempty "zano-kit-android version" "$ZANO_VER"
 
 echo "Derived HS direct versions from wallet app/build.gradle:"
 echo "  monero-kit-android:               $MONERO_VER"
@@ -599,14 +602,14 @@ echo "  blockchain-fee-rate-kit-android:  $FEERATE_VER"
 echo "  market-kit-android:               $MARKET_VER"
 echo "  solana-kit-android:               $SOLANA_VER"
 echo "  tron-kit-android:                 $TRON_VER"
-echo "  zcash-android-wallet-sdk:         $ZCASH_VER"
+echo "  zano-kit-android:                 $ZANO_VER"
 
 clone_at_commit "$GH/ton-kit-android.git"                     "$TON_VER"      /build/deps/ton-kit-android
 clone_at_commit "$GH/stellar-kit-android.git"                 "$STELLAR_VER"  /build/deps/stellar-kit-android
 clone_at_commit "$GH/market-kit-android.git"                  "$MARKET_VER"   /build/deps/market-kit-android
 clone_at_commit "$GH/blockchain-fee-rate-kit-android.git"     "$FEERATE_VER"  /build/deps/blockchain-fee-rate-kit-android
 clone_at_commit "$GH/solana-kit-android.git"                  "$SOLANA_VER"   /build/deps/solana-kit-android
-clone_at_commit "$GH/zcash-android-wallet-sdk.git"            "$ZCASH_VER"    /build/deps/zcash-android-wallet-sdk
+clone_at_commit "$GH/zano-kit-android.git"                    "$ZANO_VER"     /build/deps/zano-kit-android
 
 clone_at_commit "$GH/bitcoin-kit-android.git"                 "$BITCOIN_VER"  /home/jitpack/build
 clone_at_commit "$GH/ethereum-kit-android.git"                "$ETHEREUM_VER" /build/deps/ethereum-kit-android
@@ -685,20 +688,32 @@ cd /build/deps/solana-kit-android
 sed -i "s/version = '1.0.0'/version = '$SOLANA_VER'/" solanakit/build.gradle
 ./gradlew :solanakit:publishToMavenLocal --no-daemon
 
-echo ""; echo "=== Step 4f: zcash-android-wallet-sdk === $(date)"
-cd /build/deps/zcash-android-wallet-sdk
-sed -i 's/IS_SNAPSHOT=true/IS_SNAPSHOT=false/' gradle.properties
-sed -i 's/val myGroup = "cash.z.ecc.android"/val myGroup = "com.github.horizontalsystems.zcash-android-wallet-sdk"/' \
-    build-conventions/src/main/kotlin/zcash-sdk.publishing-conventions.gradle.kts
-sed -i "s/version = if (isSnapshot) \"\\\$myVersion-SNAPSHOT\" else myVersion,/version = \"$ZCASH_VER\",/" \
-    build-conventions/src/main/kotlin/zcash-sdk.publishing-conventions.gradle.kts
-./gradlew :sdk-lib:publishToMavenLocal :backend-lib:publishToMavenLocal \
-    :lightwallet-client-lib:publishToMavenLocal :sdk-incubator-lib:publishToMavenLocal \
-    -PskipCargoBuild=true --no-daemon
-create_root_pom \
-    "com.github.horizontalsystems" "zcash-android-wallet-sdk" "$ZCASH_VER" \
-    "com.github.horizontalsystems.zcash-android-wallet-sdk" \
-    zcash-android-sdk zcash-android-backend lightwallet-client zcash-android-sdk-incubator
+# Step 4f: zano-kit-android (new in v0.49.0; native C++/JNI). Build Kotlin SDK + libzanokit.so
+# from source + publish. CAVEAT: links ~290 MB prebuilt .a (Zano engine/Boost/OpenSSL) NOT rebuilt
+# (upstream builds them macOS-only) — trusted vendor blobs, flag in report. Needs NDK 27.0.12077973.
+echo ""; echo "=== Step 4f: zano-kit-android === $(date)"
+echo "  [BLOB CAVEAT] zano links prebuilt .a (Zano engine/Boost/OpenSSL) — not rebuilt from source"
+cd /build/deps/zano-kit-android
+sed -i "/plugins {/a\\    id 'maven-publish'" zanokit/build.gradle
+# AGP 8.11.1: components.release does not exist unless the library opts into publishing
+# the release variant. zano's build.gradle has no publishing block, so declare it.
+grep -qF "singleVariant('release')" zanokit/build.gradle || sed -i "/^android {/a\\    publishing { singleVariant('release') }" zanokit/build.gradle
+cat >> zanokit/build.gradle <<ZANO_PUB
+
+afterEvaluate {
+    publishing {
+        publications {
+            release(MavenPublication) {
+                from components.release
+                groupId = 'com.github.horizontalsystems'
+                artifactId = 'zano-kit-android'
+                version = '$ZANO_VER'
+            }
+        }
+    }
+}
+ZANO_PUB
+./gradlew :zanokit:publishToMavenLocal --no-daemon
 
 echo ""; echo "=== Step 5a: bitcoin-kit-android === $(date)"
 cd /home/jitpack/build
@@ -823,8 +838,10 @@ sha256sum /output/local-aars/* | sort
 
 echo ""; echo "=== Dependency resolution check ==="
 WLOG=/output/wallet-build.log
-HS_LOCAL=$(grep -E "horizontalsystems" "$WLOG" | grep -Ec "\.m2/repository/com/github/horizontalsystems|mavenLocal" 2>/dev/null || echo 0)
-HS_JITPACK=$(grep -Eci "Downloading https://jitpack\\.io/com/github/horizontalsystems|Downloaded from .*jitpack\\.io/com/github/horizontalsystems" "$WLOG" 2>/dev/null || echo 0)
+# grep -c prints 0 on no match but EXITS 1 → under Phase 3 `set -e` a bare assignment aborts here.
+# `|| true` forces exit 0 while keeping grep's "0" on stdout (NOT `|| echo 0`, which appends a 2nd 0 → "0\n0").
+HS_LOCAL=$(grep -E "horizontalsystems" "$WLOG" 2>/dev/null | grep -Ec "\.m2/repository/com/github/horizontalsystems|mavenLocal" || true); HS_LOCAL=${HS_LOCAL:-0}
+HS_JITPACK=$(grep -Eci "Downloading https://jitpack\\.io/com/github/horizontalsystems|Downloaded from .*jitpack\\.io/com/github/horizontalsystems" "$WLOG" 2>/dev/null || true); HS_JITPACK=${HS_JITPACK:-0}
 echo "  HS packages from mavenLocal: $HS_LOCAL  (expected: >0)"
 echo "  HS packages from JitPack:    $HS_JITPACK (expected: 0)"
 if [[ "$HS_JITPACK" -gt 0 ]]; then
@@ -968,8 +985,10 @@ for pair in "${PAIRS[@]}"; do
         P4_FINAL_MATCH=$(( P4_FINAL_MATCH + 1 ))
     else
         case "$label" in
-            bitcoin-kit-android-*|ethereum-kit-android-*|zcash-android-wallet-sdk-*)
+            bitcoin-kit-android-*|ethereum-kit-android-*)
                 p4_verdict="DIFFER — MANIFEST.MF metadata only (JitPack Built-By vs local Created-By field)" ;;
+            zano-kit-android-*)
+                p4_verdict="DIFFER — zano-kit artifact differs; note libzanokit.so links vendor-prebuilt Zano engine/Boost/OpenSSL .a blobs that were not rebuilt — see report blob caveat" ;;
             hd-wallet-kit-android-*)
                 p4_verdict="DIFFER — ZIP metadata only (extracted content identical per diff -r)" ;;
             dashkit-*)
@@ -1018,9 +1037,11 @@ for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
     rm -rf /tmp/o /tmp/b; mkdir -p /tmp/o /tmp/b
     unzip -q -o "$o" -d /tmp/o; unzip -q -o "$b" -d /tmp/b
     draw=$(diff -rq /tmp/o /tmp/b 2>/dev/null)
-    n=$(printf '%s\n' "$draw" | grep -vc '^$'); m=$(printf '%s\n' "$draw" | grep -Ec '\.(SF|RSA|DSA|EC)( |$)|MANIFEST\.MF( |$)'); nn=$((n - m))
     printf '%s\n' "$draw"
-    echo "  diffs: $n total ($m META-INF, $nn non-META-INF)"
+    # Exclude Google Play SourceStamp (stamp-cert-sha256) from counted diffs — Play-injected artifact, not developer output
+    cnt=$(printf '%s\n' "$draw" | grep -v 'stamp-cert-sha256')
+    n=$(printf '%s\n' "$cnt" | grep -vc '^$'); m=$(printf '%s\n' "$cnt" | grep -Ec '\.(SF|RSA|DSA|EC)( |$)|MANIFEST\.MF( |$)'); nn=$((n - m))
+    echo "  diffs: $n total ($m META-INF, $nn non-META-INF; stamp-cert-sha256 excluded as Play SourceStamp)"
     echo "$cfg $n $m $nn" >> /out/p5-summary.txt
     T=$((T + n)); M=$((M + m)); N=$((N + nn))
 done
