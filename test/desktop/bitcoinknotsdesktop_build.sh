@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitcoinknotsdesktop_build.sh - Bitcoin Knots Reproducible Build Verification
 # ==============================================================================
-# Version:       v1.1.4
+# Version:       v1.1.7
 # Organization:  WalletScrutiny.com
-# Last Modified: 2025-12-02
+# Last Modified: 2026-06-26
 # Project:       https://github.com/bitcoinknots/bitcoin
 # ==============================================================================
 # LICENSE: MIT License
@@ -53,12 +53,12 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v1.1.4"
+SCRIPT_VERSION="v1.1.7"
 SCRIPT_NAME="bitcoinknotsdesktop_build.sh"
 APP_ID="bitcoinknots"
 APP_NAME="Bitcoin Knots"
 REPO_URL="https://github.com/bitcoinknots/bitcoin"
-DEFAULT_VERSION="29.2.knots20251010"
+DEFAULT_VERSION="29.3.knots20260507"
 CONTAINER_NAME=""
 IMAGE_NAME=""
 
@@ -103,6 +103,12 @@ map_arch_to_guix() {
             ;;
         riscv64-linux)
             echo "riscv64-linux-gnu"
+            ;;
+        x86_64-macos)
+            echo "x86_64-apple-darwin"
+            ;;
+        arm64-macos)
+            echo "arm64-apple-darwin"
             ;;
         *)
             log_error "Unsupported architecture: $bs_arch"
@@ -323,11 +329,11 @@ Usage:
   $(basename "$0") --version <version> --arch <arch> --type <type>
 
 Required Parameters:
-  --version <version>    Bitcoin Knots version to verify (e.g., 29.2.knots20251010)
+  --version <version>    Bitcoin Knots version to verify (e.g., 29.3.knots20260507)
   --arch <arch>          Target architecture
                          Supported: x86_64-linux, aarch64-linux, arm-linux,
                                    x86_64-windows, powerpc64-linux, powerpc64le-linux,
-                                   riscv64-linux
+                                   riscv64-linux, x86_64-macos, arm64-macos
   --type <type>          Build type (tarball for linux, zip for windows)
 
 Optional Parameters:
@@ -339,9 +345,11 @@ Flags:
   --list-targets         Show available build targets
 
 Examples:
-  $(basename "$0") --version 29.2.knots20251010 --arch x86_64-linux --type tarball
-  $(basename "$0") --version 29.2.knots20251010 --arch aarch64-linux --type tarball
-  $(basename "$0") --version 29.2.knots20251010 --arch x86_64-windows --type zip
+  $(basename "$0") --version 29.3.knots20260507 --arch x86_64-linux --type tarball
+  $(basename "$0") --version 29.3.knots20260507 --arch aarch64-linux --type tarball
+  $(basename "$0") --version 29.3.knots20260507 --arch x86_64-windows --type zip
+  $(basename "$0") --version 29.3.knots20260507 --arch x86_64-macos --type tarball
+  $(basename "$0") --version 29.3.knots20260507 --arch arm64-macos --type tarball
   $(basename "$0") --list-targets
 
 Requirements:
@@ -392,6 +400,8 @@ DEFAULT BEHAVIOR:
     - powerpc64le-linux-gnu
     - riscv64-linux-gnu
     - x86_64-w64-mingw32
+    - x86_64-apple-darwin (tar.gz only)
+    - arm64-apple-darwin (tar.gz only)
 
 MACOS TARGETS:
     x86_64-apple-darwin     64-bit macOS (Intel)
@@ -418,14 +428,16 @@ FOR MACOS TARGETS:
 
 SINGLE VS MULTI-TARGET BUILDS:
 To build all default targets (all Linux + Windows), omit the --target flag:
-    $SCRIPT_NAME 29.2.knots20251010
+    $SCRIPT_NAME 29.3.knots20260507
 
 To build a single specific target, use --target:
-    $SCRIPT_NAME --target x86_64-linux-gnu 29.2.knots20251010
-    $SCRIPT_NAME --target x86_64-w64-mingw32 29.2.knots20251010
+    $SCRIPT_NAME --target x86_64-linux-gnu 29.3.knots20260507
+    $SCRIPT_NAME --target x86_64-w64-mingw32 29.3.knots20260507
+    $SCRIPT_NAME --target x86_64-apple-darwin 29.3.knots20260507
+    $SCRIPT_NAME --target arm64-apple-darwin 29.3.knots20260507
 
 To build custom target list (space-separated):
-    $SCRIPT_NAME --target "x86_64-linux-gnu x86_64-w64-mingw32" 29.2.knots20251010
+    $SCRIPT_NAME --target "x86_64-linux-gnu x86_64-w64-mingw32" 29.3.knots20260507
 
 Note: Version can be specified with or without 'v' prefix (both work)
 
@@ -1056,7 +1068,7 @@ main() {
                 exit 2
             fi
             ;;
-        x86_64-linux|aarch64-linux|arm-linux|powerpc64-linux|powerpc64le-linux|riscv64-linux)
+        x86_64-linux|aarch64-linux|arm-linux|powerpc64-linux|powerpc64le-linux|riscv64-linux|x86_64-macos|arm64-macos)
             if [[ "$build_type" != "tarball" ]]; then
                 log_error "Unsupported type for ${arch}: ${build_type}. Use --type tarball"
                 exit 2
