@@ -2,7 +2,7 @@
 # ==============================================================================
 # bitcoinknotsdesktop_build.sh - Bitcoin Knots Reproducible Build Verification
 # ==============================================================================
-# Version:       v1.1.9
+# Version:       v1.1.10
 # Organization:  WalletScrutiny.com
 # Last Modified: 2026-06-27
 # Project:       https://github.com/bitcoinknots/bitcoin
@@ -53,7 +53,7 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v1.1.9"
+SCRIPT_VERSION="v1.1.10"
 SCRIPT_NAME="bitcoinknotsdesktop_build.sh"
 APP_ID="bitcoinknots"
 APP_NAME="Bitcoin Knots"
@@ -153,7 +153,7 @@ log_success() {
     echo -e "${GREEN}[SUCCESS]${NC} $1"
 }
 
-log_warninging() {
+log_warning() {
     echo -e "${YELLOW}[WARNING]${NC} $1"
 }
 
@@ -218,7 +218,7 @@ select_artifacts_for_verification() {
     SKIPPED_OPTIONAL_ARTIFACTS=()
 
     if [[ ! -d "$output_dir" ]]; then
-        log_warninging "Output directory not found for artifact selection: $output_dir"
+        log_warning "Output directory not found for artifact selection: $output_dir"
         return 1
     fi
 
@@ -244,7 +244,7 @@ select_artifacts_for_verification() {
     shopt -u nullglob
 
     if [[ ${#SELECTED_ARTIFACTS[@]} -eq 0 ]]; then
-        log_warninging "No artifacts selected for verification"
+        log_warning "No artifacts selected for verification"
     else
         log_info "Selected ${#SELECTED_ARTIFACTS[@]} artifacts for verification"
         for artifact in "${SELECTED_ARTIFACTS[@]}"; do
@@ -645,8 +645,8 @@ prepare_bitcoin_build() {
     if ${CONTAINER_CMD} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git verify-tag $version 2>/dev/null"; then
         log_success "GPG signature verified for $version"
     else
-        log_warninging "GPG signature verification failed for $version"
-        log_warninging "This may be normal for some releases"
+        log_warning "GPG signature verification failed for $version"
+        log_warning "This may be normal for some releases"
     fi
 
     log_success "Bitcoin Knots $version prepared for build"
@@ -745,7 +745,7 @@ download_official_checksums() {
     fi
 
     if ! ${CONTAINER_CMD} exec "$CONTAINER_NAME" bash -lc "set -euo pipefail; cd '$container_temp_dir'; wget --tries=3 --timeout=60 -q -O SHA256SUMS '$base_url/SHA256SUMS' || curl -fL --retry 3 --retry-delay 2 -o SHA256SUMS '$base_url/SHA256SUMS'"; then
-        log_warninging "Could not download SHA256SUMS file"
+        log_warning "Could not download SHA256SUMS file"
         log_info "Manual verification required at: https://github.com/bitcoinknots/bitcoin/releases/tag/$version"
         ${CONTAINER_CMD} exec "$CONTAINER_NAME" rm -rf "$container_temp_dir" >/dev/null 2>&1 || true
         rm -rf "$temp_dir"
@@ -774,7 +774,7 @@ final_cleanup() {
 
     # Keep container if copy failed
     if [[ "$COPY_SUCCESS" == "false" ]]; then
-        log_warninging "Artifact copy failed, keeping container for manual extraction"
+        log_warning "Artifact copy failed, keeping container for manual extraction"
         log_info "Container: $CONTAINER_NAME"
         log_info "To extract artifacts manually:"
         log_info "  ${CONTAINER_CMD} exec $CONTAINER_NAME bash"
@@ -1020,11 +1020,11 @@ main() {
                 shift
                 ;;
             -*)
-                log_warninging "Unknown option: $1 (ignored)"
+                log_warning "Unknown option: $1 (ignored)"
                 shift
                 ;;
             *)
-                log_warninging "Unexpected positional argument: $1 (ignored)"
+                log_warning "Unexpected positional argument: $1 (ignored)"
                 shift
                 ;;
         esac
