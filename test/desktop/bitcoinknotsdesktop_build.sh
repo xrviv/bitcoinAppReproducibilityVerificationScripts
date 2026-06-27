@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitcoinknotsdesktop_build.sh - Bitcoin Knots Reproducible Build Verification
 # ==============================================================================
-# Version:       v1.1.7
+# Version:       v1.1.8
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-06-26
+# Last Modified: 2026-06-27
 # Project:       https://github.com/bitcoinknots/bitcoin
 # ==============================================================================
 # LICENSE: MIT License
@@ -53,7 +53,7 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v1.1.7"
+SCRIPT_VERSION="v1.1.8"
 SCRIPT_NAME="bitcoinknotsdesktop_build.sh"
 APP_ID="bitcoinknots"
 APP_NAME="Bitcoin Knots"
@@ -122,18 +122,11 @@ generate_error_yaml() {
     local output_file="$1"
     local error_msg="$2"
     local status="${3:-ftbfs}"
-    
+
     cat > "$output_file" << EOF
-date: $(date -Iseconds)
 script_version: ${SCRIPT_VERSION}
-build_type: ${build_type}
-results:
-  - architecture: ${arch}
-    filename: N/A
-    hash: N/A
-    match: false
-    status: ${status}
-    error: ${error_msg}
+verdict: ${status}
+notes: ${error_msg}
 EOF
 }
 
@@ -144,17 +137,10 @@ generate_yaml() {
     local hash="$3"
     local match="$4"
     local status="$5"
-    
+
     cat > "$output_file" << EOF
-date: $(date -Iseconds)
 script_version: ${SCRIPT_VERSION}
-build_type: ${build_type}
-results:
-  - filename: ${filename}
-    architecture: ${arch}
-    hash: ${hash}
-    match: ${match}
-    status: ${status}
+verdict: ${status}
 EOF
 }
 
@@ -415,10 +401,10 @@ FOR LINUX/DESKTOP TARGETS:
     bitcoin-VERSION-TARGET-debug.tar.gz     # Debug symbols
 
 FOR WINDOWS TARGET (x86_64-w64-mingw32):
-    bitcoin-VERSION-win64.zip               # Main Windows binaries
-    bitcoin-VERSION-win64-debug.zip         # Debug symbols
-    bitcoin-VERSION-win64-setup.exe         # Windows installer
-    bitcoin-VERSION-win64-unsigned.zip      # Unsigned binaries
+    bitcoin-VERSION-win64-pgpverifiable.zip       # Main Windows binaries (Guix output)
+    bitcoin-VERSION-win64-debug.zip               # Debug symbols
+    bitcoin-VERSION-win64-setup-pgpverifiable.exe # Windows installer (Guix output)
+    bitcoin-VERSION-win64-codesigning.tar.gz      # Codesigning artifacts
 
 FOR MACOS TARGETS:
     bitcoin-VERSION-TARGET.tar.gz           # Main binaries
@@ -1016,6 +1002,10 @@ main() {
                 build_type="$2"
                 shift 2
                 ;;
+            --binary)
+                log_warning "--binary is not used by this script (Guix builds from source); ignoring"
+                shift 2
+                ;;
             --list-targets)
                 show_targets
                 exit 0
@@ -1029,14 +1019,12 @@ main() {
                 shift
                 ;;
             -*)
-                log_error "Unknown option: $1"
-                show_help
-                exit 2
+                log_warning "Unknown option: $1 (ignored)"
+                shift
                 ;;
             *)
-                log_error "Unexpected positional argument: $1"
-                show_help
-                exit 2
+                log_warning "Unexpected positional argument: $1 (ignored)"
+                shift
                 ;;
         esac
     done
