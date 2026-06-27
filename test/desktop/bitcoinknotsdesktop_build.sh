@@ -2,7 +2,7 @@
 # ==============================================================================
 # bitcoinknotsdesktop_build.sh - Bitcoin Knots Reproducible Build Verification
 # ==============================================================================
-# Version:       v1.1.8
+# Version:       v1.1.9
 # Organization:  WalletScrutiny.com
 # Last Modified: 2026-06-27
 # Project:       https://github.com/bitcoinknots/bitcoin
@@ -53,7 +53,7 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v1.1.8"
+SCRIPT_VERSION="v1.1.9"
 SCRIPT_NAME="bitcoinknotsdesktop_build.sh"
 APP_ID="bitcoinknots"
 APP_NAME="Bitcoin Knots"
@@ -153,7 +153,7 @@ log_success() {
     echo -e "${GREEN}[SUCCESS]${NC} $1"
 }
 
-log_warning() {
+log_warninging() {
     echo -e "${YELLOW}[WARNING]${NC} $1"
 }
 
@@ -218,7 +218,7 @@ select_artifacts_for_verification() {
     SKIPPED_OPTIONAL_ARTIFACTS=()
 
     if [[ ! -d "$output_dir" ]]; then
-        log_warning "Output directory not found for artifact selection: $output_dir"
+        log_warninging "Output directory not found for artifact selection: $output_dir"
         return 1
     fi
 
@@ -244,7 +244,7 @@ select_artifacts_for_verification() {
     shopt -u nullglob
 
     if [[ ${#SELECTED_ARTIFACTS[@]} -eq 0 ]]; then
-        log_warning "No artifacts selected for verification"
+        log_warninging "No artifacts selected for verification"
     else
         log_info "Selected ${#SELECTED_ARTIFACTS[@]} artifacts for verification"
         for artifact in "${SELECTED_ARTIFACTS[@]}"; do
@@ -645,8 +645,8 @@ prepare_bitcoin_build() {
     if ${CONTAINER_CMD} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git verify-tag $version 2>/dev/null"; then
         log_success "GPG signature verified for $version"
     else
-        log_warning "GPG signature verification failed for $version"
-        log_warning "This may be normal for some releases"
+        log_warninging "GPG signature verification failed for $version"
+        log_warninging "This may be normal for some releases"
     fi
 
     log_success "Bitcoin Knots $version prepared for build"
@@ -745,7 +745,7 @@ download_official_checksums() {
     fi
 
     if ! ${CONTAINER_CMD} exec "$CONTAINER_NAME" bash -lc "set -euo pipefail; cd '$container_temp_dir'; wget --tries=3 --timeout=60 -q -O SHA256SUMS '$base_url/SHA256SUMS' || curl -fL --retry 3 --retry-delay 2 -o SHA256SUMS '$base_url/SHA256SUMS'"; then
-        log_warning "Could not download SHA256SUMS file"
+        log_warninging "Could not download SHA256SUMS file"
         log_info "Manual verification required at: https://github.com/bitcoinknots/bitcoin/releases/tag/$version"
         ${CONTAINER_CMD} exec "$CONTAINER_NAME" rm -rf "$container_temp_dir" >/dev/null 2>&1 || true
         rm -rf "$temp_dir"
@@ -774,7 +774,7 @@ final_cleanup() {
 
     # Keep container if copy failed
     if [[ "$COPY_SUCCESS" == "false" ]]; then
-        log_warning "Artifact copy failed, keeping container for manual extraction"
+        log_warninging "Artifact copy failed, keeping container for manual extraction"
         log_info "Container: $CONTAINER_NAME"
         log_info "To extract artifacts manually:"
         log_info "  ${CONTAINER_CMD} exec $CONTAINER_NAME bash"
@@ -849,7 +849,7 @@ verify_checksums() {
     if ${CONTAINER_CMD} exec "$CONTAINER_NAME" bash -c "curl -fsSL -o /official/${main_artifact} ${official_url}/${main_artifact}"; then
         log_success "Downloaded official release"
     else
-        log_warn "Could not download official release - manual verification required"
+        log_warning "Could not download official release - manual verification required"
         log_info "URL attempted: ${official_url}/${main_artifact}"
     fi
     
@@ -890,9 +890,9 @@ verify_checksums() {
             generate_yaml "$comparison_file" "$main_artifact" "$built_hash" "false" "not_reproducible"
             diff_count=$((diff_count + 1))
             verdict="not_reproducible"
-            log_warn "Difference: ${main_artifact}"
-            log_warn "Built:    ${built_hash}"
-            log_warn "Official: ${official_hash}"
+            log_warning "Difference: ${main_artifact}"
+            log_warning "Built:    ${built_hash}"
+            log_warning "Official: ${official_hash}"
         fi
     else
         # No official to compare - just report built hash
@@ -901,7 +901,7 @@ verify_checksums() {
             generate_error_yaml "$comparison_file" "No official release available for comparison" "nosource"
             diff_count=$((diff_count + 1))
             verdict="not_reproducible"
-            log_warn "No official release to compare - manual verification required"
+            log_warning "No official release to compare - manual verification required"
             log_info "Built hash: ${built_hash}"
         else
             generate_error_yaml "$comparison_file" "Built artifact not found" "ftbfs"
@@ -964,7 +964,7 @@ verify_checksums() {
         log_info "Build server output: ${comparison_file}"
         return 0
     else
-        log_warn "Verdict: NOT REPRODUCIBLE"
+        log_warning "Verdict: NOT REPRODUCIBLE"
         log_info "Build server output: ${comparison_file}"
         log_info "Official checksums: https://github.com/bitcoinknots/bitcoin/releases/download/${version}/SHA256SUMS"
         return 1
@@ -1004,7 +1004,8 @@ main() {
                 ;;
             --binary)
                 log_warning "--binary is not used by this script (Guix builds from source); ignoring"
-                shift 2
+                [[ -n "${2:-}" && "${2:-}" != -* ]] && shift
+                shift
                 ;;
             --list-targets)
                 show_targets
@@ -1019,11 +1020,11 @@ main() {
                 shift
                 ;;
             -*)
-                log_warning "Unknown option: $1 (ignored)"
+                log_warninging "Unknown option: $1 (ignored)"
                 shift
                 ;;
             *)
-                log_warning "Unexpected positional argument: $1 (ignored)"
+                log_warninging "Unexpected positional argument: $1 (ignored)"
                 shift
                 ;;
         esac
