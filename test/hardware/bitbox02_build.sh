@@ -1,8 +1,8 @@
 #!/bin/bash
-# bitbox02_build.sh v3.8.0 - WalletScrutiny verification script for BitBox02
+# bitbox02_build.sh v3.9.0 - WalletScrutiny verification script for BitBox02
 # Organization: WalletScrutiny.com
 # Last modified by: Daniel Garcia
-# Date last modified: 2026-06-29 (v3.8.0)
+# Date last modified: 2026-06-29 (v3.9.0)
 # Usage: bitbox02_build.sh --version VERSION [--type TYPE] [--binary PATH] [--arch ARCH]
 #
 # Verifies BitBox02 firmware reproducibility: builds from source via the upstream
@@ -13,7 +13,7 @@
 set -eE
 
 # ---- Globals ----------------------------------------------------------------
-SCRIPT_VERSION="v3.8.0"
+SCRIPT_VERSION="v3.9.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESULTS_FILE="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
 repo="https://github.com/BitBoxSwiss/bitbox02-firmware"
@@ -336,29 +336,36 @@ if ! $CONTAINER_CMD run --rm \
     sha256sum \"\$SIGNED\" | awk '{print \$1}' > /bb02/hash_signed.txt
     sha256sum \"\$BUILT\"  | awk '{print \$1}' > /bb02/hash_built.txt
 
-    # Compute header size dynamically: signed binary = header + unsigned firmware payload.
-    # The btconly header is 588 bytes; multi uses a different signing structure (516 bytes
-    # at v9.26.1). Hard-coding 588 strips 72 extra bytes of firmware for multi, causing a
-    # false not_reproducible verdict. Dynamic calculation works for both types.
-    signed_size=\$(wc -c < \"\$SIGNED\")
-    built_size=\$(wc -c < \"\$BUILT\")
-    header_size=\$(( signed_size - built_size ))
-    if [[ \$header_size -lt 400 || \$header_size -gt 700 ]]; then
-      echo \"ABORT: computed header_size=\${header_size} outside expected range 400-700\" >&2
-      exit 1
-    fi
-    dd if=\"\$SIGNED\" bs=1 skip=\"\$header_size\" of=/bb02/p_stripped.bin 2>/dev/null
+    # Upstream signed firmware layout (describe_signed_firmware.py):
+    #   4 bytes magic + 584 bytes sigdata + unsigned firmware
+    # Total header = 588 bytes for both btconly and multi.
+    HEADER_BYTES=588
+    dd if=\"\$SIGNED\" bs=1 skip=\"\${HEADER_BYTES}\" of=/bb02/p_stripped.bin 2>/dev/null
     sha256sum /bb02/p_stripped.bin | awk '{print \$1}' > /bb02/hash_stripped.txt
 
-    # Device firmware hash: double-sha256 over version (4B) + firmware + 0xff padding to 884736B.
-    # Version bytes sit at (header_size - FIRMWARE_DATA_LEN); FIRMWARE_DATA_LEN = 4 + 3*64 = 196
-    # for the standard signing structure. This may differ between firmware types.
-    version_offset=\$(( header_size - 196 ))
-    dd if=\"\$SIGNED\" bs=1 skip=\"\$version_offset\" count=4 of=/bb02/p_version.bin 2>/dev/null
+    # Diagnostic: log file sizes and parser-derived hash for post-run analysis.
+    python3 -c \"
+import hashlib, sys, os
+MAGIC_LEN = 4; SIGDATA_LEN = 584
+data = open(sys.argv[1], 'rb').read()
+firmware = data[MAGIC_LEN + SIGDATA_LEN:]
+print('diag_signed_size:', len(data))
+print('diag_parser_unsigned_size:', len(firmware))
+print('diag_parser_unsigned_hash:', hashlib.sha256(firmware).hexdigest())
+built_size = os.path.getsize(sys.argv[2])
+print('diag_built_size:', built_size)
+if len(firmware) != built_size:
+    print('WARNING: size mismatch parser_unsigned=' + str(len(firmware)) + ' built=' + str(built_size))
+\" \"\$SIGNED\" \"\$BUILT\" > /bb02/diag.txt 2>&1 || true
+    cat /bb02/diag.txt
+
+    # Device firmware hash: double-sha256 over version (4B at offset 392) + firmware + 0xff padding.
+    # Offset 392 = MAGIC_LEN(4) + SIGNING_PUBKEYS_DATA_LEN(388) per upstream parser constants.
+    dd if=\"\$SIGNED\" bs=1 skip=392 count=4 of=/bb02/p_version.bin 2>/dev/null
     FIRMWARE_BYTES=\$(wc -c < /bb02/p_stripped.bin)
     dd if=/dev/zero bs=1 count=\$(( 884736 - FIRMWARE_BYTES )) 2>/dev/null \
       | tr '\000' '\377' > /bb02/p_padding.bin
-    # Use openssl for binary SHA256 output to avoid xxd dependency.
+    # Use openssl for binary SHA256 output (xxd not present in the build container).
     cat /bb02/p_version.bin /bb02/p_stripped.bin /bb02/p_padding.bin \
       | openssl dgst -sha256 -binary \
       | sha256sum | awk '{print \$1}' \
@@ -417,9 +424,9 @@ echo "===== End Results ====="
 
 # ---- Write COMPARISON_RESULTS.yaml ------------------------------------------
 if [[ "$verdict" == "reproducible" ]]; then
-  notes="BitBox02 v${version} (${firmwareType}) reproducible from source at ${GIT_TAG} (commit ${commit}). Comparison: header dynamically sized to $(( $(wc -c < "$workDir/src/$SIGNED_FILENAME") - $(wc -c < "$workDir/src/$BUILT_FIRMWARE_PATH") )) bytes stripped from official signed binary before SHA-256 comparison against unsigned build output."
+  notes="BitBox02 v${version} (${firmwareType}) reproducible from source at ${GIT_TAG} (commit ${commit}). Comparison: first 588 bytes (4 magic + 584 sigdata) stripped from official signed binary; SHA-256 of remainder matches unsigned build output."
 else
-  notes="BitBox02 v${version} (${firmwareType}) not reproducible. Built hash ${builtHash} does not match unsigned official payload hash ${downloadStrippedSigHash} after dynamic header strip from ${SIGNED_FILENAME}."
+  notes="BitBox02 v${version} (${firmwareType}) not reproducible. Built hash ${builtHash} does not match unsigned official payload hash ${downloadStrippedSigHash} after stripping 588 bytes (4 magic + 584 sigdata) from ${SIGNED_FILENAME}."
 fi
 
 write_results "$verdict" "$notes"
