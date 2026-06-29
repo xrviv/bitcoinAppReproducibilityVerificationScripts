@@ -42,7 +42,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.2.0"
+SCRIPT_VERSION="v0.3.0"
 APP_ID="sparrow"
 PLATFORM="desktop"
 PAGE_URL="https://walletscrutiny.com/desktop/sparrow/"
@@ -177,29 +177,104 @@ trap 'rm -rf "${WORK}"' EXIT
 
 log "Sparrow ${V} - processing ${#TYPES[@]} artifact(s): ${TYPES[*]}"
 
+# ---- Phase 1: fetch manifest to get expected hashes upfront ----
+SHA256SUMS_URL="${DL_BASE}/sparrowwallet-${V}-manifest.txt"
+SHA256SUMS_FILE="${WORK}/SHA256SUMS"
+declare -A EXPECTED_HASH
+log "Fetching release hash manifest for preflight checks..."
+if curl -fsSL -o "${SHA256SUMS_FILE}" "${SHA256SUMS_URL}" 2>/dev/null; then
+    for t in "${TYPES[@]}"; do
+        fname="${ART_FILE[$t]}"
+        h="$(awk -v f="${fname}" '$2==f || $NF==f {print $1; exit}' "${SHA256SUMS_FILE}" | head -1 || true)"
+        [[ -n "${h}" ]] && EXPECTED_HASH[$t]="${h}"
+    done
+    log "Parsed hashes for ${#EXPECTED_HASH[@]} of ${#TYPES[@]} artifact(s) from manifest."
+else
+    warn "Could not fetch hash manifest — all artifacts will be downloaded."
+fi
+
+# ---- Phase 2: Blossom preflight — check which artifacts are already uploaded ----
+declare -A BLOSSOM_PRESENT
+declare -a NEED_DOWNLOAD=()
+
+echo ""
+log "Blossom preflight check (${BLOSSOM_SERVER})..."
+for t in "${TYPES[@]}"; do
+    if [[ -n "${EXPECTED_HASH[$t]:-}" ]]; then
+        h="${EXPECTED_HASH[$t]}"
+        if "${NAK}" blossom --server "${BLOSSOM_SERVER}" check "${h}" >/dev/null 2>&1; then
+            log "  [${t}] already on Blossom (${h}) — download skipped"
+            BLOSSOM_PRESENT[$t]=true
+        else
+            log "  [${t}] not on Blossom — queued for download"
+            BLOSSOM_PRESENT[$t]=false
+            NEED_DOWNLOAD+=("${t}")
+        fi
+    else
+        log "  [${t}] no hash in manifest — queued for download"
+        BLOSSOM_PRESENT[$t]=false
+        NEED_DOWNLOAD+=("${t}")
+    fi
+done
+
+# ---- Phase 3: Download only artifacts not already on Blossom ----
+declare -A ACTUAL_HASH ACTUAL_SIZE
+if [[ ${#NEED_DOWNLOAD[@]} -gt 0 ]]; then
+    echo ""
+    log "Downloading ${#NEED_DOWNLOAD[@]} artifact(s)..."
+    for t in "${NEED_DOWNLOAD[@]}"; do
+        file="${ART_FILE[$t]}"
+        url="${DL_BASE}/${file}"
+        out="${WORK}/${file}"
+        echo ""
+        echo "----- ${t}: ${file} -----"
+        if ! curl -f -L --progress-bar -o "${out}" "${url}"; then
+            warn "download failed (skipping): ${url}"
+            warn "  (this artifact may not exist for ${V}; check the release page)"
+            BLOSSOM_PRESENT[$t]=skip
+            continue
+        fi
+
+        # ---- Phase 4: Redundancy check ----
+        got="$(sha256sum "${out}" | cut -d' ' -f1)"
+        size="$(stat -c%s "${out}")"
+        printf '  sha256=%s  size=%s bytes\n' "${got}" "${size}"
+        if [[ -n "${EXPECTED_HASH[$t]:-}" && "${got}" != "${EXPECTED_HASH[$t]}" ]]; then
+            die "[${t}] hash mismatch! expected ${EXPECTED_HASH[$t]}, got ${got}"
+        fi
+        ACTUAL_HASH[$t]="${got}"
+        ACTUAL_SIZE[$t]="${size}"
+    done
+else
+    echo ""
+    log "All artifacts already on Blossom — no downloads needed."
+fi
+
+# ---- Phase 5 & 6: Upload missing + publish kind-1063 for all ----
+echo ""
 PROCESSED=0
 for t in "${TYPES[@]}"; do
+    [[ "${BLOSSOM_PRESENT[$t]:-}" == "skip" ]] && continue
+
     file="${ART_FILE[$t]}"
     mime="${ART_MIME[$t]}"
     url="${DL_BASE}/${file}"
-    out="${WORK}/${file}"
 
-    echo ""
-    echo "----- ${t}: ${file} -----"
-    echo "  downloading..."
-    if ! curl -f -L --progress-bar -o "${out}" "${url}"; then
-        warn "download failed (skipping): ${url}"
-        warn "  (this artifact may not exist for ${V}; check the release page)"
-        continue
+    if [[ "${BLOSSOM_PRESENT[$t]}" == true ]]; then
+        hash="${EXPECTED_HASH[$t]}"
+        size=""
+    else
+        hash="${ACTUAL_HASH[$t]:-}"
+        size="${ACTUAL_SIZE[$t]:-}"
+        [[ -n "${hash}" ]] || { warn "[${t}] no hash available (download failed) — skipping"; continue; }
     fi
-    hash="$(sha256sum "${out}" | cut -d' ' -f1)"
-    size="$(stat -c%s "${out}")"
-    printf '  sha256=%s  size=%s bytes\n' "${hash}" "${size}"
+
+    echo "----- ${t}: ${file} -----"
+    printf '  sha256=%s\n' "${hash}"
 
     if [[ "${PUBLISH}" == true ]]; then
-        if "${NAK}" blossom --server "${BLOSSOM_SERVER}" check "${hash}" >/dev/null 2>&1; then
-            log "    already on ${BLOSSOM_SERVER} (${hash}) - skipping upload"
-        else
+        if [[ "${BLOSSOM_PRESENT[$t]}" != true ]]; then
+            out="${WORK}/${file}"
             human="$(numfmt --to=iec "${size}" 2>/dev/null || echo "${size}B")"
             echo "  uploading ${file} (${human})..."
             blossom_upload "${out}" "${hash}" || die "blossom upload failed for ${file}"
@@ -211,13 +286,11 @@ for t in "${TYPES[@]}"; do
     content="Sparrow Desktop v${V} (${t}: ${file}) - WalletScrutiny verified artifact.
 SHA256 is the official download hash. Reproducibility verdict: ${PAGE_URL}"
 
-    # NIP-94 (kind 1063) file metadata, one event per artifact.
     EVENT_TAGS=(
         -t "url=${blossom_url}"
         -t "x=${hash}"
         -t "ox=${hash}"
         -t "m=${mime}"
-        -t "size=${size}"
         -t "i=${APP_ID}"
         -t "version=${V}"
         -t "platform=${PLATFORM}"
@@ -226,6 +299,7 @@ SHA256 is the official download hash. Reproducibility verdict: ${PAGE_URL}"
         -t "r=${PAGE_URL}"
         -t "r=${url}"
     )
+    [[ -n "${size}" ]] && EVENT_TAGS+=(-t "size=${size}")
 
     echo "  --- kind-1063 file-metadata event (preview) ---"
     "${NAK}" event -k 1063 -c "${content}" "${EVENT_TAGS[@]}" --sec "${SEC_HEX}"
@@ -236,17 +310,17 @@ SHA256 is the official download hash. Reproducibility verdict: ${PAGE_URL}"
         log "    registered ${file} under ${NPUB}"
     fi
     PROCESSED=$((PROCESSED+1))
+    echo ""
 done
 
-echo ""
 if [[ "${PROCESSED}" -eq 0 ]]; then
     die "no artifacts processed (all downloads failed - check --version / --type)"
 fi
 if [[ "${PUBLISH}" == true ]]; then
-    log "DONE. ${PROCESSED} artifact(s) uploaded to ${BLOSSOM_SERVER} and registered under ${NPUB}."
+    log "DONE. ${PROCESSED} artifact(s) processed; uploaded to ${BLOSSOM_SERVER} and registered under ${NPUB}."
     log "Verdict is still to be set in the web UI: ${PAGE_URL}"
 else
     echo "DRY RUN - nothing uploaded or broadcast."
-    echo "  ${PROCESSED} artifact(s) downloaded and hashed (shown above)."
+    echo "  ${PROCESSED} artifact(s) checked (shown above)."
     echo "  Re-run with --publish to upload to Blossom and broadcast the events."
 fi

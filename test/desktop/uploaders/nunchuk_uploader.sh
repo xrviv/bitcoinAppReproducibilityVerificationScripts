@@ -1,21 +1,18 @@
 #!/bin/bash
 #
-# bitcoinknots_uploader.sh - Upload official Bitcoin Knots release artifacts to Blossom
-#                            and register each on Nostr (NIP-94 / kind 1063), so the
-#                            WalletScrutiny web UI lists them as "to be verified".
+# nunchuk_uploader.sh - Upload verified Nunchuk Desktop release artifacts to Blossom
+#                       and register each on Nostr (NIP-94 / kind 1063).
 #
 # Version: v0.1.0
 #
 # WHAT THIS DOES
-#   Mirrors liana_uploader.sh / sparrow_uploader.sh. For each official Bitcoin Knots
-#   desktop artifact it (1) uploads the file to a Blossom mediaserver and (2) publishes
-#   ONE NIP-94 file-metadata event (kind 1063) per artifact, anchoring the file by its
-#   SHA256. Registering the artifact makes it show up on the WS page so it can be picked
-#   up for reproducibility verification.
+#   Mirrors liana_uploader.sh / sparrow_uploader.sh. For each official Nunchuk desktop
+#   artifact it (1) uploads the file to a Blossom mediaserver and (2) publishes ONE NIP-94
+#   file-metadata event (kind 1063) per artifact, anchoring the file by its SHA256.
 #
 #   Per WalletScrutiny's per-artifact verdict model (Leo): each desktop artifact is an
 #   independent unit of verification, so this tool emits one event PER artifact (not one
-#   bundled event). Run it once per artifact (or with --type all) as needed.
+#   bundled event). Run it once per artifact, as each artifact's verification completes.
 #
 # WHAT THIS DOES NOT DO  (important)
 #   It does NOT assign a reproducibility verdict. On WalletScrutiny the verdict is set ONLY
@@ -23,19 +20,11 @@
 #   artifacts publicly so a verification can reference them by hash.
 #
 # WHICH BYTES ARE UPLOADED
-#   The WHOLE official release file, unmodified (the .tar.gz / .zip / .exe exactly as
-#   published on GitHub). So the Blossom address EQUALS the SHA256 published in the Knots
-#   release `SHA256SUMS`. The outer hash is the download identity; reproducibility itself
-#   is proven by bitcoinknotsdesktop_build.sh (Guix) comparing the built artifact bytes.
-#
-# SCOPE
-#   Bitcoin Knots ships many assets per release. This tool intentionally registers ONLY the
-#   primary verifiable binary distributables and EXCLUDES:
-#     - macOS (*-apple-darwin*)          (out of scope per WS desktop verification)
-#     - debug bundles (*-debug*)
-#     - codesigning payloads (*-codesigning*, codesignatures-*)
-#     - unsigned intermediates (*-unsigned*)
-#     - source tarball (bitcoin-<ver>.tar.gz, no arch), *.desc.html, SHA256SUMS*
+#   The WHOLE official release file, unmodified (the per-platform .zip). So the Blossom
+#   address EQUALS the SHA256 listed in the release's SHA256SUMS (and shown on the WS page).
+#   The outer .zip hash is the *download identity*; reproducibility is proven at the contents
+#   level (the build script compares the AppImage/app packaged inside the zip). The verdict
+#   lives in the web UI.
 #
 # IDENTITY
 #   Uses the shared WalletScrutiny uploader keypair (generated fresh on first run, persisted,
@@ -53,20 +42,19 @@
 set -euo pipefail
 
 SCRIPT_VERSION="v0.2.0"
-APP_ID="bitcoinknots"
+APP_ID="nunchuk"
 PLATFORM="desktop"
-PAGE_URL="https://walletscrutiny.com/desktop/bitcoinknots/"
-RELEASES_REPO="bitcoinknots/bitcoin"
+PAGE_URL="https://walletscrutiny.com/desktop/nunchuk/"
+RELEASES_REPO="nunchuk-io/nunchuk-desktop"
 BLOSSOM_SERVER="${WS_BLOSSOM_SERVER:-https://files.nostr.info}"
 RELAYS=(wss://relay.nostr.info wss://nostr.mom wss://relay.primal.net wss://relay.damus.io wss://nos.lol)
 NAK="${NAK:-nak}"
 # Shared WalletScrutiny uploader identity - reused by ALL uploader scripts (sparrow,
-# liana, passportprime, this one). Override per-run with WS_UPLOAD_KEYFILE.
+# passportprime, liana, nunchuk, future ones). Override per-run with WS_UPLOAD_KEYFILE.
 KEYFILE="${WS_UPLOAD_KEYFILE:-$HOME/.config/walletscrutiny/uploader.hexkey}"
 # Blossom auth-event validity window (seconds). Must comfortably exceed the time to
 # transfer the largest artifact, or the server rejects with "Auth expired" (400).
-# Knots tarballs are larger than Liana's, so the default ceiling is higher.
-AUTH_TTL="${WS_BLOSSOM_AUTH_TTL:-3600}"
+AUTH_TTL="${WS_BLOSSOM_AUTH_TTL:-1800}"
 
 APP_VERSION=""
 TYPES_ARG="all"
@@ -95,31 +83,24 @@ blossom_upload() {
 
 usage() {
     cat <<EOF
-bitcoinknots_uploader.sh ${SCRIPT_VERSION} - upload + register Bitcoin Knots Desktop artifacts
+nunchuk_uploader.sh ${SCRIPT_VERSION} - upload + register Nunchuk Desktop artifacts
 
 Usage:
   $0 --version VERSION [--type LIST] [--publish] [--server URL] [--keyfile PATH]
 
-  --version VERSION   Knots version WITHOUT the 'v' (e.g. 29.3.knots20260507). Required.
-                      (The release tag is 'v<VERSION>'; this tool adds the 'v'.)
-  --type LIST         Comma-separated artifact keys, or a group, or 'all'. Default: all.
-                      Groups:  all | linux | windows
-                      Keys:    x86_64-linux aarch64-linux arm-linux powerpc64-linux
-                               powerpc64le-linux riscv64-linux win64-zip win64-exe
-                      macOS is intentionally NOT offered (out of scope).
+  --version VERSION   Nunchuk version WITHOUT the 'v' (e.g. 2.5.0). Required.
+                      (The Nunchuk release tag is the bare version, e.g. '2.5.0'.)
+  --type LIST         Comma-separated artifact types, or 'all'. Default: all.
+                      Valid: linux, macos, windows
+                      (each is a per-platform .zip; linux wraps the AppImage)
   --publish           Actually upload to Blossom and broadcast the kind-1063 events.
                       Omit for a dry run (default: shows everything, sends nothing).
   --server URL        Blossom mediaserver (default: ${BLOSSOM_SERVER}).
   --keyfile PATH      Nostr identity hex-key file (default: ${KEYFILE}).
   -h, --help          This help.
 
-Examples:
-  $0 --version 29.3.knots20260507                       # dry run, all 8 artifacts
-  $0 --version 29.3.knots20260507 --type linux --publish # register the 6 Linux tarballs
-  $0 --version 29.3.knots20260507 --type win64-zip,win64-exe --publish
-
-This only ANCHORS the official artifacts. The reproducibility verdict itself is assigned
-exclusively in the WalletScrutiny web UI: ${PAGE_URL}
+Only upload artifacts you have actually verified. The reproducibility verdict itself is
+assigned exclusively in the WalletScrutiny web UI.
 EOF
 }
 
@@ -140,46 +121,36 @@ command -v "${NAK}" >/dev/null 2>&1 || die "nak not found (set NAK=/path/to/nak)
 command -v curl >/dev/null 2>&1 || die "curl required"
 
 V="${APP_VERSION}"
-# Knots release tags carry a 'v' prefix (e.g. v29.3.knots20260507).
-DL_BASE="https://github.com/${RELEASES_REPO}/releases/download/v${V}"
+# Nunchuk release tags are the bare version (e.g. 2.5.0) - NO 'v' prefix (unlike Liana).
+DL_BASE="https://github.com/${RELEASES_REPO}/releases/download/${V}"
 
 # ---- preflight: confirm the release tag exists (one clear error beats N per-asset 404s) ----
-if ! curl -fsSL "https://api.github.com/repos/${RELEASES_REPO}/releases/tags/v${V}" >/dev/null 2>&1; then
-    warn "No Knots release found for tag 'v${V}'."
+if ! curl -fsSL "https://api.github.com/repos/${RELEASES_REPO}/releases/tags/${V}" >/dev/null 2>&1; then
+    warn "No Nunchuk release found for tag '${V}'."
     avail="$(curl -fsSL "https://api.github.com/repos/${RELEASES_REPO}/releases?per_page=12" 2>/dev/null \
-        | grep -oE '"tag_name": *"v[0-9][^"]*"' | sed -E 's/^.*"(v[0-9][^"]*)"$/\1/' | tr '\n' ' ')"
-    [[ -n "${avail}" ]] && warn "Available release tags: ${avail}"
-    die "Pass an exact released version WITHOUT the leading 'v' (e.g. --version 29.3.knots20260507)."
+        | grep -oE '"tag_name": *"[0-9][^"]*"' | sed -E 's/^.*"([0-9][^"]*)"$/\1/' | tr '\n' ' ')"
+    [[ -n "${avail}" ]] && warn "Recent release tags: ${avail}"
+    die "Pass an exact released version WITHOUT the leading 'v' (e.g. --version 2.5.0)."
 fi
 
-# ---- artifact catalogue: key -> filename | mime ----
-# NOTE: Windows assets use the '-pgpverifiable' suffix (confirmed present as far back as
-# 29.3.knots20260210; no plain win64.zip / win64-setup.exe exists in any known release).
-# Downloads that 404 are skipped with a warning for forward-compatibility.
-declare -A ART_FILE ART_MIME
-ART_FILE[x86_64-linux]="bitcoin-${V}-x86_64-linux-gnu.tar.gz";       ART_MIME[x86_64-linux]="application/gzip"
-ART_FILE[aarch64-linux]="bitcoin-${V}-aarch64-linux-gnu.tar.gz";     ART_MIME[aarch64-linux]="application/gzip"
-ART_FILE[arm-linux]="bitcoin-${V}-arm-linux-gnueabihf.tar.gz";       ART_MIME[arm-linux]="application/gzip"
-ART_FILE[powerpc64-linux]="bitcoin-${V}-powerpc64-linux-gnu.tar.gz"; ART_MIME[powerpc64-linux]="application/gzip"
-ART_FILE[powerpc64le-linux]="bitcoin-${V}-powerpc64le-linux-gnu.tar.gz"; ART_MIME[powerpc64le-linux]="application/gzip"
-ART_FILE[riscv64-linux]="bitcoin-${V}-riscv64-linux-gnu.tar.gz";     ART_MIME[riscv64-linux]="application/gzip"
-ART_FILE[win64-zip]="bitcoin-${V}-win64-pgpverifiable.zip";          ART_MIME[win64-zip]="application/zip"
-ART_FILE[win64-exe]="bitcoin-${V}-win64-setup-pgpverifiable.exe";    ART_MIME[win64-exe]="application/vnd.microsoft.portable-executable"
+# ---- artifact catalogue: type -> filename | mime  (+ optional alternate filename) ----
+# Asset names carry the 'v' (e.g. nunchuk-linux-v2.5.0.zip); note 'window' is singular.
+declare -A ART_FILE ART_MIME ART_ALT
+ART_FILE[linux]="nunchuk-linux-v${V}.zip";    ART_MIME[linux]="application/zip"
+ART_FILE[macos]="nunchuk-macos-v${V}.zip";    ART_MIME[macos]="application/zip"
+ART_FILE[windows]="nunchuk-window-v${V}.zip"; ART_MIME[windows]="application/zip"
+# Some releases (e.g. 2.2.2) name the Windows asset WITHOUT the 'v' prefix - try as fallback.
+ART_ALT[windows]="nunchuk-window-${V}.zip"
 
-LINUX_KEYS=(x86_64-linux aarch64-linux arm-linux powerpc64-linux powerpc64le-linux riscv64-linux)
-WINDOWS_KEYS=(win64-zip win64-exe)
-ALL_KEYS=("${LINUX_KEYS[@]}" "${WINDOWS_KEYS[@]}")
-
-# ---- resolve requested keys ----
-declare -a KEYS=()
-case "${TYPES_ARG}" in
-    all)     KEYS=("${ALL_KEYS[@]}") ;;
-    linux)   KEYS=("${LINUX_KEYS[@]}") ;;
-    windows) KEYS=("${WINDOWS_KEYS[@]}") ;;
-    *)       IFS=',' read -ra KEYS <<< "${TYPES_ARG}" ;;
-esac
-for k in "${KEYS[@]}"; do
-    [[ -n "${ART_FILE[$k]:-}" ]] || die "unknown --type '${k}' (valid: ${ALL_KEYS[*]} | all | linux | windows)"
+# ---- resolve requested types ----
+declare -a TYPES=()
+if [[ "${TYPES_ARG}" == "all" ]]; then
+    TYPES=(linux macos windows)
+else
+    IFS=',' read -ra TYPES <<< "${TYPES_ARG}"
+fi
+for t in "${TYPES[@]}"; do
+    [[ -n "${ART_FILE[$t]:-}" ]] || die "unknown --type '${t}' (valid: linux macos windows)"
 done
 
 # ---- identity (fresh on first run, persisted, displayed) ----
@@ -212,113 +183,123 @@ else
 fi
 echo "============================================================"
 
-WORK="$(mktemp -d -t bitcoinknotsupload.XXXXXX)"
+WORK="$(mktemp -d -t nunchukupload.XXXXXX)"
 trap 'rm -rf "${WORK}"' EXIT
 
-log "Bitcoin Knots ${V} - processing ${#KEYS[@]} artifact(s): ${KEYS[*]}"
+log "Nunchuk ${V} - processing ${#TYPES[@]} artifact(s): ${TYPES[*]}"
 
-# ---- Phase 1: fetch SHA256SUMS to get expected hashes upfront ----
+# ---- Phase 1: fetch hash manifest to get expected hashes upfront ----
 SHA256SUMS_URL="${DL_BASE}/SHA256SUMS"
 SHA256SUMS_FILE="${WORK}/SHA256SUMS"
 declare -A EXPECTED_HASH
-log "Fetching SHA256SUMS for preflight hash checks..."
+log "Fetching release hash manifest for preflight checks..."
 if curl -fsSL -o "${SHA256SUMS_FILE}" "${SHA256SUMS_URL}" 2>/dev/null; then
-    for k in "${KEYS[@]}"; do
-        fname="${ART_FILE[$k]}"
-        h="$(grep " ${fname}$" "${SHA256SUMS_FILE}" | awk '{print $1}' || true)"
-        [[ -n "${h}" ]] && EXPECTED_HASH[$k]="${h}"
+    for t in "${TYPES[@]}"; do
+        fname="${ART_FILE[$t]}"
+        h="$(awk -v f="${fname}" '$2==f || $NF==f {print $1; exit}' "${SHA256SUMS_FILE}" | head -1 || true)"
+        [[ -n "${h}" ]] && EXPECTED_HASH[$t]="${h}"
     done
-    log "Parsed hashes for ${#EXPECTED_HASH[@]} of ${#KEYS[@]} artifact(s) from SHA256SUMS."
+    log "Parsed hashes for ${#EXPECTED_HASH[@]} of ${#TYPES[@]} artifact(s) from manifest."
 else
-    warn "Could not fetch SHA256SUMS — all artifacts will be downloaded."
+    warn "Could not fetch hash manifest — all artifacts will be downloaded."
 fi
 
 # ---- Phase 2: Blossom preflight — check which artifacts are already uploaded ----
-declare -A BLOSSOM_PRESENT  # key -> true/false
+declare -A BLOSSOM_PRESENT
 declare -a NEED_DOWNLOAD=()
 
 echo ""
 log "Blossom preflight check (${BLOSSOM_SERVER})..."
-for k in "${KEYS[@]}"; do
-    if [[ -n "${EXPECTED_HASH[$k]:-}" ]]; then
-        h="${EXPECTED_HASH[$k]}"
+for t in "${TYPES[@]}"; do
+    if [[ -n "${EXPECTED_HASH[$t]:-}" ]]; then
+        h="${EXPECTED_HASH[$t]}"
         if "${NAK}" blossom --server "${BLOSSOM_SERVER}" check "${h}" >/dev/null 2>&1; then
-            log "  [${k}] already on Blossom (${h}) — download skipped"
-            BLOSSOM_PRESENT[$k]=true
+            log "  [${t}] already on Blossom (${h}) — download skipped"
+            BLOSSOM_PRESENT[$t]=true
         else
-            log "  [${k}] not on Blossom — queued for download"
-            BLOSSOM_PRESENT[$k]=false
-            NEED_DOWNLOAD+=("${k}")
+            log "  [${t}] not on Blossom — queued for download"
+            BLOSSOM_PRESENT[$t]=false
+            NEED_DOWNLOAD+=("${t}")
         fi
     else
-        # No hash from SHA256SUMS; must download to find out
-        log "  [${k}] no hash in SHA256SUMS — queued for download"
-        BLOSSOM_PRESENT[$k]=false
-        NEED_DOWNLOAD+=("${k}")
+        log "  [${t}] no hash in manifest — queued for download"
+        BLOSSOM_PRESENT[$t]=false
+        NEED_DOWNLOAD+=("${t}")
     fi
 done
 
 # ---- Phase 3: Download only artifacts not already on Blossom ----
-declare -A ACTUAL_HASH ACTUAL_SIZE
+# Tracks the resolved filename per type (may differ from ART_FILE if ART_ALT was used).
+declare -A ACTUAL_HASH ACTUAL_SIZE ACTUAL_FILE
 if [[ ${#NEED_DOWNLOAD[@]} -gt 0 ]]; then
     echo ""
     log "Downloading ${#NEED_DOWNLOAD[@]} artifact(s)..."
-    for k in "${NEED_DOWNLOAD[@]}"; do
-        file="${ART_FILE[$k]}"
+    for t in "${NEED_DOWNLOAD[@]}"; do
+        file="${ART_FILE[$t]}"
         url="${DL_BASE}/${file}"
         out="${WORK}/${file}"
         echo ""
-        echo "----- ${k}: ${file} -----"
+        echo "----- ${t}: ${file} -----"
         if ! curl -f -L --progress-bar -o "${out}" "${url}"; then
-            warn "download failed (skipping): ${url}"
-            warn "  (this artifact may not exist for ${V}; check the release page)"
-            BLOSSOM_PRESENT[$k]=skip
-            continue
+            # Try the alternate filename (e.g. Windows asset without the 'v' prefix).
+            if [[ -n "${ART_ALT[$t]:-}" ]]; then
+                file="${ART_ALT[$t]}"; url="${DL_BASE}/${file}"; out="${WORK}/${file}"
+                warn "primary asset not found; trying alternate name: ${file}"
+                if ! curl -f -L --progress-bar -o "${out}" "${url}"; then
+                    warn "download failed (skipping): ${url}"
+                    BLOSSOM_PRESENT[$t]=skip
+                    continue
+                fi
+            else
+                warn "download failed (skipping): ${url}"
+                warn "  (this artifact may not exist for ${V}; check the release page)"
+                BLOSSOM_PRESENT[$t]=skip
+                continue
+            fi
         fi
 
-        # ---- Phase 4: Redundancy check — verify downloaded hash == expected ----
+        # ---- Phase 4: Redundancy check ----
         got="$(sha256sum "${out}" | cut -d' ' -f1)"
         size="$(stat -c%s "${out}")"
         printf '  sha256=%s  size=%s bytes\n' "${got}" "${size}"
-        if [[ -n "${EXPECTED_HASH[$k]:-}" && "${got}" != "${EXPECTED_HASH[$k]}" ]]; then
-            die "[${k}] hash mismatch! expected ${EXPECTED_HASH[$k]}, got ${got}"
+        if [[ -n "${EXPECTED_HASH[$t]:-}" && "${got}" != "${EXPECTED_HASH[$t]}" ]]; then
+            die "[${t}] hash mismatch! expected ${EXPECTED_HASH[$t]}, got ${got}"
         fi
-        ACTUAL_HASH[$k]="${got}"
-        ACTUAL_SIZE[$k]="${size}"
+        ACTUAL_HASH[$t]="${got}"
+        ACTUAL_SIZE[$t]="${size}"
+        ACTUAL_FILE[$t]="${file}"
     done
 else
     echo ""
     log "All artifacts already on Blossom — no downloads needed."
 fi
 
-# ---- Phase 5 & 6: Upload missing artifacts + publish kind-1063 for all ----
+# ---- Phase 5 & 6: Upload missing + publish kind-1063 for all ----
 echo ""
 PROCESSED=0
-for k in "${KEYS[@]}"; do
-    [[ "${BLOSSOM_PRESENT[$k]:-}" == "skip" ]] && continue
+for t in "${TYPES[@]}"; do
+    [[ "${BLOSSOM_PRESENT[$t]:-}" == "skip" ]] && continue
 
-    file="${ART_FILE[$k]}"
-    mime="${ART_MIME[$k]}"
+    # Use resolved filename (may be ART_ALT) if available, else ART_FILE.
+    file="${ACTUAL_FILE[$t]:-${ART_FILE[$t]}}"
+    mime="${ART_MIME[$t]}"
     url="${DL_BASE}/${file}"
-    out="${WORK}/${file}"
 
-    # Resolve the hash and size we'll use for the event
-    if [[ "${BLOSSOM_PRESENT[$k]}" == true ]]; then
-        hash="${EXPECTED_HASH[$k]}"
-        # Size unknown without downloading; omit the size tag for pre-existing artifacts
+    if [[ "${BLOSSOM_PRESENT[$t]}" == true ]]; then
+        hash="${EXPECTED_HASH[$t]}"
         size=""
     else
-        hash="${ACTUAL_HASH[$k]:-}"
-        size="${ACTUAL_SIZE[$k]:-}"
-        [[ -n "${hash}" ]] || { warn "[${k}] no hash available (download failed) — skipping"; continue; }
+        hash="${ACTUAL_HASH[$t]:-}"
+        size="${ACTUAL_SIZE[$t]:-}"
+        [[ -n "${hash}" ]] || { warn "[${t}] no hash available (download failed) — skipping"; continue; }
     fi
 
-    echo "----- ${k}: ${file} -----"
+    echo "----- ${t}: ${file} -----"
     printf '  sha256=%s\n' "${hash}"
 
     if [[ "${PUBLISH}" == true ]]; then
-        # Upload to Blossom only if not already present
-        if [[ "${BLOSSOM_PRESENT[$k]}" != true ]]; then
+        if [[ "${BLOSSOM_PRESENT[$t]}" != true ]]; then
+            out="${WORK}/${file}"
             human="$(numfmt --to=iec "${size}" 2>/dev/null || echo "${size}B")"
             echo "  uploading ${file} (${human})..."
             blossom_upload "${out}" "${hash}" || die "blossom upload failed for ${file}"
@@ -327,10 +308,9 @@ for k in "${KEYS[@]}"; do
     fi
 
     blossom_url="${BLOSSOM_SERVER}/${hash}"
-    content="Bitcoin Knots Desktop v${V} (${k}: ${file}) - WalletScrutiny registered artifact.
+    content="Nunchuk Desktop v${V} (${t}: ${file}) - WalletScrutiny verified artifact.
 SHA256 is the official download hash. Reproducibility verdict: ${PAGE_URL}"
 
-    # NIP-94 (kind 1063) file metadata, one event per artifact.
     EVENT_TAGS=(
         -t "url=${blossom_url}"
         -t "x=${hash}"
@@ -339,12 +319,11 @@ SHA256 is the official download hash. Reproducibility verdict: ${PAGE_URL}"
         -t "i=${APP_ID}"
         -t "version=${V}"
         -t "platform=${PLATFORM}"
-        -t "type=${k}"
+        -t "type=${t}"
         -t "client=WalletScrutiny.com"
         -t "r=${PAGE_URL}"
         -t "r=${url}"
     )
-    # Include size tag only when we have it (not for pre-existing Blossom artifacts)
     [[ -n "${size}" ]] && EVENT_TAGS+=(-t "size=${size}")
 
     echo "  --- kind-1063 file-metadata event (preview) ---"
