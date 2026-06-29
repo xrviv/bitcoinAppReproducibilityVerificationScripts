@@ -1,8 +1,8 @@
 #!/bin/bash
-# bitbox02_build.sh v3.9.0 - WalletScrutiny verification script for BitBox02
+# bitbox02_build.sh v3.10.0 - WalletScrutiny verification script for BitBox02
 # Organization: WalletScrutiny.com
 # Last modified by: Daniel Garcia
-# Date last modified: 2026-06-29 (v3.9.0)
+# Date last modified: 2026-06-29 (v3.10.0)
 # Usage: bitbox02_build.sh --version VERSION [--type TYPE] [--binary PATH] [--arch ARCH]
 #
 # Verifies BitBox02 firmware reproducibility: builds from source via the upstream
@@ -13,7 +13,7 @@
 set -eE
 
 # ---- Globals ----------------------------------------------------------------
-SCRIPT_VERSION="v3.9.0"
+SCRIPT_VERSION="v3.10.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESULTS_FILE="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
 repo="https://github.com/BitBoxSwiss/bitbox02-firmware"
@@ -206,9 +206,13 @@ echo "Verifying BitBox02 firmware v${version} (${firmwareType})"
 echo
 
 # ---- Prepare workspace ------------------------------------------------------
+# Three isolated subdirectories keep the cloned repo completely clean:
+#   src/      — cloned source (never written to after clone; git must stay clean)
+#   official/ — official signed firmware binary (separate from src so git sees nothing)
+#   out/      — comparison outputs (hash files, diag, stripped binary)
 echo "Setting up verification environment..."
 rm -rf "$workDir"
-mkdir -p "$workDir"
+mkdir -p "$workDir/official" "$workDir/out"
 
 # ---- Clone inside container (no host git required) --------------------------
 echo "Cloning BitBox02 firmware repository at tag: $GIT_TAG"
@@ -281,14 +285,14 @@ cp "$workDir/Dockerfile.orig" "$workDir/src/Dockerfile"
 # ---- Get official firmware --------------------------------------------------
 if [[ -n "$binaryPath" ]]; then
   echo "Using provided binary: $binaryPath"
-  cp "$binaryPath" "$workDir/src/$SIGNED_FILENAME"
+  cp "$binaryPath" "$workDir/official/$SIGNED_FILENAME"
 else
   echo "Downloading official signed firmware..."
   echo "URL: $DOWNLOAD_URL"
   retry_count=0
   while [[ $retry_count -lt $MAX_RETRIES ]]; do
     if $CONTAINER_CMD run --rm \
-      --volume "$workDir/src:/out" \
+      --volume "$workDir/official:/out" \
       alpine \
       sh -c "
         set -e
@@ -308,10 +312,10 @@ else
     echo "Download failed, retrying in 5 seconds..."
     sleep 5
   done
-  repair_ownership "$workDir/src/$SIGNED_FILENAME"
+  repair_ownership "$workDir/official"
 fi
 
-if [[ ! -s "$workDir/src/$SIGNED_FILENAME" ]]; then
+if [[ ! -s "$workDir/official/$SIGNED_FILENAME" ]]; then
   echo -e "${RED}Firmware file missing or empty.${NC}"
   $CONTAINER_CMD rmi "$IMAGE_TAG" --force 2>/dev/null || true
   write_results "ftbfs" "BitBox02 v${version} (${firmwareType}): firmware file missing or empty."
@@ -319,29 +323,45 @@ if [[ ! -s "$workDir/src/$SIGNED_FILENAME" ]]; then
 fi
 
 # ---- Build firmware + compare (all inside build container) ------------------
+# Three volumes keep responsibilities isolated:
+#   /bb02     = source repo (read/write for build artifacts, must stay git-clean)
+#   /official = official signed binary (read-only input)
+#   /out      = all comparison outputs (hash files, diagnostics, stripped binary)
 echo "Building firmware ($MAKE_COMMAND) and running comparison..."
 if ! $CONTAINER_CMD run --rm \
   --platform linux/amd64 \
   --volume "$workDir/src:/bb02" \
+  --volume "$workDir/official:/official" \
+  --volume "$workDir/out:/out" \
   "$IMAGE_TAG" \
   bash -c "
     set -eo pipefail
     git config --global --add safe.directory /bb02
     cd /bb02
+
+    # Abort if the source tree is dirty — BitBox02 embeds git metadata (including
+    # 'dirty'/'pre') in the firmware version string, changing the binary output.
+    git_status=\$(git status --porcelain)
+    if [[ -n \"\$git_status\" ]]; then
+      echo 'ABORT: source tree is dirty (git status --porcelain):' >&2
+      echo \"\$git_status\" >&2
+      exit 1
+    fi
+
     ${MAKE_COMMAND}
 
-    SIGNED='/bb02/${SIGNED_FILENAME}'
+    SIGNED='/official/${SIGNED_FILENAME}'
     BUILT='/bb02/${BUILT_FIRMWARE_PATH}'
 
-    sha256sum \"\$SIGNED\" | awk '{print \$1}' > /bb02/hash_signed.txt
-    sha256sum \"\$BUILT\"  | awk '{print \$1}' > /bb02/hash_built.txt
+    sha256sum \"\$SIGNED\" | awk '{print \$1}' > /out/hash_signed.txt
+    sha256sum \"\$BUILT\"  | awk '{print \$1}' > /out/hash_built.txt
 
     # Upstream signed firmware layout (describe_signed_firmware.py):
     #   4 bytes magic + 584 bytes sigdata + unsigned firmware
     # Total header = 588 bytes for both btconly and multi.
     HEADER_BYTES=588
-    dd if=\"\$SIGNED\" bs=1 skip=\"\${HEADER_BYTES}\" of=/bb02/p_stripped.bin 2>/dev/null
-    sha256sum /bb02/p_stripped.bin | awk '{print \$1}' > /bb02/hash_stripped.txt
+    dd if=\"\$SIGNED\" bs=1 skip=\"\${HEADER_BYTES}\" of=/out/p_stripped.bin 2>/dev/null
+    sha256sum /out/p_stripped.bin | awk '{print \$1}' > /out/hash_stripped.txt
 
     # Diagnostic: log file sizes and parser-derived hash for post-run analysis.
     python3 -c \"
@@ -356,37 +376,37 @@ built_size = os.path.getsize(sys.argv[2])
 print('diag_built_size:', built_size)
 if len(firmware) != built_size:
     print('WARNING: size mismatch parser_unsigned=' + str(len(firmware)) + ' built=' + str(built_size))
-\" \"\$SIGNED\" \"\$BUILT\" > /bb02/diag.txt 2>&1 || true
-    cat /bb02/diag.txt
+\" \"\$SIGNED\" \"\$BUILT\" > /out/diag.txt 2>&1 || true
+    cat /out/diag.txt
 
     # Device firmware hash: double-sha256 over version (4B at offset 392) + firmware + 0xff padding.
     # Offset 392 = MAGIC_LEN(4) + SIGNING_PUBKEYS_DATA_LEN(388) per upstream parser constants.
-    dd if=\"\$SIGNED\" bs=1 skip=392 count=4 of=/bb02/p_version.bin 2>/dev/null
-    FIRMWARE_BYTES=\$(wc -c < /bb02/p_stripped.bin)
+    dd if=\"\$SIGNED\" bs=1 skip=392 count=4 of=/out/p_version.bin 2>/dev/null
+    FIRMWARE_BYTES=\$(wc -c < /out/p_stripped.bin)
     dd if=/dev/zero bs=1 count=\$(( 884736 - FIRMWARE_BYTES )) 2>/dev/null \
-      | tr '\000' '\377' > /bb02/p_padding.bin
+      | tr '\000' '\377' > /out/p_padding.bin
     # Use openssl for binary SHA256 output (xxd not present in the build container).
-    cat /bb02/p_version.bin /bb02/p_stripped.bin /bb02/p_padding.bin \
+    cat /out/p_version.bin /out/p_stripped.bin /out/p_padding.bin \
       | openssl dgst -sha256 -binary \
       | sha256sum | awk '{print \$1}' \
-      > /bb02/hash_device.txt
+      > /out/hash_device.txt
 
-    ${INNER_CHOWN} /bb02
+    ${INNER_CHOWN} /out
   "; then
   echo -e "${RED}Build or comparison failed!${NC}"
   $CONTAINER_CMD rmi "$IMAGE_TAG" --force 2>/dev/null || true
   write_results "ftbfs" "BitBox02 v${version} (${firmwareType}): firmware build or in-container comparison failed."
   exit "$EXIT_FAIL"
 fi
-repair_ownership "$workDir/src"
+repair_ownership "$workDir/out"
 
 echo -e "${GREEN}Firmware build and comparison completed!${NC}"
 
 # ---- Read hash results ------------------------------------------------------
-signedHash=$(cat "$workDir/src/hash_signed.txt")
-builtHash=$(cat "$workDir/src/hash_built.txt")
-downloadStrippedSigHash=$(cat "$workDir/src/hash_stripped.txt")
-downloadFirmwareHash=$(cat "$workDir/src/hash_device.txt")
+signedHash=$(cat "$workDir/out/hash_signed.txt")
+builtHash=$(cat "$workDir/out/hash_built.txt")
+downloadStrippedSigHash=$(cat "$workDir/out/hash_stripped.txt")
+downloadFirmwareHash=$(cat "$workDir/out/hash_device.txt")
 
 echo ""
 echo "============================================================"
