@@ -393,22 +393,6 @@ WORKDIR /build/keycard-shell
 # Install Python dependencies declared in pyproject.toml
 RUN uv venv && uv sync
 
-# Download ARM GNU Toolchain 15.2.rel1 for x86_64-linux-gnu
-# Logic inlined from tools/download-toolchain.sh (upstream v1.3.0):
-#   TOOLCHAIN_VERSION=15.2.rel1
-#   filename=arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi.tar.xz
-#   url=https://developer.arm.com/-/media/Files/downloads/gnu/15.2.rel1/binrel/${filename}
-#       (redirects to armkeil.blob.core.windows.net)
-#   Extracted and moved to toolchain/arm-gnu-toolchain-15.2.rel1/
-RUN wget -q -O /tmp/toolchain.tar.xz \
-        "https://developer.arm.com/-/media/Files/downloads/gnu/15.2.rel1/binrel/arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi.tar.xz" \
-    && mkdir -p /tmp/toolchain-ext \
-    && tar -xf /tmp/toolchain.tar.xz -C /tmp/toolchain-ext \
-    && mkdir -p /build/keycard-shell/toolchain \
-    && mv /tmp/toolchain-ext/arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi \
-          /build/keycard-shell/toolchain/arm-gnu-toolchain-15.2.rel1 \
-    && rm -rf /tmp/toolchain.tar.xz /tmp/toolchain-ext
-
 # Overwrite the repo's Python tools with our inlined copies (from build context)
 COPY tools/ /build/keycard-shell/tools/
 
@@ -418,24 +402,55 @@ COPY tools/ /build/keycard-shell/tools/
 RUN mkdir -p /build/keycard-shell/deployment \
     && openssl rand -hex 32 > /build/keycard-shell/deployment/fw-test-key.txt \
     && openssl rand -hex 64 > /build/keycard-shell/deployment/bootloader-pubkey.txt
-
-# Configure (reads cmake/arm-gcc.cmake toolchain file)
-RUN cmake --preset release
-
-# Build all 355 targets; CMake post-build calls firmware-sign.py and bootloader-perso.py
-RUN cmake --build --preset release
+# Toolchain is mounted from host at runtime to avoid a ~500 MB image layer.
+# cmake configure + build run via docker run -v, not during image build.
 DOCKERFILE_EOF
 
-# ── build container image ────────────────────────────────────────────────────
+# ── download ARM GNU Toolchain to host (avoids 500 MB container layer) ────────
+# Logic inlined from tools/download-toolchain.sh (upstream v1.3.0):
+#   TOOLCHAIN_VERSION=15.2.rel1
+#   filename=arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi.tar.xz
+#   url=https://developer.arm.com/-/media/Files/downloads/gnu/15.2.rel1/binrel/${filename}
+#       (redirects to armkeil.blob.core.windows.net)
+
+TOOLCHAIN_ARCHIVE="${WORK_DIR}/toolchain.tar.xz"
+TOOLCHAIN_EXTRACTED="arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi"
+TOOLCHAIN_HOST="${WORK_DIR}/toolchain/arm-gnu-toolchain-15.2.rel1"
+
+log_info "Downloading ARM GNU Toolchain 15.2.rel1 (~148 MB)..."
+wget -q -O "${TOOLCHAIN_ARCHIVE}" \
+    "https://developer.arm.com/-/media/Files/downloads/gnu/15.2.rel1/binrel/arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi.tar.xz" \
+    || ftbfs "Toolchain download failed"
+mkdir -p "${WORK_DIR}/toolchain"
+tar -xf "${TOOLCHAIN_ARCHIVE}" -C "${WORK_DIR}/toolchain" \
+    || ftbfs "Toolchain extraction failed"
+mv "${WORK_DIR}/toolchain/${TOOLCHAIN_EXTRACTED}" "${TOOLCHAIN_HOST}" \
+    || ftbfs "Toolchain move failed"
+rm -f "${TOOLCHAIN_ARCHIVE}"
+
+# ── build environment image (no toolchain layer) ─────────────────────────────
 
 log_info "Building container image ${IMAGE_TAG}..."
-log_info "(Includes toolchain download ~148 MB — this will take several minutes)"
 "${CONTAINER}" build \
     --build-arg VERSION="${VERSION}" \
     -t "${IMAGE_TAG}" \
     -f "${WORK_DIR}/Dockerfile" \
     "${WORK_DIR}" 2>&1 | tee "${WORK_DIR}/build.log" \
     || ftbfs "Container build failed — see ${WORK_DIR}/build.log"
+
+# ── cmake configure + build (toolchain mounted from host) ────────────────────
+
+mkdir -p "${WORK_DIR}/build-output"
+log_info "Running cmake configure + build (toolchain mounted, ~5 min)..."
+"${CONTAINER}" run --rm \
+    -v "${TOOLCHAIN_HOST}:/build/keycard-shell/toolchain/arm-gnu-toolchain-15.2.rel1:ro" \
+    -v "${WORK_DIR}/build-output:/output:rw" \
+    "${IMAGE_TAG}" \
+    sh -c "cd /build/keycard-shell && cmake --preset release && cmake --build --preset release && cp build/shellos.bin /output/shellos.bin" \
+    2>&1 | tee -a "${WORK_DIR}/build.log" \
+    || ftbfs "cmake build failed — see ${WORK_DIR}/build.log"
+
+BUILT_BIN="${WORK_DIR}/build-output/shellos.bin"
 
 # ── gather metadata ───────────────────────────────────────────────────────────
 
@@ -450,8 +465,9 @@ OFFICIAL_BIN_NAME="$(basename "${OFFICIAL_BIN}")"
 # ── Method 1: firmware-hash.py (Keycard's own tool) ──────────────────────────
 
 log_info "Method 1: firmware-hash.py on built binary..."
-BUILT_HASH="$("${CONTAINER}" run --rm "${IMAGE_TAG}" \
-    sh -c "cd /build/keycard-shell && uv run python tools/firmware-hash.py -b build/shellos.bin")" \
+BUILT_HASH="$("${CONTAINER}" run --rm \
+    -v "${BUILT_BIN}:/built.bin:ro" "${IMAGE_TAG}" \
+    sh -c "cd /build/keycard-shell && uv run python tools/firmware-hash.py -b /built.bin")" \
     || ftbfs "firmware-hash.py failed on built binary"
 
 log_info "Method 1: firmware-hash.py on official binary..."
@@ -463,9 +479,10 @@ OFFICIAL_HASH="$("${CONTAINER}" run --rm \
 # ── Method 2: dd chunk comparison ────────────────────────────────────────────
 
 log_info "Method 2: dd chunks on built binary..."
-DD_BUILT="$("${CONTAINER}" run --rm "${IMAGE_TAG}" sh -c "
-    dd if=/build/keycard-shell/build/shellos.bin bs=1 count=588 2>/dev/null | sha256sum | cut -d' ' -f1
-    dd if=/build/keycard-shell/build/shellos.bin bs=1 skip=652  2>/dev/null | sha256sum | cut -d' ' -f1
+DD_BUILT="$("${CONTAINER}" run --rm \
+    -v "${BUILT_BIN}:/built.bin:ro" "${IMAGE_TAG}" sh -c "
+    dd if=/built.bin bs=1 count=588 2>/dev/null | sha256sum | cut -d' ' -f1
+    dd if=/built.bin bs=1 skip=652  2>/dev/null | sha256sum | cut -d' ' -f1
 ")" || ftbfs "dd failed on built binary"
 DD_BUILT_PRE="$(echo  "${DD_BUILT}" | head -1)"
 DD_BUILT_POST="$(echo "${DD_BUILT}" | tail -1)"
