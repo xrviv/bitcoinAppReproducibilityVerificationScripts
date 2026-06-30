@@ -117,7 +117,7 @@ log_info "Container runtime: ${CONTAINER}"
 # ── work dir ─────────────────────────────────────────────────────────────────
 
 WORK_DIR="/tmp/keycardshell_${VERSION}_$$"
-IMAGE_TAG="keycardshell-build-${VERSION}-$$"
+IMAGE_TAG="localhost/keycardshell-build-${VERSION}-$$"
 mkdir -p "${WORK_DIR}/tools"
 log_info "Version:  ${VERSION}"
 log_info "Work dir: ${WORK_DIR}"
@@ -367,10 +367,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake \
         ninja-build \
         libpcsclite-dev \
+        gcc \
+        swig \
         curl \
         wget \
         ca-certificates \
         python3 \
+        python3-dev \
         python3-pip \
         xz-utils \
         git \
