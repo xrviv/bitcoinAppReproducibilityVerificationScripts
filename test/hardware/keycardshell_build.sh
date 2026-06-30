@@ -29,9 +29,9 @@
 # Only requirement: podman or docker
 # Organization: WalletScrutiny.com
 
-set -eE
+set -eEo pipefail
 
-SCRIPT_VERSION="v0.1.0"
+SCRIPT_VERSION="v0.1.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESULTS_FILE="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
 
@@ -65,7 +65,7 @@ write_yaml() {
         echo "script_version: ${SCRIPT_VERSION}"
         echo "verdict: ${verdict}"
         echo "notes: |"
-        echo "  ${notes}"
+        printf '%s\n' "${notes}" | sed 's/^/  /'
     } > "${RESULTS_FILE}"
     log_info "Result: ${verdict}"
 }
@@ -150,6 +150,9 @@ fi
 # They are written to ${WORK_DIR}/tools/ and COPYed into the container
 # (overwriting the repo's own copies) so the reviewer can audit exactly
 # what code runs without inspecting the upstream repository separately.
+# NOTE: firmware-sign.py and bootloader-perso.py are patched for Python 3.10
+# compatibility: pathlib.Path.unlink(str) → pathlib.Path(str).unlink().
+# All other logic is verbatim from upstream v1.3.0.
 
 # tools/common.py — shared constants and helpers used by all Python tools
 cat > "${WORK_DIR}/tools/common.py" <<'PYEOF'
@@ -231,6 +234,8 @@ PYEOF
 # Signs shellos.elf with a throwaway test key and converts to shellos.bin.
 # Production firmware uses an HSM key; the hash comparison skips the signature
 # region so the key content does not affect the reproducibility verdict.
+# PATCH (Python 3.10): line 29: pathlib.Path(tmp_bin).unlink() instead of
+# pathlib.Path.unlink(tmp_bin) — tmp_bin is a str, not a Path object.
 cat > "${WORK_DIR}/tools/firmware-sign.py" <<'PYEOF'
 # This tool is for development only, not to be used for releases
 
@@ -323,6 +328,8 @@ PYEOF
 # Personalises the bootloader ELF with the public key. The bootloader binary is
 # built as part of cmake --build but is not included in the comparison;
 # only shellos.bin (main firmware) is verified.
+# PATCH (Python 3.10): line 23: pathlib.Path(f.name).unlink() instead of
+# pathlib.Path.unlink(f.name) — f.name is a str, not a Path object.
 cat > "${WORK_DIR}/tools/bootloader-perso.py" <<'PYEOF'
 # This tool is for development only, not to be used for releases
 
@@ -556,11 +563,26 @@ echo ""
 echo "===== End Results ====="
 
 # ── COMPARISON_RESULTS.yaml ───────────────────────────────────────────────────
+# Notes field is static per YAML format spec; dynamic hashes appear in the
+# Begin/End Results block above.
+
+NOTES_REPRO="Compiled code verified using Keycard's firmware-hash.py methodology.
+Comparison covers bytes 0-587 and bytes 652-end of the padded 622592-byte image.
+Bytes 588-651 (64-byte ECDSA signature) are excluded: the signature necessarily
+differs between the HSM-signed release binary and the throwaway-key build.
+Cross-verified with dd chunk comparison over the same byte ranges.
+firmware-sign.py and bootloader-perso.py are patched for Python 3.10 compatibility
+(pathlib.Path(str).unlink() instead of the upstream pathlib.Path.unlink(str)).
+All other tool logic is verbatim from upstream v${VERSION}."
+
+NOTES_NOT_REPRO="Compiled code mismatch detected. Comparison covers bytes 0-587 and
+bytes 652-end (64-byte ECDSA signature at bytes 588-651 excluded per Keycard methodology).
+See Begin/End Results block for per-method hash values."
 
 if ${METHOD1_PASS} && ${METHOD2_PASS}; then
-    repro "Both methods confirm reproducibility. Method 1 firmware-hash.py (skips ECDSA sig bytes 588-651): ${BUILT_HASH}. Method 2 dd: chunk1=${DD_BUILT_PRE} chunk2=${DD_BUILT_POST}"
+    repro "${NOTES_REPRO}"
 elif ! ${METHOD1_PASS} && ! ${METHOD2_PASS}; then
-    not_repro "Both methods report mismatch. firmware-hash.py built=${BUILT_HASH} official=${OFFICIAL_HASH}. dd chunk1 built=${DD_BUILT_PRE} official=${DD_OFFICIAL_PRE}. dd chunk2 built=${DD_BUILT_POST} official=${DD_OFFICIAL_POST}"
+    not_repro "${NOTES_NOT_REPRO}"
 else
     not_repro "Methods disagree — possible script error. Method1=${METHOD1_PASS} Method2=${METHOD2_PASS}. Manual review required."
 fi
