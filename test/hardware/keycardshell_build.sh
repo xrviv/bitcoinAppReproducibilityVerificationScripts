@@ -560,6 +560,10 @@ echo "Tag type: annotated"
 echo "[INFO] GPG key not imported in build container — tag signature not verified"
 echo "[INFO] Verify manually with: git verify-tag v${VERSION}"
 echo ""
+echo "===== Also ===="
+echo "Official binary: ${OFFICIAL_BIN}"
+echo "Built binary:    ${BUILT_BIN}"
+echo ""
 echo "===== End Results ====="
 
 # ── COMPARISON_RESULTS.yaml ───────────────────────────────────────────────────
