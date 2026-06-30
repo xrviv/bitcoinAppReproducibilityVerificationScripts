@@ -260,7 +260,7 @@ def main():
     with open(tmp_bin, 'rb') as f:
         fw_size = f.readinto(fw)
 
-    pathlib.Path.unlink(tmp_bin)
+    pathlib.Path(tmp_bin).unlink()
 
     m = hash_firmware(fw)
     if args.keycard:
