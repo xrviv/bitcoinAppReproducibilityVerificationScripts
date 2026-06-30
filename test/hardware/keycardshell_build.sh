@@ -117,7 +117,7 @@ log_info "Container runtime: ${CONTAINER}"
 # ── work dir ─────────────────────────────────────────────────────────────────
 
 WORK_DIR="/tmp/keycardshell_${VERSION}_$$"
-IMAGE_TAG="localhost/keycardshell-build-${VERSION}-$$"
+IMAGE_TAG="keycardshell-build-${VERSION}-$$"
 mkdir -p "${WORK_DIR}/tools"
 log_info "Version:  ${VERSION}"
 log_info "Work dir: ${WORK_DIR}"
@@ -273,7 +273,7 @@ def main():
         f.write(fw[FW_IV_SIZE+SIG_SIZE:FW_IV_SIZE+SIG_SIZE+4])
         f.close()
         replace_elf_section(args.elf, "header", f.name)
-        pathlib.Path.unlink(f.name)
+        pathlib.Path(f.name).unlink()
 
     elf_to_bin(args.elf, args.output)
 
@@ -346,7 +346,7 @@ def main():
         f.write(pub_key)
         f.close()
         replace_elf_section(args.elf, "header", f.name)
-        pathlib.Path.unlink(f.name)
+        pathlib.Path(f.name).unlink()
 
     elf_to_bin(args.elf, args.output)
 
@@ -438,6 +438,11 @@ log_info "Building container image ${IMAGE_TAG}..."
     "${WORK_DIR}" 2>&1 | tee "${WORK_DIR}/build.log" \
     || ftbfs "Container build failed — see ${WORK_DIR}/build.log"
 
+# Resolve to image ID so subsequent run calls never trigger a registry lookup
+IMAGE_ID="$("${CONTAINER}" images -q "${IMAGE_TAG}" 2>/dev/null | head -1)"
+[[ -z "${IMAGE_ID}" ]] && ftbfs "Image not found after build"
+log_info "Image ID: ${IMAGE_ID}"
+
 # ── cmake configure + build (toolchain mounted from host) ────────────────────
 
 mkdir -p "${WORK_DIR}/build-output"
@@ -445,7 +450,7 @@ log_info "Running cmake configure + build (toolchain mounted, ~5 min)..."
 "${CONTAINER}" run --rm \
     -v "${TOOLCHAIN_HOST}:/build/keycard-shell/toolchain/arm-gnu-toolchain-15.2.rel1:ro" \
     -v "${WORK_DIR}/build-output:/output:rw" \
-    "${IMAGE_TAG}" \
+    "${IMAGE_ID}" \
     sh -c "cd /build/keycard-shell && cmake --preset release && cmake --build --preset release && cp build/shellos.bin /output/shellos.bin" \
     2>&1 | tee -a "${WORK_DIR}/build.log" \
     || ftbfs "cmake build failed — see ${WORK_DIR}/build.log"
@@ -455,7 +460,7 @@ BUILT_BIN="${WORK_DIR}/build-output/shellos.bin"
 # ── gather metadata ───────────────────────────────────────────────────────────
 
 log_info "Getting commit hash..."
-COMMIT="$("${CONTAINER}" run --rm "${IMAGE_TAG}" \
+COMMIT="$("${CONTAINER}" run --rm "${IMAGE_ID}" \
     sh -c "git -C /build/keycard-shell rev-parse HEAD")" || COMMIT="unknown"
 
 APP_HASH="$(sha256sum "${OFFICIAL_BIN}" | cut -d' ' -f1)"
@@ -466,13 +471,13 @@ OFFICIAL_BIN_NAME="$(basename "${OFFICIAL_BIN}")"
 
 log_info "Method 1: firmware-hash.py on built binary..."
 BUILT_HASH="$("${CONTAINER}" run --rm \
-    -v "${BUILT_BIN}:/built.bin:ro" "${IMAGE_TAG}" \
+    -v "${BUILT_BIN}:/built.bin:ro" "${IMAGE_ID}" \
     sh -c "cd /build/keycard-shell && uv run python tools/firmware-hash.py -b /built.bin")" \
     || ftbfs "firmware-hash.py failed on built binary"
 
 log_info "Method 1: firmware-hash.py on official binary..."
 OFFICIAL_HASH="$("${CONTAINER}" run --rm \
-    -v "${OFFICIAL_BIN}:/official.bin:ro" "${IMAGE_TAG}" \
+    -v "${OFFICIAL_BIN}:/official.bin:ro" "${IMAGE_ID}" \
     sh -c "cd /build/keycard-shell && uv run python tools/firmware-hash.py -b /official.bin")" \
     || ftbfs "firmware-hash.py failed on official binary"
 
@@ -480,7 +485,7 @@ OFFICIAL_HASH="$("${CONTAINER}" run --rm \
 
 log_info "Method 2: dd chunks on built binary..."
 DD_BUILT="$("${CONTAINER}" run --rm \
-    -v "${BUILT_BIN}:/built.bin:ro" "${IMAGE_TAG}" sh -c "
+    -v "${BUILT_BIN}:/built.bin:ro" "${IMAGE_ID}" sh -c "
     dd if=/built.bin bs=1 count=588 2>/dev/null | sha256sum | cut -d' ' -f1
     dd if=/built.bin bs=1 skip=652  2>/dev/null | sha256sum | cut -d' ' -f1
 ")" || ftbfs "dd failed on built binary"
@@ -489,7 +494,7 @@ DD_BUILT_POST="$(echo "${DD_BUILT}" | tail -1)"
 
 log_info "Method 2: dd chunks on official binary..."
 DD_OFFICIAL="$("${CONTAINER}" run --rm \
-    -v "${OFFICIAL_BIN}:/official.bin:ro" "${IMAGE_TAG}" sh -c "
+    -v "${OFFICIAL_BIN}:/official.bin:ro" "${IMAGE_ID}" sh -c "
     dd if=/official.bin bs=1 count=588 2>/dev/null | sha256sum | cut -d' ' -f1
     dd if=/official.bin bs=1 skip=652  2>/dev/null | sha256sum | cut -d' ' -f1
 ")" || ftbfs "dd failed on official binary"
