@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ======================================================================================
-# bitcoinsafedesktop_build.sh - Bitcoin Safe Desktop Reproducible Build Verification
+# bitcoinsafe_build.sh - Bitcoin Safe Desktop Reproducible Build Verification
 # ======================================================================================
-# Version:       v0.6.0
+# Version:       v0.8.11
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-02-03
+# Last Modified: 2026-04-30
 # Project:       https://github.com/andreasgriffin/bitcoin-safe
 # ==============================================================================
 # LICENSE: MIT License
@@ -37,13 +37,19 @@ set -euo pipefail
 # CONFIGURATION
 # ======================================================================================
 
-APP_ID="bitcoinsafe"
-SCRIPT_VERSION="v0.6.0"
+APP_ID="bitcoin.safe"
+SCRIPT_VERSION="v0.8.11"
 REPO_URL="https://github.com/andreasgriffin/bitcoin-safe.git"
 RELEASE_BASE="https://github.com/andreasgriffin/bitcoin-safe/releases/download"
 
 # Build configuration variables
 NEEDS_SIGNATURE_STRIP=false
+BINARY_FILE=""
+CHECKED_OUT_TAG=""
+SOURCE_COMMIT=""
+
+# Resolve script directory (for COMPARISON_RESULTS.yaml output)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Color codes for output
 readonly CYAN='\033[1;36m'
@@ -76,10 +82,11 @@ DESCRIPTION:
   artifacts to assess reproducibility.
 
 USAGE:
-  ./bitcoinsafedesktop_build.sh --version <version> [--arch <arch>] [--type <type>]
+  ./bitcoinsafe_build.sh [--version <version>] [--arch <arch>] [--type <type>] [--binary <file>]
 
-REQUIRED PARAMETERS:
+VERSION BEHAVIOR:
   --version <version>    Release version to verify (e.g., 1.6.0)
+                         If omitted, the script tries to infer it from --binary.
 
 OPTIONAL PARAMETERS:
   --arch <architecture>  Target architecture:
@@ -99,6 +106,10 @@ OPTIONAL PARAMETERS:
   Note: Builds use Bitcoin Safe's official Docker-based build system.
         Podman can be used as a drop-in replacement for Docker.
 
+  --binary <file>        Path to official binary to use instead of downloading.
+                         When provided, the download step is skipped and this
+                         file is used as the official artifact for comparison.
+
   --help, -h             Show this help text
 
 OUTPUT:
@@ -109,29 +120,28 @@ OUTPUT:
 
 EXAMPLES:
   # Verify Linux AppImage (default)
-  ./bitcoinsafedesktop_build.sh --version 1.6.0
+  ./bitcoinsafe_build.sh --version 1.6.0
 
   # Verify Linux AppImage (explicit)
-  ./bitcoinsafedesktop_build.sh --version 1.6.0 --arch x86_64-linux --type appimage
+  ./bitcoinsafe_build.sh --version 1.6.0 --arch x86_64-linux --type appimage
+
+  # Use a pre-downloaded official binary (skip download)
+  ./bitcoinsafe_build.sh --version 1.6.0 --arch x86_64-linux --type appimage --binary ~/Downloads/Bitcoin-Safe-1.6.0-x86_64.AppImage.tar.gz
 
   # Verify Debian package
-  ./bitcoinsafedesktop_build.sh --version 1.6.0 --arch x86_64-linux --type deb
+  ./bitcoinsafe_build.sh --version 1.6.0 --arch x86_64-linux --type deb
 
   # Verify Windows portable executable
-  ./bitcoinsafedesktop_build.sh --version 1.6.0 --arch x86_64-windows --type portable
+  ./bitcoinsafe_build.sh --version 1.6.0 --arch x86_64-windows --type portable
 
   # Verify Windows setup installer
-  ./bitcoinsafedesktop_build.sh --version 1.6.0 --arch x86_64-windows --type setup
+  ./bitcoinsafe_build.sh --version 1.6.0 --arch x86_64-windows --type setup
 
 REQUIREMENTS:
-  - docker or podman    Container runtime (build.py runs compilation inside Docker)
-  - python3 (3.10+)    Required by Poetry and build.py
-  - poetry              Python dependency manager (auto-installed via pip3 if missing)
-  - git                 Version control operations
-  - curl                Download official releases
-  - sha256sum           Hash verification
+  - docker or podman    Container runtime (the ONLY host dependency)
 
-  Note: Poetry orchestrates the build on the host; actual compilation runs inside Docker.
+  Note: The script auto-launches a python:3.12-slim container with all build tools
+        (git, curl, python3, poetry, etc.). No other host dependencies are needed.
         Windows signature stripping uses containerized osslsigncode (no host install needed).
 
 DIRECTORY STRUCTURE:
@@ -182,12 +192,161 @@ fetch_release_file() {
 }
 
 # ======================================================================================
+# CONTAINER BOOTSTRAP
+# ======================================================================================
+# When invoked on the host, this function launches a python:3.12-slim container with
+# all build dependencies, then re-invokes the script inside the container. The only
+# host requirement is docker (or podman). The Docker socket is bind-mounted so that
+# build.py can spawn sibling containers for compilation.
+
+detect_build_socket() {
+  if [[ -S "/var/run/docker.sock" ]]; then
+    echo "/var/run/docker.sock"
+    return 0
+  fi
+
+  if command_exists podman; then
+    local podman_socket=""
+    podman_socket="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
+    if [[ -S "$podman_socket" ]]; then
+      echo "$podman_socket"
+      return 0
+    fi
+
+    podman_socket="$(podman info --format '{{.Host.RemoteSocket.Path}}' 2>/dev/null || true)"
+    if [[ -n "$podman_socket" && -S "$podman_socket" ]]; then
+      echo "$podman_socket"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+bootstrap_container() {
+  local CONTAINER_CMD=""
+  local BUILD_SOCKET=""
+  if command_exists docker; then
+    CONTAINER_CMD="docker"
+  elif command_exists podman; then
+    CONTAINER_CMD="podman"
+  else
+    log_error "Neither Docker nor Podman found. Install one of them to proceed."
+    log_error "  - Docker: https://docs.docker.com/engine/install/"
+    log_error "  - Podman: https://podman.io/getting-started/installation"
+    exit 1
+  fi
+
+  if ! BUILD_SOCKET="$(detect_build_socket)"; then
+    log_error "No Docker-compatible build socket found."
+    log_error "For Docker, ensure /var/run/docker.sock exists."
+    log_error "For Podman, ensure podman.socket is running."
+    exit 1
+  fi
+
+  local HOST_UID HOST_GID DOCKER_SOCK_GID
+  HOST_UID=$(id -u)
+  HOST_GID=$(id -g)
+  DOCKER_SOCK_GID=$(stat -c '%g' "$BUILD_SOCKET" 2>/dev/null || echo "0")
+
+  local SCRIPT_PATH
+  SCRIPT_PATH="$(readlink -f "$0")"
+
+  log_info "Launching container for build environment..."
+  log_info "Container image: python:3.12-slim"
+  log_info "Container runtime: $CONTAINER_CMD"
+
+  # Build run args as array so we can conditionally add --binary mount
+  local run_args=(
+    --rm
+    -v "$PWD:$PWD"
+    -v "$BUILD_SOCKET:/var/run/docker.sock"
+    -v "$SCRIPT_PATH:$SCRIPT_PATH:ro"
+    -v "$SCRIPT_DIR:$SCRIPT_DIR"
+    -w "$PWD"
+    -e "_INSIDE_CONTAINER=1"
+    -e "BS_VERSION=$VERSION"
+    -e "BS_ARCH=$ARCH"
+    -e "BS_TYPE=$BUILD_TYPE"
+    -e "BS_BINARY="
+    -e "BS_SCRIPT_PATH=$SCRIPT_PATH"
+    -e "HOST_UID=$HOST_UID"
+    -e "HOST_GID=$HOST_GID"
+    -e "DOCKER_SOCK_GID=$DOCKER_SOCK_GID"
+  )
+
+  # If --binary was provided, mount the file into the container at the same path
+  if [[ -n "$BINARY_FILE" ]]; then
+    local abs_binary
+    abs_binary="$(readlink -f "$BINARY_FILE")"
+    run_args+=( -v "$abs_binary:$abs_binary:ro" )
+    run_args+=( -e "BS_BINARY=$abs_binary" )
+  fi
+
+  $CONTAINER_CMD run "${run_args[@]}" \
+    python:3.12-slim \
+    bash -c '
+      # Install dependencies (as root)
+      apt-get update -qq && apt-get install -y -qq \
+        git curl ca-certificates docker.io coreutils \
+        build-essential \
+        osslsigncode \
+        libglib2.0-0 libgl1 libegl1 libfontconfig1 \
+        libxkbcommon0 libxkbcommon-x11-0 \
+        libxcb1 libxcb-xinerama0 libxcb-randr0 libxcb-render0 \
+        libxcb-shm0 libxcb-shape0 libxcb-sync1 libxcb-xfixes0 \
+        libxcb-xkb1 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+        libxcb-cursor0 libxcb-util1 libxcb-render-util0 \
+        libx11-xcb1 libdbus-1-3 >/dev/null 2>&1
+
+      # Create builder user matching host UID/GID
+      groupadd -g "$HOST_GID" hostgrp 2>/dev/null || true
+      groupadd -g "$DOCKER_SOCK_GID" dockerhost 2>/dev/null || true
+      useradd -m -u "$HOST_UID" -g "$HOST_GID" builder 2>/dev/null || true
+      usermod -aG dockerhost builder 2>/dev/null || true
+
+      # Re-invoke script as builder user (pass --binary if provided)
+      su -p builder -c "export HOME=/home/builder && export PATH=\"/home/builder/.local/bin:\$PATH\" && cd \"$PWD\" && bash \"$BS_SCRIPT_PATH\" --version \"$BS_VERSION\" --arch \"$BS_ARCH\" --type \"$BS_TYPE\"${BS_BINARY:+ --binary \"$BS_BINARY\"}"
+    '
+  exit $?
+}
+
+# ======================================================================================
 # PARAMETER PARSING
 # ======================================================================================
 
 VERSION=""
-ARCH="x86_64-linux"
+ARCH=""
 BUILD_TYPE=""
+
+infer_metadata_from_binary() {
+  local binary_name
+  binary_name="$(basename "$BINARY_FILE")"
+
+  if [[ -z "$VERSION" && "$binary_name" =~ ^Bitcoin-Safe-([0-9][0-9A-Za-z._-]*)- ]]; then
+    VERSION="${BASH_REMATCH[1]}"
+    log_info "Inferred version from --binary filename: $VERSION"
+  fi
+
+  case "$binary_name" in
+    Bitcoin-Safe-*-x86_64.AppImage.tar.gz)
+      [[ -n "$ARCH" ]] || ARCH="x86_64-linux"
+      [[ -n "$BUILD_TYPE" ]] || BUILD_TYPE="appimage"
+      ;;
+    Bitcoin-Safe-*-x86_64.deb)
+      [[ -n "$ARCH" ]] || ARCH="x86_64-linux"
+      [[ -n "$BUILD_TYPE" ]] || BUILD_TYPE="deb"
+      ;;
+    Bitcoin-Safe-*-portable.exe)
+      [[ -n "$ARCH" ]] || ARCH="x86_64-windows"
+      [[ -n "$BUILD_TYPE" ]] || BUILD_TYPE="portable"
+      ;;
+    Bitcoin-Safe-*-setup.exe)
+      [[ -n "$ARCH" ]] || ARCH="x86_64-windows"
+      [[ -n "$BUILD_TYPE" ]] || BUILD_TYPE="setup"
+      ;;
+  esac
+}
 
 parse_args() {
   while [[ $# -gt 0 ]]; do
@@ -207,22 +366,42 @@ parse_args() {
         BUILD_TYPE="$2"
         shift 2
         ;;
+      --binary)
+        [[ $# -ge 2 ]] || { log_error "--binary requires a value"; exit 1; }
+        BINARY_FILE="$2"
+        shift 2
+        ;;
+      --apk)
+        # Accepted but unused (desktop app - no APK). Required by build server
+        # which may pass --apk to all scripts. Must not fail per Rule 11.
+        [[ $# -ge 2 ]] || { log_error "--apk requires a value"; exit 1; }
+        log_info "Ignoring --apk parameter: Bitcoin Safe is a desktop app, not an Android app"
+        shift 2
+        ;;
       --help|-h)
         show_help
         exit 0
         ;;
       *)
-        log_error "Unknown parameter: $1"
-        show_help
-        exit 1
+        # Silently ignore unrecognised parameters (build server may pass unknown flags)
+        log_warn "Ignoring unknown parameter: $1"
+        shift
         ;;
     esac
   done
 
+  if [[ -n "$BINARY_FILE" ]]; then
+    infer_metadata_from_binary
+  fi
+
   if [[ -z "$VERSION" ]]; then
-    log_error "Missing required parameter: --version"
+    log_error "Missing version. Pass --version or provide a recognizable Bitcoin Safe file with --binary."
     show_help
     exit 1
+  fi
+
+  if [[ -z "$ARCH" ]]; then
+    ARCH="x86_64-linux"
   fi
 
   # Default --type based on architecture if not explicitly provided
@@ -315,16 +494,32 @@ prepare_repository() {
   if (cd "$REPO_DIR" && git rev-parse "$ref" >/dev/null 2>&1); then
     log_info "Checking out tag $ref"
     (cd "$REPO_DIR" && git checkout "$ref")
+    CHECKED_OUT_TAG="$ref"
   else
     log_warn "Tag $ref not found, trying ${VERSION}"
     (cd "$REPO_DIR" && git checkout "$VERSION")
+    CHECKED_OUT_TAG="$VERSION"
   fi
+
+  if [[ -z "$CHECKED_OUT_TAG" ]]; then
+    CHECKED_OUT_TAG="$ref"
+  fi
+
+  # Clean untracked files and build artifacts to ensure a pristine source tree.
+  # Without this, reused workspaces can produce different builds due to stale
+  # venvs, leftover dist/ files, or cached Poetry state.
+  log_info "Cleaning source tree..."
+  (cd "$REPO_DIR" && git clean -fdx)
+  (cd "$REPO_DIR" && git checkout -- .)
 
   (cd "$REPO_DIR" && git submodule update --init --recursive)
 
+  SOURCE_COMMIT=$(cd "$REPO_DIR" && git rev-parse HEAD)
   SOURCE_DATE_EPOCH=$(cd "$REPO_DIR" && git log -1 --format=%ct HEAD)
   export SOURCE_DATE_EPOCH
+  export SOURCE_COMMIT
   log_info "SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH"
+  log_info "SOURCE_COMMIT: $SOURCE_COMMIT"
 }
 
 # ======================================================================================
@@ -342,36 +537,12 @@ run_build() {
     export SOURCE_DATE_EPOCH
     export PYTHONHASHSEED=22
     export PYTHONIOENCODING="utf-8"
+    export DOCKER_BUILDKIT=1
 
-    # Container runtime setup
-    # build.py calls 'docker' commands internally; if only podman is
-    # available, create a temporary wrapper so 'docker' resolves to podman
-    if command_exists podman && ! command_exists docker; then
-      log_info "Only Podman found - creating temporary docker wrapper"
-      local tmpbin
-      tmpbin=$(mktemp -d)
-      ln -s "$(which podman)" "${tmpbin}/docker"
-      export PATH="${tmpbin}:${PATH}"
-    elif command_exists docker; then
-      export DOCKER_BUILDKIT=1
-      log_info "Using Docker for build"
-    else
-      log_error "Neither Docker nor Podman found. Please install one of them."
-      log_error "  - Docker: https://docs.docker.com/engine/install/"
-      log_error "  - Podman: https://podman.io/getting-started/installation"
-      exit 1
-    fi
-
-    # Ensure Poetry is available
-    if ! command_exists poetry; then
-      log_info "Poetry not found, attempting install..."
-      pip3 install --user poetry || {
-        log_error "Failed to install Poetry"
-        log_error "Install manually: pip3 install poetry"
-        exit 1
-      }
-      export PATH="$HOME/.local/bin:$PATH"
-    fi
+    # Install Poetry (python:3.12-slim base provides pip3)
+    log_info "Installing Poetry..."
+    pip3 install --user poetry >/dev/null 2>&1
+    export PATH="$HOME/.local/bin:$PATH"
     log_info "Poetry version: $(poetry --version)"
 
     # Install project dependencies
@@ -417,8 +588,20 @@ run_build() {
 # ======================================================================================
 
 download_official() {
+  # If --binary was provided, use it directly instead of downloading
+  if [[ -n "$BINARY_FILE" ]]; then
+    if [[ ! -f "$BINARY_FILE" ]]; then
+      log_error "--binary file not found: $BINARY_FILE"
+      return 1
+    fi
+    OFFICIAL_FILE="$BINARY_FILE"
+    OFFICIAL_FILENAME="$(basename "$BINARY_FILE")"
+    log_info "Using provided binary as official artifact: $BINARY_FILE"
+    return 0
+  fi
+
   log_info "Downloading official artifact: $OFFICIAL_FILENAME"
-  
+
   local dest="$OFFICIAL_DIR/$OFFICIAL_FILENAME"
   if [[ -f "$dest" ]]; then
     log_info "Using cached official artifact"
@@ -458,34 +641,38 @@ strip_windows_signature() {
 
   log_info "Stripping signature from Windows executable..."
 
-  # Use Docker/Podman to run osslsigncode (avoid host dependency)
-  local CONTAINER_CMD=""
-  if command_exists podman; then
-    CONTAINER_CMD="podman"
-  elif command_exists docker; then
-    CONTAINER_CMD="docker"
+  # osslsigncode is installed in the bootstrap container (no sibling container needed).
+  # Running it directly avoids Docker-socket permission issues when writing output files.
+  local strip_output
+  strip_output=$(osslsigncode remove-signature -in "$input_file" -out "$output_file" 2>&1) || true
+
+  if [[ -f "$output_file" ]]; then
+    log_success "Signature stripped successfully"
+  elif echo "$strip_output" | grep -qiE "does not have any signature|no signature found"; then
+    log_info "No signature found in $(basename "$input_file") - using file as-is"
+    cp "$input_file" "$output_file"
   else
-    log_error "Neither Docker nor Podman found"
+    log_error "Failed to strip signature: $strip_output"
     return 1
   fi
 
-  local input_basename output_basename
-  input_basename=$(basename "$input_file")
-  output_basename=$(basename "$output_file")
-
-  # Run osslsigncode in container
-  $CONTAINER_CMD run --rm \
-    -v "$(dirname "$input_file"):/work" \
-    -w /work \
-    debian:bookworm \
-    bash -c "apt-get update -qq && apt-get install -y -qq osslsigncode >/dev/null 2>&1 && osslsigncode remove-signature -in '${input_basename}' -out '${output_basename}'" \
-    || {
-    log_error "Failed to strip signature in container"
-    return 1
-  }
-
-  log_success "Signature stripped successfully"
   return 0
+}
+
+print_diff_preview() {
+  local diff_file="$1"
+  local label="$2"
+  local max_lines=5
+  local total_lines=0
+
+  [[ -f "$diff_file" ]] || return 0
+
+  total_lines=$(wc -l < "$diff_file")
+  echo "${label} (first ${max_lines} lines; full diff in ${diff_file}):"
+  head -"${max_lines}" "$diff_file"
+  if [[ "$total_lines" -gt "$max_lines" ]]; then
+    echo "... (${total_lines} lines total)"
+  fi
 }
 
 compare_artifacts() {
@@ -505,10 +692,16 @@ compare_artifacts() {
   # For Windows builds, strip signatures before comparison
   if [[ "$NEEDS_SIGNATURE_STRIP" == "true" ]]; then
     log_info "Windows build detected - stripping signatures for comparison"
-    
-    built_compare="${BUILT_FILE}.stripped"
-    official_compare="${OFFICIAL_FILE}.stripped"
-    
+
+    local official_signed_hash built_signed_hash
+    official_signed_hash=$(sha256sum "$OFFICIAL_FILE" | awk '{print $1}')
+    built_signed_hash=$(sha256sum "$BUILT_FILE" | awk '{print $1}')
+    log_info "Official SHA256 (pre-strip): $official_signed_hash"
+    log_info "Built SHA256    (pre-strip): $built_signed_hash"
+
+    built_compare="${WORKDIR}/$(basename "$BUILT_FILE").stripped"
+    official_compare="${WORKDIR}/$(basename "$OFFICIAL_FILE").stripped"
+
     strip_windows_signature "$BUILT_FILE" "$built_compare" || return 1
     strip_windows_signature "$OFFICIAL_FILE" "$official_compare" || return 1
   fi
@@ -600,14 +793,76 @@ compare_artifacts() {
       return 0
     fi
 
-    # Show first 30 lines of diff for quick triage
-    log_warn "First 30 lines of diff:"
-    head -30 "$diff_output" | while IFS= read -r line; do
-      echo "  $line"
-    done
+    log_warn "AppImage contents differ."
+    print_diff_preview "$diff_output" "AppImage diff preview"
 
     BUILT_HASH="$built_ai_hash"
     OFFICIAL_HASH="$official_ai_hash"
+    MATCH_STATUS="false"
+    VERDICT_STATUS="not_reproducible"
+    return 1
+  fi
+
+  # DEB hashes differ -- extract data and control, diff contents
+  if [[ "$built_compare" == *.deb ]]; then
+    log_info "DEB hashes differ - extracting and comparing package contents..."
+
+    local compare_dir="$WORKDIR/deb_compare"
+    rm -rf "$compare_dir"
+    mkdir -p "$compare_dir/built-data" "$compare_dir/official-data"
+    mkdir -p "$compare_dir/built-control" "$compare_dir/official-control"
+
+    # Extract installed files (data) and package metadata (control)
+    dpkg-deb -x "$built_compare" "$compare_dir/built-data"
+    dpkg-deb -x "$official_compare" "$compare_dir/official-data"
+    dpkg-deb -e "$built_compare" "$compare_dir/built-control"
+    dpkg-deb -e "$official_compare" "$compare_dir/official-control"
+
+    local data_diff="$WORKDIR/diff-deb-data.txt"
+    local control_diff="$WORKDIR/diff-deb-control.txt"
+    local diff_output="$WORKDIR/diff-deb-contents.txt"
+
+    diff -r --no-dereference "$compare_dir/built-data" "$compare_dir/official-data" > "$data_diff" 2>&1 || true
+    diff -r --no-dereference "$compare_dir/built-control" "$compare_dir/official-control" > "$control_diff" 2>&1 || true
+
+    local data_lines control_lines
+    data_lines=$(wc -l < "$data_diff")
+    control_lines=$(wc -l < "$control_diff")
+
+    # Combined report
+    {
+      echo "=== DEB Data Files (installed content): ${data_lines} diff lines ==="
+      cat "$data_diff"
+      echo ""
+      echo "=== DEB Control Metadata: ${control_lines} diff lines ==="
+      cat "$control_diff"
+    } > "$diff_output"
+
+    log_info "DEB data diff: ${data_lines} lines | control diff: ${control_lines} lines"
+    log_info "Full diff written to ${diff_output}"
+
+    # Data identical = reproducible (control metadata may differ cosmetically,
+    # same logic as AppImage: outer packaging ≠ application content)
+    if [[ "$data_lines" -eq 0 ]]; then
+      if [[ "$control_lines" -eq 0 ]]; then
+        log_success "DEB contents are identical (ar archive metadata differs)"
+      else
+        log_success "DEB installed files are identical (control metadata differs only)"
+        print_diff_preview "$control_diff" "DEB control diff preview"
+      fi
+      BUILT_HASH="$OFFICIAL_HASH"
+      MATCH_STATUS="true"
+      VERDICT_STATUS="reproducible"
+      return 0
+    fi
+
+    log_warn "DEB installed files differ."
+    print_diff_preview "$data_diff" "DEB data diff preview"
+
+    if [[ "$control_lines" -gt 0 ]]; then
+      log_warn "Control metadata also differs (${control_lines} lines, see ${control_diff})"
+    fi
+
     MATCH_STATUS="false"
     VERDICT_STATUS="not_reproducible"
     return 1
@@ -624,43 +879,41 @@ compare_artifacts() {
 # ======================================================================================
 
 generate_comparison_yaml() {
-  local yaml_file="${execution_dir}/COMPARISON_RESULTS.yaml"
+  local yaml_file="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
 
   log_info "Generating COMPARISON_RESULTS.yaml..."
 
   cat > "$yaml_file" <<EOF
-date: $(date -u '+%Y-%m-%dT%H:%M:%S%z')
 script_version: ${SCRIPT_VERSION}
-build_type: ${BUILD_TYPE}
-results:
-  - architecture: ${ARCH}
-    filename: $(basename "${BUILT_FILE}")
-    hash: ${BUILT_HASH}
-    match: ${MATCH_STATUS}
-    status: ${VERDICT_STATUS}
+verdict: ${VERDICT_STATUS}
+notes: |
+  Bitcoin Safe uses Poetry + Docker to build cross-platform AppImage, DEB, and Windows executables.
+  Expected differences (do not affect verdict):
+  - AppImage tar.gz wrapper: non-deterministic tar metadata; raw AppImage inside is compared directly.
+  - DEB control metadata: cosmetic package metadata differences; installed file content is what matters.
+  - Windows executables compared after signature stripping (official is signed by SignPath.io, built is unsigned).
 EOF
 
   log_success "COMPARISON_RESULTS.yaml generated: ${yaml_file}"
 }
 
 generate_error_yaml() {
-  local error_status="$1"  # ftbfs, nosource, etc.
+  local error_status="$1"
   local error_msg="$2"
-  local yaml_file="${execution_dir}/COMPARISON_RESULTS.yaml"
+  local yaml_file="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
 
   log_info "Generating error COMPARISON_RESULTS.yaml..."
 
+  case "$error_status" in
+    reproducible|not_reproducible|ftbfs) ;;
+    *) error_status="ftbfs" ;;
+  esac
+
   cat > "$yaml_file" <<EOF
-date: $(date -u '+%Y-%m-%dT%H:%M:%S%z')
 script_version: ${SCRIPT_VERSION}
-build_type: ${BUILD_TYPE}
-results:
-  - architecture: ${ARCH}
-    filename: N/A
-    hash: N/A
-    match: false
-    status: ${error_status}
-    error: ${error_msg}
+verdict: ${error_status}
+notes: |
+  ${error_msg}
 EOF
 
   log_info "Error YAML generated: ${yaml_file}"
@@ -671,17 +924,10 @@ EOF
 # ======================================================================================
 
 print_summary() {
-  # Determine verdict based on match status
-  local verdict=""
-  if [[ "${MATCH_STATUS}" == "true" ]]; then
-    verdict="reproducible"
-  else
-    verdict=""  # Empty for non-reproducible (legacy compatibility)
-  fi
-
-  # Determine match indicator for Diff section
+  local summary_verdict=""
   local match_indicator="0 (DOESN'T MATCH)"
   if [[ "${MATCH_STATUS}" == "true" ]]; then
+    summary_verdict="reproducible"
     match_indicator="1 (MATCHES)"
   fi
 
@@ -689,11 +935,11 @@ print_summary() {
   echo "===== Begin Results ====="
   echo "appId:          ${APP_ID}"
   echo "signer:         N/A"
-  echo "apkVersionName: ${VERSION}"
-  echo "apkVersionCode: N/A"
-  echo "verdict:        ${verdict}"
+  echo "versionName:    ${VERSION}"
+  echo "versionCode:    N/A"
+  echo "verdict:        ${summary_verdict}"
   echo "appHash:        ${OFFICIAL_HASH:-N/A}"
-  echo "commit:         N/A"
+  echo "commit:         ${SOURCE_COMMIT:-N/A}"
   echo
   echo "Diff:"
   if [[ "${MATCH_STATUS}" == "true" ]]; then
@@ -707,24 +953,26 @@ print_summary() {
   fi
   echo
   echo "Revision, tag (and its signature):"
-  echo "Tag: v${VERSION} (checked out from git)"
+  echo "Tag: ${CHECKED_OUT_TAG:-unknown} (checked out from git)"
   echo "Note: Git signature verification not implemented"
   echo
   local diff_file="$WORKDIR/diff-appimage-contents.txt"
   if [[ -f "$diff_file" ]]; then
-    local diff_lines
-    diff_lines=$(wc -l < "$diff_file")
-    echo "AppImage content diff (${diff_lines} lines):"
-    if [[ "$diff_lines" -le 50 ]]; then
-      cat "$diff_file"
-    else
-      head -50 "$diff_file"
-      echo "... (${diff_lines} total lines, see ${diff_file})"
-    fi
+    print_diff_preview "$diff_file" "AppImage content diff"
+    echo
+  fi
+  local deb_diff_file="$WORKDIR/diff-deb-contents.txt"
+  if [[ -f "$deb_diff_file" ]]; then
+    print_diff_preview "$deb_diff_file" "DEB content diff"
     echo
   fi
   echo "===== End Results ====="
   echo
+}
+
+print_finding() {
+  local finding="$1"
+  echo "Finding: Bitcoin Safe ${VERSION} ${ARCH} ${BUILD_TYPE} -> ${finding}"
 }
 
 # ======================================================================================
@@ -732,23 +980,19 @@ print_summary() {
 # ======================================================================================
 
 main() {
-  log_info "Starting bitcoinsafedesktop_build.sh script version ${SCRIPT_VERSION}"
-  log_info "Bitcoin Safe Desktop Build Verification Script"
-  log_info "========================================================"
+  # Parse arguments first (needed for container bootstrap env vars)
+  parse_args "$@"
 
-  # Check requirements
-  require_command git "Install git to clone the repository"
-  require_command curl "Install curl to download official releases"
-  require_command sha256sum "Install coreutils for hash verification"
-  require_command python3 "Install Python 3.10+ (required by Poetry and build.py)"
-  
-  if ! command_exists docker && ! command_exists podman; then
-    log_error "Neither Docker nor Podman found. Install one of them to proceed."
-    exit 1
+  # If not inside container, bootstrap and re-invoke
+  if [[ "${_INSIDE_CONTAINER:-}" != "1" ]]; then
+    bootstrap_container
+    # bootstrap_container calls exit, never reaches here
   fi
 
-  # Parse arguments
-  parse_args "$@"
+  # Inside container - proceed with normal flow
+  log_info "Starting bitcoinsafe_build.sh script version ${SCRIPT_VERSION}"
+  log_info "Bitcoin Safe Desktop Build Verification Script"
+  log_info "========================================================"
 
   # Map architecture and type to build configuration
   map_build_config "$ARCH" "$BUILD_TYPE"
@@ -762,7 +1006,7 @@ main() {
   # Download official artifact
   if ! download_official; then
     log_error "Failed to download official artifact"
-    generate_error_yaml "nosource" "Failed to download official release from GitHub"
+    generate_error_yaml "ftbfs" "Failed to obtain official release artifact"
     exit 1
   fi
 
@@ -781,8 +1025,20 @@ main() {
   fi
 
   # Compare artifacts
+  BUILT_HASH=""
+  OFFICIAL_HASH=""
+  MATCH_STATUS="false"
+  VERDICT_STATUS="not_reproducible"
   local comparison_result=0
   compare_artifacts || comparison_result=$?
+
+  # If comparison failed before any hashes were computed (e.g. signature strip error),
+  # emit ftbfs rather than a misleading not_reproducible with empty hashes.
+  if [[ "$comparison_result" -ne 0 && -z "$BUILT_HASH" ]]; then
+    log_error "Comparison aborted before hash computation - see errors above"
+    generate_error_yaml "ftbfs" "Artifact comparison failed before hash computation - see logs above"
+    exit 1
+  fi
 
   # Generate YAML output
   generate_comparison_yaml
@@ -792,9 +1048,11 @@ main() {
 
   # Exit with appropriate code
   if [[ "$comparison_result" -eq 0 ]]; then
+    print_finding "reproducible"
     log_success "Verification complete: Build is REPRODUCIBLE (exit code: 0)"
     exit 0
   else
+    print_finding "${VERDICT_STATUS}"
     log_warn "Verification complete: Build is NOT REPRODUCIBLE (exit code: 1)"
     exit 1
   fi
