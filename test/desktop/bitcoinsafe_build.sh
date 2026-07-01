@@ -2,7 +2,7 @@
 # ======================================================================================
 # bitcoinsafe_build.sh - Bitcoin Safe Desktop Reproducible Build Verification
 # ======================================================================================
-# Version:       v0.8.14
+# Version:       v0.8.15
 # Organization:  WalletScrutiny.com
 # Last Modified: 2026-07-01
 # Project:       https://github.com/andreasgriffin/bitcoin-safe
@@ -38,7 +38,7 @@ set -euo pipefail
 # ======================================================================================
 
 APP_ID="bitcoin.safe"
-SCRIPT_VERSION="v0.8.14"
+SCRIPT_VERSION="v0.8.15"
 REPO_URL="https://github.com/andreasgriffin/bitcoin-safe.git"
 RELEASE_BASE="https://github.com/andreasgriffin/bitcoin-safe/releases/download"
 
@@ -540,21 +540,6 @@ prepare_repository() {
 # BUILD PROCESS
 # ======================================================================================
 
-# Remove Docker images created with a PID-unique name by this run.
-# build.py removes its named container after a run but does not remove the image;
-# without this, each run leaves a dangling tagged image on disk.
-cleanup_build_images() {
-  local pid_tag="$1"
-  for img in \
-      "bitcoin_safe-appimage-builder-img-${pid_tag}" \
-      "bitcoin_safe-wine-builder-img-${pid_tag}"; do
-    if docker image inspect "${img}" >/dev/null 2>&1; then
-      log_info "Removing build image: ${img}"
-      docker rmi "${img}" 2>/dev/null || log_warn "Could not remove image ${img}"
-    fi
-  done
-}
-
 run_build() {
   log_info "Starting containerized build (this may take several minutes)..."
 
@@ -708,6 +693,10 @@ print_diff_preview() {
 }
 
 compare_artifacts() {
+  # Remove stale side files from previous runs in the same workdir so they
+  # cannot bleed into the summary of a successful re-run.
+  rm -f "$WORKDIR/flatpak-hash-mismatch-note.txt"
+
   if [[ ! -f "$BUILT_FILE" ]]; then
     log_error "Built file not found: $BUILT_FILE"
     return 1
@@ -914,9 +903,9 @@ compare_artifacts() {
       echo "Official: ${OFFICIAL_HASH}"
       echo "Built:    ${BUILT_HASH}"
       echo ""
-      echo "Possible cause: org.kde.Platform//6.9 runtime fetched from live Flathub CDN."
-      echo "If Flathub updated the KDE runtime between release and this verification,"
-      echo "the bundle hash changes even if application content is identical."
+      echo "Possible cause: KDE runtime/SDK refs (org.kde.Platform//6.9, org.kde.Sdk//6.9)"
+      echo "are Flathub branch refs, not content-pinned OSTree commits. If Flathub updated"
+      echo "either ref between the official release build and this run, the bundle hash changes."
       echo "To confirm, compare OSTree content using:"
       echo "  tools/build-linux/flatpak/check_reproducibility.sh"
       echo "or extract both bundles via 'ostree' and diff the /app trees."
@@ -947,11 +936,15 @@ script_version: ${SCRIPT_VERSION}
 verdict: ${VERDICT_STATUS}
 notes: |
   Bitcoin Safe uses Poetry + Docker to build cross-platform AppImage, DEB, Flatpak, and Windows executables.
-  Expected differences (do not affect verdict):
+  Expected differences that do not affect verdict:
   - AppImage tar.gz wrapper: non-deterministic tar metadata; raw AppImage inside is compared directly.
   - DEB control metadata: cosmetic package metadata differences; installed file content is what matters.
   - Windows executables compared after signature stripping (official is signed, built is unsigned).
-  - Flatpak: org.kde.Platform//6.9 runtime fetched live from Flathub; hash may differ if runtime updated.
+  Caveats that may affect verdict:
+  - Flatpak: KDE runtime/SDK refs (org.kde.Platform//6.9, org.kde.Sdk//6.9) are Flathub branch refs,
+    not content-pinned OSTree commits. If Flathub updated either ref between the official release build
+    and this verification run, the bundle hash changes. A hash mismatch returns not_reproducible;
+    OSTree content comparison is required to determine if the application payload itself differs.
 EOF
 
   log_success "COMPARISON_RESULTS.yaml generated: ${yaml_file}"
