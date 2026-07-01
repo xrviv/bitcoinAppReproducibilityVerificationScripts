@@ -2,7 +2,7 @@
 # ======================================================================================
 # bitcoinsafe_build.sh - Bitcoin Safe Desktop Reproducible Build Verification
 # ======================================================================================
-# Version:       v0.8.13
+# Version:       v0.8.14
 # Organization:  WalletScrutiny.com
 # Last Modified: 2026-07-01
 # Project:       https://github.com/andreasgriffin/bitcoin-safe
@@ -38,7 +38,7 @@ set -euo pipefail
 # ======================================================================================
 
 APP_ID="bitcoin.safe"
-SCRIPT_VERSION="v0.8.13"
+SCRIPT_VERSION="v0.8.14"
 REPO_URL="https://github.com/andreasgriffin/bitcoin-safe.git"
 RELEASE_BASE="https://github.com/andreasgriffin/bitcoin-safe/releases/download"
 
@@ -98,6 +98,7 @@ OPTIONAL PARAMETERS:
                          Linux:
                            - appimage      AppImage (default)
                            - deb           Debian package
+                           - flatpak       Flatpak bundle (new in v2.0.0)
                          Windows:
                            - portable      Portable executable
                            - setup         Setup installer
@@ -136,6 +137,9 @@ EXAMPLES:
 
   # Verify Windows setup installer
   ./bitcoinsafe_build.sh --version 1.6.0 --arch x86_64-windows --type setup
+
+  # Verify Flatpak bundle (v2.0.0+)
+  ./bitcoinsafe_build.sh --version 2.0.0 --arch x86_64-linux --type flatpak
 
 REQUIREMENTS:
   - docker or podman    Container runtime (the ONLY host dependency)
@@ -345,6 +349,10 @@ infer_metadata_from_binary() {
       [[ -n "$ARCH" ]] || ARCH="x86_64-windows"
       [[ -n "$BUILD_TYPE" ]] || BUILD_TYPE="setup"
       ;;
+    Bitcoin-Safe-*-x86_64.flatpak)
+      [[ -n "$ARCH" ]] || ARCH="x86_64-linux"
+      [[ -n "$BUILD_TYPE" ]] || BUILD_TYPE="flatpak"
+      ;;
   esac
 }
 
@@ -445,11 +453,17 @@ map_build_config() {
       BUILT_PATTERN="*${VERSION}*setup.exe"
       NEEDS_SIGNATURE_STRIP=true
       ;;
+    x86_64-linux_flatpak)
+      OFFICIAL_FILENAME="Bitcoin-Safe-${VERSION}-x86_64.flatpak"
+      BUILD_TARGET="flatpak"
+      BUILT_PATTERN="*${VERSION}*.flatpak"
+      ;;
     *)
       log_error "Unsupported architecture/type combination: ${arch}/${type}"
       log_error "Supported combinations:"
       log_error "  - x86_64-linux / appimage"
       log_error "  - x86_64-linux / deb"
+      log_error "  - x86_64-linux / flatpak"
       log_error "  - x86_64-windows / portable"
       log_error "  - x86_64-windows / setup"
       exit 1
@@ -579,6 +593,9 @@ run_build() {
         ;;
       windows)
         build_targets="windows"
+        ;;
+      flatpak)
+        build_targets="flatpak"
         ;;
       *)
         log_error "Unsupported build target: ${BUILD_TARGET}"
@@ -883,6 +900,33 @@ compare_artifacts() {
     return 1
   fi
 
+  # Flatpak hashes differ -- report not_reproducible with OSTree note.
+  # Flatpak bundles are OSTree repositories; the KDE Platform runtime
+  # (org.kde.Platform//6.9) is fetched live from Flathub and is NOT
+  # content-pinned. If Flathub updated the runtime between the official
+  # release build and this verification run, hashes will differ even
+  # if the application content is identical. Full content diffing
+  # requires OSTree checkout comparison (manual follow-up).
+  if [[ "$built_compare" == *.flatpak ]]; then
+    local flatpak_diff_note="$WORKDIR/flatpak-hash-mismatch-note.txt"
+    {
+      echo "Flatpak bundle hashes differ."
+      echo "Official: ${OFFICIAL_HASH}"
+      echo "Built:    ${BUILT_HASH}"
+      echo ""
+      echo "Possible cause: org.kde.Platform//6.9 runtime fetched from live Flathub CDN."
+      echo "If Flathub updated the KDE runtime between release and this verification,"
+      echo "the bundle hash changes even if application content is identical."
+      echo "To confirm, compare OSTree content using:"
+      echo "  tools/build-linux/flatpak/check_reproducibility.sh"
+      echo "or extract both bundles via 'ostree' and diff the /app trees."
+    } > "$flatpak_diff_note"
+    log_warn "Flatpak hashes differ. See ${flatpak_diff_note} for details."
+    MATCH_STATUS="false"
+    VERDICT_STATUS="not_reproducible"
+    return 1
+  fi
+
   MATCH_STATUS="false"
   VERDICT_STATUS="not_reproducible"
   log_warn "Hashes differ - Build is NOT reproducible"
@@ -902,11 +946,12 @@ generate_comparison_yaml() {
 script_version: ${SCRIPT_VERSION}
 verdict: ${VERDICT_STATUS}
 notes: |
-  Bitcoin Safe uses Poetry + Docker to build cross-platform AppImage, DEB, and Windows executables.
+  Bitcoin Safe uses Poetry + Docker to build cross-platform AppImage, DEB, Flatpak, and Windows executables.
   Expected differences (do not affect verdict):
   - AppImage tar.gz wrapper: non-deterministic tar metadata; raw AppImage inside is compared directly.
   - DEB control metadata: cosmetic package metadata differences; installed file content is what matters.
-  - Windows executables compared after signature stripping (official is signed by SignPath.io, built is unsigned).
+  - Windows executables compared after signature stripping (official is signed, built is unsigned).
+  - Flatpak: org.kde.Platform//6.9 runtime fetched live from Flathub; hash may differ if runtime updated.
 EOF
 
   log_success "COMPARISON_RESULTS.yaml generated: ${yaml_file}"
@@ -979,6 +1024,12 @@ print_summary() {
   local deb_diff_file="$WORKDIR/diff-deb-contents.txt"
   if [[ -f "$deb_diff_file" ]]; then
     print_diff_preview "$deb_diff_file" "DEB content diff"
+    echo
+  fi
+  local flatpak_note_file="$WORKDIR/flatpak-hash-mismatch-note.txt"
+  if [[ -f "$flatpak_note_file" ]]; then
+    echo "Flatpak hash mismatch note (full details in ${flatpak_note_file}):"
+    head -4 "$flatpak_note_file"
     echo
   fi
   echo "===== End Results ====="
