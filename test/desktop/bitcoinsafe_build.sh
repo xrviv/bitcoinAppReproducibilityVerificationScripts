@@ -2,7 +2,7 @@
 # ======================================================================================
 # bitcoinsafe_build.sh - Bitcoin Safe Desktop Reproducible Build Verification
 # ======================================================================================
-# Version:       v0.8.12
+# Version:       v0.8.13
 # Organization:  WalletScrutiny.com
 # Last Modified: 2026-07-01
 # Project:       https://github.com/andreasgriffin/bitcoin-safe
@@ -38,7 +38,7 @@ set -euo pipefail
 # ======================================================================================
 
 APP_ID="bitcoin.safe"
-SCRIPT_VERSION="v0.8.12"
+SCRIPT_VERSION="v0.8.13"
 REPO_URL="https://github.com/andreasgriffin/bitcoin-safe.git"
 RELEASE_BASE="https://github.com/andreasgriffin/bitcoin-safe/releases/download"
 
@@ -586,28 +586,11 @@ run_build() {
         ;;
     esac
 
-    # Patch tools/build.py to use PID-unique Docker image and container names.
-    # build.py hardcodes 'bitcoin_safe-appimage-builder-img' and
-    # 'bitcoin_safe-wine-builder-img'; running AppImage and DEB simultaneously
-    # causes an exit-125 container-name conflict. This patch is
-    # orchestration-only (not app source) and applied only to the workdir copy.
-    local BUILD_PID="$$"
-    log_info "Patching tools/build.py: uniquifying Docker names (PID=${BUILD_PID})"
-    log_info "  bitcoin_safe-appimage-builder-img -> bitcoin_safe-appimage-builder-img-${BUILD_PID}"
-    log_info "  bitcoin_safe-wine-builder-img     -> bitcoin_safe-wine-builder-img-${BUILD_PID}"
-    sed -i \
-      -e "s/bitcoin_safe-appimage-builder-img/bitcoin_safe-appimage-builder-img-${BUILD_PID}/g" \
-      -e "s/bitcoin_safe-wine-builder-img/bitcoin_safe-wine-builder-img-${BUILD_PID}/g" \
-      tools/build.py
-
     log_info "Running: poetry run python tools/build.py --targets ${build_targets} --commit None"
     poetry run python tools/build.py --targets ${build_targets} --commit None || {
       log_error "Build failed"
-      cleanup_build_images "${BUILD_PID}"
       exit 1
     }
-
-    cleanup_build_images "${BUILD_PID}"
   )
 
   end_ts=$(date +%s)
