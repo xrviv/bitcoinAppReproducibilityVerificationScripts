@@ -2,7 +2,7 @@
 # ======================================================================================
 # bitcoinsafe_build.sh - Bitcoin Safe Desktop Reproducible Build Verification
 # ======================================================================================
-# Version:       v0.8.15
+# Version:       v0.8.16
 # Organization:  WalletScrutiny.com
 # Last Modified: 2026-07-01
 # Project:       https://github.com/andreasgriffin/bitcoin-safe
@@ -38,7 +38,7 @@ set -euo pipefail
 # ======================================================================================
 
 APP_ID="bitcoin.safe"
-SCRIPT_VERSION="v0.8.15"
+SCRIPT_VERSION="v0.8.16"
 REPO_URL="https://github.com/andreasgriffin/bitcoin-safe.git"
 RELEASE_BASE="https://github.com/andreasgriffin/bitcoin-safe/releases/download"
 
@@ -696,6 +696,8 @@ compare_artifacts() {
   # Remove stale side files from previous runs in the same workdir so they
   # cannot bleed into the summary of a successful re-run.
   rm -f "$WORKDIR/flatpak-hash-mismatch-note.txt"
+  rm -f "$WORKDIR/diff-appimage-contents.txt"
+  rm -f "$WORKDIR/diff-deb-contents.txt"
 
   if [[ ! -f "$BUILT_FILE" ]]; then
     log_error "Built file not found: $BUILT_FILE"
@@ -890,12 +892,12 @@ compare_artifacts() {
   fi
 
   # Flatpak hashes differ -- report not_reproducible with OSTree note.
-  # Flatpak bundles are OSTree repositories; the KDE Platform runtime
-  # (org.kde.Platform//6.9) is fetched live from Flathub and is NOT
-  # content-pinned. If Flathub updated the runtime between the official
-  # release build and this verification run, hashes will differ even
-  # if the application content is identical. Full content diffing
-  # requires OSTree checkout comparison (manual follow-up).
+  # Flatpak bundles are OSTree repositories; the KDE runtime and SDK
+  # (org.kde.Platform//6.9, org.kde.Sdk//6.9) are Flathub branch refs,
+  # not content-pinned OSTree commits. If Flathub updated either ref
+  # between the official release build and this verification run, hashes
+  # will differ even if the application content is identical. Full content
+  # diffing requires OSTree checkout comparison (manual follow-up).
   if [[ "$built_compare" == *.flatpak ]]; then
     local flatpak_diff_note="$WORKDIR/flatpak-hash-mismatch-note.txt"
     {
@@ -906,9 +908,10 @@ compare_artifacts() {
       echo "Possible cause: KDE runtime/SDK refs (org.kde.Platform//6.9, org.kde.Sdk//6.9)"
       echo "are Flathub branch refs, not content-pinned OSTree commits. If Flathub updated"
       echo "either ref between the official release build and this run, the bundle hash changes."
-      echo "To confirm, compare OSTree content using:"
-      echo "  tools/build-linux/flatpak/check_reproducibility.sh"
-      echo "or extract both bundles via 'ostree' and diff the /app trees."
+      echo "To confirm: for official-vs-built comparison, import both bundles with"
+      echo "  ostree and diff the checked-out /app trees."
+      echo "Note: tools/build-linux/flatpak/check_reproducibility.sh compares two"
+      echo "  local builds only; it does not compare against the official release."
     } > "$flatpak_diff_note"
     log_warn "Flatpak hashes differ. See ${flatpak_diff_note} for details."
     MATCH_STATUS="false"
