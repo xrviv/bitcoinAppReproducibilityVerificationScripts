@@ -2,9 +2,9 @@
 # ==============================================================================
 # greenandroid_build.sh - Blockstream Green Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.2
+# Version:       v0.3.5
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-06-04
+# Last Modified: 2026-06-05
 # Project:       https://github.com/Blockstream/green_android
 # ==============================================================================
 # LICENSE: MIT License
@@ -27,7 +27,7 @@
 # Phase 1 — GDK from source:
 #   - Clones GDK at the tag pinned in green_android's gdk/fetch_android_binaries.sh
 #   - Builds GDK Docker image from GDK's own docker/android/Dockerfile
-#     (NDK r26b, Debian Bullseye, JDK 11, Rust 1.81; compiles all C deps)
+#     (NDK r26b, Debian Bullseye, JDK 11, Rust 1.85; compiles all C deps)
 #   - Builds GDK for armeabi-v7a + arm64-v8a inside that image
 #   - Downloads official GDK tarball, verifies SHA256
 #   - Compares built .so + Java wrapper files vs official → gdk_verdict
@@ -40,14 +40,14 @@
 # Output:
 #   - Both verdicts reported separately (per-artifact model)
 #   - COMPARISON_RESULTS.yaml verdict reflects APK comparison
-#   - GDK build time warning: Phase 1 Docker image alone takes 2+ hours
+#   - GDK build time warning: Phase 1 image build is slow on first run; cached layers are reused
 
 set -euo pipefail
 
 # ------------------------------------------------------------------------------
 # Constants
 # ------------------------------------------------------------------------------
-SCRIPT_VERSION="v0.2.2"
+SCRIPT_VERSION="v0.3.5"
 APP_ID="com.greenaddress.greenbits_android_wallet"
 REPO_URL="https://github.com/Blockstream/green_android.git"
 GDK_REPO_URL="https://github.com/Blockstream/gdk.git"
@@ -167,6 +167,22 @@ else
 fi
 
 # ------------------------------------------------------------------------------
+# Workspace removal helper
+# ------------------------------------------------------------------------------
+# Files created inside containers are owned by root and may have restricted
+# permissions. Remove from inside a container (running as root) so host
+# permission checks are bypassed entirely. Mount the PARENT so the container
+# can delete the directory entry itself.
+remove_workspace_dir() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 0
+  $CONTAINER_CMD run --rm \
+    --volume "$(dirname "${dir}"):/parent${VOLUME_RW_SUFFIX}" \
+    "$WS_CONTAINER" \
+    rm -rf "/parent/$(basename "${dir}")"
+}
+
+# ------------------------------------------------------------------------------
 # Usage
 # ------------------------------------------------------------------------------
 usage() {
@@ -190,8 +206,8 @@ DESCRIPTION
          apk_verdict  - built APK vs official APK (COMPARISON_RESULTS.yaml verdict)
 
        WARNING: Phase 1 (GDK Docker image build) compiles all C dependencies from
-       source (openssl, boost, tor, libwally-core, Rust) for 4 ABIs. This alone
-       takes 2+ hours on a modern machine. Total script runtime: 3-5+ hours.
+       source (openssl, boost, tor, libwally-core, Rust) for 4 ABIs. Runtime
+       varies; first uncached builds may be much longer.
 
 OPTIONS
        --version <version>     Override version (optional). If omitted, auto-detected
@@ -372,7 +388,7 @@ generate_diff_summary() {
   local official_dir="${summary_dir}/official"
   local built_dir="${summary_dir}/built"
 
-  rm -rf "${summary_dir}"
+  remove_workspace_dir "${summary_dir}"
   mkdir -p "${summary_dir}"
 
   if ! ${CONTAINER_CMD} run --rm \
@@ -573,7 +589,7 @@ fi
 work_dir="${execution_dir}/workdir_${APP_ID}_${version_name}_${build_arch}"
 if [[ -d "${work_dir}" ]]; then
   log_info "Removing existing workspace: ${work_dir}"
-  rm -rf "${work_dir}"
+  remove_workspace_dir "${work_dir}"
 fi
 
 mkdir -p "${work_dir}"
@@ -606,6 +622,21 @@ if [[ -z "${gdk_tag}" || -z "${gdk_sha256_official}" ]]; then
   die_failed "Could not parse GDK TAGNAME or SHA256 from gdk/fetch_android_binaries.sh"
 fi
 
+# For F-Droid, the official recipe reads the GDK tag from gdk/prepare_gdk_clang.sh instead.
+# Cross-check and warn if they differ (for 5.4.0 both are release_0.77.3).
+if [[ "${apk_is_fdroid}" == "true" ]]; then
+  gdk_clang_script="${work_dir}/app/gdk/prepare_gdk_clang.sh"
+  if [[ -f "${gdk_clang_script}" ]]; then
+    gdk_tag_clang="$(grep 'TAGNAME=' "${gdk_clang_script}" | head -1 | cut -d'"' -f2)"
+    if [[ -n "${gdk_tag_clang}" && "${gdk_tag_clang}" != "${gdk_tag}" ]]; then
+      log_warn "GDK tag mismatch: fetch_android_binaries.sh says ${gdk_tag}, prepare_gdk_clang.sh says ${gdk_tag_clang}"
+      log_warn "Using ${gdk_tag} from fetch_android_binaries.sh — verify manually"
+    else
+      log_info "GDK tag cross-check: fetch_android_binaries.sh and prepare_gdk_clang.sh both say ${gdk_tag}"
+    fi
+  fi
+fi
+
 gdk_tarball_name="gdk-${gdk_tag}"
 gdk_tarball_url="https://github.com/Blockstream/gdk/releases/download/${gdk_tag}/${gdk_tarball_name}.tar.gz"
 log_info "GDK tag: ${gdk_tag} | Official SHA256: ${gdk_sha256_official}"
@@ -633,13 +664,30 @@ sed -i \
   "${gdk_src_dir}/src/docker/android/Dockerfile"
 log_info "GDK Dockerfile image names qualified for Podman compatibility"
 
+if [[ "${apk_is_fdroid}" == "true" ]]; then
+  log_info "F-Droid path: adding swig and virtualenv to GDK image..."
+  echo "RUN apt-get update && apt-get install -y --no-install-recommends swig virtualenv python3-pip" \
+    >> "${gdk_src_dir}/src/docker/android/Dockerfile"
+  log_info "F-Droid path: placing GDK source in green_android/gdk/gdk/..."
+  cp -r "${gdk_src_dir}/src" "${work_dir}/app/gdk/gdk"
+  log_info "F-Droid path: applying GDK build patches (Boost URL, prepare_gdk_clang.sh)..."
+  # Apply to original source (used during Docker image build for dep compilation)
+  sed -i 's|boostorg.jfrog.io/artifactory/main|archives.boost.io|g' \
+    "${gdk_src_dir}/src/tools/builddeps.sh"
+  # Apply to the copy (used at runtime by prepare_gdk_clang.sh)
+  sed -i 's|boostorg.jfrog.io/artifactory/main|archives.boost.io|g' \
+    "${work_dir}/app/gdk/gdk/tools/builddeps.sh"
+  sed -i -e '1a set -x' -e '/requirements/a pip install setuptools' \
+    "${work_dir}/app/gdk/prepare_gdk_clang.sh"
+fi
+
 # ------------------------------------------------------------------------------
 # Phase 1d: Build GDK Docker image
 # ------------------------------------------------------------------------------
 gdk_image_tag="gdk_android_builder_${version_name}_$$"
 log_info "Building GDK Docker image from docker/android/Dockerfile..."
 log_info "WARNING: This compiles openssl, boost, tor, libwally, Rust for 4 ABIs."
-log_info "WARNING: Expected build time: 2+ hours. Do not interrupt."
+log_info "WARNING: Phase 1 build time varies; first uncached run may be much longer. Do not interrupt."
 
 if [[ "${CONTAINER_CMD}" == "docker" ]]; then
   DOCKER_BUILDKIT=1 $CONTAINER_CMD build \
@@ -661,16 +709,38 @@ log_info "GDK Docker image built: ${gdk_image_tag}"
 gdk_built_dir="${work_dir}/gdk_built"
 mkdir -p "${gdk_built_dir}/armeabi-v7a" "${gdk_built_dir}/arm64-v8a"
 
-for abi in armeabi-v7a arm64-v8a; do
-  log_info "Building GDK from source for ${abi}..."
+if [[ "${apk_is_fdroid}" == "false" ]]; then
+  for abi in armeabi-v7a arm64-v8a; do
+    log_info "Building GDK from source for ${abi}..."
+    $CONTAINER_CMD run --rm \
+      --volume "${gdk_src_dir}/src:/root/gdk${VOLUME_RW_SUFFIX}" \
+      --volume "${gdk_built_dir}/${abi}:/output${VOLUME_RW_SUFFIX}" \
+      "${gdk_image_tag}" \
+      bash -c "./tools/build.sh --install /output --ndk ${abi}"
+    log_info "GDK build complete for ${abi}"
+  done
+else
+  log_info "F-Droid path: building GDK via prepare_gdk_clang.sh (armeabi-v7a arm64-v8a)..."
   $CONTAINER_CMD run --rm \
-    --volume "${gdk_src_dir}/src:/root/gdk${VOLUME_RW_SUFFIX}" \
-    --volume "${gdk_built_dir}/${abi}:/output${VOLUME_RW_SUFFIX}" \
+    --volume "${work_dir}/app:/ga${VOLUME_RW_SUFFIX}" \
     "${gdk_image_tag}" \
-    bash -c "./tools/build.sh --install /output --ndk ${abi}"
-  log_info "GDK build complete for ${abi}"
-done
+    bash -c "cd /ga/gdk && ./prepare_gdk_clang.sh 'armeabi-v7a arm64-v8a'"
+  log_info "F-Droid GDK build via prepare_gdk_clang.sh complete"
+fi
 
+# ------------------------------------------------------------------------------
+# Phase 1f–1g: Download/verify official GDK tarball and compare (Play Store only)
+# F-Droid: GDK built via prepare_gdk_clang.sh; comparison done at APK level
+# ------------------------------------------------------------------------------
+if [[ "${apk_is_fdroid}" == "true" ]]; then
+  gdk_verdict="not_compared"
+  gdk_diff_lines="GDK comparison skipped for F-Droid path — built via prepare_gdk_clang.sh\n"
+  log_info "F-Droid path: skipping GDK tarball comparison (APK diff covers this)"
+fi
+
+gdk_diff_file="${execution_dir}/diff_gdk_binaries.txt"
+
+if [[ "${apk_is_fdroid}" == "false" ]]; then
 # ------------------------------------------------------------------------------
 # Phase 1f: Download and verify official GDK tarball
 # ------------------------------------------------------------------------------
@@ -681,7 +751,7 @@ log_info "Downloading official GDK tarball: ${gdk_tarball_url}"
 $CONTAINER_CMD run --rm \
   --volume "${gdk_official_dir}:/output${VOLUME_RW_SUFFIX}" \
   "$WS_CONTAINER" \
-  sh -c "curl -L -f -o /output/gdk.tar.gz '${gdk_tarball_url}'"
+  sh -c "curl -L -f -o /output/gdk.tar.gz '${gdk_tarball_url}' 2>/dev/null || wget -q -O /output/gdk.tar.gz '${gdk_tarball_url}'"
 
 log_info "Verifying official GDK SHA256: ${gdk_sha256_official}"
 $CONTAINER_CMD run --rm \
@@ -772,37 +842,41 @@ if [[ -n "${gdk_diff_lines}" ]]; then
   done < <(printf '%b' "${gdk_diff_lines}")
 fi
 
-# Save full GDK diff to file
-gdk_diff_file="${execution_dir}/diff_gdk_binaries.txt"
+fi # end Play Store GDK comparison gate
+
+# Write gdk_diff_lines to file for both paths (F-Droid writes "skipped" note)
 printf '%b' "${gdk_diff_lines}" > "${gdk_diff_file}"
-log_info "Full GDK diff written to: ${gdk_diff_file}"
+log_info "GDK diff file written to: ${gdk_diff_file}"
 
 # ------------------------------------------------------------------------------
-# Phase 1h: Place from-source GDK into green_android tree
+# Phase 1h: Place from-source GDK into green_android tree (Play Store only)
+# F-Droid: prepare_gdk_clang.sh places .so into gdk/src/main/jniLibs directly
 # ------------------------------------------------------------------------------
-log_info "Placing from-source GDK into green_android tree..."
-jni_libs_dir="${work_dir}/app/gdk/src/main/jniLibs"
-java_dest_dir="${work_dir}/app/gdk/src/main/java/com/blockstream"
-mkdir -p "${java_dest_dir}/green_gdk" "${java_dest_dir}/libwally"
+if [[ "${apk_is_fdroid}" == "false" ]]; then
+  log_info "Placing from-source GDK into green_android tree..."
+  jni_libs_dir="${work_dir}/app/gdk/src/main/jniLibs"
+  java_dest_dir="${work_dir}/app/gdk/src/main/java/com/blockstream"
+  mkdir -p "${java_dest_dir}/green_gdk" "${java_dest_dir}/libwally"
 
-for abi in armeabi-v7a arm64-v8a; do
-  mkdir -p "${jni_libs_dir}/${abi}"
+  for abi in armeabi-v7a arm64-v8a; do
+    mkdir -p "${jni_libs_dir}/${abi}"
+    $CONTAINER_CMD run --rm \
+      --volume "${gdk_built_dir}/${abi}/lib/${abi}:/src${VOLUME_RO_SUFFIX}" \
+      --volume "${jni_libs_dir}/${abi}:/dest${VOLUME_RW_SUFFIX}" \
+      "$WS_CONTAINER" \
+      sh -c "cp /src/*.so /dest/"
+    log_info "Placed ${abi} .so files from source build"
+  done
+
+  # Copy Java wrappers from arm64-v8a build (identical across ABIs)
   $CONTAINER_CMD run --rm \
-    --volume "${gdk_built_dir}/${abi}/lib/${abi}:/src${VOLUME_RO_SUFFIX}" \
-    --volume "${jni_libs_dir}/${abi}:/dest${VOLUME_RW_SUFFIX}" \
+    --volume "${gdk_built_dir}/arm64-v8a/share/java/com/blockstream:/src${VOLUME_RO_SUFFIX}" \
+    --volume "${java_dest_dir}:/dest${VOLUME_RW_SUFFIX}" \
     "$WS_CONTAINER" \
-    sh -c "cp /src/*.so /dest/"
-  log_info "Placed ${abi} .so files from source build"
-done
+    sh -c "cp /src/green_gdk/GDK.java /dest/green_gdk/GDK.java && cp /src/libwally/Wally.java /dest/libwally/Wally.java"
 
-# Copy Java wrappers from arm64-v8a build (identical across ABIs)
-$CONTAINER_CMD run --rm \
-  --volume "${gdk_built_dir}/arm64-v8a/share/java/com/blockstream:/src${VOLUME_RO_SUFFIX}" \
-  --volume "${java_dest_dir}:/dest${VOLUME_RW_SUFFIX}" \
-  "$WS_CONTAINER" \
-  sh -c "cp /src/green_gdk/GDK.java /dest/green_gdk/GDK.java && cp /src/libwally/Wally.java /dest/libwally/Wally.java"
-
-log_info "From-source GDK placed in green_android tree. Gradle will skip fetchAndroidBinaries."
+  log_info "From-source GDK placed in green_android tree. Gradle will skip fetchAndroidBinaries."
+fi
 
 # ------------------------------------------------------------------------------
 # Phase 2a: Build Green Docker image from contrib/Dockerfile
@@ -818,15 +892,38 @@ $CONTAINER_CMD build \
 
 log_info "Green Docker image built: ${build_image_tag}"
 
+if [[ "${apk_is_fdroid}" == "true" ]]; then
+  fdroid_build_image_tag="green_fdroid_builder_${version_name}_$$"
+  log_info "F-Droid path: building derived image with JDK 21 (from eclipse-temurin)..."
+  $CONTAINER_CMD build -t "${fdroid_build_image_tag}" - <<EOF
+FROM docker.io/library/eclipse-temurin:21-jdk AS jdk21
+FROM ${build_image_tag}
+COPY --from=jdk21 /opt/java/openjdk /opt/java/openjdk-21
+ENV JAVA_HOME_21=/opt/java/openjdk-21
+EOF
+  build_image_tag="${fdroid_build_image_tag}"
+  log_info "F-Droid build image with JDK 21: ${build_image_tag}"
+fi
+
 # ------------------------------------------------------------------------------
 # Phase 2b: Build Green APK using from-source GDK
 # ------------------------------------------------------------------------------
 log_info "Building Blockstream Green APK (${gradle_task}) with from-source GDK..."
 log_info "This may take 15-40 minutes..."
 
-green_build_cmd="set -e; cd /ga; ./gradlew useBlockstreamKeys"
+if [[ "${apk_is_fdroid}" == "false" ]]; then
+  green_build_cmd="set -e; cd /ga; ./gradlew useBlockstreamKeys"
+else
+  green_build_cmd="set -e; export JAVA_HOME=/opt/java/openjdk-21; export PATH=/opt/java/openjdk-21/bin:\$PATH; cd /ga"
+fi
 if [[ "${apk_is_fdroid}" == "true" ]]; then
-  green_build_cmd="${green_build_cmd}; ./prepare_fdroid.sh"
+  # Official F-Droid recipe patches (replaces stale prepare_fdroid.sh)
+  green_build_cmd="${green_build_cmd}; sed -i -e '/packages.jetbrains.team/d' settings.gradle.kts"
+  green_build_cmd="${green_build_cmd}; sed -i -e '/:gms/d' settings.gradle.kts androidApp/build.gradle.kts"
+  green_build_cmd="${green_build_cmd}; sed -i -e '/mvn.breez/d;/zendesk/d;/jetbrains/d;/googleServices/d' build.gradle.kts"
+  green_build_cmd="${green_build_cmd}; sed -i -e '/libs.breez.sdk.kmp/d' -e '/jna/s|//||g' data/build.gradle.kts"
+  green_build_cmd="${green_build_cmd}; sed -i -e '/signingConfigs {/,+8d' -e '/signingConfigs.getByName/,+4d' -e '/versionNameSuffix/d' -e '/googleServices/d' androidApp/build.gradle.kts"
+  green_build_cmd="${green_build_cmd}; sed -i -e '/jvm/s/17/21/' gradle/libs.versions.toml"
 fi
 green_build_cmd="${green_build_cmd}; ./gradlew -x test ${gradle_task}"
 
@@ -863,7 +960,8 @@ log_info "APK built successfully: ${built_apk}"
 # ------------------------------------------------------------------------------
 from_play_unzipped="${work_dir}/fromPlay_${APP_ID}_${version_code}"
 from_build_unzipped="${work_dir}/fromBuild_${APP_ID}_${version_code}"
-rm -rf "${from_play_unzipped}" "${from_build_unzipped}"
+remove_workspace_dir "${from_play_unzipped}"
+remove_workspace_dir "${from_build_unzipped}"
 mkdir -p "${from_play_unzipped}" "${from_build_unzipped}"
 
 log_info "Unzipping APKs for comparison..."
@@ -955,43 +1053,66 @@ signature_keys=""
 signature_warnings=""
 tag_ref="release_${version_name}"
 
-if git_in_container "git rev-parse --verify 'refs/tags/${tag_ref}' >/dev/null 2>&1"; then
-  if git_in_container "test \"\$(git cat-file -t 'refs/tags/${tag_ref}')\" = 'tag'"; then
-    tag_type="annotated"
-    tag_output="$(git_in_container "git tag -v '${tag_ref}' 2>&1 || true")"
-    if echo "${tag_output}" | grep -q "Good signature"; then
-      tag_signature_status="[OK] Good signature on annotated tag"
-      tag_key="$(echo "${tag_output}" | grep 'using .* key' | sed -E 's/.*using .* key ([A-F0-9]+).*/\1/' | tail -1)"
-      if [[ -n "${tag_key}" ]]; then
-        signature_keys="Tag signed with: ${tag_key}"
-      fi
-    else
-      tag_signature_status="[WARNING] No valid signature found on annotated tag"
-      signature_warnings="${signature_warnings}\n- Annotated tag exists but is not signed"
-    fi
-  else
-    tag_type="lightweight"
-    tag_signature_status="[INFO] Tag is lightweight (cannot contain signature)"
-  fi
+gpg_available=false
+if git_in_container "command -v gpg >/dev/null 2>&1"; then
+  gpg_available=true
 fi
 
-commit_output="$(git_in_container "git verify-commit '${commit_hash}' 2>&1 || true")"
-if echo "${commit_output}" | grep -q "Good signature"; then
-  commit_signature_status="[OK] Good signature on commit"
-  commit_key="$(echo "${commit_output}" | grep 'using .* key' | sed -E 's/.*using .* key ([A-F0-9]+).*/\1/' | tail -1)"
-  if [[ -n "${commit_key}" ]]; then
-    if [[ -n "${signature_keys}" ]]; then
-      signature_keys="${signature_keys}\nCommit signed with: ${commit_key}"
+if [[ "${gpg_available}" == false ]]; then
+  tag_signature_status="[INFO] gpg not available in container — signature verification skipped"
+  commit_signature_status="[INFO] gpg not available in container — signature verification skipped"
+  if git_in_container "git rev-parse --verify 'refs/tags/${tag_ref}' >/dev/null 2>&1"; then
+    if git_in_container "test \"\$(git cat-file -t 'refs/tags/${tag_ref}')\" = 'tag'"; then
+      tag_type="annotated"
     else
-      signature_keys="Commit signed with: ${commit_key}"
+      tag_type="lightweight"
+      tag_signature_status="[INFO] Tag is lightweight (cannot contain signature)"
     fi
   fi
+  tag_output="$(git_in_container "git cat-file tag '${tag_ref}' 2>/dev/null || true")"
+  commit_output="[INFO] gpg not available — commit verification skipped"
 else
-  commit_signature_status="[WARNING] No valid signature found on commit"
-  if [[ -z "${signature_warnings}" ]]; then
-    signature_warnings="- Commit is not signed"
+  if git_in_container "git rev-parse --verify 'refs/tags/${tag_ref}' >/dev/null 2>&1"; then
+    if git_in_container "test \"\$(git cat-file -t 'refs/tags/${tag_ref}')\" = 'tag'"; then
+      tag_type="annotated"
+      tag_output="$(git_in_container "git tag -v '${tag_ref}' 2>&1 || true")"
+      if echo "${tag_output}" | grep -q "Good signature"; then
+        tag_signature_status="[OK] Good signature on annotated tag"
+        tag_key="$(echo "${tag_output}" | grep 'using .* key' | sed -E 's/.*using .* key ([A-F0-9]+).*/\1/' | tail -1)"
+        if [[ -n "${tag_key}" ]]; then
+          signature_keys="Tag signed with: ${tag_key}"
+        fi
+      else
+        tag_signature_status="[WARNING] No valid signature found on annotated tag"
+        signature_warnings="${signature_warnings}\n- Annotated tag exists but is not signed"
+      fi
+    else
+      tag_type="lightweight"
+      tag_signature_status="[INFO] Tag is lightweight (cannot contain signature)"
+      tag_output=""
+    fi
   else
-    signature_warnings="${signature_warnings}\n- Commit is not signed"
+    tag_output=""
+  fi
+
+  commit_output="$(git_in_container "git verify-commit '${commit_hash}' 2>&1 || true")"
+  if echo "${commit_output}" | grep -q "Good signature"; then
+    commit_signature_status="[OK] Good signature on commit"
+    commit_key="$(echo "${commit_output}" | grep 'using .* key' | sed -E 's/.*using .* key ([A-F0-9]+).*/\1/' | tail -1)"
+    if [[ -n "${commit_key}" ]]; then
+      if [[ -n "${signature_keys}" ]]; then
+        signature_keys="${signature_keys}\nCommit signed with: ${commit_key}"
+      else
+        signature_keys="Commit signed with: ${commit_key}"
+      fi
+    fi
+  else
+    commit_signature_status="[WARNING] No valid signature found on commit"
+    if [[ -z "${signature_warnings}" ]]; then
+      signature_warnings="- Commit is not signed"
+    else
+      signature_warnings="${signature_warnings}\n- Commit is not signed"
+    fi
   fi
 fi
 
@@ -1055,7 +1176,7 @@ fi
 
 if [[ -n "${signature_warnings}" ]]; then
   echo ""
-  echo "Warnings:${signature_warnings}"
+  echo -e "Warnings:${signature_warnings}"
 fi
 
 if [[ -n "${additional_info}" ]]; then
@@ -1079,7 +1200,7 @@ if $CONTAINER_CMD rmi "${build_image_tag}" >/dev/null 2>&1; then
 fi
 
 if [[ "${should_cleanup}" == true ]]; then
-  rm -rf "${work_dir}"
+  remove_workspace_dir "${work_dir}"
 else
   log_info "Workspace preserved: ${work_dir}"
 fi
