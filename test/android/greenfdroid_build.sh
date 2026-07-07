@@ -2,75 +2,46 @@
 # ==============================================================================
 # greenfdroid_build.sh - Blockstream Green F-Droid Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.1.11
+# Version:       v0.2.5
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-06-10
+# Last Modified: 2026-07-07
 # Project:       https://github.com/Blockstream/green_android
 # F-Droid:       https://f-droid.org/packages/com.greenaddress.greenbits_android_wallet/
+# License:       MIT
+# Changelog + design rationale: ws-notes/script-notes/android/com.greenaddress.greenbits_android_wallet/changelog.md
 # ==============================================================================
-# LICENSE: MIT License
+# Verifies the F-Droid distribution: compiles GDK from source (like F-Droid;
+# Play Store ships a prebuilt GDK), builds the APK, compares with apksigcopier.
+# The fdroiddata recipe is the source of truth: its commit: is built, its build
+# block must sha256-match the audited EXPECTED_RECIPE_SHA256 (any change =>
+# exit 2, re-audit), and the release tag is cross-checked for provenance.
 #
-# IMPORTANT: Changelog maintained separately at:
-# ~/work/ws-notes/script-notes/android/com.greenaddress.greenbits_android_wallet/changelog.md
-# ==============================================================================
-#
-# TECHNICAL NOTES:
-# This script verifies the F-Droid distribution of Blockstream Green Android.
-# The F-Droid APK is built by F-Droid's own servers using fdroidserver, which
-# compiles GDK (the native cryptographic library) from source — unlike the Play
-# Store distribution which uses a prebuilt GDK binary.
-#
-# Critical environment constraints (must match F-Droid's build servers):
-#   - Base OS:       Debian Trixie
-#   - Username:      vagrant  (embedded in Rust/C++ source paths in .so files)
-#   - Checkout path: /home/vagrant/build/com.greenaddress.greenbits_android_wallet/
-#                    (green_android repo cloned DIRECTLY into this dir — no subdirectory)
-#   - SDK/NDK path:  /opt/android-sdk  (NOT /opt/android-sdk-linux — NDK include
-#                    paths are embedded in DWARF and feed the GNU Build ID hash;
-#                    verified against F-Droid's official build log on monitor.f-droid.org)
-#   - cmake:         >= 3.19 (Trixie apt provides 3.31.6; gates NDK toolchain mode)
-#   - NDK:           r26b (26.1.10909125)
-#   - Rust:          read from gdk/docker/android/Dockerfile at build time
-#   - SOURCE_DATE_EPOCH: derived from git commit timestamp
-#                    (OpenSSL embeds this as "built on:" — fdroidserver sets it automatically)
-#
-# Build ID root cause (identified 2026-06-10, fix applied in v0.1.10):
-#   Through v0.1.9 only the GNU Build ID differed. The container's NDK
-#   lived at /opt/android-sdk-linux/... while F-Droid's build server uses
-#   /opt/android-sdk/... (confirmed in F-Droid's build log for versionCode
-#   22000523). NDK include paths sit in DWARF (.debug_line/.debug_str), which
-#   lld --build-id=sha1 hashes and a later strip removes — identical stripped
-#   bytes, different Build IDs. Local builds were proven deterministic (two
-#   independent runs, identical Build IDs), pinning the cause as environmental.
-#   v0.1.10 aligns ANDROID_HOME to /opt/android-sdk.
-#
-# The linker command is captured from build.ninja (CMake Ninja generator) or
-# link.txt (CMake Makefile generator) for both ABIs.
-#
-# Recipe discrepancy (documented):
-#   The F-Droid recipe's patch 5 uses /signingConfigs.getByName/,+3d which
-#   leaves an orphaned closing brace at commit 07a27956. This script uses +4d
-#   (verified to produce balanced braces). See manual build instructions §5.
-#
-# Build time: GDK compilation takes ~30-60 min first run; Docker layer cache
-# is reused on subsequent runs.
+# Env must match F-Droid's build servers (see changelog for the 5.4.0 Build ID
+# root cause): Debian Trixie; user vagrant; checkout path
+# /home/vagrant/build/com.greenaddress.greenbits_android_wallet/ (clone into
+# ".", no subdir); SDK/NDK at /opt/android-sdk (path feeds the Build ID);
+# NDK r26b; JDK 21; Rust from gdk Dockerfile; SOURCE_DATE_EPOCH from commit.
+# Deviations from literal fdroidserver: patch 5 +4d (recipe's +3d orphans a
+# brace); apt packages unpinned. GDK cloned full + tag checkout (srclib-equiv).
+# GDK compile ~30-60 min first run; Docker layers cached after.
 # ==============================================================================
 
 set -euo pipefail
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 # Constants
-# ------------------------------------------------------------------------------
-SCRIPT_VERSION="v0.1.11"
+# ----------------------------------------
+SCRIPT_VERSION="v0.2.5"
 APP_ID="com.greenaddress.greenbits_android_wallet"
 REPO_URL="https://github.com/Blockstream/green_android.git"
 GDK_REPO_URL="https://github.com/Blockstream/gdk.git"
 WS_CONTAINER="docker.io/walletscrutiny/android:5"
-# This script supports only one version. The build environment, patches, and commit hash
-# are all version-specific. Bumping to a new F-Droid version requires updating all three.
-SUPPORTED_VERSION="5.4.0"
-SUPPORTED_VERSION_CODE="22000523"
-APP_COMMIT="07a27956febe72aea122f7b2c9ba2b0097314e68"  # F-Droid recipe immutable commit for 5.4.0
+FDROID_RECIPE_URL="https://gitlab.com/fdroid/fdroiddata/-/raw/master/metadata/com.greenaddress.greenbits_android_wallet.yml"
+# sha256 of the recipe build block minus blank + versionName/versionCode/commit
+# lines; recompute with the guard pipeline below after re-auditing a change.
+EXPECTED_RECIPE_SHA256="bd2b5c1324b1cebfb17591b7bf79ff247f9ad14eff58dd1eb2a6ab7356cd4baf"
+ENV_VALIDATED_THROUGH_CODE="22000525"  # newest env-validated versionCode
+APP_COMMIT=""                          # resolved at runtime from the F-Droid recipe
 
 EXIT_SUCCESS=0
 EXIT_FAILED=1
@@ -96,9 +67,9 @@ built_apk=""
 _run_id=""
 _staging_tag=""
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 # Logging
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 log_info()  { echo "[INFO] $*"; }
 log_warn()  { echo "[WARN] $*"; }
 log_error() { echo "[ERROR] $*"; }
@@ -142,9 +113,9 @@ on_error() {
 }
 trap 'on_error $LINENO' ERR
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 # Container runtime detection
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 CONTAINER_CMD=""
 VOLUME_RO_SUFFIX=""
 VOLUME_RW_SUFFIX=""
@@ -161,9 +132,9 @@ else
   die_invalid "Neither podman nor docker found. Install one to continue."
 fi
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 # Usage
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 usage() {
   cat <<EOF
 NAME
@@ -173,19 +144,16 @@ SYNOPSIS
        ${script_name} --binary <apk_file> [OPTIONS]
 
 DESCRIPTION
-       Builds the F-Droid flavor of Blockstream Green Android from source
-       using a Debian Trixie container that matches F-Droid's build environment
-       (username vagrant, checkout path, cmake 3.31.6, NDK r26b).
+       Builds the F-Droid flavor of Blockstream Green Android from source in
+       a Debian Trixie container matching F-Droid's build environment. Version
+       is auto-detected from the APK; the fdroiddata recipe supplies the source
+       commit (cross-checked against the release_<version> tag) and its build
+       block must hash-match the audited recipe before building.
 
        Compiles GDK from source, applies all F-Droid recipe patches, builds
-       the unsigned APK, then compares against the official F-Droid APK using
-       apksigcopier --unsigned.
-
-       Also captures, for both ABIs (arm64-v8a, armeabi-v7a): the cmake
-       link.txt (exact lld invocation incl. --build-id flags), the
-       linker-output .so, and libgreen_gdk_java.syms — the debug information
-       GDK's own cmake preserves via objcopy --only-keep-debug. Comparing these
-       artifacts helps identify pre-APK inputs that changed the GNU Build ID.
+       the unsigned APK, then compares against the official APK with
+       apksigcopier --unsigned. Captures linker commands, pre-strip .so and
+       .syms per ABI for Build ID diagnostics.
 
        First run: 30-60 min (GDK C++/Rust compilation).
        Subsequent runs: ~5 min (Docker layer cache reused).
@@ -193,9 +161,9 @@ DESCRIPTION
 OPTIONS
        --binary <file>      Path to the official F-Droid APK (required).
        --apk <file>         Alias for --binary.
-       --version <version>  Version name override (optional; auto-detected from APK).
-       --arch <arch>        Architecture label for YAML output (default: universal).
-       --type <type>        Build type (accepted for build server compatibility).
+       --version <version>  Optional override (auto-detected from APK).
+       --arch <arch>        Arch label for YAML output (default: universal).
+       --type <type>        Accepted for build server compatibility.
        --cleanup            Remove work directory and Docker image after completion.
        --script-version     Print script version and exit.
        --help               Show this help and exit.
@@ -206,14 +174,14 @@ EXIT CODES
        2    Invalid parameters
 
 EXAMPLES
-       ${script_name} --binary ~/Downloads/com.greenaddress.greenbits_android_wallet_22000523.apk
-       ${script_name} --binary green_5.4.0.apk --version 5.4.0
+       ${script_name} --binary ~/Downloads/com.greenaddress.greenbits_android_wallet_22000525.apk
+       ${script_name} --binary green.apk --version 5.5.1
 EOF
 }
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 # Argument parsing
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 while [[ "$#" -gt 0 ]]; do
   case $1 in
     --version)        [[ "$#" -lt 2 ]] && die_invalid "--version requires a value"; requested_version="$2"; shift ;;
@@ -236,9 +204,9 @@ done
 
 log_info "Starting ${script_name} ${SCRIPT_VERSION}"
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 # YAML output helpers
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 generate_error_yaml() {
   local status="$1"
   cat > "${execution_dir}/COMPARISON_RESULTS.yaml" <<EOF
@@ -261,6 +229,7 @@ generate_comparison_yaml() {
     echo "  SOURCE_DATE_EPOCH: derived from app git commit timestamp"
     echo "  Comparison method: apksigcopier compare --unsigned"
     echo "  Expected non-content differences: META-INF/F-Droid signature files (MANIFEST.MF, *.SF, *.RSA)"
+    echo "  Deviations from literal fdroidserver: patch5 +4d (recipe +3d orphans a brace); apt packages unpinned"
     if [[ -n "${additional_info}" ]]; then
       while IFS= read -r _ai_line; do
         echo "  ${_ai_line}"
@@ -269,27 +238,19 @@ generate_comparison_yaml() {
   } > "${execution_dir}/COMPARISON_RESULTS.yaml"
 }
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 # Build Trixie+vagrant Docker image (inline Dockerfile) — staging tag
-# ------------------------------------------------------------------------------
-# Build first so we can use the image's own aapt for version extraction.
-# aapt is in build-tools;34.0.0 which is in PATH for both root and vagrant.
-# Staged as greenfdroid-build:staging; retagged to version-specific after
-# version extraction.
-# ------------------------------------------------------------------------------
+# ----------------------------------------
+# ----------------------------------------
 _run_id="$$-$(date +%s)"
 _staging_tag="greenfdroid-build-${_run_id}:staging"
 
-log_info "Building Debian Trixie + vagrant Docker image (tag: ${_staging_tag})..."
-log_info "This is cached after the first build — subsequent runs are fast."
+log_info "Building Debian Trixie + vagrant Docker image (tag: ${_staging_tag}; cached after first run)..."
 
 ${CONTAINER_CMD} build --tag "${_staging_tag}" - <<'DOCKERFILE'
-# Blockstream Green F-Droid build environment
-# Matches F-Droid build server: Debian Trixie, username vagrant, NDK r26b, Rust 1.85.0
-#
-# ⚠️  SOURCE_DATE_EPOCH must be set at runtime before running prepare_gdk_clang.sh.
-#     OpenSSL embeds a "built on:" timestamp using this value.
-#     Derive: git log -1 --format="%ct" <commit>
+# Green F-Droid build env: Debian Trixie, user vagrant, NDK r26b, Rust 1.85.0.
+# SOURCE_DATE_EPOCH must be set at runtime (git log -1 --format=%ct) before
+# prepare_gdk_clang.sh — OpenSSL embeds it as "built on:".
 
 FROM debian:trixie
 
@@ -359,18 +320,15 @@ DOCKERFILE
 
 log_info "Docker image ready: ${_staging_tag}"
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 # Validate APK and extract version using aapt from the build image
-# ------------------------------------------------------------------------------
-# aapt is not available on the host; the build image has build-tools;34.0.0 in PATH.
-# Always run aapt to validate package name and version regardless of --version flag.
-# ------------------------------------------------------------------------------
+# ----------------------------------------
+# ----------------------------------------
 apk_dir="$(dirname "${downloaded_apk}")"
 apk_file="$(basename "${downloaded_apk}")"
 filename_version_code="$(basename "${downloaded_apk}" .apk | grep -oE '[0-9]+$' || true)"
 
-# Reject filenames with spaces or shell metacharacters — the name is injected into
-# bash -c strings inside containers and must be safe without additional quoting.
+# Filename is injected into container bash -c strings — reject unsafe chars.
 if [[ "${apk_file}" =~ [^[:alnum:]._-] ]]; then
   die_invalid "APK filename '${apk_file}' contains unsafe characters. Rename it using only alphanumeric, '.', '-', '_'."
 fi
@@ -407,11 +365,63 @@ else
   log_info "Version: ${version_name} (versionCode: ${version_code})"
 fi
 
-if [[ "${version_name}" != "${SUPPORTED_VERSION}" ]]; then
-  die_invalid "This script only supports version ${SUPPORTED_VERSION} (got ${version_name}). The build environment, patches, and source commit are all version-specific."
+# ----------------------------------------
+# F-Droid recipe: source of truth for the built commit + build-step guard
+# ----------------------------------------
+# Ref -> commit; prefers the peeled ^{} line, falls back to the plain ref.
+resolve_ref() {
+  ${CONTAINER_CMD} run --rm "${_staging_tag}" \
+    git ls-remote --tags "${REPO_URL}" "refs/tags/$1" "refs/tags/$1^{}" 2>/dev/null \
+    | awk '$2 ~ /\^\{\}$/ {p=$1} $2 !~ /\^\{\}$/ {t=$1} END {if (p) print p; else if (t) print t}' || true
+}
+
+log_info "Fetching F-Droid recipe (fdroiddata) for versionCode ${version_code}..."
+recipe_block="$(${CONTAINER_CMD} run --rm "${_staging_tag}" \
+  curl -fsSL --max-time 60 "${FDROID_RECIPE_URL}" 2>/dev/null \
+  | awk -v vc="${version_code}" '
+      /^  - versionName:/ { if (found) exit; blk=""; inb=1 }
+      inb && /^[A-Za-z]/ { exit }
+      { if (inb) blk = blk $0 ORS }
+      inb && $1=="versionCode:" && $2==vc { found=1 }
+      END { if (found) printf "%s", blk }
+    ' || true)"
+[[ -z "${recipe_block}" ]] && die_invalid "F-Droid recipe block for versionCode ${version_code} not found (fdroiddata unreachable or version unpublished). The recipe is the source of truth — cannot proceed."
+
+recipe_hash="$(echo "${recipe_block}" | grep -vE '^[[:space:]]*$|^[[:space:]]+(- )?(versionName|versionCode|commit):' | sha256sum | awk '{print $1}')"
+if [[ "${recipe_hash}" != "${EXPECTED_RECIPE_SHA256}" ]]; then
+  die_invalid "F-Droid recipe changed for versionCode ${version_code}: block sha256 ${recipe_hash} != audited value. Diff the recipe (ndk/prebuild/srclibs/rm/gradle) vs this script, re-audit, update EXPECTED_RECIPE_SHA256."
 fi
-if [[ "${version_code}" != "${SUPPORTED_VERSION_CODE}" ]]; then
-  die_invalid "Expected versionCode ${SUPPORTED_VERSION_CODE} for version ${SUPPORTED_VERSION}, got ${version_code}. Wrong APK?"
+log_info "Recipe guard: build steps match the audited recipe block."
+append_additional_info "Recipe guard: normalized fdroiddata block sha256 matches audited value"
+
+recipe_commit="$(echo "${recipe_block}" | awk '$1=="commit:" {print $2; exit}')"
+[[ -z "${recipe_commit}" ]] && die_invalid "commit: field missing from the F-Droid recipe block."
+if [[ "${recipe_commit}" =~ ^[0-9a-f]{40}$ ]]; then
+  APP_COMMIT="${recipe_commit}"
+else
+  # Recipe may pin a ref name instead of a hash
+  APP_COMMIT="$(resolve_ref "${recipe_commit}")"
+  [[ -z "${APP_COMMIT}" ]] && die_invalid "Recipe commit ref '${recipe_commit}' not resolvable in ${REPO_URL}."
+fi
+log_info "Build source (from F-Droid recipe): commit ${APP_COMMIT}"
+append_additional_info "Source commit (F-Droid recipe commit:): ${APP_COMMIT}"
+
+# Provenance cross-check: upstream tag must match the recipe commit.
+app_tag="release_${version_name}"
+tag_commit="$(resolve_ref "${app_tag}")"
+if [[ -z "${tag_commit}" ]]; then
+  log_warn "Upstream tag ${app_tag} not found; building from recipe commit only."
+  append_additional_info "WARNING: upstream tag ${app_tag} not found; recipe commit used unchecked"
+elif [[ "${tag_commit}" != "${APP_COMMIT}" ]]; then
+  die_invalid "Provenance mismatch: recipe builds ${APP_COMMIT}, tag ${app_tag} = ${tag_commit}. Investigate first."
+else
+  log_info "Cross-check: upstream tag ${app_tag} matches the recipe commit."
+  append_additional_info "Cross-check: upstream tag ${app_tag} = recipe commit (match)"
+fi
+
+if [[ "${version_code}" =~ ^[0-9]+$ && "${version_code}" -gt "${ENV_VALIDATED_THROUGH_CODE}" ]]; then
+  log_warn "versionCode ${version_code} is newer than the last env-validated build (${ENV_VALIDATED_THROUGH_CODE}); environment assumptions may be stale."
+  append_additional_info "NOTE: env last validated for versionCode ${ENV_VALIDATED_THROUGH_CODE}; this run is newer (${version_code})."
 fi
 
 # Retag staging image to run-specific name (PID+timestamp ensures parallel-safety)
@@ -419,27 +429,21 @@ build_image_tag="greenfdroid-build-${_run_id}:${version_name}"
 ${CONTAINER_CMD} tag "${_staging_tag}" "${build_image_tag}"
 log_info "Image tagged: ${build_image_tag}"
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 # Work directory
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 work_dir="$(mktemp -d "/tmp/greenfdroid_${version_name}_XXXXXX")"
 mkdir -p "${work_dir}/artifacts"
 log_info "Work directory: ${work_dir}"
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 # Write inner build script (runs inside the container as vagrant)
-# ------------------------------------------------------------------------------
-# The inner script is mounted read-only into the container.
-# All output is written to /output inside the container (owned by vagrant).
-# After the container exits, we docker cp /output to ${work_dir}/artifacts/.
-#
-# CRITICAL PATH NOTE:
-# green_android is cloned with "." (directly into WORKDIR), not into a subdirectory.
-# This makes the GDK compile path match F-Droid's fdroidserver layout exactly:
-#   /home/vagrant/build/com.greenaddress.greenbits_android_wallet/gdk/gdk/
-# A subdirectory clone would add "green_android/" to every embedded path,
-# causing .rodata size differences in libgreen_gdk_java.so.
-# ------------------------------------------------------------------------------
+# ----------------------------------------
+# Inner script mounted read-only; output written to /output, docker cp'd after.
+# CRITICAL: green_android is cloned with "." directly into WORKDIR so the GDK
+# compile path matches fdroidserver's layout exactly — a subdirectory clone
+# adds "green_android/" to embedded paths, changing .rodata in the .so.
+# ----------------------------------------
 
 inner_script="${work_dir}/inner-build.sh"
 
@@ -464,7 +468,7 @@ export SOURCE_DATE_EPOCH
 SOURCE_DATE_EPOCH=$(git log -1 --format="%ct")
 echo "[BUILD] SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} ($(date -u -d "@${SOURCE_DATE_EPOCH}" 2>/dev/null || date -u -r "${SOURCE_DATE_EPOCH}" 2>/dev/null || echo 'date conversion unavailable'))"
 
-echo "[BUILD] Applying F-Droid recipe patches (all 8 from fdroiddata recipe)..."
+echo "[BUILD] Applying F-Droid recipe patches (faithful except documented +4d)..."
 cd androidApp
 
 # Patch 1: remove JetBrains Compose Maven repository
@@ -480,8 +484,8 @@ sed -i -e '/mvn.breez/d;/zendesk/d;/jetbrains/d;/googleServices/d' ../build.grad
 sed -i -e '/libs.breez.sdk.kmp/d' -e '/jna/s|//||g' ../data/build.gradle.kts
 
 # Patch 5: remove app signing configuration
-# NOTE: recipe uses +3d but that leaves an orphaned brace at commit 07a27956.
-# +4d is correct for this commit (verified by brace counting).
+# NOTE: recipe uses +3d but that leaves an orphaned brace (build.gradle.kts is
+# unchanged across 5.4.0-5.5.1). +4d is correct (verified by brace counting).
 sed -i -e '/signingConfigs {/,+8d' \
        -e '/signingConfigs.getByName/,+4d' \
        -e '/versionNameSuffix/d' \
@@ -497,8 +501,10 @@ echo "[BUILD] Deriving GDK version from prepare_gdk_clang.sh..."
 gdkVersion=$(sed -n -E 's/.*TAGNAME="(.*)"/\1/p' prepare_gdk_clang.sh)
 echo "[BUILD] GDK version: ${gdkVersion}"
 
-echo "[BUILD] Cloning GDK at ${gdkVersion}..."
-git clone --branch "${gdkVersion}" --depth 1 "${GDK_REPO_URL}" gdk
+# srclib-equivalent: full clone + tag checkout (recipe: git -C $$gdk$$ checkout)
+echo "[BUILD] Cloning GDK (full) and checking out ${gdkVersion}..."
+git clone "${GDK_REPO_URL}" gdk
+git -C gdk checkout "${gdkVersion}"
 
 cd gdk
 
@@ -506,6 +512,8 @@ echo "[BUILD] Confirming Rust version from GDK Dockerfile..."
 rustVersion=$(sed -n -E 's/.*RUST_VERSION=(.*)/\1/p' docker/android/Dockerfile)
 echo "[BUILD] Rust version: ${rustVersion}"
 rustup default "${rustVersion}"
+# Recipe-faithful; covers a GDK Rust bump (image pre-installs 1.85.0 only)
+rustup target add aarch64-linux-android armv7-linux-androideabi
 
 # Patch 7: fix unreachable Boost mirror in GDK's dependency-build script
 sed -i -e 's|boostorg.jfrog.io/artifactory/main|archives.boost.io|' tools/builddeps.sh
@@ -532,12 +540,11 @@ JAVA_HOME=$(readlink -f /usr/bin/javac | sed "s:/bin/javac::") \
 echo "[BUILD] GDK compilation complete."
 
 echo "[BUILD] Capturing linker command for both ABIs..."
-# CMake Makefile generator writes link.txt; Ninja generator stores the command in build.ninja.
-# Search both locations broadly across the full gdk build tree.
+# Makefile generator writes link.txt; Ninja stores commands in build.ninja.
 for abi in arm64-v8a armeabi-v7a; do
   captured=false
 
-  # Method 1: link.txt anywhere under gdk/ for this ABI (CMake Makefile or response-file mode)
+  # Method 1: link.txt anywhere under gdk/ for this ABI
   linkfile=$(find "gdk" -path "*${abi}*" -name "link.txt" 2>/dev/null \
              | xargs grep -l -- "--build-id" 2>/dev/null | head -1 || true)
   if [[ -n "${linkfile}" ]]; then
@@ -547,9 +554,8 @@ for abi in arm64-v8a armeabi-v7a; do
     captured=true
   fi
 
-  # Method 2: CMake Ninja generator. build.ninja holds per-target variables while the
-  # command template lives in rules.ninja, so grepping build.ninja alone can miss the
-  # actual linker invocation. `ninja -t commands` prints fully-expanded commands.
+  # Method 2: Ninja — `ninja -t commands` prints fully-expanded commands
+  # (grepping build.ninja alone misses the template in rules.ninja).
   if [[ "${captured}" == "false" ]]; then
     ninja_file=$(find "gdk" -path "*${abi}*" -name "build.ninja" 2>/dev/null | head -1 || true)
     if [[ -n "${ninja_file}" ]]; then
@@ -589,11 +595,9 @@ for abi in arm64-v8a armeabi-v7a; do
 done
 
 echo "[BUILD] Capturing .syms and pre-strip .so artifacts (before Gradle assembly)..."
-# GDK's src/swig_java/CMakeLists.txt runs objcopy --only-keep-debug on the linked
-# library and writes libgreen_gdk_java.syms into CMAKE_BINARY_DIR (default ALL target).
-# The .syms preserves debug information from the linked library. The linker's own
-# output .so lives under the same build dir; anchor pre-strip selection to it instead
-# of relying only on a size heuristic.
+# GDK cmake runs objcopy --only-keep-debug on the linked lib, writing
+# libgreen_gdk_java.syms next to the linker output .so — anchor pre-strip
+# selection to the .syms location, size heuristic only as fallback.
 LLVM_OBJCOPY="${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objcopy"
 for abi in arm64-v8a armeabi-v7a; do
   prestrip_so=""
@@ -633,8 +637,8 @@ for abi in arm64-v8a armeabi-v7a; do
     readelf -S  "${prestrip_so}" 2>/dev/null > "/output/prestrip-sections-${abi}.txt" || true
     readelf -n  "${prestrip_so}" 2>/dev/null >> "/output/prestrip-sections-${abi}.txt" || true
     echo "[BUILD] Pre-strip section headers saved to prestrip-sections-${abi}.txt"
-    # Cross-check: regenerating the .syms from the candidate proves it is the exact
-    # file objcopy ran on (GDK cmake uses the NDK's llvm-objcopy via CMAKE_OBJCOPY).
+    # Cross-check: regenerating .syms from the candidate proves it is the
+    # exact file objcopy ran on.
     if [[ -n "${syms}" && -x "${LLVM_OBJCOPY}" ]]; then
       "${LLVM_OBJCOPY}" --only-keep-debug "${prestrip_so}" "/tmp/recheck-${abi}.syms" 2>/dev/null || true
       if cmp -s "/tmp/recheck-${abi}.syms" "${syms}" 2>/dev/null; then
@@ -681,9 +685,9 @@ INNER_BUILD
 
 chmod 644 "${inner_script}"
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 # Run build container (persistent — docker cp afterward)
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 build_container_name="greenfdroid-build-${_run_id}"
 
 log_info "Starting build container: ${build_container_name}"
@@ -741,9 +745,9 @@ for abi in arm64-v8a armeabi-v7a; do
   append_additional_info "${abi} hashes: built-so=${built_so_sha}, prestrip-so=${prestrip_sha}, syms=${syms_sha}"
 done
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 # Log linker-command contents and diagnose Build ID behavior
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 log_info "======================================================================"
 log_info "CMake linker command for libgreen_gdk_java.so"
 log_info "======================================================================"
@@ -771,9 +775,9 @@ for abi in arm64-v8a armeabi-v7a; do
   fi
 done
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 # Report Build IDs (official vs built)
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 log_info "======================================================================"
 log_info "GNU Build IDs"
 log_info "======================================================================"
@@ -801,9 +805,9 @@ for abi in arm64-v8a armeabi-v7a; do
   append_additional_info "Build ID built    ${abi}: ${built_buildid}"
 done
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 # Compare: apksigcopier --unsigned
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 log_info "======================================================================"
 log_info "apksigcopier compare --unsigned"
 log_info "======================================================================"
@@ -832,9 +836,9 @@ else
 fi
 append_additional_info "apksigcopier exit=${apksig_exit_code}: $(echo "${apksig_output}" | head -1)"
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 # Compare: full file diff (all files in APK)
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 log_info "======================================================================"
 log_info "Full APK file diff (diff -rq on unzipped contents)"
 log_info "======================================================================"
@@ -875,10 +879,9 @@ meta_only_count="$(echo "${diff_output}" | grep -c "Only in.*META-INF" || true)"
 
 append_additional_info "diff: ${so_diff_count} .so file(s) differ, ${meta_only_count} META-INF signature file(s) present only in official"
 
-# Prove .so differences are confined to .note.gnu.build-id via cmp -l + readelf section offset.
-# Note: objcopy --remove-section rewrites ELF layout via GNU BFD and may shift section offsets,
-# producing false MISMATCHes. cmp -l gives exact differing byte positions; readelf -SW gives
-# the Build ID section file offset and size for direct range verification.
+# Prove .so diffs are confined to .note.gnu.build-id: cmp -l gives exact byte
+# positions; readelf -SW gives the section's file offset+size for range checks
+# (objcopy --remove-section rewrites layout and produces false mismatches).
 so_buildid_only=false
 if [[ "${so_diff_count}" -gt 0 ]]; then
   log_info "======================================================================"
@@ -977,9 +980,9 @@ if [[ "${so_diff_count}" -gt 0 ]]; then
   fi
 fi
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 # Determine verdict
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 verdict="not_reproducible"
 if "${apksig_ok}"; then
   verdict="reproducible"
@@ -998,9 +1001,9 @@ log_info "======================================================================
 log_info "Verdict: ${verdict}"
 log_info "======================================================================"
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 # Results summary block (ABS compliance)
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 echo ""
 echo "===== Begin Results ====="
 echo "appId:          ${APP_ID}"
@@ -1023,22 +1026,22 @@ fi
 echo "===== End Results ====="
 echo ""
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 # Write COMPARISON_RESULTS.yaml
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 generate_comparison_yaml "${verdict}"
 log_info "COMPARISON_RESULTS.yaml written."
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 # Cleanup run-specific image tags (always — layers remain cached; tags are useless after the run)
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 ${CONTAINER_CMD} rmi "${build_image_tag}" 2>/dev/null || true
 ${CONTAINER_CMD} rmi "${_staging_tag}" 2>/dev/null || true
 log_info "Run-specific image tags removed (layer cache preserved)."
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 # Cleanup work directory (optional — only with --cleanup)
-# ------------------------------------------------------------------------------
+# ----------------------------------------
 if "${should_cleanup}"; then
   log_info "Cleaning up work directory..."
   ${CONTAINER_CMD} run --rm \
