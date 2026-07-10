@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitcoincore_build.sh - Bitcoin Core Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.3.16
+# Version:       v0.4.0
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-03-12
+# Last Modified: 2026-07-10
 # Project:       https://github.com/bitcoin/bitcoin
 # ==============================================================================
 # LICENSE: MIT License
@@ -39,7 +39,7 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v0.3.16"
+SCRIPT_VERSION="v0.4.0"
 SCRIPT_NAME="bitcoincore_build.sh"
 APP_NAME="Bitcoin Core"
 APP_ID="bitcoincore"
@@ -433,6 +433,14 @@ if [[ ! "$version" =~ ^v ]]; then
   version="v${version}"
 fi
 
+# Guard against shell/git-argument injection: $version is interpolated into
+# container-exec bash -c strings (git checkout $version, etc.) below
+if [[ ! "$version" =~ ^v[0-9]+(\.[0-9]+){1,2}(rc[0-9]+)?$ ]]; then
+  log_error "Invalid --version format: ${version} (expected e.g. 31.1, v31.1, or v30.0rc1)"
+  generate_error_yaml "ftbfs"
+  exit 1
+fi
+
 # Generate unique container/image names for this invocation
 set_unique_names "$version" "$arch" "$build_type"
 
@@ -475,10 +483,15 @@ map_arch_to_guix() {
 # Generate error YAML
 generate_error_yaml() {
     local status="${1:-ftbfs}"
-    cat > "${execution_dir}/COMPARISON_RESULTS.yaml" << EOF
-script_version: ${SCRIPT_VERSION}
-verdict: ${status}
-EOF
+    local notes="${2:-}"
+    {
+        echo "script_version: ${SCRIPT_VERSION}"
+        echo "verdict: ${status}"
+        if [[ -n "$notes" ]]; then
+            echo "notes: |"
+            printf '%s\n' "$notes" | sed 's/^/  /'
+        fi
+    } > "${execution_dir}/COMPARISON_RESULTS.yaml"
 }
 
 # Generate comparison YAML
@@ -567,6 +580,7 @@ RUN apk --no-cache --update add \
       ca-certificates \
       curl \
       git \
+      gnupg \
       make \
       shadow \
       wget \
@@ -669,7 +683,7 @@ prepare_bitcoin_build() {
         ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git fetch --all --tags"
 
     log_info "Checking out version: $version"
-        if ! ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git checkout $version"; then
+        if ! ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git checkout \"$version\""; then
         log_error "Failed to checkout version: $version"
         log_error "Available tags:"
         ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git tag | grep -E '^v[0-9]' | tail -10"
@@ -677,13 +691,29 @@ prepare_bitcoin_build() {
         exit 1
     fi
 
-    # Verify GPG signature
+    # Verify GPG signature. Note: contrib/verify-commits/trusted-keys is the
+    # commit-signer list, not necessarily identical to the tag-signer key, and
+    # it comes from the same tag being verified - treat this as an
+    # informational check, not a strong trust root.
     log_info "Verifying GPG signature for $version..."
-    if ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git verify-tag $version 2>/dev/null"; then
+    for ks in hkps://keyserver.ubuntu.com hkps://keys.openpgp.org hkps://pgp.mit.edu; do
+        if ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && gpg --keyserver $ks --recv-keys \$(cat contrib/verify-commits/trusted-keys) >/dev/null 2>&1"; then
+            break
+        fi
+    done
+    verify_output=$(${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git verify-tag \"$version\" 2>&1") && verify_status=0 || verify_status=$?
+    if [[ "$verify_status" -eq 0 ]]; then
         log_success "GPG signature verified for $version"
+    elif echo "$verify_output" | grep -qi "bad signature"; then
+        log_error "GPG signature verification FAILED for $version: signature does NOT match tag content"
+        generate_error_yaml "ftbfs" "Git tag signature is bad for ${version}; refusing to build from this tag."
+        echo "Exit code: 1"
+        exit 1
+    elif echo "$verify_output" | grep -qi "no public key"; then
+        log_warn "GPG signature verification failed for $version: signer's key unavailable (not in contrib/verify-commits/trusted-keys, or all keyservers unreachable)"
     else
-        log_warn "GPG signature verification failed for $version"
-        log_warn "This may be normal for release candidates"
+        log_warn "GPG signature verification failed for $version (unrecognized reason):"
+        log_warn "$verify_output"
     fi
 
     log_success "Bitcoin Core $version prepared for build"
@@ -700,8 +730,8 @@ execute_build() {
 
     local start_time=$(date +%s)
 
-    # Execute the build (disable debug builds to save time and space)
-    local build_cmd="cd /bitcoin && time BASE_CACHE='/base_cache' SOURCE_PATH='/sources' SDK_PATH='/SDKs' HOSTS='$arch' SKIP_DEBUG=1 ./contrib/guix/guix-build"
+    # Execute the build (guix-build always produces a debug tarball; it is not compared and is discarded)
+    local build_cmd="cd /bitcoin && time BASE_CACHE='/base_cache' SOURCE_PATH='/sources' SDK_PATH='/SDKs' HOSTS='$arch' ./contrib/guix/guix-build"
 
     if ${container_cmd} exec "$CONTAINER_NAME" bash -c "$build_cmd"; then
         local end_time=$(date +%s)
@@ -849,6 +879,8 @@ verify_checksums() {
     comparison_file="${execution_dir}/COMPARISON_RESULTS.yaml"
     match_count=0
     diff_count=0
+    uncompared_count=0
+    no_official_release=false
     verdict="not_reproducible"
     built_hash=""
     official_hash=""
@@ -910,10 +942,15 @@ verify_checksums() {
             # No official to compare - just report built hash
             if [[ -f "${built_dir}/${main_artifact}" ]]; then
                 built_hash=$(sha256sum "${built_dir}/${main_artifact}" | awk '{print $1}')
-                generate_error_yaml "not_reproducible"
-                diff_count=$((diff_count + 1))
+                no_official_release=true
+                generate_error_yaml "not_reproducible" "No official release artifact found at ${official_url}/${main_artifact} - comparison could not be performed. This is NOT a hash mismatch."
+                uncompared_count=$((uncompared_count + 1))
                 verdict="not_reproducible"
-                log_warn "No official release to compare - manual verification required"
+                log_warn "########################################################"
+                log_warn "# NO OFFICIAL RELEASE FOUND - comparison NOT performed  #"
+                log_warn "# verdict below reflects inability to compare,          #"
+                log_warn "# NOT a genuine hash mismatch                           #"
+                log_warn "########################################################"
                 log_info "Built hash: ${built_hash}"
             else
                 generate_error_yaml "ftbfs"
@@ -928,8 +965,7 @@ verify_checksums() {
     echo "===== Begin Results ====="
     echo "appId:          ${APP_ID}"
     echo "signer:         N/A"
-    echo "apkVersionName: ${clean_version}"
-    echo "apkVersionCode: N/A"
+    echo "version:        ${clean_version}"
     echo "verdict:        ${verdict}"
     if [[ -n "${official_hash}" ]]; then
         echo "appHash:        ${official_hash}"
@@ -941,10 +977,12 @@ verify_checksums() {
     echo "Diff:"
     if [[ "$verdict" == "reproducible" ]]; then
         echo "BUILDS MATCH BINARIES"
+    elif [[ "$no_official_release" == "true" ]]; then
+        echo "COMPARISON NOT PERFORMED - NO OFFICIAL RELEASE AVAILABLE"
     else
         echo "BUILDS DO NOT MATCH BINARIES"
     fi
-    
+
     # Machine-readable format for desktop binaries
     if [[ -f "${built_dir}/${main_artifact}" ]]; then
         local built_hash=$(sha256sum "${built_dir}/${main_artifact}" | awk '{print $1}')
@@ -953,6 +991,9 @@ verify_checksums() {
         if [[ "$verdict" == "reproducible" ]]; then
             match_flag="1"
             match_text="MATCHES"
+        elif [[ "$no_official_release" == "true" ]]; then
+            match_flag="N/A"
+            match_text="NO OFFICIAL RELEASE"
         fi
         echo "${main_artifact} - ${guix_arch} - ${built_hash} - ${match_flag} (${match_text})"
     fi
@@ -971,7 +1012,10 @@ verify_checksums() {
     log_info "Architecture: ${arch}"
     log_info "Matches: ${match_count}"
     log_info "Differences: ${diff_count}"
-    
+    if [[ "${uncompared_count:-0}" -gt 0 ]]; then
+        log_info "Uncompared (no official release available): ${uncompared_count}"
+    fi
+
     if [[ "$verdict" == "reproducible" ]]; then
         log_success "Verdict: REPRODUCIBLE"
         log_info "Build server output: ${comparison_file}"
