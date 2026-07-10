@@ -2,55 +2,16 @@
 # ==============================================================================
 # electrumdesktop_build.sh - Electrum Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.12.12
-# Organization:  WalletScrutiny.com
-# Last Modified: 2026-07-10
+# Version:          v0.12.12
+# Organization:     WalletScrutiny.com
 # Last modified by: Claude Opus 4.8 (WalletScrutiny session)
 # Last modified on: 2026-07-10
-# Project:       https://github.com/spesmilo/electrum
+# Project:          https://github.com/spesmilo/electrum
 # ==============================================================================
-# LICENSE: MIT License
-#
-# TECHNICAL DISCLAIMER:
-# This script is provided for technical analysis and reproducible build verification purposes only.
-# No warranty is provided regarding the security, functionality, or fitness for any particular purpose.
-# Users assume all risks associated with running this script and analyzing the software.
-# This script performs automated builds and binary comparisons - review all operations before execution.
-#
-# LEGAL DISCLAIMER:
-# This script is designed for legitimate security research and reproducible build verification.
-# Users are responsible for ensuring compliance with all applicable laws and regulations.
-# The developers assume no liability for any misuse or legal consequences arising from use.
-# By using this script, you acknowledge these disclaimers and accept full responsibility.
-#
-# SCRIPT SUMMARY:
-# Supports three build paths selected via --arch and --type:
-#
-# Windows (win64):
-# - Downloads official Electrum .exe from electrum.org (setup, portable, or standalone)
-# - Builds via Wine inside a Debian Bookworm container (make_win.sh)
-# - Strips Authenticode signatures from both binaries before comparing
-# - All 3 .exe types built together; --type selects which to verify
-#
-# Linux AppImage (x86_64-linux-gnu --type appimage):
-# - Fetches build constants (TYPE2_RUNTIME_COMMIT, Debian snapshot date, base image
-#   digest) dynamically from Electrum's source at the given version tag
-# - Extracts the type2-runtime ELF from the official AppImage and caches it keyed by
-#   release version + TYPE2_RUNTIME_COMMIT + an extractor-generation suffix. Version is
-#   part of the key because Electrum ships a different runtime binary per release even at
-#   the same TYPE2_RUNTIME_COMMIT (Alpine has no snapshot service, so package drift changes
-#   the runtime bytes); keying by commit alone let a stale runtime from an earlier release
-#   be reused, producing a false not_reproducible. The suffix invalidates caches when the
-#   extraction logic changes.
-# - Independently builds the squashfs (Electrum's application code) via make_appimage.sh
-#   inside a pinned Debian Bullseye container; compares against the official release
-# - Results output states explicitly that the runtime was sourced from the official release
-#
-# Linux tarball (x86_64-linux-gnu --type tarball):
-# - Builds the source distribution via make_sdist.sh inside a Debian Bookworm container
-# - Compares the built tarball byte-for-byte against the official release
-#
-# All paths generate COMPARISON_RESULTS.yaml for build server automation.
+# MIT License. Provided as-is for reproducible-build verification and security
+# research, without warranty; you assume all risk and responsibility for lawful use.
+# Build paths / methodology + full history: script-notes/desktop/electrum/changelog.md
+# ==============================================================================
 
 set -euo pipefail
 
