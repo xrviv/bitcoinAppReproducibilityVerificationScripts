@@ -2,10 +2,10 @@
 # ==============================================================================
 # electrumdesktop_build.sh - Electrum Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.12.11
+# Version:       v0.12.12
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-04-24
-# Last modified by: Claude Sonnet 5 (WalletScrutiny session)
+# Last Modified: 2026-07-10
+# Last modified by: Claude Opus 4.8 (WalletScrutiny session)
 # Last modified on: 2026-07-10
 # Project:       https://github.com/spesmilo/electrum
 # ==============================================================================
@@ -36,9 +36,12 @@
 # - Fetches build constants (TYPE2_RUNTIME_COMMIT, Debian snapshot date, base image
 #   digest) dynamically from Electrum's source at the given version tag
 # - Extracts the type2-runtime ELF from the official AppImage and caches it keyed by
-#   TYPE2_RUNTIME_COMMIT + an extractor-generation suffix (Alpine has no snapshot service;
-#   building from source with drifted packages produces a different binary and a misleading
-#   not_reproducible verdict; the suffix invalidates caches when the extraction logic changes)
+#   release version + TYPE2_RUNTIME_COMMIT + an extractor-generation suffix. Version is
+#   part of the key because Electrum ships a different runtime binary per release even at
+#   the same TYPE2_RUNTIME_COMMIT (Alpine has no snapshot service, so package drift changes
+#   the runtime bytes); keying by commit alone let a stale runtime from an earlier release
+#   be reused, producing a false not_reproducible. The suffix invalidates caches when the
+#   extraction logic changes.
 # - Independently builds the squashfs (Electrum's application code) via make_appimage.sh
 #   inside a pinned Debian Bullseye container; compares against the official release
 # - Results output states explicitly that the runtime was sourced from the official release
@@ -64,7 +67,7 @@ INFO_ICON="[INFO]"
 
 APP_NAME="Electrum Desktop"
 APP_ID="electrum"
-SCRIPT_VERSION="v0.12.11"
+SCRIPT_VERSION="v0.12.12"
 
 # ---------- Logging Functions ----------
 log_info() { echo -e "${BLUE}${INFO_ICON}${NC} $*"; }
@@ -480,22 +483,33 @@ elif [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" ]]; then
   # is sourced from the official release itself. The scope of verification is stated
   # explicitly in the results output.
   #
-  # Cache key includes TYPE2_RUNTIME_COMMIT (auto-invalidates when Electrum bumps it)
-  # plus a suffix that changes when the offset-detection logic is revised, so runtimes
+  # Cache key includes the release VERSION as well as TYPE2_RUNTIME_COMMIT and the
+  # extractor-generation suffix.
+  #
+  # VERSION is load-bearing: the runtime is extracted from that release's own official
+  # AppImage, and Electrum ships a DIFFERENT runtime binary per release even when
+  # TYPE2_RUNTIME_COMMIT is unchanged (the runtime is rebuilt in an Alpine environment
+  # with no package snapshot service, so package drift changes the bytes). Keying only
+  # by TYPE2_RUNTIME_COMMIT let a runtime extracted for one release be reused for a
+  # later release that happened to pin the same commit -- producing a mismatched runtime
+  # prefix and a FALSE not_reproducible even when the rebuilt squashfs was byte-identical.
+  # Observed concretely: 4.7.2 and 4.8.0 both pin 5e7217b7..., but their official
+  # runtime prefixes differ; the 4.7.2 cache was wrongly reused for the 4.8.0 run.
+  # Keying by version makes the cache 1:1 with the official release it was extracted from.
+  #
+  # The offset-vN suffix changes when the offset-detection logic is revised, so runtimes
   # extracted by a buggy extractor are never silently reused.
   # ============================================================================
-  # Cache path includes extractor generation so old runtimes from buggy offset
-  # detection logic are not silently reused.
-  runtime_cache_dir="${execution_dir}/.cache/type2-runtime/${TYPE2_RUNTIME_COMMIT}-offset-v3"
+  runtime_cache_dir="${execution_dir}/.cache/type2-runtime/${version}-${TYPE2_RUNTIME_COMMIT}-offset-v3"
   runtime_cache_file="${runtime_cache_dir}/runtime-x86_64"
 
   if [[ "$fresh" == "true" && -f "$runtime_cache_file" ]]; then
     rm -f "$runtime_cache_file"
-    log_info "Cache cleared for commit ${TYPE2_RUNTIME_COMMIT:0:12} (--fresh)"
+    log_info "Cache cleared for ${version} (commit ${TYPE2_RUNTIME_COMMIT:0:12}) (--fresh)"
   fi
 
   if [[ -f "$runtime_cache_file" ]]; then
-    log_info "Stage 1: Loading type2-runtime from cache (commit ${TYPE2_RUNTIME_COMMIT:0:12}...)"
+    log_info "Stage 1: Loading type2-runtime from cache (${version}, commit ${TYPE2_RUNTIME_COMMIT:0:12}...)"
     cp "$runtime_cache_file" "$workspace/runtime-x86_64"
     runtime_hash=$(sha256sum "$workspace/runtime-x86_64" | cut -d' ' -f1)
     log_success "type2-runtime loaded from cache: ${runtime_hash}"
@@ -1026,8 +1040,7 @@ echo ""
 echo "===== Begin Results ====="
 echo "appId:          ${APP_ID}"
 echo "signer:         N/A"
-echo "apkVersionName: ${version}"
-echo "apkVersionCode: N/A"
+echo "version:        ${version}"
 echo "verdict:        ${verdict}"
 app_hash="N/A"
 if [[ ${#result_official_hashes[@]} -gt 0 ]]; then
