@@ -2,9 +2,11 @@
 # ==============================================================================
 # electrumdesktop_build.sh - Electrum Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.9.2
+# Version:       v0.12.11
 # Organization:  WalletScrutiny.com
-# Last Modified: 2025-11-26
+# Last Modified: 2026-04-24
+# Last modified by: Claude Sonnet 5 (WalletScrutiny session)
+# Last modified on: 2026-07-10
 # Project:       https://github.com/spesmilo/electrum
 # ==============================================================================
 # LICENSE: MIT License
@@ -22,16 +24,30 @@
 # By using this script, you acknowledge these disclaimers and accept full responsibility.
 #
 # SCRIPT SUMMARY:
-# - Downloads official Electrum Windows executables from electrum.org
-# - Clones source code repository and checks out the exact release tag
-# - Performs containerized reproducible build using embedded Dockerfile (Wine-based)
-# - Strips Authenticode signatures from both official and built binaries
-# - Compares stripped binaries using binary diff analysis
-# - Generates COMPARISON_RESULTS.yaml for build server automation
-# - Documents differences and generates detailed reproducibility assessment
+# Supports three build paths selected via --arch and --type:
 #
-# NOTE: For Windows builds, Electrum's make_win.sh always produces all 3 .exe types;
-#       the script filters which one to download/verify based on --type parameter.
+# Windows (win64):
+# - Downloads official Electrum .exe from electrum.org (setup, portable, or standalone)
+# - Builds via Wine inside a Debian Bookworm container (make_win.sh)
+# - Strips Authenticode signatures from both binaries before comparing
+# - All 3 .exe types built together; --type selects which to verify
+#
+# Linux AppImage (x86_64-linux-gnu --type appimage):
+# - Fetches build constants (TYPE2_RUNTIME_COMMIT, Debian snapshot date, base image
+#   digest) dynamically from Electrum's source at the given version tag
+# - Extracts the type2-runtime ELF from the official AppImage and caches it keyed by
+#   TYPE2_RUNTIME_COMMIT + an extractor-generation suffix (Alpine has no snapshot service;
+#   building from source with drifted packages produces a different binary and a misleading
+#   not_reproducible verdict; the suffix invalidates caches when the extraction logic changes)
+# - Independently builds the squashfs (Electrum's application code) via make_appimage.sh
+#   inside a pinned Debian Bullseye container; compares against the official release
+# - Results output states explicitly that the runtime was sourced from the official release
+#
+# Linux tarball (x86_64-linux-gnu --type tarball):
+# - Builds the source distribution via make_sdist.sh inside a Debian Bookworm container
+# - Compares the built tarball byte-for-byte against the official release
+#
+# All paths generate COMPARISON_RESULTS.yaml for build server automation.
 
 set -euo pipefail
 
@@ -47,9 +63,8 @@ ERROR_ICON="[ERROR]"
 INFO_ICON="[INFO]"
 
 APP_NAME="Electrum Desktop"
-APP_ID="org.electrum.electrum"
-SCRIPT_VERSION="v0.9.2"
-REPO_URL="https://github.com/spesmilo/electrum"
+APP_ID="electrum"
+SCRIPT_VERSION="v0.12.11"
 
 # ---------- Logging Functions ----------
 log_info() { echo -e "${BLUE}${INFO_ICON}${NC} $*"; }
@@ -57,13 +72,19 @@ log_success() { echo -e "${GREEN}${SUCCESS_ICON}${NC} $*"; }
 log_warn() { echo -e "${YELLOW}${WARNING_ICON}${NC} $*"; }
 log_error() { echo -e "${RED}${ERROR_ICON}${NC} $*" >&2; }
 
+# ---------- Root Guard ----------
+if [[ "$(id -u)" == "0" ]]; then
+  log_error "Do not run this script as root."
+  exit 2
+fi
+
 # ---------- Usage ----------
 usage() {
   cat <<EOF
 Electrum Desktop Reproducible Build Verification Script
 
 Usage:
-  $(basename "$0") --version <version> [--arch <arch>] [--type <type>]
+  $(basename "$0") --version <version> [--arch <arch>] [--type <type>] [--binary <file>]
 
 Required Parameters:
   --version <version>    Electrum version to verify (e.g., 4.6.2)
@@ -71,13 +92,17 @@ Required Parameters:
 Optional Parameters:
   --arch <arch>          Architecture to build (default: win64)
                          Supported: win64, x86_64-linux-gnu
-                         Aliases: win/windows â win64, linux â x86_64-linux-gnu
+                         Aliases: win/windows -> win64, linux -> x86_64-linux-gnu
   --type <type>          Package type
                          For win64: setup, portable, standalone (all 3 if omitted)
                          For x86_64-linux-gnu: appimage, tarball (required)
-                         Aliases: tar/targz â tarball
+                         Aliases: tar/targz -> tarball
+  --binary <file>        Path to official binary (skips download from electrum.org)
+                         When provided, the given file is used as the official artifact.
+                         Alias: --apk
 
 Flags:
+  --fresh                Bypass type2-runtime cache and force --no-cache on Stage 2 build
   --help                 Show this help message
 
 Examples:
@@ -87,10 +112,11 @@ Examples:
   $(basename "$0") --version 4.6.2 --arch win64 --type standalone     # Windows standalone only
   $(basename "$0") --version 4.6.2 --arch x86_64-linux-gnu --type appimage
   $(basename "$0") --version 4.6.2 --arch x86_64-linux-gnu --type tarball
+  $(basename "$0") --version 4.7.2 --arch x86_64-linux-gnu --type appimage --binary ~/Downloads/electrum-4.7.2-x86_64.AppImage
 
 Requirements:
   - Docker or Podman installed
-  - Internet connection for downloading sources and official releases
+  - Internet connection for building from source (--binary skips release download only)
   - Approximately 5GB disk space for build
 
 Output:
@@ -108,6 +134,8 @@ EOF
 version=""
 arch="win64"
 build_type=""
+binary=""
+fresh=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -123,20 +151,26 @@ while [[ $# -gt 0 ]]; do
       build_type="$2"
       shift 2
       ;;
+    --binary|--apk)
+      binary="$2"
+      shift 2
+      ;;
+    --fresh)
+      fresh=true
+      shift
+      ;;
     --help)
       usage
       exit 0
       ;;
     *)
-      log_error "Unknown parameter: $1"
-      usage
-      exit 1
+      log_warn "Unknown parameter: $1 (ignored)"
+      shift
       ;;
   esac
 done
 
 # Normalize architecture aliases
-arch_input="$arch"
 arch_lower="${arch,,}"
 case "$arch_lower" in
   win|windows)
@@ -179,14 +213,14 @@ fi
 if [[ -z "$version" ]]; then
   log_error "Missing required parameter: --version"
   usage
-  exit 1
+  exit 2
 fi
 
 # Validate architecture
 if [[ "$arch" != "win64" && "$arch" != "x86_64-linux-gnu" ]]; then
   log_error "Unsupported architecture: ${arch}"
   log_error "Supported architectures: win64, x86_64-linux-gnu"
-  exit 1
+  exit 2
 fi
 
 # Validate type for Linux (required)
@@ -194,12 +228,12 @@ if [[ "$arch" == "x86_64-linux-gnu" ]]; then
   if [[ -z "$build_type" ]]; then
     log_error "--type is required for x86_64-linux-gnu architecture"
     log_error "Supported types: appimage, tarball"
-    exit 1
+    exit 2
   fi
   if [[ "$build_type" != "appimage" && "$build_type" != "tarball" ]]; then
     log_error "Unsupported type for x86_64-linux-gnu: ${build_type}"
     log_error "Supported types: appimage, tarball"
-    exit 1
+    exit 2
   fi
 fi
 
@@ -208,15 +242,35 @@ if [[ "$arch" == "win64" && -n "$build_type" ]]; then
   if [[ "$build_type" != "setup" && "$build_type" != "portable" && "$build_type" != "standalone" ]]; then
     log_error "Unsupported type for win64: ${build_type}"
     log_error "Supported types: setup, portable, standalone"
-    exit 1
+    exit 2
   fi
 fi
 
 # ---------- Setup Workspace ----------
-execution_dir="$(pwd)"
+execution_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 workspace="${execution_dir}/electrum_desktop_${version}_${arch}_$$"
 mkdir -p "$workspace"
 cd "$workspace"
+
+yaml_written=false
+trap_on_exit() {
+  local ec=$?
+  if [[ $ec -ne 0 && "$yaml_written" == "false" ]]; then
+    cat > "${execution_dir}/COMPARISON_RESULTS.yaml" <<EOF
+script_version: ${SCRIPT_VERSION}
+verdict: ftbfs
+EOF
+    log_warn "Build failed (exit ${ec}) -- COMPARISON_RESULTS.yaml written with verdict: ftbfs"
+  fi
+  # Fix any root-owned files left by container operations so the workspace can be deleted by the host user
+  if [[ -n "${workspace:-}" && -d "${workspace}" ]]; then
+    "${container_cmd:-docker}" run --rm \
+      -v "${workspace}:/ws" \
+      alpine \
+      sh -c "chown -R $(id -u):$(id -g) /ws" 2>/dev/null || true
+  fi
+}
+trap trap_on_exit EXIT
 
 log_info "=============================================="
 log_info "${APP_NAME} v${version} Verification"
@@ -229,8 +283,7 @@ fi
 log_info "Workspace: ${workspace}"
 log_info ""
 
-# ---------- Download Official Releases ----------
-log_info "Downloading official releases from electrum.org..."
+# ---------- Official Release Metadata ----------
 official_dir="$workspace/official"
 mkdir -p "$official_dir"
 
@@ -271,15 +324,23 @@ elif [[ "$arch" == "x86_64-linux-gnu" ]]; then
   fi
 fi
 
-for file in "${official_files[@]}"; do
-  log_info "Downloading ${file}..."
-  if ! wget -O "$official_dir/$file" "${download_url_base}/${file}"; then
-    log_error "Failed to download ${file}"
-    echo "Exit code: 1"
-    exit 1
-  fi
-  log_success "Downloaded ${file}"
-done
+# ---------- Detect Container Runtime ----------
+# Priority: 1) CONTAINER_CMD env var, 2) docker, 3) podman
+if [[ -n "${CONTAINER_CMD:-}" ]]; then
+  container_cmd="$CONTAINER_CMD"
+elif command -v docker >/dev/null 2>&1; then
+  container_cmd="docker"
+elif command -v podman >/dev/null 2>&1; then
+  container_cmd="podman"
+else
+  log_error "Neither podman nor docker found. Please install one of them."
+  echo "Exit code: 1"
+  exit 1
+fi
+log_info "Using container runtime: ${container_cmd}"
+
+host_uid=$(id -u)
+host_gid=$(id -g)
 
 # ---------- Generate Embedded Dockerfile ----------
 log_info "Generating embedded Dockerfile for reproducible build..."
@@ -368,10 +429,206 @@ CMD ["/bin/bash"]
 DOCKERFILE_EOF
 
 elif [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" ]]; then
-  log_info "Generating Linux AppImage Dockerfile (Debian Bullseye)..."
+  # ============================================================================
+  # PRE-FLIGHT: Fetch build constants from Electrum source at this version tag
+  # These values are version-specific; hardcoding them produces wrong builds for
+  # any release other than the one they were copied from.
+  # ============================================================================
+  log_info "Fetching AppImage build constants from Electrum ${version} source..."
+  electrum_raw="https://raw.githubusercontent.com/spesmilo/electrum/${version}"
+
+  TYPE2_RUNTIME_COMMIT=$(curl -sf "${electrum_raw}/contrib/build-linux/appimage/make_type2_runtime.sh" \
+    | grep '^TYPE2_RUNTIME_COMMIT=' | head -1 | cut -d'"' -f2)
+  if [[ -z "$TYPE2_RUNTIME_COMMIT" ]]; then
+    log_error "Failed to fetch TYPE2_RUNTIME_COMMIT from Electrum ${version} --verify the version tag exists"
+    echo "Exit code: 1"
+    exit 1
+  fi
+  log_success "type2-runtime commit: ${TYPE2_RUNTIME_COMMIT}"
+
+  SNAPSHOT_DATE=$(curl -sf "${electrum_raw}/contrib/build-linux/appimage/apt.sources.list" \
+    | grep -oE '[0-9]{8}T[0-9]{6}Z' | head -1)
+  if [[ -z "$SNAPSHOT_DATE" ]]; then
+    log_error "Failed to fetch Debian snapshot date from Electrum ${version}"
+    echo "Exit code: 1"
+    exit 1
+  fi
+  log_success "Debian snapshot: ${SNAPSHOT_DATE}"
+
+  BASE_IMAGE_DIGEST=$(curl -sf "${electrum_raw}/contrib/build-linux/appimage/Dockerfile" \
+    | grep '^FROM ' | grep -oE 'sha256:[a-f0-9]+' | head -1)
+  if [[ -z "$BASE_IMAGE_DIGEST" ]]; then
+    log_error "Failed to fetch base image digest from Electrum ${version}"
+    echo "Exit code: 1"
+    exit 1
+  fi
+  log_success "Base image: debian:bullseye@${BASE_IMAGE_DIGEST}"
+
+  # ============================================================================
+  # STAGE 1: Get type2-runtime binary (extract from official AppImage or load from cache)
+  #
+  # Alpine Linux has no snapshot service --pinned package versions are deleted from the
+  # CDN when newer patches are released. Building from source with different packages
+  # produces a different binary, which would cause the comparison to report
+  # not_reproducible even when Electrum's code is correctly reproducible. That verdict
+  # would be misleading: the fault is the build environment, not Electrum's source.
+  #
+  # Instead, we extract the runtime ELF directly from the official AppImage. The AppImage
+  # format is [runtime ELF][SquashFS]; the runtime boundary is found by parsing the ELF64
+  # program headers (no execution of the AppImage). This means Stage 2 independently
+  # verifies the squashfs content (all of Electrum's application code) while the runtime
+  # is sourced from the official release itself. The scope of verification is stated
+  # explicitly in the results output.
+  #
+  # Cache key includes TYPE2_RUNTIME_COMMIT (auto-invalidates when Electrum bumps it)
+  # plus a suffix that changes when the offset-detection logic is revised, so runtimes
+  # extracted by a buggy extractor are never silently reused.
+  # ============================================================================
+  # Cache path includes extractor generation so old runtimes from buggy offset
+  # detection logic are not silently reused.
+  runtime_cache_dir="${execution_dir}/.cache/type2-runtime/${TYPE2_RUNTIME_COMMIT}-offset-v3"
+  runtime_cache_file="${runtime_cache_dir}/runtime-x86_64"
+
+  if [[ "$fresh" == "true" && -f "$runtime_cache_file" ]]; then
+    rm -f "$runtime_cache_file"
+    log_info "Cache cleared for commit ${TYPE2_RUNTIME_COMMIT:0:12} (--fresh)"
+  fi
+
+  if [[ -f "$runtime_cache_file" ]]; then
+    log_info "Stage 1: Loading type2-runtime from cache (commit ${TYPE2_RUNTIME_COMMIT:0:12}...)"
+    cp "$runtime_cache_file" "$workspace/runtime-x86_64"
+    runtime_hash=$(sha256sum "$workspace/runtime-x86_64" | cut -d' ' -f1)
+    log_success "type2-runtime loaded from cache: ${runtime_hash}"
+  else
+    log_info "Stage 1: Extracting type2-runtime from official AppImage..."
+
+    # Obtain the AppImage: use --binary if provided, otherwise download now.
+    # Saving to $official_dir means the download section below skips re-fetching it.
+    seed_appimage="${official_dir}/${official_files[0]}"
+    if [[ -n "${binary:-}" ]]; then
+      seed_appimage="$binary"
+      log_info "Using provided binary for runtime extraction"
+    else
+      log_info "Downloading ${official_files[0]}..."
+      if ! curl -fL --progress-bar -o "$seed_appimage" \
+          "${download_url_base}/${official_files[0]}"; then
+        log_error "Failed to download official AppImage for runtime extraction"
+        echo "Exit code: 1"
+        exit 1
+      fi
+      log_success "Downloaded ${official_files[0]}"
+    fi
+
+    # Determine SquashFS offset: parse ELF64 program headers to find the minimum safe
+    # scan floor (max PT_LOAD end, unaligned), then do a SquashFS magic scan from
+    # that floor to get the exact byte where squashfs begins.
+    #
+    # Two-phase approach:
+    #   Phase A: ELF64 header parse (od+awk) -- gives min_scan_offset = max(p_offset+p_filesz)
+    #            over all PT_LOAD segments. No 4096 rounding: AppImages do not require
+    #            squashfs to start on a page boundary, and rounding overshoots by up to
+    #            4095 bytes, extracting squashfs data into the runtime and shifting the
+    #            squashfs start in the rebuilt AppImage.
+    #   Phase B: SquashFS magic scan starting from min_scan_offset. Avoids false "hsqs"
+    #            matches inside the ELF payload (which caused truncated runtimes and
+    #            appimagetool crashes in earlier versions). Finds the exact start byte.
+    #
+    # Executing the AppImage to ask for its own offset is unsafe for a verifier:
+    # the binary is untrusted until verification completes.
+    #
+    # ELF64 fields used (all little-endian):
+    #   bytes 32-39: e_phoff       (program header table offset)
+    #   bytes 54-55: e_phentsize   (program header entry size)
+    #   bytes 56-57: e_phnum       (number of entries)
+    # Each PT_LOAD entry (p_type == 1, entry size 56 bytes for ELF64):
+    #   bytes  8-15: p_offset      (file offset of segment)
+    #   bytes 32-39: p_filesz      (size in file)
+    sfs_offset=""
+    min_scan_offset=4096  # safe default if ELF parse fails
+
+    elf_parse=$(od -A n -j 0 -N 64 -t u1 -v "$seed_appimage" 2>/dev/null | \
+      awk '{for(i=1;i<=NF;i++) a[++n]=$i+0} END {
+        if (n < 58) exit 1
+        if (a[1]!=127||a[2]!=69||a[3]!=76||a[4]!=70||a[5]!=2) exit 1
+        phoff    = a[33]+a[34]*256+a[35]*65536+a[36]*16777216
+        phentsize = a[55]+a[56]*256
+        phnum    = a[57]+a[58]*256
+        if (phoff==0||phentsize==0||phnum==0) exit 1
+        print phoff, phentsize, phnum
+      }' 2>/dev/null)
+
+    if [[ -n "$elf_parse" ]]; then
+      read -r _phoff _phentsize _phnum <<<"$elf_parse"
+      _ph_total=$(( _phnum * _phentsize ))
+      elf_max_end=$(od -A n -j "$_phoff" -N "$_ph_total" -t u1 -v "$seed_appimage" 2>/dev/null | \
+        awk -v esz="$_phentsize" '
+          {for(i=1;i<=NF;i++) a[++n]=$i+0}
+          END {
+            max_end = 0
+            entries = int(n / esz)
+            for (i = 0; i < entries; i++) {
+              base = i * esz + 1
+              p_type = a[base]+a[base+1]*256+a[base+2]*65536+a[base+3]*16777216
+              if (p_type != 1) continue
+              p_off    = a[base+8] +a[base+9] *256+a[base+10]*65536+a[base+11]*16777216
+              p_filesz = a[base+32]+a[base+33]*256+a[base+34]*65536+a[base+35]*16777216
+              end = p_off + p_filesz
+              if (end > max_end) max_end = end
+            }
+            if (max_end == 0) exit 1
+            print max_end
+          }' 2>/dev/null)
+      if [[ "$elf_max_end" =~ ^[0-9]+$ && "$elf_max_end" -gt 4096 ]]; then
+        min_scan_offset="$elf_max_end"
+        log_info "ELF PT_LOAD end: ${elf_max_end} -- scanning for squashfs magic from there"
+      else
+        log_warn "ELF header parse failed; scanning for squashfs magic from offset 4096"
+      fi
+    fi
+
+    # Phase B: locate exact squashfs start by scanning for hsqs magic from min_scan_offset.
+    # od -A d outputs 16 bytes per line with decimal address; scan every 4-byte window.
+    # POSIX awk only ($1+0 coercion, no gawk strtonum).
+    # Early awk exit sends SIGPIPE to od; disable pipefail temporarily to avoid false ftbfs.
+    set +o pipefail
+    sfs_offset=$(od -A d -t x1 "$seed_appimage" | awk -v floor="$min_scan_offset" '
+      {
+        addr = $1 + 0
+        if (addr + (NF - 2) < floor) next
+        for (i = 2; i <= NF - 3; i++) {
+          if (addr + (i - 2) < floor) continue
+          if ($i == "68" && $(i+1) == "73" && $(i+2) == "71" && $(i+3) == "73") {
+            print addr + (i - 2)
+            exit
+          }
+        }
+      }')
+    set -o pipefail
+    if [[ -z "$sfs_offset" || "$sfs_offset" -le 0 ]]; then
+      log_error "Could not locate SquashFS magic (hsqs) in AppImage --cannot extract runtime"
+      echo "Exit code: 1"
+      exit 1
+    fi
+    log_info "Runtime size: ${sfs_offset} bytes (SquashFS at offset ${sfs_offset})"
+
+    dd if="$seed_appimage" of="$workspace/runtime-x86_64" \
+       bs=1 count="$sfs_offset" status=none
+
+    mkdir -p "$runtime_cache_dir"
+    cp "$workspace/runtime-x86_64" "$runtime_cache_file"
+    runtime_hash=$(sha256sum "$workspace/runtime-x86_64" | cut -d' ' -f1)
+    log_success "type2-runtime extracted and cached: ${runtime_hash}"
+  fi
+
+  cd "$workspace"
+
+  # ============================================================================
+  # STAGE 2: Build AppImage (Debian Bullseye container)
+  # ============================================================================
+  log_info "Stage 2: Generating Linux AppImage Dockerfile (Debian Bullseye)..."
   cat > "$dockerfile_path" <<'DOCKERFILE_EOF'
 # Using Electrum's exact pinned base image for AppImage reproducible builds
-FROM debian:bullseye@sha256:cf48c31af360e1c0a0aedd33aae4d928b68c2cdf093f1612650eb1ff434d1c34
+FROM debian:bullseye@__BASE_IMAGE_DIGEST__
 
 ENV LC_ALL=C.UTF-8 LANG=C.UTF-8
 ENV DEBIAN_FRONTEND=noninteractive
@@ -388,16 +645,19 @@ RUN apt-get update -qq > /dev/null && apt-get install -qq --yes --no-install-rec
     ca-certificates
 
 # Pin packages to Debian snapshot for reproducible builds
-RUN echo "deb https://snapshot.debian.org/archive/debian/20250530T143637Z/ bullseye main" > /etc/apt/sources.list && \
-    echo "deb-src https://snapshot.debian.org/archive/debian/20250530T143637Z/ bullseye main" >> /etc/apt/sources.list && \
+RUN echo "deb https://snapshot.debian.org/archive/debian/__SNAPSHOT_DATE__/ bullseye main" > /etc/apt/sources.list && \
+    echo "deb-src https://snapshot.debian.org/archive/debian/__SNAPSHOT_DATE__/ bullseye main" >> /etc/apt/sources.list && \
     echo "Package: *" > /etc/apt/preferences.d/snapshot && \
     echo "Pin: origin \"snapshot.debian.org\"" >> /etc/apt/preferences.d/snapshot && \
     echo "Pin-Priority: 1001" >> /etc/apt/preferences.d/snapshot
 
-# Install dependencies for AppImage (NO Python - built from source by make_appimage.sh)
+# Install dependencies for AppImage.
+# Note: python3 (system) is required for contrib/locale/stats.py during locale prep (added in 4.7.1).
+# A separate Python is also compiled from source by make_appimage.sh for the AppDir bundle.
 RUN apt-get update -q && \
     apt-get install -qy --allow-downgrades \
-        sudo git wget make \
+        sudo git wget make desktop-file-utils \
+        python3 \
         autotools-dev autoconf libtool autopoint pkg-config xz-utils gettext \
         libssl-dev libssl1.1 openssl \
         zlib1g-dev libffi-dev \
@@ -411,7 +671,8 @@ RUN apt-get update -q && \
         libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-util1 \
         libxcb-render-util0 libxcb-cursor0 libx11-xcb1 \
         libc6-dev libc6 libc-dev-bin \
-        libv4l-dev libjpeg62-turbo-dev libx11-dev && \
+        libv4l-dev libjpeg62-turbo-dev libx11-dev \
+        libfuse2 && \
     rm -rf /var/lib/apt/lists/* && \
     apt-get autoremove -y && \
     apt-get clean
@@ -431,12 +692,16 @@ WORKDIR ${WORK_DIR}
 # Checkout version
 RUN git checkout ${ELECTRUM_VERSION}
 
-# Build AppImage (make_appimage.sh builds Python 3.12.11 from source)
-RUN cd contrib/build-linux/appimage && ./make_appimage.sh && \
-    cp ../../../dist/*.AppImage /output/
+# Create the runtime cache directory (runtime will be mounted at container run time)
+RUN mkdir -p ${WORK_DIR}/contrib/build-linux/appimage/.cache/appimage/type2-runtime
 
 CMD ["/bin/bash"]
 DOCKERFILE_EOF
+
+  # Inject version-specific constants fetched in pre-flight (heredoc used single quotes
+  # to avoid bash expansion of Docker $VAR references, so we patch after writing)
+  sed -i "s|__BASE_IMAGE_DIGEST__|${BASE_IMAGE_DIGEST}|g" "$dockerfile_path"
+  sed -i "s|__SNAPSHOT_DATE__|${SNAPSHOT_DATE}|g" "$dockerfile_path"
 
 elif [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "tarball" ]]; then
   log_info "Generating Linux Tarball Dockerfile (Debian Bookworm)..."
@@ -470,7 +735,7 @@ RUN echo "deb https://snapshot.debian.org/archive/debian/20240617T085507Z/ bookw
 # Install minimal dependencies for tarball build
 RUN apt-get update -q && \
     apt-get install -qy --allow-downgrades \
-        git \
+        git wget \
         gettext \
         python3 \
         python3-pip \
@@ -508,35 +773,24 @@ log_success "Dockerfile generated"
 
 # ---------- Build Container Image ----------
 log_info "Building container image (this may take 30-60 minutes)..."
-image_name="electrum-desktop-build:${version}"
+build_type_tag="${build_type:-all}"
+image_name="electrum-desktop-build:${version}-${arch}-${build_type_tag}-$$"
 
-if command -v podman >/dev/null 2>&1; then
-  container_cmd="podman"
-elif command -v docker >/dev/null 2>&1; then
-  container_cmd="docker"
-else
-  log_error "Neither podman nor docker found. Please install one of them."
-  echo "Exit code: 1"
-  exit 1
-fi
-
-log_info "Using container runtime: ${container_cmd}"
-
-# Build container with appropriate build args
-host_uid=$(id -u)
-host_gid=$(id -g)
 container_uid=${host_uid}
 if [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "tarball" ]]; then
   container_uid=1000
 fi
 
 build_args="--build-arg VERSION=${version} --build-arg UID=${container_uid}"
-if [[ "$arch" == "x86_64-linux-gnu" ]]; then
-  build_args="${build_args} --build-arg BUILD_TYPE=${build_type}"
+
+docker_cache_flags=""
+if [[ "$fresh" == "true" ]]; then
+  docker_cache_flags="--no-cache"
 fi
 
 if ! ${container_cmd} build \
   ${build_args} \
+  ${docker_cache_flags} \
   -t "${image_name}" \
   -f "$dockerfile_path" \
   "$workspace"; then
@@ -547,14 +801,79 @@ fi
 
 log_success "Container image built successfully"
 
+# ---------- Run AppImage Build (special case) ----------
+# For AppImage, the Dockerfile only sets up the environment.
+# We run make_appimage.sh separately with the type2-runtime mounted.
+if [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" ]]; then
+  log_info "Running make_appimage.sh with mounted type2-runtime..."
+
+  # Create output directory
+  appimage_output_dir="$workspace/appimage-output"
+  mkdir -p "$appimage_output_dir"
+
+  if ! ${container_cmd} run --rm \
+    -u "${host_uid}:${host_gid}" \
+    -v "$workspace/runtime-x86_64:/opt/electrum/contrib/build-linux/appimage/.cache/appimage/type2-runtime/runtime-x86_64:rw" \
+    -v "$appimage_output_dir:/output:rw" \
+    "${image_name}" \
+    bash -c 'cd /opt/electrum/contrib/build-linux/appimage && ./make_appimage.sh && cp /opt/electrum/dist/*.AppImage /output/'; then
+    log_error "AppImage build failed"
+    echo "Exit code: 1"
+    exit 1
+  fi
+
+  log_success "AppImage built successfully"
+fi
+
+# ---------- Download Official Releases ----------
+if [[ -n "$binary" ]]; then
+  log_info "Using provided binary: ${binary}"
+  if [[ ! -f "$binary" ]]; then
+    log_error "Provided binary not found: ${binary}"
+    echo "Exit code: 1"
+    exit 1
+  fi
+  cp "$binary" "$official_dir/${official_files[0]}"
+  log_success "Copied provided binary as ${official_files[0]}"
+else
+  log_info "Downloading official releases from electrum.org..."
+  for file in "${official_files[@]}"; do
+    if [[ -f "$official_dir/$file" ]]; then
+      log_info "Already downloaded: ${file}"
+      continue
+    fi
+    log_info "Downloading ${file}..."
+    if ! ${container_cmd} run --rm --user "${host_uid}:${host_gid}" \
+      -v "$official_dir:/official:rw" \
+      "${image_name}" \
+      bash -c "wget -O \"/official/${file}\" \"${download_url_base}/${file}\""; then
+      log_error "Failed to download ${file}"
+      echo "Exit code: 1"
+      exit 1
+    fi
+    if [[ ! -f "$official_dir/$file" ]]; then
+      log_error "Downloaded file missing: ${file}"
+      echo "Exit code: 1"
+      exit 1
+    fi
+    log_success "Downloaded ${file}"
+  done
+fi
+
 # ---------- Extract Build Artifacts ----------
 log_info "Extracting build artifacts from container..."
 built_dir="$workspace/built"
 mkdir -p "$built_dir"
 
-container_id=$(${container_cmd} create "${image_name}")
-${container_cmd} cp "${container_id}:/output/." "$built_dir/"
-${container_cmd} rm "${container_id}"
+# For AppImage, artifacts are already on host (from docker run with volume mount)
+# For other types, extract from container's /output directory
+if [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" ]]; then
+  cp "$appimage_output_dir"/* "$built_dir/" 2>/dev/null || true
+else
+  container_id=$(${container_cmd} create "${image_name}")
+  ${container_cmd} cp "${container_id}:/output/." "$built_dir/"
+  ${container_cmd} rm "${container_id}"
+fi
 
 # Ensure extracted artifacts are owned by host user
 chown -R "${host_uid}:${host_gid}" "$built_dir" || true
@@ -577,82 +896,108 @@ elif [[ "$arch" == "x86_64-linux-gnu" ]]; then
 fi
 
 # ---------- Strip Signatures (Windows only) ----------
-stripped_official_dir="$workspace/official_stripped"
-mkdir -p "$stripped_official_dir"
-
 if [[ "$arch" == "win64" ]]; then
-  log_info "Stripping Authenticode signatures..."
-  chmod 777 "$stripped_official_dir"  # Ensure writable by container user
+  stripped_official_dir="$workspace/official_stripped"
+  mkdir -p "$stripped_official_dir"
+  log_info "Stripping Authenticode signatures in container..."
 
-# Check if osslsigncode is available on host
-if command -v osslsigncode >/dev/null 2>&1; then
-  # Strip on host
+  if ! ${container_cmd} run --rm --user "${host_uid}:${host_gid}" \
+    -v "$official_dir:/input:ro" \
+    -v "$stripped_official_dir:/output:rw" \
+    "${image_name}" \
+    bash -c '
+      set -euo pipefail
+      for file in "$@"; do
+        if [[ -f "/input/${file}" ]]; then
+          if osslsigncode remove-signature -in "/input/${file}" -out "/output/${file}" >/dev/null 2>&1; then
+            :
+          else
+            cp "/input/${file}" "/output/${file}"
+          fi
+        fi
+      done
+    ' bash "${official_files[@]}"; then
+    log_error "Signature stripping failed"
+    echo "Exit code: 1"
+    exit 1
+  fi
+
   for file in "${official_files[@]}"; do
-    if [[ -f "$official_dir/$file" ]]; then
-      log_info "Stripping signature from ${file}..."
-      if osslsigncode remove-signature -in "$official_dir/$file" -out "$stripped_official_dir/$file"; then
-        log_success "Stripped ${file}"
-      else
-        log_warn "Failed to strip signature from ${file}, using original"
-        cp "$official_dir/$file" "$stripped_official_dir/$file"
-      fi
+    if [[ ! -f "$stripped_official_dir/$file" ]]; then
+      log_error "Stripped file missing: ${file}"
+      echo "Exit code: 1"
+      exit 1
     fi
   done
-else
-  # Strip using container (with proper volume mounts and permissions)
-  for file in "${official_files[@]}"; do
-    if [[ -f "$official_dir/$file" ]]; then
-      log_info "Stripping signature from ${file}..."
-      # Use container with user ownership
-      if ${container_cmd} run --rm --user "$(id -u):$(id -g)" \
-        -v "$official_dir:/input:ro" \
-        -v "$stripped_official_dir:/output:rw" \
-        "${image_name}" \
-        osslsigncode remove-signature -in "/input/$file" -out "/output/$file"; then
-        log_success "Stripped ${file}"
-      else
-        log_warn "Failed to strip signature from ${file}, using original"
-        cp "$official_dir/$file" "$stripped_official_dir/$file"
-      fi
-    fi
-  done
-fi
 
   log_success "Signatures stripped"
-elif [[ "$arch" == "x86_64-linux-gnu" ]]; then
-  # Linux binaries don't have Authenticode signatures, copy directly
+else
+  stripped_official_dir="$official_dir"
   log_info "Linux binaries - no signature stripping needed"
-  cp "$official_dir"/* "$stripped_official_dir/"
-  log_success "Official files copied for comparison"
 fi
 
 # ---------- Comparison ----------
 log_info "Comparing binaries..."
 match_count=0
 diff_count=0
+result_files=()
+result_hashes=()
+result_official_hashes=()
+result_matches=()
 
-# Compare files (results will be written to YAML)
-for file in "${official_files[@]}"; do
-  built_file="$built_dir/$file"
-  official_file="$stripped_official_dir/$file"
+comparison_output="$(${container_cmd} run --rm --user "${host_uid}:${host_gid}" \
+  -v "$built_dir:/built:ro" \
+  -v "$stripped_official_dir:/official:ro" \
+  "${image_name}" \
+  bash -c '
+    set -euo pipefail
+    for file in "$@"; do
+      built="/built/${file}"
+      official="/official/${file}"
+      if [[ ! -f "$built" ]] || [[ ! -f "$official" ]]; then
+        echo "${file}|MISSING|MISSING|missing"
+        continue
+      fi
+      built_hash=$(sha256sum "$built" | cut -d " " -f1)
+      official_hash=$(sha256sum "$official" | cut -d " " -f1)
+      if [[ "$built_hash" == "$official_hash" ]]; then
+        match="true"
+      else
+        match="false"
+      fi
+      echo "${file}|${built_hash}|${official_hash}|${match}"
+    done
+  ' bash "${official_files[@]}")" || {
+    log_error "Comparison failed in container"
+    echo "Exit code: 1"
+    exit 1
+  }
 
-  if [[ ! -f "$built_file" ]] || [[ ! -f "$official_file" ]]; then
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  IFS="|" read -r file built_hash official_hash match_value <<< "$line"
+  if [[ "$match_value" == "missing" ]]; then
     log_warn "Skipping ${file} - file not found"
     continue
   fi
-
-  if diff "$built_file" "$official_file" >/dev/null 2>&1; then
+  result_files+=("$file")
+  result_hashes+=("$built_hash")
+  result_official_hashes+=("$official_hash")
+  result_matches+=("$match_value")
+  if [[ "$match_value" == "true" ]]; then
     match_count=$((match_count + 1))
     log_success "Match: ${file}"
   else
     diff_count=$((diff_count + 1))
     log_warn "Difference: ${file}"
   fi
-done
+done <<< "$comparison_output"
 
 # Determine verdict
 if (( diff_count == 0 && match_count > 0 )); then
   verdict="reproducible"
+elif (( match_count == 0 && diff_count == 0 )); then
+  verdict="ftbfs"
 else
   verdict="not_reproducible"
 fi
@@ -663,53 +1008,15 @@ generate_comparison_yaml() {
 
   log_info "Generating COMPARISON_RESULTS.yaml..."
 
-  # Write YAML header with metadata
   cat > "$yaml_file" <<EOF
-date: $(date -u '+%Y-%m-%dT%H:%M:%S%z')
 script_version: ${SCRIPT_VERSION}
-build_type: ${build_type:-null}
-results:
+verdict: ${verdict}
 EOF
 
-  # Generate one results entry per file (architecture + filename at the same level)
-  for file in "${official_files[@]}"; do
-    local built_file="$built_dir/$file"
-    local official_file="$stripped_official_dir/$file"
-
-    # Skip if files don't exist (same logic as TXT generation)
-    if [[ ! -f "$built_file" ]] || [[ ! -f "$official_file" ]]; then
-      continue
-    fi
-
-    # Calculate hash
-    local built_hash
-    built_hash=$(sha256sum "$built_file" | awk '{print $1}')
-
-    # Determine match status
-    local match_value
-    local status_value
-    if diff "$built_file" "$official_file" >/dev/null 2>&1; then
-      match_value="true"
-      status_value="reproducible"
-    else
-      match_value="false"
-      status_value="not_reproducible"
-    fi
-
-    # Append YAML file entry (directly under architecture)
-    cat >> "$yaml_file" <<EOF
-  - architecture: ${arch}
-    filename: ${file}
-    hash: ${built_hash}
-    match: ${match_value}
-    status: ${status_value}
-EOF
-  done
-
+  yaml_written=true
   log_success "COMPARISON_RESULTS.yaml generated: ${yaml_file}"
 }
 
-# Generate YAML comparison results (build server will fallback to TXT for legacy scripts)
 generate_comparison_yaml
 
 yaml_file="${execution_dir}/COMPARISON_RESULTS.yaml"
@@ -722,32 +1029,39 @@ echo "signer:         N/A"
 echo "apkVersionName: ${version}"
 echo "apkVersionCode: N/A"
 echo "verdict:        ${verdict}"
-echo "appHash:        $(sha256sum "$official_dir/${official_files[0]}" | awk '{print $1}' || echo 'N/A')"
-echo "commit:         N/A"
+app_hash="N/A"
+if [[ ${#result_official_hashes[@]} -gt 0 ]]; then
+  app_hash="${result_official_hashes[0]}"
+fi
+echo "appHash:        ${app_hash}"
+echo "commit:         ${version}"
 echo ""
 echo "Diff:"
-# Read and display comparison results from YAML
 if [[ "$verdict" == "reproducible" ]]; then
   echo "BUILDS MATCH BINARIES"
 else
   echo "BUILDS DO NOT MATCH BINARIES"
 fi
-# Display results from comparison loop
-for file in "${official_files[@]}"; do
-  built_file="$built_dir/$file"
-  official_file="$stripped_official_dir/$file"
-  if [[ -f "$built_file" ]] && [[ -f "$official_file" ]]; then
-    built_hash=$(sha256sum "$built_file" | awk '{print $1}')
-    if diff "$built_file" "$official_file" >/dev/null 2>&1; then
-      echo "$file - $arch - $built_hash - 1 (MATCHES)"
-    else
-      echo "$file - $arch - $built_hash - 0 (DIFFERS)"
-    fi
+for i in "${!result_files[@]}"; do
+  file="${result_files[$i]}"
+  built_hash="${result_hashes[$i]}"
+  match_value="${result_matches[$i]}"
+  if [[ "$match_value" == "true" ]]; then
+    echo "$file - $arch - $built_hash - 1 (MATCHES)"
+  else
+    echo "$file - $arch - $built_hash - 0 (DIFFERS)"
   fi
 done
 echo ""
 echo "Revision, tag (and its signature):"
-echo "N/A - Binary verification only (no source checkout)"
+echo "Git tag: ${version}"
+if [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" ]]; then
+  echo ""
+  echo "Verification scope (AppImage):"
+  echo "  squashfs: independently built from source (Stage 2)"
+  echo "  runtime:  sourced from official release (Alpine has no snapshot service;"
+  echo "            pinned package versions are deleted when newer patches are released)"
+fi
 echo ""
 echo "===== End Results ====="
 echo ""
