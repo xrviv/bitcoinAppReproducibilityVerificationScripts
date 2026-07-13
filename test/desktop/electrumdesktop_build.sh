@@ -2,7 +2,7 @@
 # ==============================================================================
 # electrumdesktop_build.sh - Electrum Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:          v0.15.0
+# Version:          v0.15.1
 # Organization:     WalletScrutiny.com
 # Last modified by: Claude Fable 5 (WalletScrutiny session)
 # Last modified on: 2026-07-13
@@ -28,7 +28,7 @@ INFO_ICON="[INFO]"
 
 APP_NAME="Electrum Desktop"
 APP_ID="electrum"
-SCRIPT_VERSION="v0.15.0"
+SCRIPT_VERSION="v0.15.1"
 
 # ---------- Logging Functions ----------
 log_info() { echo -e "${BLUE}${INFO_ICON}${NC} $*"; }
@@ -218,7 +218,7 @@ verdict: ftbfs
 EOF
     log_warn "Build failed (exit ${ec}) -- COMPARISON_RESULTS.yaml written with verdict: ftbfs"
   fi
-  # Fix any root-owned files left by container operations so the workspace can be deleted by the host user
+  # Chown container-created root-owned files so the host user can delete them
   if [[ -n "${workspace:-}" && -d "${workspace}" ]]; then
     "${container_cmd:-docker}" run --rm \
       -v "${workspace}:/ws" \
@@ -1193,6 +1193,19 @@ log_info "Version: ${version}"
 log_info "Architecture: ${arch}"
 log_info "Matches: ${match_count}"
 log_info "Differences: ${diff_count}"
+# Per-artifact hash pairs for visual comparison
+off_label="official SHA256"
+[[ "$arch" == "win64" ]] && off_label="official SHA256 (signature-stripped)"
+for i in "${!result_files[@]}"; do
+  log_info "${result_files[$i]}"
+  log_info "  built SHA256:    ${result_hashes[$i]}"
+  log_info "  ${off_label}: ${result_official_hashes[$i]}"
+  if [[ "${result_matches[$i]}" == "true" ]]; then
+    log_success "  MATCH"
+  else
+    log_warn "  MISMATCH"
+  fi
+done
 if [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" && -n "$official_runtime_prefix_hash" ]]; then
   log_info "Runtime SHA256 (built, ${runtime_source}): ${srcbuilt_runtime_hash}"
   log_info "Runtime SHA256 (official AppImage prefix): ${official_runtime_prefix_hash}"
