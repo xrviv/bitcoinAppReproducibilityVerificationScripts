@@ -1,11 +1,12 @@
 #!/bin/bash
 # ==============================================================================
-# org.electrum.electrum_build.sh - Electrum Android Reproducible Build Verification
+# electrumandroid_build.sh - Electrum Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v2.1.18
-# Organization:  WalletScrutiny.com
-# Last Modified: 2026-05-07
-# Project:       https://github.com/spesmilo/electrum
+# Version:          v2.1.18
+# Organization:     WalletScrutiny.com
+# Last modified by: Danny Garcia
+# Last modified on: 2026-07-13
+# Project:          https://github.com/spesmilo/electrum
 # ==============================================================================
 # LICENSE: MIT License
 #
@@ -25,7 +26,7 @@
 # By using this script, you acknowledge these disclaimers and accept full responsibility.
 
 SCRIPT_VERSION="v2.1.18"
-echo "Starting org.electrum.electrum_build.sh script version ${SCRIPT_VERSION}"
+echo "Starting electrumandroid_build.sh script version ${SCRIPT_VERSION}"
 
 set -eo pipefail
 
@@ -235,11 +236,11 @@ generate_filtered_build_log() {
 
 usage() {
   echo 'NAME
-       org.electrum.electrum_build.sh - verify Electrum wallet build
+       electrumandroid_build.sh - verify Electrum wallet build
 
 SYNOPSIS
-       org.electrum.electrum_build.sh --apk APK_FILE
-       org.electrum.electrum_build.sh --binary APK_FILE
+       electrumandroid_build.sh --apk APK_FILE
+       electrumandroid_build.sh --binary APK_FILE
 
 DESCRIPTION
        This command verifies builds of Electrum wallet.
@@ -249,8 +250,8 @@ DESCRIPTION
        --binary    Alias for --apk (accepted for build server compatibility)
 
 EXAMPLES
-       org.electrum.electrum_build.sh --apk electrum.apk
-       org.electrum.electrum_build.sh --binary /path/to/electrum.apk'
+       electrumandroid_build.sh --apk electrum.apk
+       electrumandroid_build.sh --binary /path/to/electrum.apk'
 }
 
 # Parse arguments
