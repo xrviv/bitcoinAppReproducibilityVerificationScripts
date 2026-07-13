@@ -2,7 +2,7 @@
 # ==============================================================================
 # electrumdesktop_build.sh - Electrum Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:          v0.14.1
+# Version:          v0.15.0
 # Organization:     WalletScrutiny.com
 # Last modified by: Claude Fable 5 (WalletScrutiny session)
 # Last modified on: 2026-07-13
@@ -28,7 +28,7 @@ INFO_ICON="[INFO]"
 
 APP_NAME="Electrum Desktop"
 APP_ID="electrum"
-SCRIPT_VERSION="v0.14.1"
+SCRIPT_VERSION="v0.15.0"
 
 # ---------- Logging Functions ----------
 log_info() { echo -e "${BLUE}${INFO_ICON}${NC} $*"; }
@@ -76,16 +76,10 @@ Examples:
   $(basename "$0") --version 4.6.2 --arch x86_64-linux-gnu --type tarball
   $(basename "$0") --version 4.7.2 --arch x86_64-linux-gnu --type appimage --binary ~/Downloads/electrum-4.7.2-x86_64.AppImage
 
-Requirements:
-  - Docker or Podman installed
-  - Internet connection for building from source (--binary skips release download only)
-  - Approximately 5GB disk space for build
+Requirements: Docker or Podman, internet, ~5GB disk space
 
-Output:
-  - Exit code 0: Binaries are reproducible
-  - Exit code 1: Binaries differ or verification failed
-  - COMPARISON_RESULTS.yaml: Machine-readable comparison results
-  - Standardized results format between ===== Begin/End Results =====
+Output: exit 0 reproducible / exit 1 differs or failed; COMPARISON_RESULTS.yaml;
+  standardized block between ===== Begin/End Results =====
 
 Version: ${SCRIPT_VERSION}
 Organization: WalletScrutiny.com
@@ -307,11 +301,26 @@ host_gid=$(id -g)
 # ---------- Generate Embedded Dockerfile ----------
 log_info "Generating embedded Dockerfile for reproducible build..."
 dockerfile_path="$workspace/Dockerfile"
+electrum_raw="https://raw.githubusercontent.com/spesmilo/electrum/${version}"
 
 if [[ "$arch" == "win64" ]]; then
-  log_info "Generating Windows (Wine) build Dockerfile..."
+  # Pre-flight: fetch upstream's win64 pins at this tag (changelog v0.15.0)
+  log_info "Fetching win64 build constants from Electrum ${version} source..."
+  win_upstream_df=$(curl -sf "${electrum_raw}/contrib/build-wine/Dockerfile" || true)
+  WIN_BASE_IMAGE=$(echo "$win_upstream_df" | grep -m1 '^FROM ' | awk '{print $2}' || true)
+  WINE_VER=$(echo "$win_upstream_df" | grep -oE 'WINEVERSION="[0-9.]+' | head -1 | cut -d'"' -f2 || true)
+  WIN_SNAPSHOT=$(curl -sf "${electrum_raw}/contrib/build-wine/apt.sources.list" \
+    | grep -oE '[0-9]{8}T[0-9]{6}Z' | head -1 || true)
+  _t="${WIN_BASE_IMAGE#*:}"; WIN_CODENAME="${_t%%@*}"
+  if [[ -z "$WIN_BASE_IMAGE" || -z "$WINE_VER" || -z "$WIN_SNAPSHOT" || -z "$WIN_CODENAME" ]]; then
+    log_error "Failed to fetch win64 build constants from Electrum ${version} -- verify the tag exists"
+    echo "Exit code: 1"
+    exit 1
+  fi
+  log_success "Base image: ${WIN_BASE_IMAGE} | Wine: ${WINE_VER}~${WIN_CODENAME}-1 | snapshot: ${WIN_SNAPSHOT}"
+
   cat > "$dockerfile_path" <<'DOCKERFILE_EOF'
-FROM debian:bookworm
+FROM __WIN_BASE_IMAGE__
 
 ENV LC_ALL=C.UTF-8 LANG=C.UTF-8
 ENV DEBIAN_FRONTEND=noninteractive
@@ -323,39 +332,37 @@ ENV USER="user"
 ENV HOME_DIR="/home/${USER}"
 ENV WORK_DIR="/opt/wine64/drive_c"
 
-# Add i386 architecture for 32-bit wine
-RUN dpkg --add-architecture i386
+RUN apt-get update -qq > /dev/null && apt-get install -qq --yes --no-install-recommends \
+    ca-certificates
 
-# Install dependencies
-RUN apt-get update -q && \
+RUN echo "deb https://snapshot.debian.org/archive/debian/__WIN_SNAPSHOT__/ __WIN_CODENAME__ main" > /etc/apt/sources.list && \
+    echo "Package: *" > /etc/apt/preferences.d/snapshot && \
+    echo "Pin: origin \"snapshot.debian.org\"" >> /etc/apt/preferences.d/snapshot && \
+    echo "Pin-Priority: 1001" >> /etc/apt/preferences.d/snapshot
+
+RUN dpkg --add-architecture i386 && \
+    apt-get update -q && \
     apt-get install -qy --allow-downgrades \
-        ca-certificates wget gnupg2 dirmngr python3 python3-pip python3-venv \
-        git curl p7zip-full make mingw-w64 mingw-w64-tools autotools-dev \
+        wget gnupg2 dirmngr python3 python3-pip python3-venv \
+        git curl p7zip-full make cmake pkgconf mingw-w64 mingw-w64-tools autotools-dev \
         autoconf autopoint libtool gettext nsis sudo osslsigncode && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Wine 10.0.0.0
-RUN DEBIAN_CODENAME=$(cat /etc/debian_version | cut -d'.' -f1) && \
-    if [ "$DEBIAN_CODENAME" = "12" ]; then DEBIAN_CODENAME="bookworm"; fi && \
-    WINEVERSION="10.0.0.0~${DEBIAN_CODENAME}-1" && \
+RUN WINEVERSION="__WINE_VER__~__WIN_CODENAME__-1" && \
     wget -nc https://dl.winehq.org/wine-builds/winehq.key && \
     echo "d965d646defe94b3dfba6d5b4406900ac6c81065428bf9d9303ad7a72ee8d1b8 winehq.key" | sha256sum -c - && \
     mkdir -p /etc/apt/keyrings && \
     cat winehq.key | gpg --dearmor -o /etc/apt/keyrings/winehq.gpg && \
-    echo "deb [signed-by=/etc/apt/keyrings/winehq.gpg] https://dl.winehq.org/wine-builds/debian/ ${DEBIAN_CODENAME} main" > /etc/apt/sources.list.d/winehq.list && \
+    echo "deb [signed-by=/etc/apt/keyrings/winehq.gpg] https://dl.winehq.org/wine-builds/debian/ __WIN_CODENAME__ main" > /etc/apt/sources.list.d/winehq.list && \
     rm winehq.key && \
     apt-get update -q && \
     apt-get install -qy --allow-downgrades \
         wine-stable-amd64:amd64=${WINEVERSION} \
         wine-stable-i386:i386=${WINEVERSION} \
         wine-stable:amd64=${WINEVERSION} \
-        winehq-stable:amd64=${WINEVERSION} \
-        || apt-get install -qy --allow-downgrades \
-        wine-stable-amd64:amd64 wine-stable-i386:i386 \
-        wine-stable:amd64 winehq-stable:amd64 && \
+        winehq-stable:amd64=${WINEVERSION} && \
     rm -rf /var/lib/apt/lists/*
 
-# Create user and setup workspace
 RUN useradd --uid $UID --create-home --shell /bin/bash ${USER} && \
     usermod -append --groups sudo ${USER} && \
     echo "%sudo ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers && \
@@ -364,15 +371,12 @@ RUN useradd --uid $UID --create-home --shell /bin/bash ${USER} && \
 
 USER ${USER}
 
-# Clone repository
 RUN git clone https://github.com/spesmilo/electrum.git ${WORK_DIR}/electrum
 
 WORKDIR ${WORK_DIR}/electrum
 
-# Checkout version
 RUN git checkout ${ELECTRUM_VERSION}
 
-# Install Python dependencies
 RUN python3 -m venv ${HOME_DIR}/.venv && \
     ${HOME_DIR}/.venv/bin/pip install --no-cache-dir \
         -r contrib/deterministic-build/requirements-build-base.txt \
@@ -380,15 +384,17 @@ RUN python3 -m venv ${HOME_DIR}/.venv && \
 
 ENV PATH="${HOME_DIR}/.venv/bin:${PATH}"
 
-# Build using make_win.sh which handles all the preparation and building
-# This script sets up CONTRIB, WINEPREFIX, and other required env vars
 RUN cd contrib/build-wine && ./make_win.sh
 
-# Copy artifacts to /output for extraction (directory created as root earlier)
 RUN cp contrib/build-wine/dist/*.exe /output/
 
 CMD ["/bin/bash"]
 DOCKERFILE_EOF
+
+  sed -i "s|__WIN_BASE_IMAGE__|${WIN_BASE_IMAGE}|g" "$dockerfile_path"
+  sed -i "s|__WIN_SNAPSHOT__|${WIN_SNAPSHOT}|g" "$dockerfile_path"
+  sed -i "s|__WIN_CODENAME__|${WIN_CODENAME}|g" "$dockerfile_path"
+  sed -i "s|__WINE_VER__|${WINE_VER}|g" "$dockerfile_path"
 
 elif [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" ]]; then
   # ============================================================================
@@ -397,7 +403,6 @@ elif [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" ]]; then
   # any release other than the one they were copied from.
   # ============================================================================
   log_info "Fetching AppImage build constants from Electrum ${version} source..."
-  electrum_raw="https://raw.githubusercontent.com/spesmilo/electrum/${version}"
 
   TYPE2_RUNTIME_COMMIT=$(curl -sf "${electrum_raw}/contrib/build-linux/appimage/make_type2_runtime.sh" \
     | grep '^TYPE2_RUNTIME_COMMIT=' | head -1 | cut -d'"' -f2)
@@ -628,7 +633,6 @@ elif [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" ]]; then
   # ============================================================================
   log_info "Stage 2: Generating Linux AppImage Dockerfile (Debian Bullseye)..."
   cat > "$dockerfile_path" <<'DOCKERFILE_EOF'
-# Using Electrum's exact pinned base image for AppImage reproducible builds
 FROM debian:bullseye@__BASE_IMAGE_DIGEST__
 
 ENV LC_ALL=C.UTF-8 LANG=C.UTF-8
@@ -641,20 +645,16 @@ ENV USER="user"
 ENV HOME_DIR="/home/${USER}"
 ENV WORK_DIR="/opt/electrum"
 
-# Install ca-certificates first (needed for snapshot.debian.org)
 RUN apt-get update -qq > /dev/null && apt-get install -qq --yes --no-install-recommends \
     ca-certificates
 
-# Pin packages to Debian snapshot for reproducible builds
 RUN echo "deb https://snapshot.debian.org/archive/debian/__SNAPSHOT_DATE__/ bullseye main" > /etc/apt/sources.list && \
     echo "deb-src https://snapshot.debian.org/archive/debian/__SNAPSHOT_DATE__/ bullseye main" >> /etc/apt/sources.list && \
     echo "Package: *" > /etc/apt/preferences.d/snapshot && \
     echo "Pin: origin \"snapshot.debian.org\"" >> /etc/apt/preferences.d/snapshot && \
     echo "Pin-Priority: 1001" >> /etc/apt/preferences.d/snapshot
 
-# Install dependencies for AppImage.
-# Note: python3 (system) is required for contrib/locale/stats.py during locale prep (added in 4.7.1).
-# A separate Python is also compiled from source by make_appimage.sh for the AppDir bundle.
+# python3 (system) needed by contrib/locale/stats.py; make_appimage.sh compiles its own
 RUN apt-get update -q && \
     apt-get install -qy --allow-downgrades \
         sudo git wget make desktop-file-utils \
@@ -678,37 +678,29 @@ RUN apt-get update -q && \
     apt-get autoremove -y && \
     apt-get clean
 
-# Create user and setup workspace
 RUN useradd --uid $UID --create-home --shell /bin/bash ${USER} && \
     mkdir -p ${WORK_DIR} /output && \
     chown -R ${USER}:${USER} ${WORK_DIR} /output
 
 USER ${USER}
 
-# Clone repository
 RUN git clone https://github.com/spesmilo/electrum.git ${WORK_DIR}
 
 WORKDIR ${WORK_DIR}
 
-# Checkout version
 RUN git checkout ${ELECTRUM_VERSION}
 
-# Create the runtime cache directory (runtime will be mounted at container run time)
 RUN mkdir -p ${WORK_DIR}/contrib/build-linux/appimage/.cache/appimage/type2-runtime
 
 CMD ["/bin/bash"]
 DOCKERFILE_EOF
 
-  # Inject version-specific constants fetched in pre-flight (heredoc used single quotes
-  # to avoid bash expansion of Docker $VAR references, so we patch after writing)
   sed -i "s|__BASE_IMAGE_DIGEST__|${BASE_IMAGE_DIGEST}|g" "$dockerfile_path"
   sed -i "s|__SNAPSHOT_DATE__|${SNAPSHOT_DATE}|g" "$dockerfile_path"
 
 elif [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "tarball" ]]; then
   log_info "Generating Linux Tarball Dockerfile (Debian Bookworm)..."
   cat > "$dockerfile_path" <<'DOCKERFILE_EOF'
-# Using Electrum's exact base image for tarball builds (requires Python 3.10+)
-# Build as unprivileged user matching Electrum's official tarball workflow
 FROM debian:bookworm@sha256:b877a1a3fdf02469440f1768cf69c9771338a875b7add5e80c45b756c92ac20a
 
 ENV LC_ALL=C.UTF-8 LANG=C.UTF-8
@@ -725,15 +717,12 @@ ENV WORK_DIR="/opt/electrum"
 RUN apt-get update -qq > /dev/null && apt-get install -qq --yes --no-install-recommends \
     ca-certificates
 
-# Pin packages to Debian snapshot for reproducible builds
-# Using snapshot from 2024-06-17 (around Debian 12.6 stable release)
 RUN echo "deb https://snapshot.debian.org/archive/debian/20240617T085507Z/ bookworm main" > /etc/apt/sources.list && \
     echo "deb-src https://snapshot.debian.org/archive/debian/20240617T085507Z/ bookworm main" >> /etc/apt/sources.list && \
     echo "Package: *" > /etc/apt/preferences.d/snapshot && \
     echo "Pin: origin \"snapshot.debian.org\"" >> /etc/apt/preferences.d/snapshot && \
     echo "Pin-Priority: 1001" >> /etc/apt/preferences.d/snapshot
 
-# Install minimal dependencies for tarball build
 RUN apt-get update -q && \
     apt-get install -qy --allow-downgrades \
         git wget \
@@ -746,7 +735,6 @@ RUN apt-get update -q && \
     apt-get autoremove -y && \
     apt-get clean
 
-# Create user and setup workspace (Electrum tarball built as regular user)
 RUN useradd --uid $UID --non-unique --create-home --shell /bin/bash ${USER} && \
     mkdir -p ${WORK_DIR} /output && \
     chown -R ${USER}:${USER} ${WORK_DIR} /output
@@ -761,7 +749,6 @@ WORKDIR ${WORK_DIR}
 # Checkout version
 RUN git checkout ${ELECTRUM_VERSION}
 
-# Build tarball (make_sdist.sh uses system Python with setup.py)
 RUN ./contrib/build-linux/sdist/make_sdist.sh && \
     cp dist/*.tar.gz /output/
 
