@@ -2,10 +2,10 @@
 # ==============================================================================
 # electrumdesktop_build.sh - Electrum Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:          v0.12.12
+# Version:          v0.14.1
 # Organization:     WalletScrutiny.com
-# Last modified by: Claude Opus 4.8 (WalletScrutiny session)
-# Last modified on: 2026-07-10
+# Last modified by: Claude Fable 5 (WalletScrutiny session)
+# Last modified on: 2026-07-13
 # Project:          https://github.com/spesmilo/electrum
 # ==============================================================================
 # MIT License. Provided as-is for reproducible-build verification and security
@@ -28,7 +28,7 @@ INFO_ICON="[INFO]"
 
 APP_NAME="Electrum Desktop"
 APP_ID="electrum"
-SCRIPT_VERSION="v0.12.12"
+SCRIPT_VERSION="v0.14.1"
 
 # ---------- Logging Functions ----------
 log_info() { echo -e "${BLUE}${INFO_ICON}${NC} $*"; }
@@ -71,9 +71,7 @@ Flags:
 
 Examples:
   $(basename "$0") --version 4.6.2                                    # All 3 Windows executables
-  $(basename "$0") --version 4.6.2 --arch win64 --type setup          # Windows setup only
-  $(basename "$0") --version 4.6.2 --arch win64 --type portable       # Windows portable only
-  $(basename "$0") --version 4.6.2 --arch win64 --type standalone     # Windows standalone only
+  $(basename "$0") --version 4.6.2 --arch win64 --type setup          # One Windows type (setup|portable|standalone)
   $(basename "$0") --version 4.6.2 --arch x86_64-linux-gnu --type appimage
   $(basename "$0") --version 4.6.2 --arch x86_64-linux-gnu --type tarball
   $(basename "$0") --version 4.7.2 --arch x86_64-linux-gnu --type appimage --binary ~/Downloads/electrum-4.7.2-x86_64.AppImage
@@ -429,99 +427,21 @@ elif [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" ]]; then
   log_success "Base image: debian:bullseye@${BASE_IMAGE_DIGEST}"
 
   # ============================================================================
-  # STAGE 1: Get type2-runtime binary (extract from official AppImage or load from cache)
-  #
-  # Alpine Linux has no snapshot service --pinned package versions are deleted from the
-  # CDN when newer patches are released. Building from source with different packages
-  # produces a different binary, which would cause the comparison to report
-  # not_reproducible even when Electrum's code is correctly reproducible. That verdict
-  # would be misleading: the fault is the build environment, not Electrum's source.
-  #
-  # Instead, we extract the runtime ELF directly from the official AppImage. The AppImage
-  # format is [runtime ELF][SquashFS]; the runtime boundary is found by parsing the ELF64
-  # program headers (no execution of the AppImage). This means Stage 2 independently
-  # verifies the squashfs content (all of Electrum's application code) while the runtime
-  # is sourced from the official release itself. The scope of verification is stated
-  # explicitly in the results output.
-  #
-  # Cache key includes the release VERSION as well as TYPE2_RUNTIME_COMMIT and the
-  # extractor-generation suffix.
-  #
-  # VERSION is load-bearing: the runtime is extracted from that release's own official
-  # AppImage, and Electrum ships a DIFFERENT runtime binary per release even when
-  # TYPE2_RUNTIME_COMMIT is unchanged (the runtime is rebuilt in an Alpine environment
-  # with no package snapshot service, so package drift changes the bytes). Keying only
-  # by TYPE2_RUNTIME_COMMIT let a runtime extracted for one release be reused for a
-  # later release that happened to pin the same commit -- producing a mismatched runtime
-  # prefix and a FALSE not_reproducible even when the rebuilt squashfs was byte-identical.
-  # Observed concretely: 4.7.2 and 4.8.0 both pin 5e7217b7..., but their official
-  # runtime prefixes differ; the 4.7.2 cache was wrongly reused for the 4.8.0 run.
-  # Keying by version makes the cache 1:1 with the official release it was extracted from.
-  #
-  # The offset-vN suffix changes when the offset-detection logic is revised, so runtimes
-  # extracted by a buggy extractor are never silently reused.
+  # STAGE 1: Obtain type2-runtime binary
+  # Primary: build from source. Fallback: extract from official AppImage.
+  # Full design rationale: script-notes/desktop/electrum/changelog.md (v0.13.0)
   # ============================================================================
-  runtime_cache_dir="${execution_dir}/.cache/type2-runtime/${version}-${TYPE2_RUNTIME_COMMIT}-offset-v3"
-  runtime_cache_file="${runtime_cache_dir}/runtime-x86_64"
 
-  if [[ "$fresh" == "true" && -f "$runtime_cache_file" ]]; then
-    rm -f "$runtime_cache_file"
-    log_info "Cache cleared for ${version} (commit ${TYPE2_RUNTIME_COMMIT:0:12}) (--fresh)"
-  fi
+  # Locate the byte offset where the SquashFS starts inside an AppImage
+  # (ELF64 program-header parse for the scan floor, then hsqs magic scan;
+  # the untrusted AppImage is never executed). Logs go to stderr so command
+  # substitution captures only the offset.
+  find_squashfs_offset() {
+    local appimage="$1"
+    local min_scan_offset=4096
+    local elf_parse elf_max_end sfs_offset _phoff _phentsize _phnum _ph_total
 
-  if [[ -f "$runtime_cache_file" ]]; then
-    log_info "Stage 1: Loading type2-runtime from cache (${version}, commit ${TYPE2_RUNTIME_COMMIT:0:12}...)"
-    cp "$runtime_cache_file" "$workspace/runtime-x86_64"
-    runtime_hash=$(sha256sum "$workspace/runtime-x86_64" | cut -d' ' -f1)
-    log_success "type2-runtime loaded from cache: ${runtime_hash}"
-  else
-    log_info "Stage 1: Extracting type2-runtime from official AppImage..."
-
-    # Obtain the AppImage: use --binary if provided, otherwise download now.
-    # Saving to $official_dir means the download section below skips re-fetching it.
-    seed_appimage="${official_dir}/${official_files[0]}"
-    if [[ -n "${binary:-}" ]]; then
-      seed_appimage="$binary"
-      log_info "Using provided binary for runtime extraction"
-    else
-      log_info "Downloading ${official_files[0]}..."
-      if ! curl -fL --progress-bar -o "$seed_appimage" \
-          "${download_url_base}/${official_files[0]}"; then
-        log_error "Failed to download official AppImage for runtime extraction"
-        echo "Exit code: 1"
-        exit 1
-      fi
-      log_success "Downloaded ${official_files[0]}"
-    fi
-
-    # Determine SquashFS offset: parse ELF64 program headers to find the minimum safe
-    # scan floor (max PT_LOAD end, unaligned), then do a SquashFS magic scan from
-    # that floor to get the exact byte where squashfs begins.
-    #
-    # Two-phase approach:
-    #   Phase A: ELF64 header parse (od+awk) -- gives min_scan_offset = max(p_offset+p_filesz)
-    #            over all PT_LOAD segments. No 4096 rounding: AppImages do not require
-    #            squashfs to start on a page boundary, and rounding overshoots by up to
-    #            4095 bytes, extracting squashfs data into the runtime and shifting the
-    #            squashfs start in the rebuilt AppImage.
-    #   Phase B: SquashFS magic scan starting from min_scan_offset. Avoids false "hsqs"
-    #            matches inside the ELF payload (which caused truncated runtimes and
-    #            appimagetool crashes in earlier versions). Finds the exact start byte.
-    #
-    # Executing the AppImage to ask for its own offset is unsafe for a verifier:
-    # the binary is untrusted until verification completes.
-    #
-    # ELF64 fields used (all little-endian):
-    #   bytes 32-39: e_phoff       (program header table offset)
-    #   bytes 54-55: e_phentsize   (program header entry size)
-    #   bytes 56-57: e_phnum       (number of entries)
-    # Each PT_LOAD entry (p_type == 1, entry size 56 bytes for ELF64):
-    #   bytes  8-15: p_offset      (file offset of segment)
-    #   bytes 32-39: p_filesz      (size in file)
-    sfs_offset=""
-    min_scan_offset=4096  # safe default if ELF parse fails
-
-    elf_parse=$(od -A n -j 0 -N 64 -t u1 -v "$seed_appimage" 2>/dev/null | \
+    elf_parse=$(od -A n -j 0 -N 64 -t u1 -v "$appimage" 2>/dev/null | \
       awk '{for(i=1;i<=NF;i++) a[++n]=$i+0} END {
         if (n < 58) exit 1
         if (a[1]!=127||a[2]!=69||a[3]!=76||a[4]!=70||a[5]!=2) exit 1
@@ -535,7 +455,7 @@ elif [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" ]]; then
     if [[ -n "$elf_parse" ]]; then
       read -r _phoff _phentsize _phnum <<<"$elf_parse"
       _ph_total=$(( _phnum * _phentsize ))
-      elf_max_end=$(od -A n -j "$_phoff" -N "$_ph_total" -t u1 -v "$seed_appimage" 2>/dev/null | \
+      elf_max_end=$(od -A n -j "$_phoff" -N "$_ph_total" -t u1 -v "$appimage" 2>/dev/null | \
         awk -v esz="$_phentsize" '
           {for(i=1;i<=NF;i++) a[++n]=$i+0}
           END {
@@ -555,18 +475,16 @@ elif [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" ]]; then
           }' 2>/dev/null)
       if [[ "$elf_max_end" =~ ^[0-9]+$ && "$elf_max_end" -gt 4096 ]]; then
         min_scan_offset="$elf_max_end"
-        log_info "ELF PT_LOAD end: ${elf_max_end} -- scanning for squashfs magic from there"
+        log_info "ELF PT_LOAD end: ${elf_max_end} -- scanning for squashfs magic from there" >&2
       else
-        log_warn "ELF header parse failed; scanning for squashfs magic from offset 4096"
+        log_warn "ELF header parse failed; scanning for squashfs magic from offset 4096" >&2
       fi
     fi
 
-    # Phase B: locate exact squashfs start by scanning for hsqs magic from min_scan_offset.
     # od -A d outputs 16 bytes per line with decimal address; scan every 4-byte window.
-    # POSIX awk only ($1+0 coercion, no gawk strtonum).
-    # Early awk exit sends SIGPIPE to od; disable pipefail temporarily to avoid false ftbfs.
+    # POSIX awk only. Early awk exit sends SIGPIPE to od; disable pipefail temporarily.
     set +o pipefail
-    sfs_offset=$(od -A d -t x1 "$seed_appimage" | awk -v floor="$min_scan_offset" '
+    sfs_offset=$(od -A d -t x1 "$appimage" | awk -v floor="$min_scan_offset" '
       {
         addr = $1 + 0
         if (addr + (NF - 2) < floor) next
@@ -579,6 +497,113 @@ elif [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" ]]; then
         }
       }')
     set -o pipefail
+    echo "$sfs_offset"
+  }
+
+  # Build type2-runtime from source. Logic inlined from:
+  #   electrum contrib/build-linux/appimage/make_type2_runtime.sh (tag ${version})
+  #   type2-runtime scripts/docker/{build-with-docker.sh,create-build-container.sh}
+  #     (commit ${TYPE2_RUNTIME_COMMIT})
+  # Success: $workspace/runtime-x86_64 exists, returns 0. Any failure returns 1
+  # so the caller falls back to official-AppImage extraction.
+  build_runtime_from_source() {
+    local src_dir="$workspace/type2-runtime-src"
+    local out_dir="$workspace/runtime-build-out"
+    local patch_file="$workspace/type2-runtime-reproducible-build.patch"
+    local img="type2-runtime-build:${version}-$$"
+
+    log_info "Stage 1: Building type2-runtime from source (commit ${TYPE2_RUNTIME_COMMIT:0:12}...)"
+
+    # Upstream's reproducibility patch (absent at older tags -> fall back)
+    if ! curl -sf -o "$patch_file" \
+        "${electrum_raw}/contrib/build-linux/appimage/patches/type2-runtime-reproducible-build.patch"; then
+      log_warn "type2-runtime reproducible-build patch not found at electrum tag ${version}"
+      return 1
+    fi
+
+    # Clone at the pinned commit + apply patch (root inside throwaway container:
+    # apk needs it; integrity comes from the full-SHA checkout)
+    rm -rf "$src_dir" "$out_dir"
+    mkdir -p "$out_dir"
+    if ! ${container_cmd} run --rm -v "$workspace:/ws:rw" alpine sh -c "
+        apk add --no-cache -q git >/dev/null 2>&1 &&
+        git config --global --add safe.directory /ws/type2-runtime-src &&
+        git clone -q https://github.com/AppImage/type2-runtime.git /ws/type2-runtime-src &&
+        cd /ws/type2-runtime-src &&
+        git checkout -q ${TYPE2_RUNTIME_COMMIT} &&
+        git apply /ws/type2-runtime-reproducible-build.patch &&
+        chown -R ${host_uid}:${host_gid} /ws/type2-runtime-src"; then
+      log_warn "type2-runtime clone/checkout/patch failed"
+      return 1
+    fi
+
+    # Pinned-Alpine build image (context = repo root, as create-build-container.sh does)
+    if ! ${container_cmd} build --platform linux/amd64 -t "$img" \
+        -f "$src_dir/scripts/docker/Dockerfile" "$src_dir"; then
+      log_warn "type2-runtime build image failed (pinned Alpine packages may no longer be available)"
+      return 1
+    fi
+
+    # Run the patched build-runtime.sh (same mounts/user as create-build-container.sh)
+    if ! ${container_cmd} run --rm -u "${host_uid}:${host_gid}" --platform linux/amd64 \
+        -w /ws -v "$src_dir:/ws:rw" -v "$out_dir:/ws/out:rw" \
+        -e ARCH=x86_64 "$img" bash scripts/build-runtime.sh; then
+      log_warn "type2-runtime source build failed"
+      return 1
+    fi
+
+    if [[ ! -f "$out_dir/runtime-x86_64" ]]; then
+      log_warn "runtime-x86_64 missing after source build"
+      return 1
+    fi
+    cp "$out_dir/runtime-x86_64" "$workspace/runtime-x86_64"
+    return 0
+  }
+  ext_cache_dir="${execution_dir}/.cache/type2-runtime/${version}-${TYPE2_RUNTIME_COMMIT}-offset-v3"
+  ext_cache_file="${ext_cache_dir}/runtime-x86_64"
+
+  if [[ "$fresh" == "true" ]]; then
+    rm -f "$ext_cache_file"
+    log_info "Runtime cache cleared for ${version} (commit ${TYPE2_RUNTIME_COMMIT:0:12}) (--fresh)"
+  fi
+
+  # runtime_source drives scope wording, YAML notes, and component comparison.
+  # The source-built runtime is deliberately NOT cached: it is rebuilt on every
+  # run so the "independently built from source" claim holds for THIS run.
+  runtime_source=""
+  if build_runtime_from_source; then
+    runtime_hash=$(sha256sum "$workspace/runtime-x86_64" | cut -d' ' -f1)
+    log_success "type2-runtime built from source: ${runtime_hash}"
+    runtime_source="source-build"
+  elif [[ -f "$ext_cache_file" ]]; then
+    log_warn "Runtime source build unavailable -- falling back to official-AppImage extraction"
+    log_info "Stage 1 (fallback): Loading extracted type2-runtime from cache (${version}, commit ${TYPE2_RUNTIME_COMMIT:0:12}...)"
+    cp "$ext_cache_file" "$workspace/runtime-x86_64"
+    runtime_hash=$(sha256sum "$workspace/runtime-x86_64" | cut -d' ' -f1)
+    log_success "type2-runtime (extracted) loaded from cache: ${runtime_hash}"
+    runtime_source="official-extraction"
+  else
+    log_warn "Runtime source build unavailable -- falling back to official-AppImage extraction"
+    log_info "Stage 1 (fallback): Extracting type2-runtime from official AppImage..."
+
+    # Obtain the AppImage: use --binary if provided, otherwise download now.
+    # Saving to $official_dir means the download section below skips re-fetching it.
+    seed_appimage="${official_dir}/${official_files[0]}"
+    if [[ -n "${binary:-}" ]]; then
+      seed_appimage="$binary"
+      log_info "Using provided binary for runtime extraction"
+    else
+      log_info "Downloading ${official_files[0]}..."
+      if ! curl -fL --progress-bar -o "$seed_appimage" \
+          "${download_url_base}/${official_files[0]}"; then
+        log_error "Failed to download official AppImage for runtime extraction"
+        echo "Exit code: 1"
+        exit 1
+      fi
+      log_success "Downloaded ${official_files[0]}"
+    fi
+
+    sfs_offset=$(find_squashfs_offset "$seed_appimage")
     if [[ -z "$sfs_offset" || "$sfs_offset" -le 0 ]]; then
       log_error "Could not locate SquashFS magic (hsqs) in AppImage --cannot extract runtime"
       echo "Exit code: 1"
@@ -589,10 +614,11 @@ elif [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" ]]; then
     dd if="$seed_appimage" of="$workspace/runtime-x86_64" \
        bs=1 count="$sfs_offset" status=none
 
-    mkdir -p "$runtime_cache_dir"
-    cp "$workspace/runtime-x86_64" "$runtime_cache_file"
+    mkdir -p "$ext_cache_dir"
+    cp "$workspace/runtime-x86_64" "$ext_cache_file"
     runtime_hash=$(sha256sum "$workspace/runtime-x86_64" | cut -d' ' -f1)
     log_success "type2-runtime extracted and cached: ${runtime_hash}"
+    runtime_source="official-extraction"
   fi
 
   cd "$workspace"
@@ -977,6 +1003,124 @@ else
   verdict="not_reproducible"
 fi
 
+# Strict semantics: an extraction-fallback run may not claim reproducible ->
+# downgrade to ftbfs; a mismatch stays not_reproducible (changelog v0.14.0)
+runtime_fallback_downgrade=false
+if [[ "${runtime_source:-}" == "official-extraction" && "$verdict" == "reproducible" ]]; then
+  verdict="ftbfs"
+  runtime_fallback_downgrade=true
+fi
+
+# ---------- Component Comparison (AppImage: runtime | squashfs) ----------
+# Evidence only; verdict = whole-file hash + fallback ftbfs downgrade (v0.14.0)
+official_runtime_prefix_hash=""
+built_runtime_prefix_hash=""
+official_sfs_hash=""
+built_sfs_hash=""
+srcbuilt_runtime_hash=""
+runtime_component_note=""
+if [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" ]]; then
+  official_appimage="$official_dir/${official_files[0]}"
+  built_appimage="$built_dir/${official_files[0]}"
+  if [[ -f "$official_appimage" && -f "$built_appimage" ]]; then
+    echo ""
+    log_info "=============================================="
+    log_info "Component Comparison (runtime | squashfs)"
+    log_info "=============================================="
+    official_sfs_offset=$(find_squashfs_offset "$official_appimage")
+    built_sfs_offset=$(find_squashfs_offset "$built_appimage")
+    if [[ -n "$official_sfs_offset" && -n "$built_sfs_offset" ]]; then
+      log_info "SquashFS offset: official=${official_sfs_offset} built=${built_sfs_offset}"
+      head -c "$official_sfs_offset" "$official_appimage" > "$workspace/official-runtime-prefix.bin"
+      official_runtime_prefix_hash=$(sha256sum "$workspace/official-runtime-prefix.bin" | cut -d' ' -f1)
+      built_runtime_prefix_hash=$(head -c "$built_sfs_offset" "$built_appimage" | sha256sum | cut -d' ' -f1)
+      official_sfs_hash=$(tail -c +"$((official_sfs_offset + 1))" "$official_appimage" | sha256sum | cut -d' ' -f1)
+      built_sfs_hash=$(tail -c +"$((built_sfs_offset + 1))" "$built_appimage" | sha256sum | cut -d' ' -f1)
+      srcbuilt_runtime_hash=$(sha256sum "$workspace/runtime-x86_64" | cut -d' ' -f1)
+      log_info "Runtime  (official AppImage prefix) SHA256: ${official_runtime_prefix_hash}"
+      log_info "Runtime  (built AppImage prefix)    SHA256: ${built_runtime_prefix_hash}"
+      log_info "Runtime  (Stage 1, pre-assembly)    SHA256: ${srcbuilt_runtime_hash} (${runtime_source})"
+      log_info "SquashFS (official)                 SHA256: ${official_sfs_hash}"
+      log_info "SquashFS (built)                    SHA256: ${built_sfs_hash}"
+      if [[ "$official_sfs_hash" == "$built_sfs_hash" ]]; then
+        log_success "SquashFS payloads are byte-identical"
+      else
+        log_warn "SquashFS payloads DIFFER"
+      fi
+      if [[ "$runtime_source" == "source-build" ]]; then
+        # Byte-level runtime analysis (.digest_md5 is filled by appimagetool at
+        # assembly; source build carries zeros there -- changelog v0.13.0).
+        # Full byte diff to file; terminal preview capped at 5 lines.
+        cmp -l "$workspace/runtime-x86_64" "$workspace/official-runtime-prefix.bin" \
+          > "$workspace/diff_runtime_cmp.txt" 2>&1 || true
+        cmp_lines=$(wc -l < "$workspace/diff_runtime_cmp.txt")
+        log_info "Runtime bytes differing (source-built vs official prefix): ${cmp_lines}"
+        if (( cmp_lines > 0 )); then
+          head -5 "$workspace/diff_runtime_cmp.txt"
+          if (( cmp_lines > 5 )); then
+            log_info "... full byte diff in ${workspace}/diff_runtime_cmp.txt"
+          fi
+        fi
+        # Mask .digest_md5 (located via ELF section headers) in both, compare rest
+        cat > "$workspace/compare_runtime_masked.py" <<'PYEOF'
+import struct, sys
+def read(p):
+    with open(p, "rb") as f:
+        return f.read()
+def digest_section(data):
+    shoff = struct.unpack_from("<Q", data, 0x28)[0]
+    shentsize = struct.unpack_from("<H", data, 0x3A)[0]
+    shnum = struct.unpack_from("<H", data, 0x3C)[0]
+    shstrndx = struct.unpack_from("<H", data, 0x3E)[0]
+    stroff = struct.unpack_from("<Q", data, shoff + shstrndx * shentsize + 0x18)[0]
+    for i in range(shnum):
+        o = shoff + i * shentsize
+        nameoff = struct.unpack_from("<I", data, o)[0]
+        name = data[stroff + nameoff:data.index(b"\0", stroff + nameoff)].decode()
+        if name == ".digest_md5":
+            return struct.unpack_from("<Q", data, o + 0x18)[0], struct.unpack_from("<Q", data, o + 0x20)[0]
+    return None, None
+built, official = read(sys.argv[1]), read(sys.argv[2])
+if len(built) != len(official):
+    print(f"sizes differ: built={len(built)} official={len(official)}")
+    sys.exit(0)
+off, size = digest_section(built)
+ooff, osize = digest_section(official)
+if off is None or ooff is None:
+    print(f"digest_md5_section=not-found (built={off} official={ooff})")
+    sys.exit(0)
+if (off, size) != (ooff, osize):
+    print(f"digest_md5_section MISMATCH: built offset {off} size {size} vs official offset {ooff} size {osize}")
+    print("masked_identical=no")
+    sys.exit(0)
+print(f"digest_md5_section=offset {off} (0x{off:x}), size {size} (same offset/size in both ELFs)")
+bm, om = bytearray(built), bytearray(official)
+bm[off:off + size] = b"\0" * size
+om[off:off + size] = b"\0" * size
+print("masked_identical=" + ("yes" if bm == om else "no"))
+PYEOF
+        masked_result=$(${container_cmd} run --rm -u "${host_uid}:${host_gid}" \
+          -v "$workspace:/ws:ro" "${image_name}" \
+          python3 /ws/compare_runtime_masked.py /ws/runtime-x86_64 /ws/official-runtime-prefix.bin) \
+          || masked_result="masked comparison failed"
+        echo "$masked_result"
+        if echo "$masked_result" | grep -q "masked_identical=yes"; then
+          runtime_component_note="source-built; byte-identical to official modulo 16-byte .digest_md5 (embedded by appimagetool at assembly)"
+          log_success "Runtime: source-built binary is byte-identical to official (modulo .digest_md5)"
+        else
+          runtime_component_note="source-built; DIFFERS beyond .digest_md5 -- see diff_runtime_cmp.txt"
+          log_warn "Runtime: source-built binary differs from official beyond .digest_md5"
+        fi
+      else
+        runtime_component_note="sourced from official release (extraction fallback); runtime comparison is not independent evidence"
+        log_warn "Runtime was extracted from the official AppImage -- its comparison is not independent evidence"
+      fi
+    else
+      log_warn "Could not locate squashfs offset in one of the AppImages -- component comparison skipped"
+    fi
+  fi
+fi
+
 # ---------- Generate YAML Comparison Results ----------
 generate_comparison_yaml() {
   local yaml_file="${execution_dir}/COMPARISON_RESULTS.yaml"
@@ -987,6 +1131,14 @@ generate_comparison_yaml() {
 script_version: ${SCRIPT_VERSION}
 verdict: ${verdict}
 EOF
+
+  if [[ "${runtime_source:-}" == "official-extraction" ]]; then
+    if [[ "$runtime_fallback_downgrade" == "true" ]]; then
+      echo "notes: verdict downgraded to ftbfs -- runtime failed to build from source (extraction fallback); whole-file hash MATCHED official and squashfs was independently rebuilt, but the runtime was not independently verified. Human review required for any scoped verdict." >> "$yaml_file"
+    else
+      echo "notes: AppImage runtime sourced from official release (runtime source build unavailable); squashfs independently rebuilt from source" >> "$yaml_file"
+    fi
+  fi
 
   yaml_written=true
   log_success "COMPARISON_RESULTS.yaml generated: ${yaml_file}"
@@ -1011,7 +1163,8 @@ echo "appHash:        ${app_hash}"
 echo "commit:         ${version}"
 echo ""
 echo "Diff:"
-if [[ "$verdict" == "reproducible" ]]; then
+# Reflects file comparison; verdict may be ftbfs-downgraded above
+if (( diff_count == 0 && match_count > 0 )); then
   echo "BUILDS MATCH BINARIES"
 else
   echo "BUILDS DO NOT MATCH BINARIES"
@@ -1033,8 +1186,13 @@ if [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" ]]; then
   echo ""
   echo "Verification scope (AppImage):"
   echo "  squashfs: independently built from source (Stage 2)"
-  echo "  runtime:  sourced from official release (Alpine has no snapshot service;"
-  echo "            pinned package versions are deleted when newer patches are released)"
+  if [[ "$runtime_source" == "source-build" ]]; then
+    echo "  runtime:  independently built from source (Stage 1; upstream"
+    echo "            make_type2_runtime.sh logic, pinned Alpine image + packages)"
+  else
+    echo "  runtime:  sourced from official release (Alpine has no snapshot service;"
+    echo "            pinned package versions are deleted when newer patches are released)"
+  fi
 fi
 echo ""
 echo "===== End Results ====="
@@ -1048,12 +1206,37 @@ log_info "Version: ${version}"
 log_info "Architecture: ${arch}"
 log_info "Matches: ${match_count}"
 log_info "Differences: ${diff_count}"
+if [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" && -n "$official_runtime_prefix_hash" ]]; then
+  log_info "Runtime SHA256 (built, ${runtime_source}): ${srcbuilt_runtime_hash}"
+  log_info "Runtime SHA256 (official AppImage prefix): ${official_runtime_prefix_hash}"
+  log_info "Runtime status: ${runtime_component_note}"
+  log_info "SquashFS SHA256 (official): ${official_sfs_hash}"
+  log_info "SquashFS SHA256 (built): ${built_sfs_hash}"
+fi
+
+if [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" && "${runtime_source:-}" == "official-extraction" ]]; then
+  log_warn "=============================================="
+  log_warn "RUNTIME NOT INDEPENDENTLY VERIFIED"
+  log_warn "The AppImage runtime was sourced from the official release (extraction"
+  log_warn "fallback -- runtime source build unavailable)."
+  if [[ "$runtime_fallback_downgrade" == "true" ]]; then
+    log_warn "Whole-file hash MATCHED official, but the verdict is downgraded to"
+    log_warn "FTBFS: the runtime failed to build from source. Component evidence"
+    log_warn "above is diagnostic; any scoped verdict requires human review."
+  fi
+  log_warn "=============================================="
+fi
 
 if [[ "$verdict" == "reproducible" ]]; then
   log_success "Verdict: REPRODUCIBLE"
   log_info "Build server output: ${yaml_file}"
   echo "Exit code: 0"
   exit 0
+elif [[ "$verdict" == "ftbfs" ]]; then
+  log_warn "Verdict: FTBFS"
+  log_info "Build server output: ${yaml_file}"
+  echo "Exit code: 1"
+  exit 1
 else
   log_warn "Verdict: NOT REPRODUCIBLE"
   log_info "Build server output: ${yaml_file}"
