@@ -2,10 +2,10 @@
 # ==============================================================================
 # electrumandroid_build.sh - Electrum Android Reproducible Build Verification
 # ==============================================================================
-# Version:          v2.1.18
+# Version:          v2.2.0
 # Organization:     WalletScrutiny.com
 # Last modified by: Danny Garcia
-# Last modified on: 2026-07-13
+# Last modified on: 2026-07-14
 # Project:          https://github.com/spesmilo/electrum
 # ==============================================================================
 # LICENSE: MIT License
@@ -25,7 +25,7 @@
 # The developers assume no liability for any misuse or legal consequences arising from use.
 # By using this script, you acknowledge these disclaimers and accept full responsibility.
 
-SCRIPT_VERSION="v2.1.18"
+SCRIPT_VERSION="v2.2.0"
 echo "Starting electrumandroid_build.sh script version ${SCRIPT_VERSION}"
 
 set -eo pipefail
@@ -132,6 +132,195 @@ NC='\033[0m'
 # Electrum constants
 repo="https://github.com/spesmilo/electrum"
 appId="org.electrum.electrum"
+
+# Neutral comparator image for the libpybundle.so inner comparison (digest-pinned,
+# multi-arch manifest list; never referenced by tag alone)
+PYTHON_IMAGE="docker.io/library/python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf"
+
+# Verdict-note accumulators (populated in result(), consumed by write_results())
+privateTarNote=""
+libpybundleNotes=""
+libpybundleFailNotes=""
+pybundleSummary=""
+
+# libpybundle.so inner comparator. Exit 0 = proven acceptable (contents identical;
+# at most regular-file 0644->0664 mode diffs, confirmed by a raw-block allowlist
+# over the decompressed tar streams). Exit 1 = verdict-affecting. Exit 2 = error.
+read -r -d '' PY_INNER_COMPARE <<'PY_INNER_EOF' || true
+import difflib, gzip, hashlib, json, os, sys, tarfile
+
+TYPES = {b"0": "file", b"\x00": "file", b"1": "hardlink", b"2": "symlink",
+         b"3": "char", b"4": "block", b"5": "dir", b"6": "fifo", b"7": "contiguous"}
+
+def norm(n):
+    return n[2:] if n.startswith("./") else n
+
+def read_manifest(path):
+    entries = []
+    with tarfile.open(path, "r:gz") as tf:
+        for idx, m in enumerate(tf):
+            sha = "-"
+            if m.isreg():
+                h = hashlib.sha256()
+                f = tf.extractfile(m)
+                if f is not None:
+                    while True:
+                        chunk = f.read(1048576)
+                        if not chunk:
+                            break
+                        h.update(chunk)
+                sha = h.hexdigest()
+            entries.append({
+                "index": idx, "name": m.name,
+                "type": TYPES.get(m.type, "other"), "linkname": m.linkname,
+                "mode": format(m.mode & 0o7777, "04o"),
+                "uid": m.uid, "gid": m.gid, "uname": m.uname, "gname": m.gname,
+                "mtime": m.mtime, "size": m.size, "sha256": sha})
+    return entries
+
+def cksum(block):
+    return sum(block[:148]) + 256 + sum(block[156:])
+
+def octfield(b):
+    s = b.split(b"\0")[0].strip(b" \0")
+    return int(s, 8) if s else 0
+
+def main():
+    offp, bltp, outdir = sys.argv[1], sys.argv[2], sys.argv[3]
+    off = read_manifest(offp)
+    blt = read_manifest(bltp)
+    mlines = {}
+    for tag, ents in (("official", off), ("built", blt)):
+        mlines[tag] = [json.dumps(e, sort_keys=True) for e in ents]
+        with open(os.path.join(outdir, "manifest-%s.jsonl" % tag), "w") as fh:
+            for ln in mlines[tag]:
+                fh.write(ln + "\n")
+    print("  archive members: %d official / %d built" % (len(off), len(blt)))
+    print("  regular files:   %d / %d" %
+          (sum(1 for e in off if e["type"] == "file"),
+           sum(1 for e in blt if e["type"] == "file")))
+    problems = []
+    allowed = []
+
+    def finalize(status):
+        rep = ["libpybundle.so inner comparison full report", "status: " + status, ""]
+        rep.append("== all problems (%d) ==" % len(problems))
+        rep.extend("  - " + p for p in problems)
+        rep.append("")
+        rep.append("== all accepted mode changes (%d) ==" % len(allowed))
+        rep.extend("  0644 -> 0664: " + n for n in allowed)
+        rep.append("")
+        mdiff = list(difflib.unified_diff(
+            mlines["official"], mlines["built"],
+            "manifest-official.jsonl", "manifest-built.jsonl", lineterm=""))
+        with open(os.path.join(outdir, "manifest-diff.txt"), "w") as fh:
+            for ln in mdiff:
+                fh.write(ln + "\n")
+        rep.append("== manifest diff, unified (%d lines; complete copy: manifest-diff.txt) ==" % len(mdiff))
+        rep.extend(mdiff[:40])
+        if len(mdiff) > 40:
+            rep.append("  ... (%d more lines - see manifest-diff.txt)"
+                       % (len(mdiff) - 40))
+        with open(os.path.join(outdir, "inner-report.txt"), "w") as fh:
+            fh.write("\n".join(rep) + "\n")
+    if [e["name"] for e in off] != [e["name"] for e in blt]:
+        problems.append("member name sequence differs (added/removed/reordered/renamed)")
+    else:
+        sha_diffs = 0
+        for a, b in zip(off, blt):
+            bad = [k for k in ("type", "linkname", "uid", "gid", "uname",
+                               "gname", "mtime", "size", "sha256") if a[k] != b[k]]
+            if bad:
+                if "sha256" in bad:
+                    sha_diffs += 1
+                problems.append("%s: %s differ" % (a["name"], ",".join(bad)))
+                continue
+            if a["mode"] != b["mode"]:
+                if a["type"] == "file" and a["mode"] == "0644" and b["mode"] == "0664":
+                    allowed.append(norm(a["name"]))
+                else:
+                    problems.append("%s: disallowed mode change %s -> %s (type %s)"
+                                    % (a["name"], a["mode"], b["mode"], a["type"]))
+        print("  contents:        %s" % ("IDENTICAL (per-occurrence SHA-256)"
+              if sha_diffs == 0 else "%d member(s) DIFFER" % sha_diffs))
+    if not problems:
+        with gzip.open(offp, "rb") as f:
+            rawa = f.read()
+        with gzip.open(bltp, "rb") as f:
+            rawb = f.read()
+        if rawa == rawb:
+            finalize("ACCEPTABLE - gzip wrapper only (decompressed streams byte-identical)")
+            print("  header diffs:    0 (decompressed tar streams byte-identical)")
+            print("  verdict impact:  none (gzip wrapper only)")
+            sys.exit(0)
+        if len(rawa) != len(rawb):
+            problems.append("decompressed stream lengths differ (%d vs %d)"
+                            % (len(rawa), len(rawb)))
+        else:
+            aset = set(allowed)
+            nblocks = 0
+            for pos in range(0, len(rawa), 512):
+                ba = rawa[pos:pos + 512]
+                bb = rawb[pos:pos + 512]
+                if ba == bb:
+                    continue
+                nblocks += 1
+                err = None
+                if ba[257:262] != b"ustar" or bb[257:262] != b"ustar":
+                    err = "non-header block differs"
+                elif (ba[:100] + bytes(8) + ba[108:148] + bytes(8) + ba[156:]) != \
+                     (bb[:100] + bytes(8) + bb[108:148] + bytes(8) + bb[156:]):
+                    err = "header differs beyond mode/checksum fields"
+                else:
+                    try:
+                        ma = octfield(ba[100:108]) & 0o7777
+                        mb = octfield(bb[100:108]) & 0o7777
+                        ck_ok = (octfield(ba[148:156]) == cksum(ba) and
+                                 octfield(bb[148:156]) == cksum(bb))
+                    except ValueError:
+                        ma = mb = -1
+                        ck_ok = False
+                    nm = ba[:100].split(b"\0")[0].decode("utf-8", "replace")
+                    pref = ba[345:500].split(b"\0")[0].decode("utf-8", "replace")
+                    full = norm(pref + "/" + nm if pref else nm)
+                    if (ma, mb) != (0o644, 0o664):
+                        err = "raw mode pair %s -> %s is not the accepted 0644 -> 0664" % (oct(ma), oct(mb))
+                    elif not ck_ok:
+                        err = "stored header checksum invalid"
+                    elif full not in aset:
+                        err = "mode change on unexpected entry %r" % full
+                if err:
+                    problems.append("raw-block proof FAILED at offset %d: %s" % (pos, err))
+                    break
+            if not problems and nblocks != len(allowed):
+                problems.append("differing raw blocks (%d) != accepted entries (%d)"
+                                % (nblocks, len(allowed)))
+    if problems:
+        finalize("MISMATCH - verdict-affecting")
+        print("  RESULT:          MISMATCH - verdict-affecting")
+        for p in problems[:5]:
+            print("    - %s" % p)
+        if len(problems) > 5:
+            print("    ... (%d more - see inner-report.txt)" % (len(problems) - 5))
+        sys.exit(1)
+    finalize("ACCEPTABLE - regular-file 0644->0664 mode fields only")
+    print("  header diffs:    %d - all regular files, mode 0644 -> 0664 only" % len(allowed))
+    for n in allowed[:5]:
+        print("    0644 -> 0664: %s" % n)
+    if len(allowed) > 5:
+        print("    ... (%d more - see inner-report.txt)" % (len(allowed) - 5))
+    print("  raw-tar proof:   PASSED - every differing block is a valid header of an accepted entry, mode+checksum fields only")
+    print("  verdict impact:  none (proven-acceptable case)")
+    sys.exit(0)
+
+try:
+    main()
+except SystemExit:
+    raise
+except Exception as e:
+    print("  ERROR: inner comparison failed: %s" % e)
+    sys.exit(2)
+PY_INNER_EOF
 
 # Helper functions
 containerApktool() {
@@ -551,8 +740,111 @@ result() {
 
   # Strict root-level META-INF filter (per Leo's guideline)
   local excludedDiffs nonExcludedDiffs
-  excludedDiffs=$(echo "$diffResult" | grep -E "^(Files|Only in) /tmp/fromPlay/META-INF|^(Files|Only in) /tmp/fromBuild/META-INF|libpybundle\.so" || true)
-  nonExcludedDiffs=$(echo "$diffResult" | grep -vE "^(Files|Only in) /tmp/fromPlay/META-INF|^(Files|Only in) /tmp/fromBuild/META-INF|libpybundle\.so|^$" || true)
+  excludedDiffs=$(echo "$diffResult" | grep -E "^(Files|Only in) /tmp/fromPlay/META-INF|^(Files|Only in) /tmp/fromBuild/META-INF" || true)
+  nonExcludedDiffs=$(echo "$diffResult" | grep -vE "^(Files|Only in) /tmp/fromPlay/META-INF|^(Files|Only in) /tmp/fromBuild/META-INF|^$" || true)
+
+  # libpybundle.so inner comparison (v2.2.0). The bundle is a gzip-compressed tar
+  # (Python bytecode, nested native libs, stdlib). It is never excluded by
+  # filename: a differing bundle is lifted from the verdict only when proven
+  # acceptable — stage 1: decompressed tar streams byte-identical (gzip wrapper
+  # only); stage 2: per-occurrence manifest identical except regular-file
+  # 0644->0664 mode fields, plus a raw-block allowlist proving no other tar byte
+  # changed. Any other difference, or any comparator failure, stays
+  # verdict-affecting (fail closed).
+  local pybundleLines pline member safeMember cmpDir evidenceFile stage1 pyOut pyRc noteText
+  pybundleLines=$(echo "$nonExcludedDiffs" | grep -E '^Files .*/libpybundle\.so and .*/libpybundle\.so differ$' || true)
+  while IFS= read -r pline; do
+    [ -z "$pline" ] && continue
+    member=${pline#Files /tmp/fromPlay/}
+    member=${member%% and *}
+    safeMember=$(echo "$member" | tr '/' '_')
+    cmpDir="$workDir/pybundle-compare-$safeMember"
+    evidenceFile="$workDir/diff_libpybundle_${safeMember}.txt"
+    mkdir -p "$cmpDir/out"
+    echo "libpybundle.so differs — running inner comparison for $member ..."
+    if ! stage1=$($CONTAINER_CMD run --rm \
+      --env MEMBER="$member" \
+      --volume "${downloadedApk}:/play.apk:ro" \
+      --volume "${builtApk}:/built.apk:ro" \
+      --volume "$cmpDir":/cmp \
+      $wsContainer \
+      sh -c 'set -e
+        unzip -p /play.apk "$MEMBER" > /cmp/official.so
+        unzip -p /built.apk "$MEMBER" > /cmp/built.so
+        zcat /cmp/official.so > /cmp/official.tar
+        zcat /cmp/built.so > /cmp/built.tar
+        if cmp -s /cmp/official.tar /cmp/built.tar; then echo WRAPPER_ONLY; else echo STREAMS_DIFFER; fi
+        rm -f /cmp/official.tar /cmp/built.tar' 2>&1); then
+      echo -e "${RED}  inner comparison stage 1 failed — $member stays verdict-affecting${NC}"
+      echo "$stage1" | tail -3
+      {
+        echo "libpybundle.so inner comparison ($member):"
+        echo "  RESULT: stage 1 (extract/decompress) FAILED - verdict-affecting"
+        echo ""
+        echo "----- stage 1 output -----"
+        echo "$stage1"
+      } > "$evidenceFile"
+      pybundleSummary+="libpybundle.so inner comparison ($member):
+  RESULT:          stage 1 (extract/decompress) FAILED - verdict-affecting
+  evidence:        diff_libpybundle_${safeMember}.txt
+
+"
+      libpybundleFailNotes+="${member}: inner comparison could not run (stage 1 failure) - treated as verdict-affecting. Evidence: diff_libpybundle_${safeMember}.txt
+"
+      continue
+    fi
+    if echo "$stage1" | grep -q '^WRAPPER_ONLY$'; then
+      pyOut="  decompressed tar streams: byte-identical
+  difference confined to:   gzip container metadata only
+  verdict impact:           none"
+      pyRc=0
+      noteText="${member}: decompressed tar streams byte-identical; difference confined to gzip container metadata."
+    else
+      if pyOut=$($CONTAINER_CMD run --rm --network none \
+        --volume "$cmpDir/official.so":/in/official.so:ro \
+        --volume "$cmpDir/built.so":/in/built.so:ro \
+        --volume "$cmpDir/out":/out \
+        "$PYTHON_IMAGE" \
+        python3 -c "$PY_INNER_COMPARE" /in/official.so /in/built.so /out 2>&1); then
+        pyRc=0
+      else
+        pyRc=$?
+      fi
+      noteText="${member}: inner tar contents byte-identical per occurrence; remaining differences proven confined to accepted regular-file 0644->0664 mode fields."
+    fi
+    {
+      echo "libpybundle.so inner comparison ($member):"
+      echo "$pyOut"
+      echo ""
+      if [ -f "$cmpDir/out/inner-report.txt" ]; then
+        echo "----- full inner report -----"
+        cat "$cmpDir/out/inner-report.txt" 2>/dev/null || echo "(inner-report.txt not readable)"
+      fi
+      if [ -f "$cmpDir/out/manifest-official.jsonl" ]; then
+        echo ""
+        echo "Manifests (JSON Lines, one object per entry in archive order) and full diff:"
+        echo "  $cmpDir/out/manifest-official.jsonl"
+        echo "  $cmpDir/out/manifest-built.jsonl"
+        echo "  $cmpDir/out/manifest-diff.txt"
+      fi
+    } > "$evidenceFile"
+    pybundleSummary+="libpybundle.so inner comparison ($member):
+$pyOut
+  evidence:        diff_libpybundle_${safeMember}.txt
+
+"
+    if [ "$pyRc" -eq 0 ]; then
+      nonExcludedDiffs=$(echo "$nonExcludedDiffs" | grep -vF "$pline" || true)
+      excludedDiffs=$(printf '%s\n%s' "$excludedDiffs" "$pline" | sed '/^$/d')
+      libpybundleNotes+="$noteText Evidence: diff_libpybundle_${safeMember}.txt
+"
+      echo -e "${GREEN}  inner comparison: proven acceptable — lifted from verdict${NC}"
+    else
+      libpybundleFailNotes+="${member}: inner comparison found verdict-affecting differences (exit $pyRc). Evidence: diff_libpybundle_${safeMember}.txt
+"
+      echo -e "${RED}  inner comparison: NOT acceptable (exit $pyRc) — stays verdict-affecting${NC}"
+    fi
+  done <<< "$pybundleLines"
 
   local diffCount=0
   [ -n "$nonExcludedDiffs" ] && diffCount=$(echo "$nonExcludedDiffs" | wc -l)
@@ -565,7 +857,7 @@ result() {
   # that forces 0664 on all new files, which python-for-android records verbatim into
   # private.tar headers. File contents are identical; only tar entry mode bits differ.
   # Root cause is infrastructure-level (setfacl on ABS host), not a build source issue.
-  local privateTarNote=""
+  privateTarNote=""
   if [ "$diffCount" -eq 1 ] && echo "$nonExcludedDiffs" | grep -q "assets/private\.tar"; then
     local tarContentDiff
     tarContentDiff=$($CONTAINER_CMD run --rm \
@@ -605,7 +897,7 @@ result() {
   echo ""
 
   if [ -n "$excludedDiffs" ]; then
-    echo "Excluded from verdict (root META-INF signing files / known non-reproducible):"
+    echo "Excluded from verdict (root META-INF signing files / proven-acceptable inner diffs):"
     echo "$excludedDiffs" \
       | sed 's|/tmp/fromPlay/||;s|/tmp/fromBuild/||' \
       | head -5
@@ -621,6 +913,10 @@ result() {
     echo ""
   fi
 
+  if [ -n "$pybundleSummary" ]; then
+    printf '%s' "$pybundleSummary"
+  fi
+
   echo "Diff (non-excluded, max 5 lines — full diff: $DIFF_FILE):"
   if [ -n "$nonExcludedDiffs" ]; then
     echo "$nonExcludedDiffs" | head -5
@@ -631,7 +927,7 @@ result() {
     echo "(no differences)"
   fi
   echo ""
-  echo "Differences found (excluding root META-INF and libpybundle.so): $diffCount"
+  echo "Differences found (root META-INF and proven-acceptable diffs excluded): $diffCount"
   echo "===== End Results ====="
 
   write_results "$verdict"
@@ -640,16 +936,30 @@ result() {
 write_results() {
   local status=$1
 
-  cat > "$RESULTS_FILE" << EOF
+  if [ "$status" = "ftbfs" ]; then
+    cat > "$RESULTS_FILE" << EOF
 script_version: ${SCRIPT_VERSION}
-verdict: ${status}
+verdict: ftbfs
 notes: |
-  Expected differences (do not affect reproducibility verdict):
-  - META-INF/*: Google Play signing files
-  - libpybundle.so: Python bytecode with embedded timestamps and build paths.
-    This is a known limitation of Python builds and does not indicate
-    malicious code - the Python source is verifiable in the repository.
+  Comparison stage failed before completing; see terminal logs.
 EOF
+  else
+    {
+      echo "script_version: ${SCRIPT_VERSION}"
+      echo "verdict: ${status}"
+      echo "notes: |"
+      echo "  Root META-INF/* differences (Google Play signing files) are excluded from the verdict."
+      if [ -n "$libpybundleNotes" ]; then
+        printf '%s' "$libpybundleNotes" | sed 's/^/  Accepted: /'
+      fi
+      if [ -n "$privateTarNote" ]; then
+        echo "  Accepted: $privateTarNote"
+      fi
+      if [ -n "$libpybundleFailNotes" ]; then
+        printf '%s' "$libpybundleFailNotes" | sed 's/^/  Verdict-affecting: /'
+      fi
+    } > "$RESULTS_FILE"
+  fi
 
   RESULTS_WRITTEN=1
   echo -e "${GREEN}Results written to: $RESULTS_FILE${NC}"
