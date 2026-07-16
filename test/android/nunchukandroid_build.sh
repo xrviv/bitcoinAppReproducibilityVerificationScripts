@@ -2,7 +2,7 @@
 # ==============================================================================
 # nunchukandroid_build.sh - Nunchuk Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.0
+# Version:       v0.2.1
 # Organization:  WalletScrutiny.com
 # Last Modified: 2026-07-16
 # Project:       https://github.com/nunchuk-io/nunchuk-android
@@ -52,7 +52,7 @@ readonly EXEC_DIR
 # ------------------------------------------------------------------------------
 # Script metadata
 # ------------------------------------------------------------------------------
-readonly SCRIPT_VERSION="v0.2.0"
+readonly SCRIPT_VERSION="v0.2.1"
 readonly SCRIPT_NAME="nunchukandroid_build.sh"
 readonly APP_ID="io.nunchuk.android"
 readonly REPO_URL="https://github.com/nunchuk-io/nunchuk-android.git"
@@ -467,13 +467,22 @@ fetch_and_extend_dockerfile() {
         exit "${EXIT_FAILED}"
     fi
 
-    # Write extended Dockerfile: Nunchuk's official + bundletool for split extraction
+    # Write extended Dockerfile: Nunchuk's official + bundletool for split extraction.
+    # Nunchuk's Dockerfile installs curl in every tag checked back to android.1.67;
+    # it has never installed wget. Prefer curl (matches upstream's own package set);
+    # fall back to wget only in case a future revision drops curl.
     cat > "${output_path}" <<DOCKERFILE_EOF
 ${original_dockerfile}
 
 # WalletScrutiny: install bundletool for split APK extraction from built AAB
-RUN wget -q https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar \
-    -O /tmp/bundletool.jar
+RUN set -e; \\
+    if command -v curl >/dev/null 2>&1; then \\
+        curl -fsSL -o /tmp/bundletool.jar https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar; \\
+    elif command -v wget >/dev/null 2>&1; then \\
+        wget -q -O /tmp/bundletool.jar https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar; \\
+    else \\
+        echo "ERROR: neither curl nor wget available in build image" >&2; exit 1; \\
+    fi
 DOCKERFILE_EOF
 
     log_info "Extended Dockerfile written to ${output_path}"
