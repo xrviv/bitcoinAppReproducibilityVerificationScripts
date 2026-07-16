@@ -1,8 +1,8 @@
 #!/bin/bash
-# bitbox02_build.sh v3.10.0 - WalletScrutiny verification script for BitBox02
+# bitbox02_build.sh v3.11.0 - WalletScrutiny verification script for BitBox02
 # Organization: WalletScrutiny.com
 # Last modified by: Daniel Garcia
-# Date last modified: 2026-06-29 (v3.10.0)
+# Date last modified: 2026-07-15 (v3.11.0)
 # Usage: bitbox02_build.sh --version VERSION [--type TYPE] [--binary PATH] [--arch ARCH]
 #
 # Verifies BitBox02 firmware reproducibility: builds from source via the upstream
@@ -13,7 +13,7 @@
 set -eE
 
 # ---- Globals ----------------------------------------------------------------
-SCRIPT_VERSION="v3.10.0"
+SCRIPT_VERSION="v3.11.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESULTS_FILE="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
 repo="https://github.com/BitBoxSwiss/bitbox02-firmware"
@@ -193,10 +193,14 @@ if [[ "$firmwareType" == "btc" ]]; then
   MAKE_COMMAND="make firmware-btc"
   BUILT_FIRMWARE_PATH="build/bin/firmware-btc.bin"
   SIGNED_FILENAME="firmware-bitbox02-btconly.v${version}.signed.bin"
+  # Product id per src/bootloader/bootloader_product.h (magic 0x11233b0b).
+  EXPECTED_PRODUCT_ID=2
 else
   MAKE_COMMAND="make firmware"
   BUILT_FIRMWARE_PATH="build/bin/firmware.bin"
   SIGNED_FILENAME="firmware-bitbox02-multi.v${version}.signed.bin"
+  # Product id per src/bootloader/bootloader_product.h (magic 0x653f362b).
+  EXPECTED_PRODUCT_ID=1
 fi
 
 DOWNLOAD_URL="${repo}/releases/download/firmware%2Fv${version}/${SIGNED_FILENAME}"
@@ -379,17 +383,57 @@ if len(firmware) != built_size:
 \" \"\$SIGNED\" \"\$BUILT\" > /out/diag.txt 2>&1 || true
     cat /out/diag.txt
 
-    # Device firmware hash: double-sha256 over version (4B at offset 392) + firmware + 0xff padding.
-    # Offset 392 = MAGIC_LEN(4) + SIGNING_PUBKEYS_DATA_LEN(388) per upstream parser constants.
-    dd if=\"\$SIGNED\" bs=1 skip=392 count=4 of=/out/p_version.bin 2>/dev/null
-    FIRMWARE_BYTES=\$(wc -c < /out/p_stripped.bin)
-    dd if=/dev/zero bs=1 count=\$(( 884736 - FIRMWARE_BYTES )) 2>/dev/null \
-      | tr '\000' '\377' > /out/p_padding.bin
-    # Use openssl for binary SHA256 output (xxd not present in the build container).
-    cat /out/p_version.bin /out/p_stripped.bin /out/p_padding.bin \
-      | openssl dgst -sha256 -binary \
-      | sha256sum | awk '{print \$1}' \
-      > /out/hash_device.txt
+    # Edition check + device firmware hash, mirroring upstream releases/describe_signed_firmware.py.
+    #
+    # The 4-byte magic identifies the edition; it must match the edition this run targets,
+    # otherwise a wrong-edition --binary would be compared against the wrong build.
+    #
+    # The hash the device shows at boot is bootloader-dependent. Bootloader v1.2.2 (shipped by
+    # firmware 9.26.2, the mandatory intermediate upgrade) computes
+    # sha256(product_id_le16 + version + padded_firmware) -- see src/bootloader/bootloader.c
+    # _firmware_hash()/_maybe_show_hash(). Firmware monotonic version >= 50 implies that
+    # bootloader is present, which is why upstream branches on 50.
+    # Older bootloaders use the legacy sha256d(version + padded_firmware).
+    python3 -c \"
+import hashlib, struct, sys
+MAGIC_LEN = 4; SIGDATA_LEN = 584; VERSION_OFF = 392; MAX_FIRMWARE_SIZE = 884736
+NEW_SIGHASH_VERSION_CUTOFF = 50
+# magic -> (product_id, label); product ids per src/bootloader/bootloader_product.h
+EDITIONS = {
+    '653f362b': (1, 'BitBox02 Multi'),
+    '11233b0b': (2, 'BitBox02 Bitcoin-only'),
+    '5b648ceb': (3, 'BitBox02 Nova Multi'),
+    '48714774': (4, 'BitBox02 Nova Bitcoin-only'),
+}
+expected_pid = int(sys.argv[2])
+data = open(sys.argv[1], 'rb').read()
+magic = data[:MAGIC_LEN].hex()
+if magic not in EDITIONS:
+    print('ABORT: unrecognized firmware edition magic 0x' + magic, file=sys.stderr)
+    sys.exit(1)
+product_id, label = EDITIONS[magic]
+if product_id != expected_pid:
+    print('ABORT: edition mismatch -- binary is ' + label + ' (magic 0x' + magic +
+          '), but this run targets product id ' + str(expected_pid), file=sys.stderr)
+    sys.exit(1)
+version = data[VERSION_OFF:VERSION_OFF + 4]
+firmware = data[MAGIC_LEN + SIGDATA_LEN:]
+padded = firmware + b'\\xff' * (MAX_FIRMWARE_SIZE - len(firmware))
+monotonic = struct.unpack('<I', version)[0]
+if monotonic >= NEW_SIGHASH_VERSION_CUTOFF:
+    device_hash = hashlib.sha256(struct.pack('<H', product_id) + version + padded).hexdigest()
+    scheme = 'sha256(product_id_le16 + version + padded), bootloader >= v1.2.2'
+else:
+    device_hash = hashlib.sha256(hashlib.sha256(version + padded).digest()).hexdigest()
+    scheme = 'legacy sha256d(version + padded)'
+open('/out/hash_device.txt', 'w').write(device_hash + '\\n')
+open('/out/edition.txt', 'w').write(label + '\\n')
+open('/out/monotonic.txt', 'w').write(str(monotonic) + '\\n')
+open('/out/device_hash_scheme.txt', 'w').write(scheme + '\\n')
+print('edition: ' + label + ' (magic 0x' + magic + ', product id ' + str(product_id) + ')')
+print('monotonic version: ' + str(monotonic))
+print('device hash scheme: ' + scheme)
+\" \"\$SIGNED\" '${EXPECTED_PRODUCT_ID}'
 
     ${INNER_CHOWN} /out
   "; then
@@ -407,14 +451,20 @@ signedHash=$(cat "$workDir/out/hash_signed.txt")
 builtHash=$(cat "$workDir/out/hash_built.txt")
 downloadStrippedSigHash=$(cat "$workDir/out/hash_stripped.txt")
 downloadFirmwareHash=$(cat "$workDir/out/hash_device.txt")
+edition=$(cat "$workDir/out/edition.txt")
+monotonicVersion=$(cat "$workDir/out/monotonic.txt")
+deviceHashScheme=$(cat "$workDir/out/device_hash_scheme.txt")
 
 echo ""
 echo "============================================================"
 echo "VERIFICATION RESULTS:"
+echo "Edition:                     $edition"
+echo "Monotonic version:           $monotonicVersion"
 echo "Signed download:             $signedHash"
 echo "Signed download minus sig:   $downloadStrippedSigHash"
 echo "Built binary:                $builtHash"
 echo "Firmware hash (on device):   $downloadFirmwareHash"
+echo "Device hash scheme:          $deviceHashScheme"
 echo "============================================================"
 
 if [[ "$downloadStrippedSigHash" == "$builtHash" ]]; then
@@ -437,6 +487,8 @@ echo "signedHash:   $signedHash"
 echo "builtHash:    $builtHash"
 echo "unsignedHash: $downloadStrippedSigHash"
 echo "deviceHash:   $downloadFirmwareHash"
+echo "edition:      $edition"
+echo "monotonic:    $monotonicVersion"
 echo "repository:   $repo"
 echo "tag:          $GIT_TAG"
 echo "commit:       $commit"
