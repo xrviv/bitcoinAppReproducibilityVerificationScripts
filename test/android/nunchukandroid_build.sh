@@ -2,7 +2,7 @@
 # ==============================================================================
 # nunchukandroid_build.sh - Nunchuk Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.1
+# Version:       v0.3.3
 # Organization:  WalletScrutiny.com
 # Last Modified: 2026-07-16
 # Project:       https://github.com/nunchuk-io/nunchuk-android
@@ -52,7 +52,7 @@ readonly EXEC_DIR
 # ------------------------------------------------------------------------------
 # Script metadata
 # ------------------------------------------------------------------------------
-readonly SCRIPT_VERSION="v0.2.1"
+readonly SCRIPT_VERSION="v0.3.3"
 readonly SCRIPT_NAME="nunchukandroid_build.sh"
 readonly APP_ID="io.nunchuk.android"
 readonly REPO_URL="https://github.com/nunchuk-io/nunchuk-android.git"
@@ -89,6 +89,8 @@ BUILT_AAB=""
 GIT_TAG=""
 RESULT_DONE=false
 TOTAL_DIFFS=0
+SEMANTIC_UPGRADE="false"
+SEMANTIC_NOTES=""
 
 # ------------------------------------------------------------------------------
 # Logging
@@ -201,6 +203,17 @@ ws_exec() {
         -v "${WORK_DIR}:/work${VOLUME_RW}" \
         -w /work \
         "${WS_CONTAINER}" \
+        sh -c "$cmd"
+}
+
+# Run a command in the version-specific nunchuk build image (java + pinned apktool).
+nunchuk_exec() {
+    local cmd="$1"
+    ${CONTAINER_CMD} run --rm \
+        ${CONTAINER_RUN_EXTRA} \
+        -v "${WORK_DIR}:/work${VOLUME_RW}" \
+        -w /work \
+        "${NUNCHUK_IMAGE_BASE}:${VERSION_SAFE}" \
         sh -c "$cmd"
 }
 
@@ -483,6 +496,17 @@ RUN set -e; \\
     else \\
         echo "ERROR: neither curl nor wget available in build image" >&2; exit 1; \\
     fi
+
+# WalletScrutiny: install apktool (pinned + hash-verified) for decoded manifest/resources comparison
+RUN set -e; \\
+    if command -v curl >/dev/null 2>&1; then \\
+        curl -fsSL -o /tmp/apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v3.0.2/apktool_3.0.2.jar; \\
+    elif command -v wget >/dev/null 2>&1; then \\
+        wget -q -O /tmp/apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v3.0.2/apktool_3.0.2.jar; \\
+    else \\
+        echo "ERROR: neither curl nor wget available in build image" >&2; exit 1; \\
+    fi; \\
+    echo "eee4669a704a14e0623407e6701b0b91887e61e1e4049cb7a82833e14ae8b5fd  /tmp/apktool.jar" | sha256sum -c -
 DOCKERFILE_EOF
 
     log_info "Extended Dockerfile written to ${output_path}"
@@ -494,9 +518,15 @@ DOCKERFILE_EOF
 ensure_build_image() {
     local image_tag="${NUNCHUK_IMAGE_BASE}:${VERSION_SAFE}"
 
+    # Reuse the cached image only if it carries every WalletScrutiny addition;
+    # an image cached by an older script version may lack the newer jars.
     if ${CONTAINER_CMD} image inspect "${image_tag}" >/dev/null 2>&1; then
-        log_info "Build image ${image_tag} already exists, skipping build."
-        return 0
+        if ${CONTAINER_CMD} run --rm "${image_tag}" \
+            sh -c 'test -f /tmp/bundletool.jar && test -f /tmp/apktool.jar' >/dev/null 2>&1; then
+            log_info "Build image ${image_tag} already exists, skipping build."
+            return 0
+        fi
+        log_warn "Cached image ${image_tag} is stale (missing WS tooling) — rebuilding."
     fi
 
     log_info "Building Nunchuk build image ${image_tag}..."
@@ -553,6 +583,11 @@ extract_split_apks_from_aab() {
         -w /work \
         "${image_tag}" \
         bash -c "
+            set -e
+            if ! unzip -tqq \"${aab_rel}\" >/dev/null 2>&1; then
+                echo '[ERROR] Built AAB is not a valid zip archive (corrupt bundle)'
+                exit 1
+            fi
             java -jar /tmp/bundletool.jar build-apks \
                 --bundle=\"${aab_rel}\" \
                 --output=\"${apks_rel}\" \
@@ -560,8 +595,11 @@ extract_split_apks_from_aab() {
                 --mode=default \
                 --overwrite 2>&1
             mkdir -p \"${output_rel}\"
-            unzip -qq -o \"${apks_rel}\" -d \"${output_rel}\" 2>&1 || true
-        "
+            unzip -qq -o \"${apks_rel}\" -d \"${output_rel}\" 2>&1
+        " || {
+        log_fail "bundletool failed to extract split APKs from the built AAB"
+        exit "${EXIT_FAILED}"
+    }
 
     # Normalize: base-master.apk → base.apk
     local splits_subdir="${output_dir}/splits"
@@ -572,6 +610,10 @@ extract_split_apks_from_aab() {
 
     local split_count
     split_count="$(find "${output_dir}" -name "*.apk" | wc -l)"
+    if [[ "${split_count}" -eq 0 ]]; then
+        log_fail "bundletool produced no split APKs in ${output_dir}"
+        exit "${EXIT_FAILED}"
+    fi
     log_info "Extracted ${split_count} split APK(s) to ${output_dir}"
 }
 
@@ -584,7 +626,11 @@ unzip_apk_in_container() {
     local apk_rel out_rel
     apk_rel="${apk_path#"${WORK_DIR}/"}"
     out_rel="${out_dir#"${WORK_DIR}/"}"
-    ws_exec "mkdir -p '${out_rel}' && unzip -qq '${apk_rel}' -d '${out_rel}' 2>/dev/null || true"
+    # unzip rc 0 = clean, 1 = warnings only; anything above is a real failure.
+    ws_exec "mkdir -p '${out_rel}' && { unzip -qq '${apk_rel}' -d '${out_rel}' 2>/dev/null; rc=\$?; [ \"\${rc}\" -le 1 ]; }" || {
+        log_fail "unzip failed for ${apk_path}"
+        exit "${EXIT_FAILED}"
+    }
 }
 
 # ------------------------------------------------------------------------------
@@ -611,17 +657,23 @@ compare_split_apks() {
     built_rel="${built_unzip#"${WORK_DIR}/"}"
     diff_rel="${diff_file#"${WORK_DIR}/"}"
 
+    # diff rc: 0 identical, 1 differences, >=2 operational error. An error line
+    # starts with "diff:" (colon), which DIFF_LINE_MATCH does not count -- so a
+    # swallowed error would read as zero diffs. Fail closed on rc >= 2.
     ws_exec "diff -r \"${official_rel}\" \"${built_rel}\" \
-        > \"${diff_rel}\" 2>&1 || true"
+        > \"${diff_rel}\" 2>&1; rc=\$?; [ \"\${rc}\" -le 1 ]" || {
+        log_fail "diff -r failed (operational error) -- see ${diff_file}"
+        exit "${EXIT_FAILED}"
+    }
 
     local total_lines=0
     local non_meta_count=0
 
     if [[ -s "${diff_file}" ]]; then
         total_lines="$(wc -l < "${diff_file}")"
-        non_meta_count="$(grep -E '^Only in |^Files ' "${diff_file}" \
-            | grep -cvE '^Only in [^/:]+: META-INF$|^Only in [^/:]+/META-INF:|^Files [^/]+/META-INF/' \
-            || echo 0)"
+        non_meta_count="$(grep -E "${DIFF_LINE_MATCH}" "${diff_file}" \
+            | grep -cvE "${META_INF_ROOT_EXCLUDE}" \
+            || true)"
     fi
 
     TOTAL_DIFFS=$(( TOTAL_DIFFS + non_meta_count ))
@@ -633,6 +685,136 @@ compare_split_apks() {
         if [[ "${total_lines}" -gt 5 ]]; then
             log_info "    ... (${total_lines} total lines)"
         fi
+    fi
+
+    if [[ "${non_meta_count}" -gt 0 ]]; then
+        analyze_acceptable_diffs "${official_apk}" "${built_apk}" "${split_label}" "${diff_file}"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Semantic analysis of known binary diffs (policy: resources.arsc.md +
+# verification-reproducibility-guidelines.md). Decodes both APKs with apktool in
+# the WS container and classifies every counted diff line. Sets
+# SEMANTIC_UPGRADE=true only if EVERY diff falls into an acceptable class:
+#   - stamp-cert-sha256 only in official (Google Play SourceStamp)
+#   - AndroidManifest.xml: official-only Play-injected <meta-data> entries
+#   - resources.arsc: decoded res/ identical, or only crashlytics mapping_file_id
+# Anything unexplained keeps the verdict at not_reproducible.
+# ------------------------------------------------------------------------------
+PLAY_META_ALLOWED='com\.android\.stamp\.source|com\.android\.stamp\.type|com\.android\.vending\.derived\.apk\.id|com\.android\.vending\.splits|com\.android\.dynamic\.apk\.fused\.modules'
+
+# Every kind of entry `diff -r` emits for a difference: only-in, brief-mode file
+# notes, binary notes, and per-file headers for text diffs.
+DIFF_LINE_MATCH='^Only in |^Files |^Binary files |^diff '
+# Exclude ONLY the APK-root META-INF signing dir (Leo 2025-10-30: never filter
+# META-INF appearing deeper in the tree). Unzip roots are comparison/<side>_<label>.
+META_INF_ROOT_EXCLUDE='^Only in comparison/(official|built)_[^/:]+: META-INF$|^Only in comparison/(official|built)_[^/:]+/META-INF(/[^:]*)?: |^(Files|Binary files) comparison/(official|built)_[^/]+/META-INF/|^diff (-r )?comparison/(official|built)_[^/]+/META-INF/'
+
+analyze_acceptable_diffs() {
+    local official_apk="$1"
+    local built_apk="$2"
+    local split_label="$3"
+    local diff_file="$4"
+    local results_dir="${WORK_DIR}/comparison"
+
+    log_info "  Semantic analysis of diffs (${split_label})..."
+
+    local counted_lines
+    counted_lines="$(grep -E "${DIFF_LINE_MATCH}" "${diff_file}" \
+        | grep -vE "${META_INF_ROOT_EXCLUDE}" || true)"
+
+    local unexplained="" accepted="" needs_manifest=0 needs_arsc=0
+    while IFS= read -r line; do
+        [[ -z "${line}" ]] && continue
+        if echo "${line}" | grep -qE '^Only in comparison/official_[^/:]+: stamp-cert-sha256$'; then
+            accepted+="stamp-cert-sha256 only in official (Google Play SourceStamp certificate hash)"$'\n'
+        elif echo "${line}" | grep -qE '^Binary files .*AndroidManifest\.xml .* differ$'; then
+            needs_manifest=1
+        elif echo "${line}" | grep -qE '^Binary files .*resources\.arsc .* differ$'; then
+            needs_arsc=1
+        else
+            unexplained+="${line}"$'\n'
+        fi
+    done <<< "${counted_lines}"
+
+    if [[ "${needs_manifest}" -eq 1 || "${needs_arsc}" -eq 1 ]]; then
+        # apktool needs the APKs under the /work mount.
+        cp "${official_apk}" "${results_dir}/official_${split_label}.apk"
+        cp "${built_apk}"    "${results_dir}/built_${split_label}.apk"
+        log_info "  Decoding both APKs with pinned apktool 3.0.2 (nunchuk image, --no-src)..."
+        nunchuk_exec "java -jar /tmp/apktool.jar d -f --no-src --no-debug-info \
+                   'comparison/official_${split_label}.apk' \
+                   -o 'comparison/official_${split_label}_decoded' >/dev/null 2>&1 && \
+                 java -jar /tmp/apktool.jar d -f --no-src --no-debug-info \
+                   'comparison/built_${split_label}.apk' \
+                   -o 'comparison/built_${split_label}_decoded' >/dev/null 2>&1" || {
+            log_warn "  apktool decode failed — semantic analysis inconclusive"
+            unexplained+="apktool decode failed"$'\n'
+            needs_manifest=0
+            needs_arsc=0
+        }
+    fi
+
+    if [[ "${needs_manifest}" -eq 1 ]]; then
+        local mf_diff_file="${results_dir}/diff_manifest_decoded_${split_label}.txt"
+        ws_exec "diff 'comparison/official_${split_label}_decoded/AndroidManifest.xml' \
+                      'comparison/built_${split_label}_decoded/AndroidManifest.xml' \
+                 > 'comparison/diff_manifest_decoded_${split_label}.txt' 2>&1 || true"
+        local mf_changed mf_bad
+        # Notable = everything except hunk-position lines, separators, and blanks.
+        # This keeps diff error messages and any other noise, which then fail closed.
+        mf_changed="$(grep -vE '^[0-9]+(,[0-9]+)?[acd][0-9]+(,[0-9]+)?$|^---$|^$' "${mf_diff_file}" 2>/dev/null || true)"
+        # Acceptable: ONLY official-side (<) meta-data lines whose android:name is
+        # a documented Google Play injection. Any built-side (>) line, other
+        # official-side line, or non-diff noise is unexplained.
+        mf_bad="$(echo "${mf_changed}" \
+            | grep -vE "^< *<meta-data android:name=\"(${PLAY_META_ALLOWED})\"" \
+            | grep -vE '^$' || true)"
+        if [[ -z "${mf_changed}" ]]; then
+            accepted+="AndroidManifest.xml: binary differs, decoded content IDENTICAL (non-semantic artifact)"$'\n'
+        elif [[ -z "${mf_bad}" ]]; then
+            accepted+="AndroidManifest.xml: only Google Play-injected meta-data in official (stamp.source, stamp.type, derived.apk.id class) — see $(basename "${mf_diff_file}")"$'\n'
+        else
+            unexplained+="AndroidManifest.xml decoded diff has non-Play-injection changes — see $(basename "${mf_diff_file}")"$'\n'
+        fi
+    fi
+
+    if [[ "${needs_arsc}" -eq 1 ]]; then
+        local rs_diff_file="${results_dir}/diff_resources_decoded_${split_label}.txt"
+        ws_exec "diff -r 'comparison/official_${split_label}_decoded/res' \
+                         'comparison/built_${split_label}_decoded/res' \
+                 > 'comparison/diff_resources_decoded_${split_label}.txt' 2>&1 || true"
+        local rs_changed rs_bad
+        # Notable = everything except per-file `diff -r` headers, hunk-position
+        # lines, separators, and blanks. `Only in` lines (added/removed decoded
+        # files) and diff error messages stay notable and fail closed.
+        rs_changed="$(grep -vE '^diff -r |^[0-9]+(,[0-9]+)?[acd][0-9]+(,[0-9]+)?$|^---$|^$' "${rs_diff_file}" 2>/dev/null || true)"
+        rs_bad="$(echo "${rs_changed}" \
+            | grep -v 'com.google.firebase.crashlytics.mapping_file_id' \
+            | grep -vE '^$' || true)"
+        if [[ -z "${rs_changed}" ]]; then
+            accepted+="resources.arsc: binary differs, decoded res/ IDENTICAL (non-semantic artifact)"$'\n'
+        elif [[ -z "${rs_bad}" ]]; then
+            accepted+="resources.arsc: sole decoded diff is com.google.firebase.crashlytics.mapping_file_id (build-time ID, acceptable per WS policy) — see $(basename "${rs_diff_file}")"$'\n'
+        else
+            unexplained+="resources.arsc decoded res/ diff has non-crashlytics changes — see $(basename "${rs_diff_file}")"$'\n'
+        fi
+    fi
+
+    if [[ -n "${accepted}" ]]; then
+        log_info "  Acceptable diffs:"
+        echo "${accepted}" | sed '/^$/d; s/^/    - /'
+    fi
+
+    if [[ -z "${unexplained//[$'\n ']}" ]]; then
+        SEMANTIC_UPGRADE="true"
+        SEMANTIC_NOTES="${accepted}"
+        log_pass "  All diffs are documented acceptable classes — verdict upgraded to reproducible."
+    else
+        SEMANTIC_UPGRADE="false"
+        log_warn "  Unexplained diffs remain — verdict stays not_reproducible:"
+        echo "${unexplained}" | sed '/^$/d; s/^/    ! /'
     fi
 }
 
@@ -659,16 +841,22 @@ compare_universal_apks() {
     built_rel="${built_unzip#"${WORK_DIR}/"}"
     diff_rel="${diff_file#"${WORK_DIR}/"}"
 
+    # diff rc: 0 identical, 1 differences, >=2 operational error. An error line
+    # starts with "diff:" (colon), which DIFF_LINE_MATCH does not count -- so a
+    # swallowed error would read as zero diffs. Fail closed on rc >= 2.
     ws_exec "diff -r \"${official_rel}\" \"${built_rel}\" \
-        > \"${diff_rel}\" 2>&1 || true"
+        > \"${diff_rel}\" 2>&1; rc=\$?; [ \"\${rc}\" -le 1 ]" || {
+        log_fail "diff -r failed (operational error) -- see ${diff_file}"
+        exit "${EXIT_FAILED}"
+    }
 
     TOTAL_DIFFS=0
     if [[ -s "${diff_file}" ]]; then
         local total_lines
         total_lines="$(wc -l < "${diff_file}")"
-        TOTAL_DIFFS="$(grep -E '^Only in |^Files ' "${diff_file}" \
-            | grep -cvE '^Only in [^/:]+: META-INF$|^Only in [^/:]+/META-INF:|^Files [^/]+/META-INF/' \
-            || echo 0)"
+        TOTAL_DIFFS="$(grep -E "${DIFF_LINE_MATCH}" "${diff_file}" \
+            | grep -cvE "${META_INF_ROOT_EXCLUDE}" \
+            || true)"
         log_info "diff_full.txt: ${TOTAL_DIFFS} non-META-INF diff(s) (${total_lines} total lines)"
         log_info "First 5 lines (full diff: ${diff_file}):"
         head -5 "${diff_file}" | while IFS= read -r line; do echo "  ${line}"; done
@@ -677,6 +865,10 @@ compare_universal_apks() {
         fi
     else
         log_pass "No differences found."
+    fi
+
+    if [[ "${TOTAL_DIFFS}" -gt 0 ]]; then
+        analyze_acceptable_diffs "${official_apk}" "${built_apk}" "universal" "${diff_file}"
     fi
 }
 
@@ -889,18 +1081,22 @@ build() {
             echo '[INFO] Running ./gradlew ${gradle_task}...'
             ./gradlew ${gradle_task} \
                 --no-daemon \
-                --stacktrace \
-                -Dorg.gradle.jvmargs='-Xmx8g -Xms2g -XX:MaxMetaspaceSize=512m'
+                --stacktrace
 
-            # Copy build outputs back to workspace (disorderfs mount is read-only for outputs)
-            echo '[INFO] Copying build outputs to workspace...'
-            find /build-src -name '*.aab' -o -name '*.apk' 2>/dev/null \
-                | grep -v '/intermediates/' \
-                | while read -r f; do
-                    rel=\"\${f#/build-src/}\"
-                    mkdir -p \"/workspace/app/\$(dirname \"\${rel}\")\"
-                    cp \"\${f}\" \"/workspace/app/\${rel}\" 2>/dev/null || true
-                done || true
+            # Copy outputs back only when /build-src is a real separate dir (disorderfs
+            # fallback); with the mount active this cp is a destructive self-copy.
+            if ! mountpoint -q /build-src; then
+                echo '[INFO] Copying build outputs to workspace...'
+                find /build-src -name '*.aab' -o -name '*.apk' 2>/dev/null \
+                    | grep -v '/intermediates/' \
+                    | while read -r f; do
+                        rel=\"\${f#/build-src/}\"
+                        mkdir -p \"/workspace/app/\$(dirname \"\${rel}\")\"
+                        cp \"\${f}\" \"/workspace/app/\${rel}\" 2>/dev/null || true
+                    done || true
+            else
+                echo '[INFO] disorderfs mount active; outputs already in workspace.'
+            fi
 
             echo '[INFO] Build complete.'
         "
@@ -1013,9 +1209,14 @@ extract_and_compare() {
 result() {
     log_info "=== RESULT PHASE ==="
 
-    local verdict
+    local verdict semantic_summary=""
     if [[ "${TOTAL_DIFFS}" -eq 0 ]]; then
         verdict="reproducible"
+    elif [[ "${SEMANTIC_UPGRADE}" == "true" ]]; then
+        verdict="reproducible"
+        semantic_summary="
+  All ${TOTAL_DIFFS} diff(s) are documented acceptable classes (decoded evidence in comparison/):
+$(echo "${SEMANTIC_NOTES}" | sed '/^$/d; s/^/    - /')"
     else
         verdict="not_reproducible"
     fi
@@ -1024,11 +1225,11 @@ result() {
     if [[ "${BUILD_MODE}" == "split" ]]; then
         notes="Split mode: official $(basename "${OFFICIAL_APK}") vs built split from ${GIT_TAG}.
   Build: ./gradlew bundleProductionRelease with disorderfs (reproducible directory ordering).
-  Non-META-INF diffs: ${TOTAL_DIFFS}."
+  Non-META-INF diffs: ${TOTAL_DIFFS}.${semantic_summary}"
     else
         notes="GitHub mode: official APK from GitHub releases vs built assembleProductionRelease.
   Build: ./gradlew assembleProductionRelease with disorderfs (reproducible directory ordering).
-  Tag: ${GIT_TAG}. Non-META-INF diffs: ${TOTAL_DIFFS}."
+  Tag: ${GIT_TAG}. Non-META-INF diffs: ${TOTAL_DIFFS}.${semantic_summary}"
     fi
 
     generate_comparison_yaml "${verdict}" "${notes}"
