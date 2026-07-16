@@ -1,13 +1,73 @@
 #!/bin/bash
-# bitbox2nova_build.sh v2.1.0 - Standardized verification script for BitBox02 Nova Hardware Wallet
+# bitbox2nova_build.sh v3.1.0 - WalletScrutiny verification script for BitBox02 Nova
 # Organization: WalletScrutiny.com
-# Follows WalletScrutiny reproducible verification standards
-# Usage: bitbox2nova_build.sh --version VERSION [--type TYPE] [--binary FILE]
+# Last modified by: Daniel Garcia
+# Date last modified: 2026-07-15 (v3.1.0)
+# Usage: bitbox2nova_build.sh --version VERSION [--type TYPE] [--binary PATH] [--arch ARCH]
+#
+# Verifies BitBox02 Nova firmware reproducibility: builds from source via the upstream
+# Dockerfile at the release tag, then compares the locally-built unsigned firmware
+# against the official signed binary with its first 588 bytes (header + signatures) stripped.
+# Host requirements: docker or podman only.
 
-set -e
+set -eE
 
-# Display disclaimer
-echo -e "\033[1;33m"
+# ---- Globals ----------------------------------------------------------------
+SCRIPT_VERSION="v3.1.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RESULTS_FILE="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
+repo="https://github.com/BitBoxSwiss/bitbox02-firmware"
+
+firmwareType="btc"
+version=""
+binaryPath=""
+ARCH=""
+
+HOST_UID=$(id -u)
+HOST_GID=$(id -g)
+
+EXIT_OK=0
+EXIT_FAIL=1
+EXIT_INVALID=2
+
+YELLOW='\033[1;33m'
+GREEN='\033[1;32m'
+RED='\033[1;31m'
+NC='\033[0m'
+
+# ---- Results writer (single-line notes, minimal 3-field YAML) ---------------
+write_results() {
+  local verdict="$1"
+  local notes="$2"
+  notes="${notes//\\/ }"
+  notes="${notes//\"/\'}"
+  notes="${notes//$'\n'/ }"
+  notes="${notes//$'\r'/ }"
+  cat > "$RESULTS_FILE" << EOF
+script_version: ${SCRIPT_VERSION}
+verdict: ${verdict}
+notes: "${notes}"
+EOF
+  echo -e "${GREEN}Results written to: $RESULTS_FILE${NC}"
+}
+
+# ---- ERR trap ---------------------------------------------------------------
+handle_err() {
+  local rc=$?
+  echo -e "${RED}Unexpected error (exit ${rc}).${NC}"
+  write_results "ftbfs" "BitBox02 Nova v${version:-?} (${firmwareType}): unexpected error (exit ${rc}) during verification."
+  exit "$EXIT_FAIL"
+}
+trap handle_err ERR
+
+# ---- Root check -------------------------------------------------------------
+if [[ "$(id -u)" -eq 0 ]]; then
+  echo -e "${RED}Error: do not run this script as root.${NC}"
+  exit "$EXIT_FAIL"
+fi
+
+# ---- Disclaimer -------------------------------------------------------------
+echo -e "${YELLOW}"
 echo "=============================================================================="
 echo "                               DISCLAIMER"
 echo "=============================================================================="
@@ -15,466 +75,473 @@ echo "Please examine this script yourself prior to running it."
 echo "This script is provided as-is without warranty and may contain bugs or"
 echo "security vulnerabilities. Use at your own risk."
 echo "=============================================================================="
-echo -e "\033[0m"
+echo -e "${NC}"
 sleep 2
 echo
 
-# Global Variables
-SCRIPT_VERSION="v2.1.0"
-BUILD_TYPE="firmware"
-EXEC_DIR="$(pwd)"
-RESULTS_FILE="${EXEC_DIR}/COMPARISON_RESULTS.yaml"
-EXIT_INVALID=2   # invalid/missing parameters (ABS convention)
-
-# Detect container runtime
-if command -v docker &> /dev/null; then
-    CONTAINER_CMD="docker"
-    echo "Using Docker for containerization"
-elif command -v podman &> /dev/null; then
-    CONTAINER_CMD="podman"
-    echo "Using Podman for containerization"
+# ---- Container runtime detection --------------------------------------------
+if command -v docker &>/dev/null && docker info &>/dev/null; then
+  CONTAINER_CMD="docker"
+elif command -v podman &>/dev/null; then
+  CONTAINER_CMD="podman"
+elif command -v docker &>/dev/null; then
+  echo -e "${RED}Error: docker is installed but its daemon is not responding, and podman is unavailable.${NC}"
+  write_results "ftbfs" "BitBox02 Nova: docker daemon not responding and podman unavailable."
+  exit "$EXIT_FAIL"
 else
-    echo "Error: Neither docker nor podman found. Please install Docker or Podman."
-    exit 1
+  echo -e "${RED}Error: neither docker nor podman found. Install one of them.${NC}"
+  write_results "ftbfs" "BitBox02 Nova: no container runtime (docker/podman) available on host."
+  exit "$EXIT_FAIL"
+fi
+echo "Container runtime: $CONTAINER_CMD"
+
+# ---- Ownership helpers ------------------------------------------------------
+# Docker containers run as real root; chown inside the container correctly sets
+# host ownership to HOST_UID:HOST_GID.
+#
+# Rootless Podman maps container root (UID 0) to the real host user, so files
+# created as root are already accessible. However chown to a non-zero UID inside
+# a rootless Podman container maps to a subordinate host UID (~subuid range), making
+# files inaccessible. Strategy: skip in-container chown for Podman; use
+# podman unshare chown on the host side instead.
+if [[ "$CONTAINER_CMD" == "docker" ]]; then
+  INNER_CHOWN="chown -R ${HOST_UID}:${HOST_GID}"
+else
+  INNER_CHOWN=":"
 fi
 
-# Color constants
-YELLOW='\033[1;33m'
-GREEN='\033[1;32m'
-RED='\033[1;31m'
-NC='\033[0m'
+repair_ownership() {
+  if [[ "$CONTAINER_CMD" == "podman" ]]; then
+    podman unshare chown -R 0:0 "$1" 2>/dev/null || true
+  fi
+}
 
-# BitBox02 Nova constants
-firmwareType="btc"  # Default to BTC-only (normalized below)
-arch=""             # Accepted for ABS compliance; firmware has a single device arch
-providedBinary=""   # Optional official artifact supplied via --binary
-verdict=""
-notes=""
-exit_code=1
-
+# ---- Usage ------------------------------------------------------------------
 usage() {
   echo 'NAME
        bitbox2nova_build.sh - verify BitBox02 Nova hardware wallet firmware
 
 SYNOPSIS
-       bitbox2nova_build.sh --version VERSION [--type TYPE] [--binary FILE]
+       bitbox2nova_build.sh --version VERSION [--type TYPE] [--binary PATH] [--arch ARCH]
 
 DESCRIPTION
-       This command verifies firmware builds of BitBox02 Nova hardware wallet.
-       Follows the WalletScrutiny standardized verification script format.
-
-       --version   Firmware version (e.g., "9.23.3")
-       --type      Firmware edition: btc (a.k.a. btc-only/bitcoin) or multi.
-                   Default: btc.
-       --arch      Accepted for build-server compatibility. BitBox02 firmware
-                   has a single device architecture, so this does not select a
-                   variant; it is recorded only.
-       --binary    Path to the official signed firmware artifact to compare
-                   against. When omitted, the script downloads it from GitHub.
+       --version   Firmware version (e.g., "9.23.3"). Required.
+       --type      Firmware type: btc|multi (default: btc)
+       --binary    Path to official firmware binary. If omitted, downloaded automatically.
+       --arch      Accepted for compatibility; ignored (build is always linux/amd64).
+       --apk       Accepted for compatibility; ignored (not applicable to firmware).
 
 EXAMPLES
        bitbox2nova_build.sh --version 9.23.3
        bitbox2nova_build.sh --version 9.23.3 --type multi
-       bitbox2nova_build.sh --version 9.23.3 --binary /path/to/firmware.signed.bin'
+       bitbox2nova_build.sh --version 9.23.3 --type btc --binary /path/to/firmware.bin'
 }
 
-# Parse arguments
-# NOTE: unknown arguments must never be fatal (WS ABS requirement, 2026-03-11).
+# ---- Argument parsing (unknown args warn and continue; never fatal) ----------
 while [[ "$#" -gt 0 ]]; do
-  case $1 in
-    --version) version="$2"; shift ;;
-    --type) firmwareType="$2"; shift ;;
-    --arch) arch="$2"; shift ;;
-    --binary|--apk) providedBinary="$2"; shift ;;
-    --help) usage; exit 0 ;;
-    *) echo -e "${YELLOW}WARN: Ignoring unknown argument: $1${NC}" >&2 ;;
+  case "$1" in
+    --version) version="${2:-}";      shift 2 || shift ;;
+    --type)    firmwareType="${2:-}"; shift 2 || shift ;;
+    --binary)  binaryPath="${2:-}";   shift 2 || shift ;;
+    --arch)    ARCH="${2:-}";         shift 2 || shift ;;
+    --apk)                            shift 2 || shift ;;
+    --help)    usage; exit "$EXIT_OK" ;;
+    *)         echo "Warning: unknown argument '$1' (ignored)"; shift ;;
   esac
-  shift
 done
 
-# Validate inputs
-if [ -z "$version" ]; then
-  echo "Error: Version is required!"
-  echo
+# ---- Validate inputs --------------------------------------------------------
+if [[ -z "$version" ]]; then
+  echo -e "${RED}Error: --version is required.${NC}"
   usage
-  exit $EXIT_INVALID
+  write_results "ftbfs" "BitBox02 Nova: --version is required."
+  exit "$EXIT_INVALID"
 fi
 
-# Normalize firmware type. The wallet .md `builds:` types may be expressed as
-# btc-only/bitcoin (BTC-only edition) or multi (multi-coin edition). Per the WS
-# rule that unknown/extra parameter values must never be fatal, an unrecognized
-# value warns and falls back to the btc default instead of exiting.
+if ! [[ "$version" =~ ^[0-9]+(\.[0-9]+)*([._-][A-Za-z0-9]+)?$ ]]; then
+  echo -e "${RED}Error: --version '${version}' contains unsafe characters.${NC}"
+  write_results "ftbfs" "BitBox02 Nova: --version '${version}' contains unsafe characters."
+  exit "$EXIT_INVALID"
+fi
+
+# Unknown --type is an error, not a silent default — a typo on --type multi
+# must not silently verify the wrong firmware edition.
 case "${firmwareType,,}" in
   btc|btc-only|btconly|bitcoin) firmwareType="btc" ;;
-  multi|multicoin) firmwareType="multi" ;;
+  multi|multicoin)               firmwareType="multi" ;;
   *)
-    echo -e "${YELLOW}WARN: Unrecognized --type '${firmwareType}', defaulting to btc${NC}" >&2
-    firmwareType="btc"
+    echo -e "${RED}Error: --type '${firmwareType}' is invalid. Must be: btc or multi.${NC}"
+    write_results "ftbfs" "BitBox02 Nova: --type '${firmwareType}' is invalid. Must be: btc or multi."
+    exit "$EXIT_INVALID"
     ;;
 esac
 
-# Parallel-safety (script_verifications.md rule 7): the build server launches
-# arch/type combinations concurrently, so per-combination resource names must be
-# unique to avoid clobbering each other's work dir and container image.
-workDir="${EXEC_DIR}/bitbox02-nova-work-${firmwareType}"
-IMAGE_TAG="bitbox02-nova-firmware-${firmwareType}"
+if [[ -n "$binaryPath" && ! -f "$binaryPath" ]]; then
+  echo -e "${RED}Error: binary file not found: $binaryPath${NC}"
+  write_results "ftbfs" "BitBox02 Nova: binary file not found: ${binaryPath}."
+  exit "$EXIT_INVALID"
+fi
+
+if [[ -n "$binaryPath" ]] && ! [[ "$binaryPath" =~ ^/ ]]; then
+  binaryPath="$PWD/$binaryPath"
+fi
+
+# ---- Type-specific variables ------------------------------------------------
+# PID in workDir and IMAGE_TAG prevents parallel-run collisions.
+RUN_ID="${version}_${firmwareType}_$$"
+workDir="$(pwd)/bitbox02nova-work_${RUN_ID}"
+IMAGE_TAG="bitbox02nova-firmware_${RUN_ID}"
+
+if [[ "$firmwareType" == "btc" ]]; then
+  MAKE_COMMAND="make firmware-btc"
+  BUILT_FIRMWARE_PATH="build/bin/firmware-btc.bin"
+  SIGNED_FILENAME="firmware-bitbox02nova-btconly.v${version}.signed.bin"
+  # Pre-v9.25.1 BTC-only editions used a separate tag; from v9.25.1 unified under firmware/vX.
+  LEGACY_TAG="firmware-btc-only/v${version}"
+  # Product id per src/bootloader/bootloader_product.h (magic 0x48714774).
+  EXPECTED_PRODUCT_ID=4
+else
+  MAKE_COMMAND="make firmware"
+  BUILT_FIRMWARE_PATH="build/bin/firmware.bin"
+  SIGNED_FILENAME="firmware-bitbox02nova-multi.v${version}.signed.bin"
+  LEGACY_TAG=""
+  # Product id per src/bootloader/bootloader_product.h (magic 0x5b648ceb).
+  EXPECTED_PRODUCT_ID=3
+fi
+
+MAX_RETRIES=3
 
 echo
-echo "Verifying BitBox02 Nova firmware version $version ($firmwareType)${arch:+, arch=$arch}"
+echo "Verifying BitBox02 Nova firmware v${version} (${firmwareType})"
 echo
 
-# Return 0 if the given upstream tag exists on the remote.
-tag_exists() {
-  local t="$1"
-  local url="https://github.com/BitBoxSwiss/bitbox02-firmware"
-  [[ -n "${GITHUB_TOKEN:-}" ]] && url="https://x-access-token:${GITHUB_TOKEN}@github.com/BitBoxSwiss/bitbox02-firmware"
-  git ls-remote --tags "$url" "refs/tags/${t}" 2>/dev/null | grep -q "refs/tags/${t}$"
-}
+# ---- Prepare workspace ------------------------------------------------------
+# Three isolated subdirectories keep the cloned repo completely clean:
+#   src/      — cloned source (never written to after clone; git must stay clean)
+#   official/ — official signed firmware binary (separate from src so git sees nothing)
+#   out/      — comparison outputs (hash files, diag, stripped binary)
+echo "Setting up verification environment..."
+rm -rf "$workDir"
+mkdir -p "$workDir/official" "$workDir/out"
 
-prepare() {
-  echo "Setting up verification environment..."
-
-  # Detect system architecture
-  ARCH=$(uname -m)
-  echo "System Architecture: $ARCH"
-
-  # Per-edition build settings (independent of the upstream tag scheme).
-  if [[ "$firmwareType" == "btc" ]]; then
-    MAKE_COMMAND="make firmware-btc"
-    FIRMWARE_PREFIX="firmware-btc"
-    BUILT_FIRMWARE_PATH="build/bin/firmware-btc.bin"
-    SIGNED_FILENAME="firmware-bitbox02nova-btconly.v${version}.signed.bin"
-    LEGACY_TAG="firmware-btc-only/v${version}"
-  else
-    MAKE_COMMAND="make firmware"
-    FIRMWARE_PREFIX="firmware"
-    BUILT_FIRMWARE_PATH="build/bin/firmware.bin"
-    SIGNED_FILENAME="firmware-bitbox02nova-multi.v${version}.signed.bin"
-    LEGACY_TAG=""
-  fi
-
-  # Resolve the upstream tag. Through v9.25.0 the BTC-only edition had its own
-  # `firmware-btc-only/vX` tag; from v9.25.1 the repo unified everything under
-  # `firmware/vX` (editions differ only by make target, and all signed assets
-  # live on the one release). Probe the legacy tag first, then fall back.
-  VERSION="firmware/v${version}"
-  if [[ -n "$LEGACY_TAG" ]] && tag_exists "$LEGACY_TAG"; then
-    VERSION="$LEGACY_TAG"
-  fi
-  echo "Resolved upstream tag: $VERSION"
-
-  # Release asset path mirrors the resolved tag (slashes URL-encoded).
-  RELEASE_TAG_PATH="${VERSION//\//%2F}"
-  DOWNLOAD_URL="https://github.com/BitBoxSwiss/bitbox02-firmware/releases/download/${RELEASE_TAG_PATH}/${SIGNED_FILENAME}"
-
-  # cleanup any existing work
-  rm -rf "$workDir" || true
-  mkdir -p "$workDir"
-  cd "$workDir"
-
-  echo "Using version tag: $VERSION"
-  echo "Make command: $MAKE_COMMAND"
-  echo "Download URL: $DOWNLOAD_URL"
-  echo -e "${GREEN}Environment prepared${NC}"
-}
-
-build_firmware() {
-  echo "Cloning BitBox02 firmware repository..."
-
-  cd "$workDir"
-
-  # Use the build server's GITHUB_TOKEN when available (rule 8) to avoid
-  # unauthenticated rate limits; fall back to anonymous clone otherwise.
-  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-    CLONE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/BitBoxSwiss/bitbox02-firmware"
-  else
-    CLONE_URL="https://github.com/BitBoxSwiss/bitbox02-firmware"
-  fi
-
-  MAX_RETRIES=3
-  retry_count=0
-  while [ $retry_count -lt $MAX_RETRIES ]; do
-    if git clone --depth 1 --branch "$VERSION" --recurse-submodules "$CLONE_URL" temp; then
-      break
-    fi
-    retry_count=$((retry_count + 1))
-    if [ $retry_count -eq $MAX_RETRIES ]; then
-      echo -e "${RED}Failed to clone repository after $MAX_RETRIES attempts${NC}"
-      write_results "ftbfs" "repository clone failed"
-      exit 1
-    fi
-    echo "Clone failed, retrying in 5 seconds..."
-    sleep 5
-  done
-
-  cd temp
-
-  # Fetch tags
-  git fetch --tags
-
-  # Apply version-specific patches if needed
-  if [[ "$VERSION" == "firmware-btc-only/v9.15.0" || "$VERSION" == "firmware/v9.15.0" ]]; then
-    echo "Applying patch for v9.15.0..."
-    sed -i 's/RUN CARGO_HOME=\/opt\/cargo cargo install bindgen-cli --version 0.65.1/RUN CARGO_HOME=\/opt\/cargo cargo install bindgen-cli --version 0.65.1 --locked/' Dockerfile
-  fi
-
-  # Check if Nova-specific build targets exist
-  echo "Configuring for BitBox02 Nova build..."
-  if grep -q "firmware-nova" Makefile 2>/dev/null; then
-    if [[ "$firmwareType" == "btc" ]]; then
-      MAKE_COMMAND="make firmware-nova-btc"
-    else
-      MAKE_COMMAND="make firmware-nova"
-    fi
-    echo "Using Nova-specific make command: $MAKE_COMMAND"
-  else
-    echo "Using standard firmware build (Nova features included in main build)"
-  fi
-
-  # Modify Dockerfile for explicit architecture
-  echo "Configuring Dockerfile for architecture: $ARCH"
-  case "$ARCH" in
-    x86_64)
-      sed -i 's|go1.19.3.linux-${TARGETARCH}|go1.19.3.linux-amd64|g' Dockerfile
-      ;;
-    aarch64|arm64)
-      sed -i 's|go1.19.3.linux-${TARGETARCH}|go1.19.3.linux-arm64|g' Dockerfile
-      ;;
-    *)
-      echo -e "${RED}Unsupported architecture: $ARCH${NC}"
-      write_results "ftbfs" "unsupported build architecture: $ARCH"
-      exit 1
-      ;;
-  esac
-
-  echo "Building Docker image for BitBox02 Nova firmware..."
-  if ! $CONTAINER_CMD build --pull --platform linux/amd64 --force-rm --no-cache -t "$IMAGE_TAG" .; then
-    echo -e "${RED}Docker build failed!${NC}"
-    write_results "ftbfs" "docker image build failed"
-    exit 1
-  fi
-
-  # Revert local Dockerfile patch
-  git checkout -- Dockerfile
-
-  echo "Running firmware build command: $MAKE_COMMAND"
-  if ! $CONTAINER_CMD run -it --rm --volume "$(pwd)":/bb02 "$IMAGE_TAG" bash -c "git config --global --add safe.directory /bb02 && cd /bb02 && $MAKE_COMMAND"; then
-    echo -e "${RED}Firmware build failed!${NC}"
-    write_results "ftbfs" "firmware build command failed"
-    exit 1
-  fi
-
-  echo -e "${GREEN}Firmware build completed successfully!${NC}"
-}
-
-download_and_compare() {
-  cd "$workDir/temp"
-
-  if [[ -n "$providedBinary" ]]; then
-    # Use the official artifact supplied via --binary instead of downloading.
-    if [[ ! -s "$providedBinary" ]]; then
-      echo -e "${RED}Error: --binary file '$providedBinary' is missing or empty${NC}" >&2
-      write_results "ftbfs" "provided --binary artifact missing or empty"
-      exit 1
-    fi
-    echo "Using official firmware supplied via --binary: $providedBinary"
-    cp "$providedBinary" "$SIGNED_FILENAME"
-  else
-    echo "Downloading official signed Nova firmware..."
-    echo "URL: $DOWNLOAD_URL"
-
-    # Pass the build server's GITHUB_TOKEN (rule 8) when present.
-    WGET_AUTH=()
-    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-      WGET_AUTH=(--header="Authorization: Bearer ${GITHUB_TOKEN}")
-    fi
-
-    MAX_RETRIES=3
-    retry_count=0
-    while [ $retry_count -lt $MAX_RETRIES ]; do
-      if wget "${WGET_AUTH[@]}" -O "$SIGNED_FILENAME" "$DOWNLOAD_URL"; then
-        break
-      fi
-      status=$?
-      if [[ $status -eq 8 ]]; then
-        echo -e "${YELLOW}Warning: Received HTTP 404 from ${DOWNLOAD_URL}${NC}" >&2
-
-        # Try alternative Nova naming patterns
-        ALT_SIGNED_FILENAME="firmware-nova-${firmwareType}.v${version}.signed.bin"
-        ALT_DOWNLOAD_URL="https://github.com/BitBoxSwiss/bitbox02-firmware/releases/download/${RELEASE_TAG_PATH}/${ALT_SIGNED_FILENAME}"
-        echo -e "${YELLOW}Trying alternative URL: ${ALT_DOWNLOAD_URL}${NC}" >&2
-
-        if wget "${WGET_AUTH[@]}" -O "$ALT_SIGNED_FILENAME" "$ALT_DOWNLOAD_URL"; then
-          SIGNED_FILENAME="$ALT_SIGNED_FILENAME"
-          break
+# ---- Clone + tag resolution inside container --------------------------------
+# For BTC-only pre-v9.25.1, the upstream used firmware-btc-only/vX; from v9.25.1
+# everything unified under firmware/vX. Probe the legacy tag inside Alpine first.
+echo "Resolving upstream tag and cloning repository..."
+retry_count=0
+while [[ $retry_count -lt $MAX_RETRIES ]]; do
+  if $CONTAINER_CMD run --rm \
+    --volume "$workDir:/work" \
+    alpine \
+    sh -c "
+      set -e
+      rm -rf /work/src
+      apk add --no-cache git >/dev/null 2>&1
+      RESOLVED_TAG='firmware/v${version}'
+      if [ -n '${LEGACY_TAG}' ]; then
+        if git ls-remote --tags '${repo}' 'refs/tags/${LEGACY_TAG}' 2>/dev/null \
+            | grep -q 'refs/tags/${LEGACY_TAG}\$'; then
+          RESOLVED_TAG='${LEGACY_TAG}'
         fi
       fi
-      retry_count=$((retry_count + 1))
-      if [ $retry_count -eq $MAX_RETRIES ]; then
-        echo -e "${RED}Failed to download firmware after $MAX_RETRIES attempts${NC}" >&2
-        write_results "ftbfs" "official firmware download failed"
-        exit 1
-      fi
-      echo "Download failed, retrying in 5 seconds..."
-      sleep 5
-    done
+      echo \"\$RESOLVED_TAG\" > /work/resolved_tag.txt
+      git clone --branch \"\$RESOLVED_TAG\" --recurse-submodules '${repo}' /work/src
+      cd /work/src
+      git fetch --tags
+      git rev-parse HEAD > /work/commit.txt
+      ${INNER_CHOWN} /work
+    "; then
+    break
   fi
-
-  if [[ ! -s "$SIGNED_FILENAME" ]]; then
-    echo -e "${RED}Error: Official asset '$SIGNED_FILENAME' is missing or empty${NC}" >&2
-    write_results "ftbfs" "official firmware artifact missing or empty"
-    exit 1
+  retry_count=$(( retry_count + 1 ))
+  if [[ $retry_count -eq $MAX_RETRIES ]]; then
+    echo -e "${RED}Failed to clone repository after $MAX_RETRIES attempts.${NC}"
+    write_results "ftbfs" "BitBox02 Nova v${version} (${firmwareType}): failed to clone repository."
+    exit "$EXIT_FAIL"
   fi
+  echo "Clone failed, retrying in 5 seconds..."
+  sleep 5
+done
+repair_ownership "$workDir"
 
-  echo "Calculating hashes..."
-
-  # Calculate hash of signed download
-  signedHash=$(sha256sum "$SIGNED_FILENAME" | awk '{print $1}')
-  echo "Hash of signed download: $signedHash"
-
-  # Calculate hash of built binary
-  builtHash=$(sha256sum "$BUILT_FIRMWARE_PATH" | awk '{print $1}')
-  echo "Hash of built binary: $builtHash"
-
-  # Unpack signed binary (remove signature)
-  echo "Unpacking signed binary..."
-  head -c 588 "$SIGNED_FILENAME" > p_head.bin
-  tail -c +589 "$SIGNED_FILENAME" > p_${FIRMWARE_PREFIX}.bin
-
-  if [[ ! -s "p_${FIRMWARE_PREFIX}.bin" ]]; then
-    echo -e "${YELLOW}Warning: Standard signature extraction failed, trying Nova-specific format...${NC}" >&2
-
-    # Try alternative signature format
-    head -c 600 "$SIGNED_FILENAME" > p_head_alt.bin
-    tail -c +601 "$SIGNED_FILENAME" > p_${FIRMWARE_PREFIX}_alt.bin
-
-    if [[ -s "p_${FIRMWARE_PREFIX}_alt.bin" ]]; then
-      mv p_head_alt.bin p_head.bin
-      mv p_${FIRMWARE_PREFIX}_alt.bin p_${FIRMWARE_PREFIX}.bin
-    else
-      echo -e "${RED}Error: Failed to extract unsigned payload from '$SIGNED_FILENAME'${NC}" >&2
-      write_results "ftbfs" "failed to extract unsigned payload from official artifact"
-      exit 1
-    fi
-  fi
-
-  downloadStrippedSigHash=$(sha256sum p_${FIRMWARE_PREFIX}.bin | awk '{print $1}')
-
-  # Extract version and calculate device firmware hash
-  cat p_head.bin | tail -c +$(( 8 + 6 * 64 + 1 )) | head -c 4 > p_version.bin
-  firmwareBytesCount=$(wc -c p_${FIRMWARE_PREFIX}.bin | sed 's/ .*//g')
-  maxFirmwareSize=884736
-  paddingBytesCount=$(( maxFirmwareSize - firmwareBytesCount ))
-
-  if [ $paddingBytesCount -lt 0 ]; then
-    echo -e "${YELLOW}Warning: Firmware size exceeds standard limit, adjusting for Nova...${NC}"
-    maxFirmwareSize=$((firmwareBytesCount + 1024))
-    paddingBytesCount=1024
-  fi
-
-  dd if=/dev/zero ibs=1 count=$paddingBytesCount 2>/dev/null | tr "\000" "\377" > p_padding.bin
-  downloadFirmwareHash=$( cat p_version.bin p_${FIRMWARE_PREFIX}.bin p_padding.bin | sha256sum | cut -c1-64 | xxd -r -p | sha256sum | cut -c1-64 )
-
-  echo ""
-  echo "============================================================"
-  echo "VERIFICATION RESULTS:"
-  echo "Signed download:             $signedHash"
-  echo "Signed download minus sig:   $downloadStrippedSigHash"
-  echo "Built binary:                $builtHash"
-  echo "Firmware as shown in device: $downloadFirmwareHash"
-  echo "                            (double sha256 over version,"
-  echo "                             firmware and padding)"
-  echo ""
-
-  # Determine verdict
-  if [[ "$downloadStrippedSigHash" == "$builtHash" ]]; then
-    verdict="reproducible"
-    notes="built firmware matches unsigned content of official artifact"
-    echo -e "${GREEN}REPRODUCIBLE: Built firmware matches unsigned content${NC}"
-    echo "============================================================"
-    exit_code=0
-  else
-    verdict="not_reproducible"
-    notes="built binary hash ${builtHash} != unsigned official hash ${downloadStrippedSigHash}"
-    echo -e "${RED}NOT REPRODUCIBLE: Firmware hashes differ${NC}"
-    echo "============================================================"
-    exit_code=1
-  fi
-
-  write_results "$verdict" "$notes"
-}
-
-write_results() {
-  local status=$1
-  local note=$2
-
-  # Minimal YAML output (WS ABS requirement, 2026-03-12):
-  # only script_version, verdict, and optional notes.
-  {
-    echo "script_version: ${SCRIPT_VERSION}"
-    echo "verdict: ${status}"
-    if [[ -n "$note" ]]; then
-      echo "notes: ${note}"
-    fi
-  } > "$RESULTS_FILE"
-
-  echo -e "${GREEN}Results written to: $RESULTS_FILE${NC}"
-}
-
-result() {
-  echo ""
-  echo "===== Begin Results ====="
-  echo "firmware:       BitBox02 Nova"
-  echo "version:        $version"
-  echo "type:           $firmwareType"
-  echo "verdict:        $verdict"
-  echo "signedHash:     ${signedHash:-N/A}"
-  echo "builtHash:      ${builtHash:-N/A}"
-  echo "unsignedHash:   ${downloadStrippedSigHash:-N/A}"
-  echo "deviceHash:     ${downloadFirmwareHash:-N/A}"
-  echo "repository:     https://github.com/BitBoxSwiss/bitbox02-firmware"
-  echo "tag:            $VERSION"
-  echo ""
-  if [[ "$verdict" == "reproducible" ]]; then
-    echo "The firmware builds reproducibly from source code."
-  else
-    echo "The firmware does not build reproducibly."
-  fi
-  echo "===== End Results ====="
-  echo ""
-  echo "Verification files available at: $workDir/temp"
-  echo "  - Built firmware: $BUILT_FIRMWARE_PATH"
-  echo "  - Official firmware: $SIGNED_FILENAME"
-  echo "Results file: $RESULTS_FILE"
-}
-
-cleanup() {
-  echo "Cleaning up Docker resources..."
-  $CONTAINER_CMD rmi "$IMAGE_TAG" -f 2>/dev/null || true
-  $CONTAINER_CMD image prune -f 2>/dev/null || true
-}
-
-# Main execution
-echo "Starting BitBox02 Nova firmware verification..."
-echo "This process may take 15-30 minutes depending on your system."
+GIT_TAG=$(cat "$workDir/resolved_tag.txt")
+commit=$(cat "$workDir/commit.txt")
+echo "Resolved tag: $GIT_TAG"
+echo "Commit: $commit"
 echo
 
-prepare
-echo "Environment prepared. Building firmware..."
+# ---- Check for Nova-specific make targets (read-only, host grep is fine) ----
+if grep -q "firmware-nova" "$workDir/src/Makefile" 2>/dev/null; then
+  if [[ "$firmwareType" == "btc" ]]; then
+    MAKE_COMMAND="make firmware-nova-btc"
+    BUILT_FIRMWARE_PATH="build/bin/firmware-nova-btc.bin"
+  else
+    MAKE_COMMAND="make firmware-nova"
+    BUILT_FIRMWARE_PATH="build/bin/firmware-nova.bin"
+  fi
+  echo "Nova-specific make targets detected: using $MAKE_COMMAND"
+fi
 
-build_firmware
-echo "Build completed. Downloading and comparing..."
+# ---- Patch Dockerfile inside container (no host sed required) ---------------
+cp "$workDir/src/Dockerfile" "$workDir/Dockerfile.orig"
 
-download_and_compare
-echo "Comparison completed."
+$CONTAINER_CMD run --rm \
+  --volume "$workDir/src:/src" \
+  alpine \
+  sh -c "
+    set -e
+    if [ '${GIT_TAG}' = 'firmware/v9.15.0' ] || [ '${GIT_TAG}' = 'firmware-btc-only/v9.15.0' ]; then
+      sed -i 's|cargo install bindgen-cli --version 0.65.1\$|cargo install bindgen-cli --version 0.65.1 --locked|' /src/Dockerfile
+    fi
+    # Always patch Go to linux-amd64 regardless of host arch — build is forced linux/amd64.
+    sed -i 's|go1.19.3.linux-\${TARGETARCH}|go1.19.3.linux-amd64|g' /src/Dockerfile
+    ${INNER_CHOWN} /src/Dockerfile
+  "
+repair_ownership "$workDir/src/Dockerfile"
 
-result
-echo "Verification completed."
+# ---- Build Docker image -----------------------------------------------------
+echo "Building Docker image (this may take 10-20 minutes)..."
+if ! $CONTAINER_CMD build \
+  --pull \
+  --platform linux/amd64 \
+  --force-rm \
+  --no-cache \
+  --tag "$IMAGE_TAG" \
+  "$workDir/src"; then
+  echo -e "${RED}Docker build failed!${NC}"
+  write_results "ftbfs" "BitBox02 Nova v${version} (${firmwareType}): Docker image build failed."
+  exit "$EXIT_FAIL"
+fi
 
-cleanup
+cp "$workDir/Dockerfile.orig" "$workDir/src/Dockerfile"
+
+# ---- Get official firmware --------------------------------------------------
+if [[ -n "$binaryPath" ]]; then
+  echo "Using provided binary: $binaryPath"
+  cp "$binaryPath" "$workDir/official/$SIGNED_FILENAME"
+else
+  RELEASE_TAG_PATH="${GIT_TAG//\//%2F}"
+  DOWNLOAD_URL="${repo}/releases/download/${RELEASE_TAG_PATH}/${SIGNED_FILENAME}"
+  echo "Downloading official signed firmware..."
+  echo "URL: $DOWNLOAD_URL"
+  retry_count=0
+  while [[ $retry_count -lt $MAX_RETRIES ]]; do
+    if $CONTAINER_CMD run --rm \
+      --volume "$workDir/official:/out" \
+      alpine \
+      sh -c "
+        set -e
+        apk add --no-cache wget >/dev/null 2>&1
+        wget -O '/out/${SIGNED_FILENAME}' '${DOWNLOAD_URL}'
+        ${INNER_CHOWN} '/out/${SIGNED_FILENAME}'
+      "; then
+      break
+    fi
+    retry_count=$(( retry_count + 1 ))
+    if [[ $retry_count -eq $MAX_RETRIES ]]; then
+      echo -e "${RED}Failed to download firmware after $MAX_RETRIES attempts.${NC}"
+      $CONTAINER_CMD rmi "$IMAGE_TAG" --force 2>/dev/null || true
+      write_results "ftbfs" "BitBox02 Nova v${version} (${firmwareType}): failed to download official firmware."
+      exit "$EXIT_FAIL"
+    fi
+    echo "Download failed, retrying in 5 seconds..."
+    sleep 5
+  done
+  repair_ownership "$workDir/official"
+fi
+
+if [[ ! -s "$workDir/official/$SIGNED_FILENAME" ]]; then
+  echo -e "${RED}Firmware file missing or empty.${NC}"
+  $CONTAINER_CMD rmi "$IMAGE_TAG" --force 2>/dev/null || true
+  write_results "ftbfs" "BitBox02 Nova v${version} (${firmwareType}): firmware file missing or empty."
+  exit "$EXIT_FAIL"
+fi
+
+# ---- Build firmware + compare (all inside build container) ------------------
+# Three volumes keep responsibilities isolated:
+#   /bb02     = source repo (read/write for build artifacts, must stay git-clean)
+#   /official = official signed binary (read-only input)
+#   /out      = all comparison outputs (hash files, diagnostics, stripped binary)
+echo "Building firmware ($MAKE_COMMAND) and running comparison..."
+if ! $CONTAINER_CMD run --rm \
+  --platform linux/amd64 \
+  --volume "$workDir/src:/bb02" \
+  --volume "$workDir/official:/official" \
+  --volume "$workDir/out:/out" \
+  "$IMAGE_TAG" \
+  bash -c "
+    set -eo pipefail
+    git config --global --add safe.directory /bb02
+    cd /bb02
+
+    # Abort if the source tree is dirty — BitBox02 embeds git metadata (including
+    # 'dirty'/'pre') in the firmware version string, changing the binary output.
+    git_status=\$(git status --porcelain)
+    if [[ -n \"\$git_status\" ]]; then
+      echo 'ABORT: source tree is dirty (git status --porcelain):' >&2
+      echo \"\$git_status\" >&2
+      exit 1
+    fi
+
+    ${MAKE_COMMAND}
+
+    SIGNED='/official/${SIGNED_FILENAME}'
+    BUILT='/bb02/${BUILT_FIRMWARE_PATH}'
+
+    sha256sum \"\$SIGNED\" | awk '{print \$1}' > /out/hash_signed.txt
+    sha256sum \"\$BUILT\"  | awk '{print \$1}' > /out/hash_built.txt
+
+    # Upstream signed firmware layout (describe_signed_firmware.py):
+    #   4 bytes magic + 584 bytes sigdata + unsigned firmware
+    # Total header = 588 bytes for both btconly and multi.
+    HEADER_BYTES=588
+    dd if=\"\$SIGNED\" bs=1 skip=\"\${HEADER_BYTES}\" of=/out/p_stripped.bin 2>/dev/null
+    sha256sum /out/p_stripped.bin | awk '{print \$1}' > /out/hash_stripped.txt
+
+    # Diagnostic: log file sizes and parser-derived hash for post-run analysis.
+    python3 -c \"
+import hashlib, sys, os
+MAGIC_LEN = 4; SIGDATA_LEN = 584
+data = open(sys.argv[1], 'rb').read()
+firmware = data[MAGIC_LEN + SIGDATA_LEN:]
+print('diag_signed_size:', len(data))
+print('diag_parser_unsigned_size:', len(firmware))
+print('diag_parser_unsigned_hash:', hashlib.sha256(firmware).hexdigest())
+built_size = os.path.getsize(sys.argv[2])
+print('diag_built_size:', built_size)
+if len(firmware) != built_size:
+    print('WARNING: size mismatch parser_unsigned=' + str(len(firmware)) + ' built=' + str(built_size))
+\" \"\$SIGNED\" \"\$BUILT\" > /out/diag.txt 2>&1 || true
+    cat /out/diag.txt
+
+    # Edition check + device firmware hash, mirroring upstream releases/describe_signed_firmware.py.
+    #
+    # The 4-byte magic identifies the edition; it must match the edition this run targets.
+    # This matters especially for Nova: at releases where the Nova and BitBox02 payloads are
+    # byte-identical, a wrong-edition --binary would otherwise still compare equal and yield a
+    # false 'Nova reproducible'.
+    #
+    # The hash the device shows at boot is bootloader-dependent. Bootloader v1.2.2 (shipped by
+    # firmware 9.26.2, the mandatory intermediate upgrade) computes
+    # sha256(product_id_le16 + version + padded_firmware) -- see src/bootloader/bootloader.c
+    # _firmware_hash()/_maybe_show_hash(). Firmware monotonic version >= 50 implies that
+    # bootloader is present, which is why upstream branches on 50.
+    # Older bootloaders use the legacy sha256d(version + padded_firmware).
+    python3 -c \"
+import hashlib, struct, sys
+MAGIC_LEN = 4; SIGDATA_LEN = 584; VERSION_OFF = 392; MAX_FIRMWARE_SIZE = 884736
+NEW_SIGHASH_VERSION_CUTOFF = 50
+# magic -> (product_id, label); product ids per src/bootloader/bootloader_product.h
+EDITIONS = {
+    '653f362b': (1, 'BitBox02 Multi'),
+    '11233b0b': (2, 'BitBox02 Bitcoin-only'),
+    '5b648ceb': (3, 'BitBox02 Nova Multi'),
+    '48714774': (4, 'BitBox02 Nova Bitcoin-only'),
+}
+expected_pid = int(sys.argv[2])
+data = open(sys.argv[1], 'rb').read()
+magic = data[:MAGIC_LEN].hex()
+if magic not in EDITIONS:
+    print('ABORT: unrecognized firmware edition magic 0x' + magic, file=sys.stderr)
+    sys.exit(1)
+product_id, label = EDITIONS[magic]
+if product_id != expected_pid:
+    print('ABORT: edition mismatch -- binary is ' + label + ' (magic 0x' + magic +
+          '), but this run targets product id ' + str(expected_pid), file=sys.stderr)
+    sys.exit(1)
+version = data[VERSION_OFF:VERSION_OFF + 4]
+firmware = data[MAGIC_LEN + SIGDATA_LEN:]
+padded = firmware + b'\\xff' * (MAX_FIRMWARE_SIZE - len(firmware))
+monotonic = struct.unpack('<I', version)[0]
+if monotonic >= NEW_SIGHASH_VERSION_CUTOFF:
+    device_hash = hashlib.sha256(struct.pack('<H', product_id) + version + padded).hexdigest()
+    scheme = 'sha256(product_id_le16 + version + padded), bootloader >= v1.2.2'
+else:
+    device_hash = hashlib.sha256(hashlib.sha256(version + padded).digest()).hexdigest()
+    scheme = 'legacy sha256d(version + padded)'
+open('/out/hash_device.txt', 'w').write(device_hash + '\\n')
+open('/out/edition.txt', 'w').write(label + '\\n')
+open('/out/monotonic.txt', 'w').write(str(monotonic) + '\\n')
+open('/out/device_hash_scheme.txt', 'w').write(scheme + '\\n')
+print('edition: ' + label + ' (magic 0x' + magic + ', product id ' + str(product_id) + ')')
+print('monotonic version: ' + str(monotonic))
+print('device hash scheme: ' + scheme)
+\" \"\$SIGNED\" '${EXPECTED_PRODUCT_ID}'
+
+    ${INNER_CHOWN} /out
+  "; then
+  echo -e "${RED}Build or comparison failed!${NC}"
+  $CONTAINER_CMD rmi "$IMAGE_TAG" --force 2>/dev/null || true
+  write_results "ftbfs" "BitBox02 Nova v${version} (${firmwareType}): firmware build or in-container comparison failed."
+  exit "$EXIT_FAIL"
+fi
+repair_ownership "$workDir/out"
+
+echo -e "${GREEN}Firmware build and comparison completed!${NC}"
+
+# ---- Read hash results ------------------------------------------------------
+signedHash=$(cat "$workDir/out/hash_signed.txt")
+builtHash=$(cat "$workDir/out/hash_built.txt")
+downloadStrippedSigHash=$(cat "$workDir/out/hash_stripped.txt")
+downloadFirmwareHash=$(cat "$workDir/out/hash_device.txt")
+edition=$(cat "$workDir/out/edition.txt")
+monotonicVersion=$(cat "$workDir/out/monotonic.txt")
+deviceHashScheme=$(cat "$workDir/out/device_hash_scheme.txt")
+
+echo ""
+echo "============================================================"
+echo "VERIFICATION RESULTS:"
+echo "Edition:                     $edition"
+echo "Monotonic version:           $monotonicVersion"
+echo "Signed download:             $signedHash"
+echo "Signed download minus sig:   $downloadStrippedSigHash"
+echo "Built binary:                $builtHash"
+echo "Firmware hash (on device):   $downloadFirmwareHash"
+echo "Device hash scheme:          $deviceHashScheme"
+echo "============================================================"
+
+if [[ "$downloadStrippedSigHash" == "$builtHash" ]]; then
+  verdict="reproducible"
+  exit_code="$EXIT_OK"
+  echo -e "${GREEN}REPRODUCIBLE: built firmware matches unsigned content${NC}"
+else
+  verdict="not_reproducible"
+  exit_code="$EXIT_FAIL"
+  echo -e "${RED}NOT REPRODUCIBLE: firmware hashes differ${NC}"
+fi
+
+echo ""
+echo "===== Begin Results ====="
+echo "firmware:     BitBox02 Nova"
+echo "version:      $version"
+echo "type:         $firmwareType"
+echo "verdict:      $verdict"
+echo "signedHash:   $signedHash"
+echo "builtHash:    $builtHash"
+echo "unsignedHash: $downloadStrippedSigHash"
+echo "deviceHash:   $downloadFirmwareHash"
+echo "edition:      $edition"
+echo "monotonic:    $monotonicVersion"
+echo "repository:   $repo"
+echo "tag:          $GIT_TAG"
+echo "commit:       $commit"
+echo "===== End Results ====="
+
+# ---- Write COMPARISON_RESULTS.yaml ------------------------------------------
+if [[ "$verdict" == "reproducible" ]]; then
+  notes="BitBox02 Nova v${version} (${firmwareType}) reproducible from source at ${GIT_TAG} (commit ${commit}). Comparison: first 588 bytes (4 magic + 584 sigdata) stripped from official signed binary; SHA-256 of remainder matches unsigned build output."
+else
+  notes="BitBox02 Nova v${version} (${firmwareType}) not reproducible. Built hash ${builtHash} does not match unsigned official payload hash ${downloadStrippedSigHash} after stripping 588 bytes (4 magic + 584 sigdata) from ${SIGNED_FILENAME}."
+fi
+
+write_results "$verdict" "$notes"
+
+# ---- Cleanup ----------------------------------------------------------------
+echo "Cleaning up container resources..."
+$CONTAINER_CMD rmi "$IMAGE_TAG" --force 2>/dev/null || true
 
 echo
 echo "BitBox02 Nova firmware verification finished!"
-echo "COMPARISON_RESULTS.yaml has been generated in the current directory."
+echo "Results: $RESULTS_FILE"
 
-exit $exit_code
+exit "$exit_code"
