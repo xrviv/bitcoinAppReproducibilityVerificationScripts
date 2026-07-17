@@ -1,72 +1,20 @@
 #!/bin/bash
-# ==============================================================================
-# nunchukandroid_build.sh - Nunchuk Android Reproducible Build Verification
-# ==============================================================================
-# Version:       v0.3.3
-# Organization:  WalletScrutiny.com
-# Last Modified: 2026-07-16
-# Project:       https://github.com/nunchuk-io/nunchuk-android
-# ==============================================================================
-# LICENSE: MIT License
-#
-# TECHNICAL DISCLAIMER:
-# This script is provided for technical analysis and reproducible build
-# verification purposes only. No warranty is provided regarding security,
-# functionality, or fitness for any particular purpose. Users assume all risks
-# associated with running this script and analyzing the software.
-#
-# LEGAL DISCLAIMER:
-# This script is designed for legitimate security research and reproducible build
-# verification. Users are responsible for ensuring compliance with all applicable
-# laws and regulations. The developers assume no liability for any misuse or
-# legal consequences arising from use. By using this script, you acknowledge
-# these disclaimers and accept full responsibility.
-#
-# SCRIPT SUMMARY:
-# Two operating modes, selected by arguments:
-#
-#   split mode (--binary <split.apk>):
-#     Accepts one official split APK from Google Play. Auto-detects version from
-#     APK metadata. Fetches Nunchuk's official reproducible-builds/Dockerfile
-#     from the matching tag, extends it with bundletool, and builds a container
-#     image. Builds AAB via bundleProductionRelease (with disorderfs for
-#     reproducible directory ordering). Extracts split APKs via bundletool +
-#     device-spec.json, finds the matching built split, runs a content diff.
-#     Generates COMPARISON_RESULTS.yaml with verdict.
-#
-#   github mode (--version <ver>, no --binary):
-#     Downloads the official APK from Nunchuk GitHub releases. Builds via
-#     assembleProductionRelease. Runs a content diff. Generates
-#     COMPARISON_RESULTS.yaml with verdict.
-#
-# NOTE: Nunchuk uses disorderfs (FUSE) for reproducible directory ordering.
-# The build container runs with --privileged to enable FUSE mounts.
-# ==============================================================================
-
+# nunchukandroid_build.sh — Nunchuk Android Reproducible Build Verification
+# Version: v0.4.6
+# Organization: WalletScrutiny.com
+# License: MIT
 set -euo pipefail
-
-# Capture execution directory before anything can change CWD
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-
-# ------------------------------------------------------------------------------
-# Script metadata
-# ------------------------------------------------------------------------------
-readonly SCRIPT_VERSION="v0.3.3"
+readonly SCRIPT_VERSION="v0.4.6"
 readonly SCRIPT_NAME="nunchukandroid_build.sh"
 readonly APP_ID="io.nunchuk.android"
 readonly REPO_URL="https://github.com/nunchuk-io/nunchuk-android.git"
 readonly WS_CONTAINER="docker.io/walletscrutiny/android:5"
 readonly NUNCHUK_IMAGE_BASE="nunchuk_build_env"
-
-# Exit codes
 readonly EXIT_SUCCESS=0
 readonly EXIT_FAILED=1
 readonly EXIT_INVALID=2
-
-# ------------------------------------------------------------------------------
-# Global state (set by argument parsing)
-# ------------------------------------------------------------------------------
 VERSION=""
 ARCH=""
 TYPE=""
@@ -78,8 +26,6 @@ VOLUME_RO=":ro"
 VOLUME_RW=""
 REQUESTED_TAG=""
 should_cleanup=false
-
-# Set during prepare/build
 BUILD_MODE=""
 VERSION_SAFE=""
 ARCH_SAFE=""
@@ -89,27 +35,19 @@ BUILT_AAB=""
 GIT_TAG=""
 RESULT_DONE=false
 TOTAL_DIFFS=0
-SEMANTIC_UPGRADE="false"
+SEMANTIC_UPGRADE="true"
 SEMANTIC_NOTES=""
-
-# ------------------------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------------------------
+APK_INPUT_IS_DIR="false"
 log_info()  { echo "[INFO] $*"; }
 log_pass()  { echo "[PASS] $*"; }
 log_fail()  { echo "[FAIL] $*"; }
 log_warn()  { echo "[WARNING] $*"; }
-
 safe_grep_count() {
     local grep_output
     grep_output="$("$@" 2>/dev/null || true)"
     grep_output="${grep_output//$'\n'/}"
     [[ -n "${grep_output}" ]] && printf '%s\n' "${grep_output}" || printf '0\n'
 }
-
-# ------------------------------------------------------------------------------
-# YAML output helpers
-# ------------------------------------------------------------------------------
 write_yaml_outputs() {
     local content="$1"
     printf '%s\n' "$content" > "${EXEC_DIR}/COMPARISON_RESULTS.yaml"
@@ -117,13 +55,11 @@ write_yaml_outputs() {
         printf '%s\n' "$content" > "${WORK_DIR}/COMPARISON_RESULTS.yaml" || true
     fi
 }
-
 generate_error_yaml() {
     local status="$1"
     write_yaml_outputs "script_version: ${SCRIPT_VERSION}
 verdict: ${status}"
 }
-
 generate_comparison_yaml() {
     local verdict="$1"
     local notes="$2"
@@ -133,10 +69,6 @@ notes: |
   ${notes}"
     log_info "Generated COMPARISON_RESULTS.yaml (verdict: ${verdict})"
 }
-
-# ------------------------------------------------------------------------------
-# Error handling
-# ------------------------------------------------------------------------------
 on_error() {
     local exit_code=$?
     local line_no=$1
@@ -148,23 +80,16 @@ on_error() {
     echo "Exit code: ${EXIT_FAILED}"
     exit "${EXIT_FAILED}"
 }
-
 cleanup_on_error() {
     local exit_code=$?
-    # Only write YAML if we got past argument parsing (WORK_DIR is set).
     if [[ "${exit_code}" -ne 0 && "${RESULT_DONE}" != "true" && -n "${WORK_DIR:-}" ]]; then
         log_warn "Script failed with exit code: ${exit_code}"
         log_warn "Work directory preserved: ${WORK_DIR}"
         generate_error_yaml "ftbfs" || true
     fi
 }
-
 trap 'on_error $LINENO' ERR
 trap 'cleanup_on_error'  EXIT
-
-# ------------------------------------------------------------------------------
-# Container runtime detection
-# ------------------------------------------------------------------------------
 detect_container_runtime() {
     if command -v podman >/dev/null 2>&1; then
         CONTAINER_CMD="podman"
@@ -190,12 +115,6 @@ EOF
         exit "${EXIT_FAILED}"
     fi
 }
-
-# ------------------------------------------------------------------------------
-# Container helpers
-# ------------------------------------------------------------------------------
-
-# Run a command in WORK_DIR using the WS container
 ws_exec() {
     local cmd="$1"
     ${CONTAINER_CMD} run --rm \
@@ -205,8 +124,6 @@ ws_exec() {
         "${WS_CONTAINER}" \
         sh -c "$cmd"
 }
-
-# Run a command in the version-specific nunchuk build image (java + pinned apktool).
 nunchuk_exec() {
     local cmd="$1"
     ${CONTAINER_CMD} run --rm \
@@ -216,7 +133,6 @@ nunchuk_exec() {
         "${NUNCHUK_IMAGE_BASE}:${VERSION_SAFE}" \
         sh -c "$cmd"
 }
-
 container_sha256() {
     local file_path="$1"
     ${CONTAINER_CMD} run --rm \
@@ -224,7 +140,6 @@ container_sha256() {
         "${WS_CONTAINER}" \
         sh -c "sha256sum /data/$(basename "$file_path") | awk '{print \$1}'"
 }
-
 container_signer() {
     local apk_path="$1"
     ${CONTAINER_CMD} run --rm \
@@ -233,8 +148,6 @@ container_signer() {
         sh -c "apksigner verify --print-certs /apk/$(basename "$apk_path") 2>/dev/null \
                | grep 'Signer #1 certificate SHA-256' | awk '{print \$6}'" || echo "unknown"
 }
-
-# Zeus-pattern: aapt -> aapt2 -> apktool fallback. Never reads from filename.
 container_aapt_version() {
     local apk_path="$1"
     local field="$2"
@@ -267,10 +180,6 @@ container_aapt_version() {
             rm -rf "$tmpdir"
         ' 2>/dev/null || true
 }
-
-# ------------------------------------------------------------------------------
-# Split APK name helpers (MetaMask pattern)
-# ------------------------------------------------------------------------------
 canonicalize_split_apk_name() {
     local apk_name="$1"
     case "$apk_name" in
@@ -280,7 +189,6 @@ canonicalize_split_apk_name() {
         *) echo "$apk_name" ;;
     esac
 }
-
 find_official_base_apk() {
     local dir="${WORK_DIR}/official-split-apks"
     if   [[ -f "${dir}/base.apk" ]];        then echo "${dir}/base.apk"; return; fi
@@ -288,7 +196,6 @@ find_official_base_apk() {
     local matches=("${dir}"/base*.apk)
     [[ ${#matches[@]} -gt 0 && -f "${matches[0]}" ]] && echo "${matches[0]}" && return
 }
-
 resolve_built_split_apk() {
     local official_apk="$1"
     local built_dir="$2"
@@ -297,26 +204,23 @@ resolve_built_split_apk() {
     [[ -f "${built_dir}/${official_name}" ]] && echo "${built_dir}/${official_name}" && return 0
     canonical_name="$(canonicalize_split_apk_name "$official_name")"
     [[ -f "${built_dir}/${canonical_name}" ]] && echo "${built_dir}/${canonical_name}" && return 0
+    if [[ "${official_name}" == split_config.*.apk ]]; then
+        local bt_name="base-${official_name#split_config.}"
+        [[ -f "${built_dir}/${bt_name}" ]] && echo "${built_dir}/${bt_name}" && return 0
+    fi
     return 1
 }
-
-# ------------------------------------------------------------------------------
-# Usage
-# ------------------------------------------------------------------------------
 usage() {
     cat <<EOF
 NAME
        ${SCRIPT_NAME} - Nunchuk Android reproducible build verification
-
 SYNOPSIS
        ${SCRIPT_NAME} --binary <split.apk> [--version <version>] [OPTIONS]
        ${SCRIPT_NAME} --version <version> [OPTIONS]
        ${SCRIPT_NAME} --help
-
 DESCRIPTION
        Builds Nunchuk Android from source using Nunchuk's official
        reproducible-builds/Dockerfile and compares against an official artifact.
-
        split mode (--binary <file>):
          Accepts one official split APK from Google Play (e.g. base.apk).
          Fetches Nunchuk's Dockerfile from the matching tag, extends it with
@@ -324,15 +228,13 @@ DESCRIPTION
          for reproducible directory ordering), extracts splits with bundletool,
          and compares the matching split.
          Version is auto-detected from the APK unless --version is given.
-
        github mode (--version <ver>, no --binary):
          Downloads the official APK from Nunchuk GitHub releases. Builds via
          assembleProductionRelease and runs a content diff.
-
 OPTIONS
-       --binary <file|dir>        Path to one official Play Store split APK,
-                                  or a directory containing base.apk (the
-                                  base split is used). Alias: --apk.
+       --binary <file|dir>        Directory of official Play Store split APKs
+                                  (ALL splits verified — recommended), or one
+                                  split APK (single-split scope). Alias: --apk.
        --version <version>        Version to verify (e.g. 1.9.47). Required in
                                   github mode; optional in split mode (auto-detect).
        --arch <arch>              Target architecture for device-spec.json.
@@ -343,27 +245,16 @@ OPTIONS
        --cleanup                  Remove work directory after completion.
        --script-version           Print script version and exit.
        --help                     Show this help and exit.
-
 EXIT CODES
        0    Reproducible (only META-INF differences, or identical)
        1    Differences found or build failure
        2    Invalid parameters
-
 EXAMPLES
-       # Split mode — one split from Play Store (version auto-detected):
        ${SCRIPT_NAME} --binary ~/apks/base.apk
-
-       # Split mode — explicit version:
        ${SCRIPT_NAME} --binary ~/apks/base.apk --version 1.9.47
-
-       # GitHub mode — download and compare GitHub release APK:
        ${SCRIPT_NAME} --version 1.9.47
 EOF
 }
-
-# ------------------------------------------------------------------------------
-# Argument parsing
-# ------------------------------------------------------------------------------
 parse_arguments() {
     while [[ "$#" -gt 0 ]]; do
         case "$1" in
@@ -379,36 +270,30 @@ parse_arguments() {
         esac
         shift
     done
-
-    # Root check
     if [[ "$(id -u)" -eq 0 ]]; then
         echo "[ERROR] Do not run this script as root."
         echo "Exit code: ${EXIT_INVALID}"
         exit "${EXIT_INVALID}"
     fi
-
-    # Determine mode
     if [[ -n "${APK_INPUT}" ]]; then
         BUILD_MODE="split"
-        # A directory is accepted; the base split inside it is what gets compared.
         if [[ -d "${APK_INPUT}" ]]; then
-            if [[ -f "${APK_INPUT%/}/base.apk" ]]; then
-                APK_INPUT="${APK_INPUT%/}/base.apk"
-                log_info "--binary is a directory; using ${APK_INPUT}"
-            else
+            if [[ ! -f "${APK_INPUT%/}/base.apk" ]]; then
                 echo "[ERROR] --binary directory contains no base.apk: ${APK_INPUT}"
                 generate_error_yaml "ftbfs"
                 echo "Exit code: ${EXIT_INVALID}"
                 exit "${EXIT_INVALID}"
             fi
+            APK_INPUT="${APK_INPUT%/}"
+            APK_INPUT_IS_DIR="true"
+            log_info "--binary is a directory; ALL split APKs in it will be verified"
         fi
-        if [[ ! -f "${APK_INPUT}" ]]; then
+        if [[ "${APK_INPUT_IS_DIR}" != "true" && ! -f "${APK_INPUT}" ]]; then
             echo "[ERROR] --binary file not found: ${APK_INPUT}"
             generate_error_yaml "ftbfs"
             echo "Exit code: ${EXIT_INVALID}"
             exit "${EXIT_INVALID}"
         fi
-        # Resolve relative path
         [[ "${APK_INPUT}" != /* ]] && APK_INPUT="${EXEC_DIR}/${APK_INPUT}"
         ARCH="${ARCH:-arm64-v8a}"
     elif [[ -n "${VERSION}" ]]; then
@@ -419,8 +304,6 @@ parse_arguments() {
         echo "Exit code: ${EXIT_INVALID}"
         exit "${EXIT_INVALID}"
     fi
-
-    # Validate arch
     case "${ARCH}" in
         arm64-v8a|armeabi-v7a|x86_64|x86) ;;
         *)
@@ -430,23 +313,16 @@ parse_arguments() {
             exit "${EXIT_INVALID}"
             ;;
     esac
-
     VERSION_SAFE="${VERSION:-provided}"
     ARCH_SAFE="${ARCH//-/_}"
     WORK_DIR="/tmp/test_${APP_ID}_${VERSION_SAFE}_${ARCH_SAFE}"
+    log_info "${SCRIPT_NAME} ${SCRIPT_VERSION}"
     log_info "Build mode: ${BUILD_MODE}"
     log_info "Work directory: ${WORK_DIR}"
 }
-
-# ------------------------------------------------------------------------------
-# Git tag resolution
-# Nunchuk uses tag format android.X.Y.Z (fallback: vX.Y.Z, X.Y.Z)
-# ------------------------------------------------------------------------------
-# Sets global GIT_TAG. Uses git ls-remote on the host (avoids container network issues).
 resolve_git_tag() {
     local version="$1"
     local candidates=("android.${version}" "v${version}" "${version}")
-
     log_info "Resolving git tag for version ${version}..."
     for candidate in "${candidates[@]}"; do
         if git ls-remote --tags --exit-code "${REPO_URL}" "refs/tags/${candidate}" >/dev/null 2>&1; then
@@ -456,38 +332,23 @@ resolve_git_tag() {
         fi
         log_info "  Tag ${candidate}: not found"
     done
-
     log_fail "Could not find git tag for version ${version}"
     log_fail "Tried: ${candidates[*]}"
     return 1
 }
-
-# ------------------------------------------------------------------------------
-# Fetch Nunchuk's Dockerfile and extend it with bundletool
-# ------------------------------------------------------------------------------
 fetch_and_extend_dockerfile() {
     local git_tag="$1"
     local output_path="$2"
-
     local dockerfile_url="https://raw.githubusercontent.com/nunchuk-io/nunchuk-android/${git_tag}/reproducible-builds/Dockerfile"
     log_info "Fetching Nunchuk Dockerfile from tag ${git_tag}..."
-
     local original_dockerfile
     original_dockerfile="$(curl -fsSL --max-time 30 "${dockerfile_url}" 2>/dev/null || true)"
-
     if [[ -z "${original_dockerfile}" ]]; then
         log_fail "Could not fetch Dockerfile for tag ${git_tag}"
         exit "${EXIT_FAILED}"
     fi
-
-    # Write extended Dockerfile: Nunchuk's official + bundletool for split extraction.
-    # Nunchuk's Dockerfile installs curl in every tag checked back to android.1.67;
-    # it has never installed wget. Prefer curl (matches upstream's own package set);
-    # fall back to wget only in case a future revision drops curl.
     cat > "${output_path}" <<DOCKERFILE_EOF
 ${original_dockerfile}
-
-# WalletScrutiny: install bundletool for split APK extraction from built AAB
 RUN set -e; \\
     if command -v curl >/dev/null 2>&1; then \\
         curl -fsSL -o /tmp/bundletool.jar https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar; \\
@@ -496,8 +357,6 @@ RUN set -e; \\
     else \\
         echo "ERROR: neither curl nor wget available in build image" >&2; exit 1; \\
     fi
-
-# WalletScrutiny: install apktool (pinned + hash-verified) for decoded manifest/resources comparison
 RUN set -e; \\
     if command -v curl >/dev/null 2>&1; then \\
         curl -fsSL -o /tmp/apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v3.0.2/apktool_3.0.2.jar; \\
@@ -508,18 +367,10 @@ RUN set -e; \\
     fi; \\
     echo "eee4669a704a14e0623407e6701b0b91887e61e1e4049cb7a82833e14ae8b5fd  /tmp/apktool.jar" | sha256sum -c -
 DOCKERFILE_EOF
-
     log_info "Extended Dockerfile written to ${output_path}"
 }
-
-# ------------------------------------------------------------------------------
-# Build the extended Nunchuk image (once per version)
-# ------------------------------------------------------------------------------
 ensure_build_image() {
     local image_tag="${NUNCHUK_IMAGE_BASE}:${VERSION_SAFE}"
-
-    # Reuse the cached image only if it carries every WalletScrutiny addition;
-    # an image cached by an older script version may lack the newer jars.
     if ${CONTAINER_CMD} image inspect "${image_tag}" >/dev/null 2>&1; then
         if ${CONTAINER_CMD} run --rm "${image_tag}" \
             sh -c 'test -f /tmp/bundletool.jar && test -f /tmp/apktool.jar' >/dev/null 2>&1; then
@@ -528,54 +379,69 @@ ensure_build_image() {
         fi
         log_warn "Cached image ${image_tag} is stale (missing WS tooling) — rebuilding."
     fi
-
     log_info "Building Nunchuk build image ${image_tag}..."
     local dockerfile_path="${WORK_DIR}/Dockerfile"
     fetch_and_extend_dockerfile "${GIT_TAG}" "${dockerfile_path}"
-
     ${CONTAINER_CMD} build \
         --no-cache \
         -t "${image_tag}" \
         -f "${dockerfile_path}" \
         "${WORK_DIR}"
-
     log_pass "Build image ${image_tag} ready."
 }
-
-# ------------------------------------------------------------------------------
-# Create device-spec.json for bundletool
-# ------------------------------------------------------------------------------
 create_device_spec() {
     local output_path="$1"
     local arch="$2"
+    local splits_dir="${WORK_DIR}/official-split-apks"
+    local abis=() locales=() density="" f name cfg
+    for f in "${splits_dir}"/split_config.*.apk; do
+        [[ -f "${f}" ]] || continue
+        name="$(basename "${f}")"
+        cfg="${name#split_config.}"
+        cfg="${cfg%.apk}"
+        case "${cfg}" in
+            arm64_v8a)    abis+=("arm64-v8a") ;;
+            armeabi_v7a)  abis+=("armeabi-v7a") ;;
+            x86_64)       abis+=("x86_64") ;;
+            x86)          abis+=("x86") ;;
+            ldpi)         density=120 ;;
+            mdpi)         density=160 ;;
+            tvdpi)        density=213 ;;
+            hdpi)         density=240 ;;
+            xhdpi)        density=320 ;;
+            xxhdpi)       density=480 ;;
+            xxxhdpi)      density=640 ;;
+            [a-z][a-z]|[a-z][a-z][a-z]|[a-z][a-z]_*|[a-z][a-z][a-z]_*) locales+=("${cfg//_/-}") ;;
+            *) log_warn "Unrecognized config split '${cfg}' — not reflected in device-spec" ;;
+        esac
+    done
+    [[ ${#abis[@]} -eq 0 ]] && abis=("${arch}")
+    [[ ${#locales[@]} -eq 0 ]] && locales=("en")
+    [[ -z "${density}" ]] && density=480
+    local abis_json locales_json
+    abis_json="$(printf '"%s",' "${abis[@]}")"; abis_json="${abis_json%,}"
+    locales_json="$(printf '"%s",' "${locales[@]}")"; locales_json="${locales_json%,}"
     cat > "${output_path}" <<EOF
 {
-  "supportedAbis": ["${arch}"],
-  "supportedLocales": ["en"],
-  "screenDensity": 480,
+  "supportedAbis": [${abis_json}],
+  "supportedLocales": [${locales_json}],
+  "screenDensity": ${density},
   "sdkVersion": 31
 }
 EOF
-    log_info "device-spec.json created (arch=${arch})"
+    log_info "device-spec.json created (abis=[${abis_json}], locales=[${locales_json}], density=${density}) — derived from official split set"
 }
-
-# ------------------------------------------------------------------------------
-# Extract split APKs from built AAB using bundletool
-# ------------------------------------------------------------------------------
 extract_split_apks_from_aab() {
     local aab_path="$1"
     local device_spec_path="$2"
     local output_dir="$3"
     local image_tag="${NUNCHUK_IMAGE_BASE}:${VERSION_SAFE}"
-
     mkdir -p "${output_dir}"
-
     local aab_rel device_spec_rel apks_rel output_rel
     aab_rel="${aab_path#"${WORK_DIR}/"}"
     device_spec_rel="${device_spec_path#"${WORK_DIR}/"}"
     apks_rel="built-splits.apks"
     output_rel="${output_dir#"${WORK_DIR}/"}"
-
     log_info "Running bundletool to extract split APKs..."
     ${CONTAINER_CMD} run --rm \
         ${CONTAINER_RUN_EXTRA} \
@@ -600,14 +466,11 @@ extract_split_apks_from_aab() {
         log_fail "bundletool failed to extract split APKs from the built AAB"
         exit "${EXIT_FAILED}"
     }
-
-    # Normalize: base-master.apk → base.apk
     local splits_subdir="${output_dir}/splits"
     if [[ -f "${splits_subdir}/base-master.apk" ]]; then
         mv "${splits_subdir}/base-master.apk" "${splits_subdir}/base.apk"
         log_info "Renamed base-master.apk -> base.apk"
     fi
-
     local split_count
     split_count="$(find "${output_dir}" -name "*.apk" | wc -l)"
     if [[ "${split_count}" -eq 0 ]]; then
@@ -616,69 +479,48 @@ extract_split_apks_from_aab() {
     fi
     log_info "Extracted ${split_count} split APK(s) to ${output_dir}"
 }
-
-# ------------------------------------------------------------------------------
-# Unzip APK in WS container
-# ------------------------------------------------------------------------------
 unzip_apk_in_container() {
     local apk_path="$1"
     local out_dir="$2"
     local apk_rel out_rel
     apk_rel="${apk_path#"${WORK_DIR}/"}"
     out_rel="${out_dir#"${WORK_DIR}/"}"
-    # unzip rc 0 = clean, 1 = warnings only; anything above is a real failure.
     ws_exec "mkdir -p '${out_rel}' && { unzip -qq '${apk_rel}' -d '${out_rel}' 2>/dev/null; rc=\$?; [ \"\${rc}\" -le 1 ]; }" || {
         log_fail "unzip failed for ${apk_path}"
         exit "${EXIT_FAILED}"
     }
 }
-
-# ------------------------------------------------------------------------------
-# Compare split APKs (split mode)
-# ------------------------------------------------------------------------------
 compare_split_apks() {
     local official_apk="$1"
     local built_apk="$2"
     local split_label="$3"
     local results_dir="${WORK_DIR}/comparison"
-
     mkdir -p "${results_dir}"
     log_info "Comparing split: ${split_label}"
-
     local official_unzip="${results_dir}/official_${split_label}"
     local built_unzip="${results_dir}/built_${split_label}"
     local diff_file="${results_dir}/diff_${split_label}.txt"
-
     unzip_apk_in_container "${official_apk}" "${official_unzip}"
     unzip_apk_in_container "${built_apk}"    "${built_unzip}"
-
     local official_rel built_rel diff_rel
     official_rel="${official_unzip#"${WORK_DIR}/"}"
     built_rel="${built_unzip#"${WORK_DIR}/"}"
     diff_rel="${diff_file#"${WORK_DIR}/"}"
-
-    # diff rc: 0 identical, 1 differences, >=2 operational error. An error line
-    # starts with "diff:" (colon), which DIFF_LINE_MATCH does not count -- so a
-    # swallowed error would read as zero diffs. Fail closed on rc >= 2.
     ws_exec "diff -r \"${official_rel}\" \"${built_rel}\" \
         > \"${diff_rel}\" 2>&1; rc=\$?; [ \"\${rc}\" -le 1 ]" || {
         log_fail "diff -r failed (operational error) -- see ${diff_file}"
         exit "${EXIT_FAILED}"
     }
-
     local total_lines=0
     local non_meta_count=0
-
     if [[ -s "${diff_file}" ]]; then
         total_lines="$(wc -l < "${diff_file}")"
         non_meta_count="$(grep -E "${DIFF_LINE_MATCH}" "${diff_file}" \
             | grep -cvE "${META_INF_ROOT_EXCLUDE}" \
             || true)"
     fi
-
     TOTAL_DIFFS=$(( TOTAL_DIFFS + non_meta_count ))
     log_info "  ${split_label}: ${non_meta_count} non-META-INF diff(s) (${total_lines} lines total)"
-
     if [[ -s "${diff_file}" ]]; then
         log_info "  First 5 lines (full diff: ${diff_file}):"
         head -5 "${diff_file}" | while IFS= read -r line; do echo "    ${line}"; done
@@ -686,49 +528,73 @@ compare_split_apks() {
             log_info "    ... (${total_lines} total lines)"
         fi
     fi
-
     if [[ "${non_meta_count}" -gt 0 ]]; then
         analyze_acceptable_diffs "${official_apk}" "${built_apk}" "${split_label}" "${diff_file}"
     fi
 }
-
-# ------------------------------------------------------------------------------
-# Semantic analysis of known binary diffs (policy: resources.arsc.md +
-# verification-reproducibility-guidelines.md). Decodes both APKs with apktool in
-# the WS container and classifies every counted diff line. Sets
-# SEMANTIC_UPGRADE=true only if EVERY diff falls into an acceptable class:
-#   - stamp-cert-sha256 only in official (Google Play SourceStamp)
-#   - AndroidManifest.xml: official-only Play-injected <meta-data> entries
-#   - resources.arsc: decoded res/ identical, or only crashlytics mapping_file_id
-# Anything unexplained keeps the verdict at not_reproducible.
-# ------------------------------------------------------------------------------
-PLAY_META_ALLOWED='com\.android\.stamp\.source|com\.android\.stamp\.type|com\.android\.vending\.derived\.apk\.id|com\.android\.vending\.splits|com\.android\.dynamic\.apk\.fused\.modules'
-
-# Every kind of entry `diff -r` emits for a difference: only-in, brief-mode file
-# notes, binary notes, and per-file headers for text diffs.
 DIFF_LINE_MATCH='^Only in |^Files |^Binary files |^diff '
-# Exclude ONLY the APK-root META-INF signing dir (Leo 2025-10-30: never filter
-# META-INF appearing deeper in the tree). Unzip roots are comparison/<side>_<label>.
 META_INF_ROOT_EXCLUDE='^Only in comparison/(official|built)_[^/:]+: META-INF$|^Only in comparison/(official|built)_[^/:]+/META-INF(/[^:]*)?: |^(Files|Binary files) comparison/(official|built)_[^/]+/META-INF/|^diff (-r )?comparison/(official|built)_[^/]+/META-INF/'
-
+ensure_manifest_norm_awk() {
+    local awk_path="${WORK_DIR}/manifest_norm.awk"
+    cat > "${awk_path}" <<'AWK_EOF'
+function accepted_play_metadata(name) {
+  return name == "com.android.stamp.source" ||
+         name == "com.android.stamp.type" ||
+         name == "com.android.vending.derived.apk.id" ||
+         name == "com.android.vending.splits" ||
+         name == "com.android.dynamic.apk.fused.modules"
+}
+function meta_name(line,   nm) {
+  if (line !~ /^[[:space:]]*<meta-data[[:space:]]/) return ""
+  if (line !~ /android:name="/) return ""
+  nm = line; sub(/^.*android:name="/, "", nm); sub(/".*$/, "", nm); return nm
+}
+role == "built" && NR == FNR {
+  nm = meta_name($0)
+  if (nm != "" && accepted_play_metadata(nm)) avail[$0]++
+  next
+}
+{ raw[++n] = $0 }
+END {
+  m = 0
+  for (k = 1; k <= n; k++) {
+    line = raw[k]; nm = meta_name(line)
+    if (nm != "" && accepted_play_metadata(nm)) {
+      if (role == "official") continue
+      else if (avail[line] > 0) { avail[line]--; continue }
+    }
+    L[++m] = line
+  }
+  i = 1
+  while (i <= m) {
+    cur = L[i]; nxt = (i < m) ? L[i+1] : ""
+    if (cur ~ /^[[:space:]]*<[A-Za-z][A-Za-z0-9_.:-]*/ && cur ~ />[[:space:]]*$/ && cur !~ /\/>[[:space:]]*$/ && cur !~ /^[[:space:]]*<\//) {
+      tag = cur; sub(/^[[:space:]]*</, "", tag); sub(/[[:space:]>].*/, "", tag)
+      if (nxt ~ ("^[[:space:]]*</" tag ">[[:space:]]*$")) {
+        c = cur; sub(/>[[:space:]]*$/, "/>", c); print c; i += 2; continue
+      }
+    }
+    print cur; i++
+  }
+}
+AWK_EOF
+}
 analyze_acceptable_diffs() {
     local official_apk="$1"
     local built_apk="$2"
     local split_label="$3"
     local diff_file="$4"
     local results_dir="${WORK_DIR}/comparison"
-
+    ensure_manifest_norm_awk
     log_info "  Semantic analysis of diffs (${split_label})..."
-
     local counted_lines
     counted_lines="$(grep -E "${DIFF_LINE_MATCH}" "${diff_file}" \
         | grep -vE "${META_INF_ROOT_EXCLUDE}" || true)"
-
     local unexplained="" accepted="" needs_manifest=0 needs_arsc=0
     while IFS= read -r line; do
         [[ -z "${line}" ]] && continue
         if echo "${line}" | grep -qE '^Only in comparison/official_[^/:]+: stamp-cert-sha256$'; then
-            accepted+="stamp-cert-sha256 only in official (Google Play SourceStamp certificate hash)"$'\n'
+            accepted+="${split_label}: stamp-cert-sha256 only in official (Google Play SourceStamp certificate hash)"$'\n'
         elif echo "${line}" | grep -qE '^Binary files .*AndroidManifest\.xml .* differ$'; then
             needs_manifest=1
         elif echo "${line}" | grep -qE '^Binary files .*resources\.arsc .* differ$'; then
@@ -737,9 +603,7 @@ analyze_acceptable_diffs() {
             unexplained+="${line}"$'\n'
         fi
     done <<< "${counted_lines}"
-
     if [[ "${needs_manifest}" -eq 1 || "${needs_arsc}" -eq 1 ]]; then
-        # apktool needs the APKs under the /work mount.
         cp "${official_apk}" "${results_dir}/official_${split_label}.apk"
         cp "${built_apk}"    "${results_dir}/built_${split_label}.apk"
         log_info "  Decoding both APKs with pinned apktool 3.0.2 (nunchuk image, --no-src)..."
@@ -755,101 +619,88 @@ analyze_acceptable_diffs() {
             needs_arsc=0
         }
     fi
-
     if [[ "${needs_manifest}" -eq 1 ]]; then
         local mf_diff_file="${results_dir}/diff_manifest_decoded_${split_label}.txt"
-        ws_exec "diff 'comparison/official_${split_label}_decoded/AndroidManifest.xml' \
-                      'comparison/built_${split_label}_decoded/AndroidManifest.xml' \
-                 > 'comparison/diff_manifest_decoded_${split_label}.txt' 2>&1 || true"
-        local mf_changed mf_bad
-        # Notable = everything except hunk-position lines, separators, and blanks.
-        # This keeps diff error messages and any other noise, which then fail closed.
-        mf_changed="$(grep -vE '^[0-9]+(,[0-9]+)?[acd][0-9]+(,[0-9]+)?$|^---$|^$' "${mf_diff_file}" 2>/dev/null || true)"
-        # Acceptable: ONLY official-side (<) meta-data lines whose android:name is
-        # a documented Google Play injection. Any built-side (>) line, other
-        # official-side line, or non-diff noise is unexplained.
-        mf_bad="$(echo "${mf_changed}" \
-            | grep -vE "^< *<meta-data android:name=\"(${PLAY_META_ALLOWED})\"" \
-            | grep -vE '^$' || true)"
-        if [[ -z "${mf_changed}" ]]; then
-            accepted+="AndroidManifest.xml: binary differs, decoded content IDENTICAL (non-semantic artifact)"$'\n'
-        elif [[ -z "${mf_bad}" ]]; then
-            accepted+="AndroidManifest.xml: only Google Play-injected meta-data in official (stamp.source, stamp.type, derived.apk.id class) — see $(basename "${mf_diff_file}")"$'\n'
+        local off_mf="comparison/official_${split_label}_decoded/AndroidManifest.xml"
+        local built_mf="comparison/built_${split_label}_decoded/AndroidManifest.xml"
+        if ! ws_exec "if diff '${off_mf}' '${built_mf}' \
+                 > 'comparison/diff_manifest_decoded_${split_label}.txt' 2>&1; then :; else rc=\$?; [ \"\${rc}\" -eq 1 ] || exit \"\${rc}\"; fi"; then
+            unexplained+="AndroidManifest.xml decoded diff command failed"$'\n'
         else
-            unexplained+="AndroidManifest.xml decoded diff has non-Play-injection changes — see $(basename "${mf_diff_file}")"$'\n'
-        fi
+            local mf_changed
+            mf_changed="$(grep -vE '^[0-9]+(,[0-9]+)?[acd][0-9]+(,[0-9]+)?$|^---$|^$' "${mf_diff_file}" 2>/dev/null || true)"
+            if [[ -z "${mf_changed}" ]]; then
+                accepted+="${split_label}: AndroidManifest.xml binary differs, decoded content IDENTICAL (non-semantic artifact)"$'\n'
+            else
+            local mf_res_file="${results_dir}/residual_manifest_${split_label}.txt"
+                if ! ws_exec "set -e; \
+                     awk -v role=official -f /work/manifest_norm.awk '${off_mf}' > 'comparison/norm_off_manifest_${split_label}.txt'; \
+                     awk -v role=built -f /work/manifest_norm.awk '${off_mf}' '${built_mf}' > 'comparison/norm_built_manifest_${split_label}.txt'; \
+                     if diff 'comparison/norm_off_manifest_${split_label}.txt' 'comparison/norm_built_manifest_${split_label}.txt' > 'comparison/residual_manifest_${split_label}.txt' 2>&1; then :; else rc=\$?; [ \"\${rc}\" -eq 1 ] || exit \"\${rc}\"; fi"; then
+                    unexplained+="AndroidManifest.xml normalization failed"$'\n'
+                else
+                    local mf_residual
+                    mf_residual="$(grep -vE '^[0-9]+(,[0-9]+)?[acd][0-9]+(,[0-9]+)?$|^---$|^$' "${mf_res_file}" 2>/dev/null || true)"
+                    if [[ -z "${mf_residual}" ]]; then
+                        accepted+="${split_label}: AndroidManifest.xml diff is only official Google Play-injected meta-data (structure-normalized; raw diff: $(basename "${mf_diff_file}"))"$'\n'
+                    else
+                        unexplained+="AndroidManifest.xml has non-Play-injection changes after normalization — see $(basename "${mf_res_file}")"$'\n'
+                    fi
+                fi
+            fi
+            fi
     fi
-
     if [[ "${needs_arsc}" -eq 1 ]]; then
         local rs_diff_file="${results_dir}/diff_resources_decoded_${split_label}.txt"
         ws_exec "diff -r 'comparison/official_${split_label}_decoded/res' \
                          'comparison/built_${split_label}_decoded/res' \
                  > 'comparison/diff_resources_decoded_${split_label}.txt' 2>&1 || true"
         local rs_changed rs_bad
-        # Notable = everything except per-file `diff -r` headers, hunk-position
-        # lines, separators, and blanks. `Only in` lines (added/removed decoded
-        # files) and diff error messages stay notable and fail closed.
         rs_changed="$(grep -vE '^diff -r |^[0-9]+(,[0-9]+)?[acd][0-9]+(,[0-9]+)?$|^---$|^$' "${rs_diff_file}" 2>/dev/null || true)"
         rs_bad="$(echo "${rs_changed}" \
             | grep -v 'com.google.firebase.crashlytics.mapping_file_id' \
             | grep -vE '^$' || true)"
         if [[ -z "${rs_changed}" ]]; then
-            accepted+="resources.arsc: binary differs, decoded res/ IDENTICAL (non-semantic artifact)"$'\n'
+            accepted+="${split_label}: resources.arsc binary differs, decoded res/ IDENTICAL (non-semantic artifact)"$'\n'
         elif [[ -z "${rs_bad}" ]]; then
-            accepted+="resources.arsc: sole decoded diff is com.google.firebase.crashlytics.mapping_file_id (build-time ID, acceptable per WS policy) — see $(basename "${rs_diff_file}")"$'\n'
+            accepted+="${split_label}: resources.arsc sole decoded diff is com.google.firebase.crashlytics.mapping_file_id (build-time ID, acceptable per WS policy) — see $(basename "${rs_diff_file}")"$'\n'
         else
             unexplained+="resources.arsc decoded res/ diff has non-crashlytics changes — see $(basename "${rs_diff_file}")"$'\n'
         fi
     fi
-
     if [[ -n "${accepted}" ]]; then
         log_info "  Acceptable diffs:"
         echo "${accepted}" | sed '/^$/d; s/^/    - /'
     fi
-
     if [[ -z "${unexplained//[$'\n ']}" ]]; then
-        SEMANTIC_UPGRADE="true"
-        SEMANTIC_NOTES="${accepted}"
-        log_pass "  All diffs are documented acceptable classes — verdict upgraded to reproducible."
+        SEMANTIC_NOTES+="${accepted}"
+        log_pass "  ${split_label}: all diffs are documented acceptable classes."
     else
         SEMANTIC_UPGRADE="false"
-        log_warn "  Unexplained diffs remain — verdict stays not_reproducible:"
+        log_warn "  ${split_label}: unexplained diffs remain — verdict stays not_reproducible:"
         echo "${unexplained}" | sed '/^$/d; s/^/    ! /'
     fi
 }
-
-# ------------------------------------------------------------------------------
-# Compare universal APKs (github mode)
-# ------------------------------------------------------------------------------
 compare_universal_apks() {
     local official_apk="$1"
     local built_apk="$2"
     local results_dir="${WORK_DIR}/comparison"
-
     mkdir -p "${results_dir}"
     log_info "Comparing universal APKs..."
-
     local official_unzip="${results_dir}/official_unzipped"
     local built_unzip="${results_dir}/built_unzipped"
     local diff_file="${results_dir}/diff_full.txt"
-
     unzip_apk_in_container "${official_apk}" "${official_unzip}"
     unzip_apk_in_container "${built_apk}"    "${built_unzip}"
-
     local official_rel built_rel diff_rel
     official_rel="${official_unzip#"${WORK_DIR}/"}"
     built_rel="${built_unzip#"${WORK_DIR}/"}"
     diff_rel="${diff_file#"${WORK_DIR}/"}"
-
-    # diff rc: 0 identical, 1 differences, >=2 operational error. An error line
-    # starts with "diff:" (colon), which DIFF_LINE_MATCH does not count -- so a
-    # swallowed error would read as zero diffs. Fail closed on rc >= 2.
     ws_exec "diff -r \"${official_rel}\" \"${built_rel}\" \
         > \"${diff_rel}\" 2>&1; rc=\$?; [ \"\${rc}\" -le 1 ]" || {
         log_fail "diff -r failed (operational error) -- see ${diff_file}"
         exit "${EXIT_FAILED}"
     }
-
     TOTAL_DIFFS=0
     if [[ -s "${diff_file}" ]]; then
         local total_lines
@@ -866,48 +717,46 @@ compare_universal_apks() {
     else
         log_pass "No differences found."
     fi
-
     if [[ "${TOTAL_DIFFS}" -gt 0 ]]; then
         analyze_acceptable_diffs "${official_apk}" "${built_apk}" "universal" "${diff_file}"
     fi
 }
-
-# ------------------------------------------------------------------------------
-# Print verification results block
-# ------------------------------------------------------------------------------
 print_results_block() {
     local verdict="$1"
     local apk_path="${OFFICIAL_BASE_APK:-${OFFICIAL_APK}}"
-
     local version_name version_code signer app_hash commit tag_info
-
     version_name="$(container_aapt_version "${apk_path}" "versionName" || true)"
     version_code="$(container_aapt_version "${apk_path}" "versionCode" || true)"
     signer="$(container_signer "${apk_path}" || true)"
     app_hash="$(container_sha256 "${apk_path}" || true)"
-
     commit=""
     if [[ -f "${WORK_DIR}/built-aab/commit.txt" ]]; then
         commit="$(cat "${WORK_DIR}/built-aab/commit.txt")"
     fi
-
     tag_info=""
     if [[ -f "${WORK_DIR}/built-aab/tag_verify.txt" ]]; then
         tag_info="$(cat "${WORK_DIR}/built-aab/tag_verify.txt")"
     fi
-
     echo ""
     echo "===== Begin Results ====="
+    echo "scriptVersion:  ${SCRIPT_VERSION}"
     echo "appId:          ${APP_ID}"
     echo "signer:         ${signer:-unknown}"
     echo "apkVersionName: ${version_name:-unknown}"
     echo "apkVersionCode: ${version_code:-unknown}"
     echo "verdict:        ${verdict}"
     echo "appHash:        ${app_hash:-unknown}"
+    if [[ "${BUILD_MODE}" == "split" ]]; then
+        echo "officialSplits (sha256, as provided):"
+        local sp
+        for sp in "${WORK_DIR}/official-split-apks"/*.apk; do
+            [[ -f "${sp}" ]] || continue
+            echo "  $(basename "${sp}"): $(container_sha256 "${sp}" || echo unknown)"
+        done
+    fi
     echo "commit:         ${commit:-unknown}"
     echo ""
     echo "Diff:"
-
     local results_dir="${WORK_DIR}/comparison"
     local shown=0
     if [[ -d "${results_dir}" ]]; then
@@ -932,7 +781,6 @@ print_results_block() {
     if [[ "${shown}" -eq 0 ]]; then
         echo "  (no diff files found)"
     fi
-
     echo ""
     echo "Revision, tag (and its signature):"
     if [[ -n "${tag_info}" ]]; then
@@ -940,41 +788,47 @@ print_results_block() {
     else
         echo "  (tag verification not available)"
     fi
-
     echo "===== End Results ====="
     echo ""
-
     if [[ "${should_cleanup}" != "true" ]]; then
         echo "Work directory: ${WORK_DIR}"
         echo "Diff files:     ${WORK_DIR}/comparison/"
     fi
 }
-
-# ------------------------------------------------------------------------------
-# Phase 1: Prepare
-# ------------------------------------------------------------------------------
 prepare() {
     log_info "=== PREPARE PHASE ==="
-
     rm -rf "${WORK_DIR}"
     mkdir -p "${WORK_DIR}"
     mkdir -p "${WORK_DIR}/official-split-apks"
     mkdir -p "${WORK_DIR}/built-aab"
-
     if [[ "${BUILD_MODE}" == "split" ]]; then
         local original_name canonical_name
-        original_name="$(basename "${APK_INPUT}")"
-        canonical_name="$(canonicalize_split_apk_name "${original_name}")"
-        cp "${APK_INPUT}" "${WORK_DIR}/official-split-apks/${canonical_name}"
-
-        if [[ "${original_name}" != "${canonical_name}" ]]; then
-            log_info "Normalized split name: ${original_name} -> ${canonical_name}"
+        if [[ "${APK_INPUT_IS_DIR}" == "true" ]]; then
+            local src_apk split_count=0
+            for src_apk in "${APK_INPUT}"/*.apk; do
+                [[ -f "${src_apk}" ]] || continue
+                original_name="$(basename "${src_apk}")"
+                canonical_name="$(canonicalize_split_apk_name "${original_name}")"
+                cp "${src_apk}" "${WORK_DIR}/official-split-apks/${canonical_name}"
+                if [[ "${original_name}" != "${canonical_name}" ]]; then
+                    log_info "Normalized split name: ${original_name} -> ${canonical_name}"
+                fi
+                split_count=$(( split_count + 1 ))
+            done
+            log_info "Collected ${split_count} official split APK(s) for verification"
+            OFFICIAL_APK="${WORK_DIR}/official-split-apks/base.apk"
+        else
+            log_warn "Single-split mode: ONLY $(basename "${APK_INPUT}") will be verified."
+            log_warn "The installed split set is NOT fully covered — pass the directory of splits for full coverage."
+            original_name="$(basename "${APK_INPUT}")"
+            canonical_name="$(canonicalize_split_apk_name "${original_name}")"
+            cp "${APK_INPUT}" "${WORK_DIR}/official-split-apks/${canonical_name}"
+            if [[ "${original_name}" != "${canonical_name}" ]]; then
+                log_info "Normalized split name: ${original_name} -> ${canonical_name}"
+            fi
+            OFFICIAL_APK="${WORK_DIR}/official-split-apks/${canonical_name}"
         fi
-
-        OFFICIAL_APK="${WORK_DIR}/official-split-apks/${canonical_name}"
         OFFICIAL_BASE_APK="${OFFICIAL_APK}"
-
-        # Auto-detect version from APK content if not provided
         if [[ -z "${VERSION}" ]]; then
             log_info "Auto-detecting version from APK content..."
             VERSION="$(container_aapt_version "${OFFICIAL_APK}" "versionName" || true)"
@@ -985,20 +839,12 @@ prepare() {
             log_info "Version detected: ${VERSION}"
             VERSION_SAFE="${VERSION}"
         fi
-
         create_device_spec "${WORK_DIR}/device-spec.json" "${ARCH}"
     fi
-
     log_pass "Preparation complete."
 }
-
-# ------------------------------------------------------------------------------
-# Phase 2: Build
-# ------------------------------------------------------------------------------
 build() {
     log_info "=== BUILD PHASE ==="
-
-    # Resolve git tag
     GIT_TAG="${REQUESTED_TAG:-}"
     if [[ -z "${GIT_TAG}" ]]; then
         if ! resolve_git_tag "${VERSION}"; then
@@ -1018,9 +864,7 @@ build() {
         fi
     fi
     log_info "Git tag: ${GIT_TAG}"
-
     ensure_build_image
-
     local image_tag="${NUNCHUK_IMAGE_BASE}:${VERSION_SAFE}"
     local gradle_task
     if [[ "${BUILD_MODE}" == "split" ]]; then
@@ -1028,13 +872,8 @@ build() {
     else
         gradle_task="assembleProductionRelease"
     fi
-
     log_info "Cloning + building in container (this may take 20-40 minutes)..."
     log_info "NOTE: Requires --privileged for disorderfs (FUSE)."
-
-    # Clone, verify tag, and build all in one privileged container run.
-    # disorderfs mounts the cloned source with sorted directory entries for
-    # reproducible builds — this is Nunchuk's official reproducible build approach.
     ${CONTAINER_CMD} run --rm \
         --privileged \
         -v "${WORK_DIR}/built-aab:/workspace${VOLUME_RW}" \
@@ -1042,15 +881,11 @@ build() {
         -e "GRADLE_USER_HOME=/tmp/.gradle" \
         "${image_tag}" \
         bash -c "set -euo pipefail
-
             echo '[INFO] Cloning ${REPO_URL} at ${GIT_TAG}...'
             git clone --depth 1 --branch '${GIT_TAG}' '${REPO_URL}' /workspace/app
-
             cd /workspace/app
             git rev-parse HEAD > /workspace/commit.txt
             echo '[INFO] Commit: \$(cat /workspace/commit.txt)'
-
-            # Tag and signature verification (best-effort)
             tag_type=\$(git cat-file -t 'refs/tags/${GIT_TAG}' 2>/dev/null || echo 'missing')
             printf 'TAG_TYPE=%s\n' \"\${tag_type}\" > /workspace/tag_verify.txt
             if [ \"\${tag_type}\" = 'tag' ]; then
@@ -1062,29 +897,20 @@ build() {
             fi
             printf '%s\n' '---COMMIT---' >> /workspace/tag_verify.txt
             git verify-commit HEAD >> /workspace/tag_verify.txt 2>&1 || true
-
-            # disorderfs: mount source with sorted directory entries for reproducibility.
-            # This matches Nunchuk's official reproducible build process.
             echo '[INFO] Mounting source with disorderfs...'
             mkdir -p /build-src
             disorderfs --sort-dirents=yes --reverse-dirents=no /workspace/app /build-src/ 2>&1 || {
                 echo '[WARNING] disorderfs failed or not available; building without it'
                 cp -a /workspace/app/. /build-src/ 2>/dev/null || true
             }
-
             cd /build-src
             chmod +x gradlew
-
             echo 'org.gradle.daemon=false'       >> gradle.properties
             echo 'org.gradle.parallel=false'     >> gradle.properties
-
             echo '[INFO] Running ./gradlew ${gradle_task}...'
             ./gradlew ${gradle_task} \
                 --no-daemon \
                 --stacktrace
-
-            # Copy outputs back only when /build-src is a real separate dir (disorderfs
-            # fallback); with the mount active this cp is a destructive self-copy.
             if ! mountpoint -q /build-src; then
                 echo '[INFO] Copying build outputs to workspace...'
                 find /build-src -name '*.aab' -o -name '*.apk' 2>/dev/null \
@@ -1097,10 +923,8 @@ build() {
             else
                 echo '[INFO] disorderfs mount active; outputs already in workspace.'
             fi
-
             echo '[INFO] Build complete.'
         "
-
     if [[ "${BUILD_MODE}" == "split" ]]; then
         local aab_path
         aab_path="$(find "${WORK_DIR}/built-aab/app" \
@@ -1118,97 +942,81 @@ build() {
         log_pass "Built AAB: ${BUILT_AAB}"
     fi
 }
-
-# ------------------------------------------------------------------------------
-# Phase 3: Extract and compare
-# ------------------------------------------------------------------------------
 extract_and_compare() {
     log_info "=== EXTRACT AND COMPARE PHASE ==="
-
     TOTAL_DIFFS=0
-
     if [[ "${BUILD_MODE}" == "split" ]]; then
         local built_splits_dir="${WORK_DIR}/built-split-apks"
         extract_split_apks_from_aab \
             "${BUILT_AAB}" \
             "${WORK_DIR}/device-spec.json" \
             "${built_splits_dir}"
-
-        # Find the matching built split for the provided official split
-        local built_split
-        built_split="$(resolve_built_split_apk "${OFFICIAL_APK}" "${built_splits_dir}/splits")" || {
-            log_fail "Could not find matching built split for $(basename "${OFFICIAL_APK}")"
-            log_info "Available built splits:"
-            find "${built_splits_dir}" -name "*.apk" | while IFS= read -r f; do echo "  ${f}"; done
-            exit "${EXIT_FAILED}"
-        }
-
-        log_info "Official: $(basename "${OFFICIAL_APK}")"
-        log_info "Built:    $(basename "${built_split}")"
-
-        local split_label
-        split_label="$(basename "${OFFICIAL_APK}" .apk)"
-        compare_split_apks "${OFFICIAL_APK}" "${built_split}" "${split_label}"
-
+        local official_split built_split split_label compared=0
+        for official_split in "${WORK_DIR}/official-split-apks"/*.apk; do
+            [[ -f "${official_split}" ]] || continue
+            built_split="$(resolve_built_split_apk "${official_split}" "${built_splits_dir}/splits")" || {
+                log_fail "Could not find matching built split for $(basename "${official_split}")"
+                log_info "Available built splits:"
+                find "${built_splits_dir}" -name "*.apk" | while IFS= read -r f; do echo "  ${f}"; done
+                exit "${EXIT_FAILED}"
+            }
+            split_label="$(basename "${official_split}" .apk)"
+            log_info "Official: $(basename "${official_split}")  <->  Built: $(basename "${built_split}")"
+            compare_split_apks "${official_split}" "${built_split}" "${split_label}"
+            compared=$(( compared + 1 ))
+        done
+        log_info "Compared ${compared} split pair(s)."
+        for built_split in "${built_splits_dir}/splits"/*.apk; do
+            [[ -f "${built_split}" ]] || continue
+            local built_canonical
+            built_canonical="$(canonicalize_split_apk_name "$(basename "${built_split}")")"
+            if [[ ! -f "${WORK_DIR}/official-split-apks/${built_canonical}" ]]; then
+                log_warn "Built split $(basename "${built_split}") has no official counterpart (not compared)"
+            fi
+        done
     else
-        # github mode: download official APK then compare
         log_info "Downloading official APK from GitHub releases (tag: ${GIT_TAG})..."
-
         local api_url="https://api.github.com/repos/nunchuk-io/nunchuk-android/releases/tags/${GIT_TAG}"
         local release_json
         release_json="$(${CONTAINER_CMD} run --rm \
             "${WS_CONTAINER}" \
             sh -c "curl -fsSL --max-time 30 '${api_url}'")"
-
         if echo "${release_json}" | grep -q '"message".*"Not Found"'; then
             log_fail "GitHub release not found for tag ${GIT_TAG}"
             exit "${EXIT_FAILED}"
         fi
-
         local apk_url
         apk_url="$(echo "${release_json}" \
             | grep -o '"browser_download_url":"[^"]*\.apk"' \
             | head -1 \
             | sed 's/"browser_download_url":"//; s/"//')"
-
         if [[ -z "${apk_url}" ]]; then
             log_fail "No APK asset found in GitHub release for ${GIT_TAG}"
             exit "${EXIT_FAILED}"
         fi
-
         log_info "Downloading: ${apk_url}"
         ${CONTAINER_CMD} run --rm \
             -v "${WORK_DIR}:/work${VOLUME_RW}" \
             "${WS_CONTAINER}" \
             sh -c "curl -fsSL --max-time 300 '${apk_url}' -o '/work/official-github.apk'"
-
         OFFICIAL_APK="${WORK_DIR}/official-github.apk"
         OFFICIAL_BASE_APK="${OFFICIAL_APK}"
-
-        # Find built APK
         local built_apk
         built_apk="$(find "${WORK_DIR}/built-aab/app" \
             -name "*.apk" \
             -path "*/outputs/apk/*" \
             ! -path "*/intermediates/*" \
             | head -1)"
-
         if [[ -z "${built_apk}" ]]; then
             log_fail "Built APK not found after assembleProductionRelease"
             exit "${EXIT_FAILED}"
         fi
         log_info "Built APK: ${built_apk}"
-
         compare_universal_apks "${OFFICIAL_APK}" "${built_apk}"
     fi
 }
-
-# ------------------------------------------------------------------------------
-# Phase 4: Result
-# ------------------------------------------------------------------------------
 result() {
     log_info "=== RESULT PHASE ==="
-
     local verdict semantic_summary=""
     if [[ "${TOTAL_DIFFS}" -eq 0 ]]; then
         verdict="reproducible"
@@ -1220,29 +1028,31 @@ $(echo "${SEMANTIC_NOTES}" | sed '/^$/d; s/^/    - /')"
     else
         verdict="not_reproducible"
     fi
-
     local notes
     if [[ "${BUILD_MODE}" == "split" ]]; then
-        notes="Split mode: official $(basename "${OFFICIAL_APK}") vs built split from ${GIT_TAG}.
+        if [[ "${APK_INPUT_IS_DIR}" == "true" ]]; then
+            notes="Split-set mode: all supplied official splits vs matching built splits from ${GIT_TAG}.
   Build: ./gradlew bundleProductionRelease with disorderfs (reproducible directory ordering).
   Non-META-INF diffs: ${TOTAL_DIFFS}.${semantic_summary}"
+        else
+            notes="Split mode: official $(basename "${OFFICIAL_APK}") vs built split from ${GIT_TAG}.
+  Build: ./gradlew bundleProductionRelease with disorderfs (reproducible directory ordering).
+  Non-META-INF diffs: ${TOTAL_DIFFS}.${semantic_summary}"
+        fi
     else
         notes="GitHub mode: official APK from GitHub releases vs built assembleProductionRelease.
   Build: ./gradlew assembleProductionRelease with disorderfs (reproducible directory ordering).
   Tag: ${GIT_TAG}. Non-META-INF diffs: ${TOTAL_DIFFS}.${semantic_summary}"
     fi
-
     generate_comparison_yaml "${verdict}" "${notes}"
     print_results_block "${verdict}"
     RESULT_DONE=true
-
     if [[ "${should_cleanup}" == "true" ]]; then
         log_info "Cleaning up ${WORK_DIR}..."
         rm -rf "${WORK_DIR}"
     else
         log_info "Work directory preserved: ${WORK_DIR}"
     fi
-
     if [[ "${verdict}" == "reproducible" ]]; then
         echo "Exit code: ${EXIT_SUCCESS}"
         exit "${EXIT_SUCCESS}"
@@ -1251,10 +1061,6 @@ $(echo "${SEMANTIC_NOTES}" | sed '/^$/d; s/^/    - /')"
         exit "${EXIT_FAILED}"
     fi
 }
-
-# ------------------------------------------------------------------------------
-# Main
-# ------------------------------------------------------------------------------
 detect_container_runtime
 parse_arguments "$@"
 prepare
