@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitcoincore_build.sh - Bitcoin Core Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.4.0
+# Version:       v0.5.0
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-07-10
+# Last Modified: 2026-07-18
 # Project:       https://github.com/bitcoin/bitcoin
 # ==============================================================================
 # LICENSE: MIT License
@@ -38,8 +38,20 @@
 
 set -euo pipefail
 
+echo -e "\033[1;33m"
+echo "=============================================================================="
+echo "                               DISCLAIMER"
+echo "=============================================================================="
+echo "Please examine this script yourself prior to running it."
+echo "This script is provided as-is without warranty and may contain bugs or"
+echo "security vulnerabilities. Use at your own risk."
+echo "=============================================================================="
+echo -e "\033[0m"
+sleep 2
+echo
+
 # Script metadata
-SCRIPT_VERSION="v0.4.0"
+SCRIPT_VERSION="v0.5.0"
 SCRIPT_NAME="bitcoincore_build.sh"
 APP_NAME="Bitcoin Core"
 APP_ID="bitcoincore"
@@ -256,7 +268,7 @@ ADDITIONAL LINUX TARGETS (use these with --arch):
     ppc64-linux             64-bit PowerPC Linux
     ppc64le-linux           64-bit PowerPC Little Endian Linux
 
-NOTE: These are mapped internally to Guix host triplets (e.g., x86_64-linux → x86_64-linux-gnu)
+NOTE: These are mapped internally to Guix host triplets (e.g., x86_64-linux Ã¢ x86_64-linux-gnu)
 
 OUTPUT FILES PER TARGET:
 Each build produces ONE standard release binary per architecture:
@@ -289,6 +301,76 @@ available at: https://bitcoin.org/bin/bitcoin-core-VERSION/
 For latest releases and to check actual binary names:
     https://bitcoincore.org/bin/
 
+EOF
+}
+
+# Map build server architecture to Guix host triplet
+map_arch_to_guix() {
+    local bs_arch="$1"
+    case "$bs_arch" in
+        x86_64-linux)
+            echo "x86_64-linux-gnu"
+            ;;
+        x86_64-linux-gnu)
+            echo "x86_64-linux-gnu"
+            ;;
+        aarch64-linux)
+            echo "aarch64-linux-gnu"
+            ;;
+        arm-linux)
+            echo "arm-linux-gnueabihf"
+            ;;
+        x86_64-windows|win64)
+            echo "x86_64-w64-mingw32"
+            ;;
+        riscv64-linux)
+            echo "riscv64-linux-gnu"
+            ;;
+        ppc64-linux)
+            echo "powerpc64-linux-gnu"
+            ;;
+        ppc64le-linux)
+            echo "powerpc64le-linux-gnu"
+            ;;
+        *)
+            log_error "Unsupported architecture: $bs_arch"
+            generate_error_yaml "ftbfs"
+            exit 1
+            ;;
+    esac
+}
+
+# Generate error YAML
+# NOTE: must be defined before ---------- Parameter Parsing ---------- below,
+# since that section calls this function directly on validation failures. In
+# bash, a function must be *defined* (i.e. its defining statement executed)
+# before it can be called - defining it further down the file, as originally
+# written, caused "generate_error_yaml: command not found" on any invocation
+# with missing/invalid arguments (verified by reproducing the ordering bug in
+# isolation before fixing it here).
+generate_error_yaml() {
+    local status="${1:-ftbfs}"
+    local notes="${2:-}"
+    {
+        echo "script_version: ${SCRIPT_VERSION}"
+        echo "verdict: ${status}"
+        if [[ -n "$notes" ]]; then
+            echo "notes: |"
+            printf '%s\n' "$notes" | sed 's/^/  /'
+        fi
+    } > "${execution_dir}/COMPARISON_RESULTS.yaml"
+}
+
+# Generate comparison YAML
+generate_comparison_yaml() {
+    local verdict="$1"
+    local extra="${2:-}"
+    cat > "${execution_dir}/COMPARISON_RESULTS.yaml" << EOF
+script_version: ${SCRIPT_VERSION}
+verdict: ${verdict}
+notes: |
+  Bitcoin Core ${version#v} (${arch}, ${build_type}) built reproducibly using Guix (contrib/guix/guix-build) inside a containerized Alpine environment, following the upstream reproducible-build process.
+  ${extra}
 EOF
 }
 
@@ -444,68 +526,6 @@ fi
 # Generate unique container/image names for this invocation
 set_unique_names "$version" "$arch" "$build_type"
 
-# Map build server architecture to Guix host triplet
-map_arch_to_guix() {
-    local bs_arch="$1"
-    case "$bs_arch" in
-        x86_64-linux)
-            echo "x86_64-linux-gnu"
-            ;;
-        x86_64-linux-gnu)
-            echo "x86_64-linux-gnu"
-            ;;
-        aarch64-linux)
-            echo "aarch64-linux-gnu"
-            ;;
-        arm-linux)
-            echo "arm-linux-gnueabihf"
-            ;;
-        x86_64-windows|win64)
-            echo "x86_64-w64-mingw32"
-            ;;
-        riscv64-linux)
-            echo "riscv64-linux-gnu"
-            ;;
-        ppc64-linux)
-            echo "powerpc64-linux-gnu"
-            ;;
-        ppc64le-linux)
-            echo "powerpc64le-linux-gnu"
-            ;;
-        *)
-            log_error "Unsupported architecture: $bs_arch"
-            generate_error_yaml "ftbfs"
-            exit 1
-            ;;
-    esac
-}
-
-# Generate error YAML
-generate_error_yaml() {
-    local status="${1:-ftbfs}"
-    local notes="${2:-}"
-    {
-        echo "script_version: ${SCRIPT_VERSION}"
-        echo "verdict: ${status}"
-        if [[ -n "$notes" ]]; then
-            echo "notes: |"
-            printf '%s\n' "$notes" | sed 's/^/  /'
-        fi
-    } > "${execution_dir}/COMPARISON_RESULTS.yaml"
-}
-
-# Generate comparison YAML
-generate_comparison_yaml() {
-    local verdict="$1"
-    cat > "${execution_dir}/COMPARISON_RESULTS.yaml" << EOF
-script_version: ${SCRIPT_VERSION}
-verdict: ${verdict}
-notes: |
-  Uses Guix for reproducible builds.
-  For unsigned Windows artifacts, compares against guix.sigs attestations from independent builders.
-EOF
-}
-
 # Dependency checks
 check_dependencies() {
     log_info "Checking dependencies..."
@@ -635,7 +655,7 @@ build_container() {
     log_info "Building Bitcoin Core verification container..."
     log_info "This may take 5-15 minutes depending on network speed..."
 
-    if ! ${container_cmd} build --pull --no-cache -t "$IMAGE_NAME" - < "$imagefile_path"; then
+    if ! ${container_cmd} build --pull --no-cache --ulimit nofile=65536:65536 -t "$IMAGE_NAME" - < "$imagefile_path"; then
         log_error "Container build failed"
         generate_error_yaml "ftbfs"
         exit 1
@@ -654,7 +674,7 @@ start_container() {
         ${container_cmd} rm -f "$CONTAINER_NAME" || true
     fi
 
-    if ! ${container_cmd} run -d --name "$CONTAINER_NAME" --privileged "$IMAGE_NAME"; then
+    if ! ${container_cmd} run -d --name "$CONTAINER_NAME" --privileged --ulimit nofile=65536:65536 "$IMAGE_NAME"; then
         log_error "Failed to start container"
         generate_error_yaml "ftbfs"
         exit 1
@@ -777,7 +797,7 @@ fetch_guix_sigs_hashes() {
             xargs -0 -r awk -v f='${artifact}' '\$2==f {print \$1}'
         fi
     " 2>/dev/null)
-    
+
     # Only output lines that look like valid SHA256 hashes (64 hex chars)
     echo "$result" | grep -E '^[a-f0-9]{64}$' || true
 }
@@ -867,15 +887,15 @@ verify_checksums() {
     # Copy built artifacts to /built inside container
     log_info "Organizing built artifacts inside container..."
     ${container_cmd} exec "$CONTAINER_NAME" bash -c "cp $build_dir/* /built/"
-    
+
     # Copy artifacts from container to host for final comparison
     ${container_cmd} cp "$CONTAINER_NAME:/official/." "$official_dir/" 2>/dev/null || true
     ${container_cmd} cp "$CONTAINER_NAME:/built/." "$built_dir/"
-    
+
     # Generate checksums and compare
     echo ""
     log_info "Comparing checksums..."
-    
+
     comparison_file="${execution_dir}/COMPARISON_RESULTS.yaml"
     match_count=0
     diff_count=0
@@ -885,7 +905,7 @@ verify_checksums() {
     built_hash=""
     official_hash=""
     attestation_hashes=""
-    
+
     if [[ "$use_guix_sigs" == "true" ]]; then
         if [[ -f "${built_dir}/${main_artifact}" ]]; then
             built_hash=$(sha256sum "${built_dir}/${main_artifact}" | awk '{print $1}')
@@ -893,13 +913,13 @@ verify_checksums() {
             if [[ -n "$attestation_hashes" ]]; then
                 official_hash=$(echo "$attestation_hashes" | head -n 1)
                 if echo "$attestation_hashes" | grep -Fxq "$built_hash"; then
-                    generate_comparison_yaml "reproducible"
+                    generate_comparison_yaml "reproducible" "Artifact ${main_artifact}: built SHA256 ${built_hash} matches a guix.sigs attestation (no single official checksum exists for unsigned Windows artifacts)."
                     match_count=$((match_count + 1))
                     verdict="reproducible"
                     log_success "Match: ${main_artifact}"
                     log_success "Hash: ${built_hash}"
                 else
-                    generate_comparison_yaml "not_reproducible"
+                    generate_comparison_yaml "not_reproducible" "Artifact ${main_artifact}: built SHA256 ${built_hash} does not match any guix.sigs attestation (attested example: ${official_hash})."
                     diff_count=$((diff_count + 1))
                     verdict="not_reproducible"
                     log_warn "Difference: ${main_artifact}"
@@ -925,13 +945,13 @@ verify_checksums() {
             official_hash=$(sha256sum "${official_dir}/${main_artifact}" | awk '{print $1}')
 
             if [[ "$built_hash" == "$official_hash" ]]; then
-                generate_comparison_yaml "reproducible"
+                generate_comparison_yaml "reproducible" "Artifact ${main_artifact}: official and built SHA256 both ${built_hash}."
                 match_count=$((match_count + 1))
                 verdict="reproducible"
                 log_success "Match: ${main_artifact}"
                 log_success "Hash: ${built_hash}"
             else
-                generate_comparison_yaml "not_reproducible"
+                generate_comparison_yaml "not_reproducible" "Artifact ${main_artifact}: built SHA256 ${built_hash} does not match official SHA256 ${official_hash}."
                 diff_count=$((diff_count + 1))
                 verdict="not_reproducible"
                 log_warn "Difference: ${main_artifact}"
@@ -959,7 +979,7 @@ verify_checksums() {
             fi
         fi
     fi
-    
+
     # ---------- Standardized Output Format ----------
     echo ""
     echo "===== Begin Results ====="
@@ -1003,7 +1023,7 @@ verify_checksums() {
     echo ""
     echo "===== End Results ====="
     echo ""
-    
+
     # ---------- Summary ----------
     log_info "=============================================="
     log_info "Verification Summary"
