@@ -2,7 +2,7 @@
 # ==============================================================================
 # liana_build.sh - Liana Desktop Wallet Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.1.11
+# Version:       v0.1.13
 # Organization:  WalletScrutiny.com
 # Project:       https://github.com/wizardsardine/liana
 # ==============================================================================
@@ -21,18 +21,15 @@
 # misuse or legal consequences arising from use of this script.
 #
 # SCRIPT SUMMARY:
-# - Clones Liana at the release tag, builds via the official guix-build.sh in an
-#   Alpine+Guix container, compares SHA256 vs the official release (or --binary),
-#   and writes COMPARISON_RESULTS.yaml for build server automation.
-#
-# CREDITS: Alpine+Guix approach adapted from fanquake/core-review and WS bitcoincore_build.sh.
+# - Clones Liana at the release tag, builds via the official guix-build.sh (tarball/deb) or the
+#   Nix flake (exe), compares SHA256 vs the official release, writes COMPARISON_RESULTS.yaml.
 
 set -euo pipefail
 
 # ==============================================================================
 # Metadata
 # ==============================================================================
-SCRIPT_VERSION="v0.1.11"
+SCRIPT_VERSION="v0.1.13"
 SCRIPT_NAME="liana_build.sh"
 APP_NAME="Liana"
 APP_ID="liana"
@@ -120,10 +117,7 @@ Examples:
   $(basename "$0") --version 13.0 --binary /tmp/liana-13.0-x86_64-linux-gnu.tar.gz
 
 Requirements:
-  - Docker or Podman installed (only host dependency)
-  - Internet connection (for Guix substitutes and source download)
-  - ~10 GB disk space for Guix store + build artifacts
-  - 60-180 minutes build time (Guix downloads packages on first run)
+  - Docker or Podman (only host dependency); internet; ~10 GB disk; 60-180 min build time
 
 Output:
   - Exit code 0: Binaries are reproducible
@@ -731,7 +725,7 @@ _create_nix_imagefile() {
 FROM nixos/nix:2.24.10
 
 RUN echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf && \
-    echo "sandbox = false" >> /etc/nix/nix.conf
+    echo "sandbox = true" >> /etc/nix/nix.conf
 
 RUN nix-env -iA nixpkgs.git nixpkgs.curl
 DOCKERFILE
@@ -906,13 +900,15 @@ _run_nix_exe_pipeline() {
         win_flake_target=".#liana.x86_64-pc-windows-gnu"
     fi
 
-    log_info "Running Nix Windows build: nix build ${win_flake_target}"
+    # Mirror upstream release.sh's Windows env (SOURCE_DATE_EPOCH=last-commit, TZ=UTC); its
+    # `.#liana.release` is a buildEnv over this same derivation (details in changelog).
+    log_info "Running Nix Windows build (release.sh-equivalent env): nix build ${win_flake_target}"
     log_info "This downloads dependencies and cross-compiles — may take 30-90 minutes."
     local start_time
     start_time=$(date +%s)
 
     if ! ${container_cmd} exec "$CONTAINER_NAME" bash -c \
-        "cd /liana && nix build ${win_flake_target} --out-link ${container_built}"; then
+        "cd /liana && export SOURCE_DATE_EPOCH=\"\$(git -c log.showsignature=false log --format=%at -1)\" && export TZ=UTC && nix build ${win_flake_target} --out-link ${container_built}"; then
         log_error "Nix Windows build failed"
         generate_error_yaml "ftbfs" "nix build ${win_flake_target} failed. See output above."
         exit 1
