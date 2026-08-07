@@ -2,7 +2,7 @@
 # ==============================================================================
 # wasabidesktop_build.sh - Wasabi Wallet Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:          v1.7.0
+# Version:          v1.7.1
 # Organization:     WalletScrutiny.com
 # Last modified by: Danny Garcia
 # Last modified on: 2026-08-07
@@ -23,7 +23,7 @@
 set -Eeuo pipefail
 
 # ---------- Script Metadata ----------
-SCRIPT_VERSION="v1.7.0"
+SCRIPT_VERSION="v1.7.1"
 APP_NAME="Wasabi Wallet"
 APP_ID="wasabi"
 
@@ -224,16 +224,33 @@ if [ -n "$BINARY_FILE" ] && [ ! -f "$BINARY_FILE" ]; then
 fi
 
 # ---------- Detect Container Runtime + user-mapping args (avoid root-owned host files) ----------
+# Two profiles. CONTAINER_RUN_USER_ARGS maps to the invoking user and is used for every
+# auxiliary step (clone, hashing, diffing) so nothing lands root-owned on the host.
+# CONTAINER_BUILD_USER_ARGS omits that mapping so the packaging step runs as root INSIDE
+# the container: upstream's release job is invoked as `sudo bash -x ./Contrib/release.sh
+# debian`, so its staged tree is root-owned and dpkg-deb records root/root for all 471
+# payload entries. Running unprivileged recorded danny/danny and made every entry differ.
+# This replicates CI's privilege context; the inlined transcription itself is unchanged --
+# the same reasoning by which the build is mounted at GitHub's CI path rather than
+# patching PathMap into the source.
 CONTAINER_CMD=""
 CONTAINER_RUN_USER_ARGS=""
+CONTAINER_BUILD_USER_ARGS=""
 if command -v podman &> /dev/null; then
   CONTAINER_CMD="podman"
   CONTAINER_RUN_USER_ARGS="--userns=keep-id -e HOME=/tmp"
+  # Rootless podman maps container root to the invoking host user, so files created on
+  # the bind mount stay host-owned while dpkg-deb still sees root/root inside.
+  CONTAINER_BUILD_USER_ARGS="-e HOME=/tmp"
   log_info "Using Podman for containerization"
 elif command -v docker &> /dev/null; then
   CONTAINER_CMD="docker"
   CONTAINER_RUN_USER_ARGS="--user $(id -u):$(id -g) -e HOME=/tmp"
+  CONTAINER_BUILD_USER_ARGS="-e HOME=/tmp"
   log_info "Using Docker for containerization"
+  log_warning "Rootful Docker: the packaging step runs as container root, so files it"
+  log_warning "creates in the workspace will be root-owned on the host and may need"
+  log_warning "sudo to remove. Podman (rootless) does not have this problem."
 else
   log_error "Neither Docker nor Podman found"
   write_yaml "ftbfs" "  Neither Docker nor Podman found on host."
@@ -728,7 +745,7 @@ INLINE_EOF
   log_info "(inlined transcription of Contrib/release.sh @ v2.8.1 -- see script header)"
   # Build path must be GitHub's CI path: [CallerFilePath] bakes it into
   # Fluent.Desktop.dll, so building elsewhere breaks reproduction. See changelog v1.6.0.
-  if ! $CONTAINER_CMD run --name "$CONTAINER_NAME" $CONTAINER_RUN_USER_ARGS \
+  if ! $CONTAINER_CMD run --name "$CONTAINER_NAME" $CONTAINER_BUILD_USER_ARGS \
     -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     -v "$WORKSPACE/walletwasabi:/home/runner/work/WalletWasabi/WalletWasabi:Z" \
     -v "$WORKSPACE/inline-release-debian.sh:/workspace/inline-release-debian.sh:Z" \
