@@ -2,7 +2,7 @@
 # ==============================================================================
 # wasabidesktop_build.sh - Wasabi Wallet Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:          v1.7.1
+# Version:          v1.7.2
 # Organization:     WalletScrutiny.com
 # Last modified by: Danny Garcia
 # Last modified on: 2026-08-07
@@ -23,7 +23,7 @@
 set -Eeuo pipefail
 
 # ---------- Script Metadata ----------
-SCRIPT_VERSION="v1.7.1"
+SCRIPT_VERSION="v1.7.2"
 APP_NAME="Wasabi Wallet"
 APP_ID="wasabi"
 
@@ -224,33 +224,19 @@ if [ -n "$BINARY_FILE" ] && [ ! -f "$BINARY_FILE" ]; then
 fi
 
 # ---------- Detect Container Runtime + user-mapping args (avoid root-owned host files) ----------
-# Two profiles. CONTAINER_RUN_USER_ARGS maps to the invoking user and is used for every
-# auxiliary step (clone, hashing, diffing) so nothing lands root-owned on the host.
-# CONTAINER_BUILD_USER_ARGS omits that mapping so the packaging step runs as root INSIDE
-# the container: upstream's release job is invoked as `sudo bash -x ./Contrib/release.sh
-# debian`, so its staged tree is root-owned and dpkg-deb records root/root for all 471
-# payload entries. Running unprivileged recorded danny/danny and made every entry differ.
-# This replicates CI's privilege context; the inlined transcription itself is unchanged --
-# the same reasoning by which the build is mounted at GitHub's CI path rather than
-# patching PathMap into the source.
+# Every container step runs mapped to the invoking user, so nothing lands root-owned on the
+# host. Payload ownership is handled at the packaging command instead -- see the
+# --root-owner-group note in the inlined script.
 CONTAINER_CMD=""
 CONTAINER_RUN_USER_ARGS=""
-CONTAINER_BUILD_USER_ARGS=""
 if command -v podman &> /dev/null; then
   CONTAINER_CMD="podman"
   CONTAINER_RUN_USER_ARGS="--userns=keep-id -e HOME=/tmp"
-  # Rootless podman maps container root to the invoking host user, so files created on
-  # the bind mount stay host-owned while dpkg-deb still sees root/root inside.
-  CONTAINER_BUILD_USER_ARGS="-e HOME=/tmp"
   log_info "Using Podman for containerization"
 elif command -v docker &> /dev/null; then
   CONTAINER_CMD="docker"
   CONTAINER_RUN_USER_ARGS="--user $(id -u):$(id -g) -e HOME=/tmp"
-  CONTAINER_BUILD_USER_ARGS="-e HOME=/tmp"
   log_info "Using Docker for containerization"
-  log_warning "Rootful Docker: the packaging step runs as container root, so files it"
-  log_warning "creates in the workspace will be root-owned on the host and may need"
-  log_warning "sudo to remove. Podman (rootless) does not have this problem."
 else
   log_error "Neither Docker nor Podman found"
   write_yaml "ftbfs" "  Neither Docker nor Podman found on host."
@@ -482,8 +468,10 @@ trap 'cleanup_container' EXIT
 # other targets (wininstaller/dmg/releasenote/gpgsign) is removed below since
 # their guard variables are unconditionally "no" on this path in the source
 # and produce no side effects. Everything that DOES execute here is an unmodified
-# transcription, with one explicitly marked exception: the ClientVersion
-# postcondition below is a verifier fail-closed guard, not upstream code.
+# transcription, with two explicitly marked exceptions: the ClientVersion
+# postcondition below is a verifier fail-closed guard, and the dpkg-deb call
+# passes --root-owner-group to match the ownership upstream's sudo produces.
+# Neither is upstream code; both are commented where they appear.
 # Do not "improve" this logic; any change must be re-justified against the
 # source file above.
 set -xe
@@ -733,7 +721,15 @@ if [[ "$PACKAGE_COORDINATOR" == "yes" ]]; then
   chmod 0755 ${DEBIAN_BIN}/${COORDINATOR_EXECUTABLE_NAME}
 fi
 
-dpkg-deb -Zxz --build "${DEBIAN_PACKAGE_DIR}" "$PACKAGES_DIR/${PACKAGE_FILE_NAME_PREFIX}${DEBIAN_ARCH_NAME}.deb"
+# --root-owner-group is a VERIFIER ADAPTATION, not upstream's command. Upstream's release
+# job runs `sudo bash -x ./Contrib/release.sh debian`, so its staged tree is root-owned and
+# dpkg-deb records uid/gid 0/0 for every payload entry. This script builds unprivileged so
+# host files stay host-owned; without this option every entry would record the invoking
+# user and differ from the official package. The option sets 0/0 for all entries, producing
+# the same observable artifact as upstream's privileged run without a privilege change.
+# It does not affect compilation or file contents. See the ClientVersion guard above for
+# the other deliberate deviation.
+dpkg-deb --root-owner-group -Zxz --build "${DEBIAN_PACKAGE_DIR}" "$PACKAGES_DIR/${PACKAGE_FILE_NAME_PREFIX}${DEBIAN_ARCH_NAME}.deb"
 
 done
 fi
@@ -745,7 +741,7 @@ INLINE_EOF
   log_info "(inlined transcription of Contrib/release.sh @ v2.8.1 -- see script header)"
   # Build path must be GitHub's CI path: [CallerFilePath] bakes it into
   # Fluent.Desktop.dll, so building elsewhere breaks reproduction. See changelog v1.6.0.
-  if ! $CONTAINER_CMD run --name "$CONTAINER_NAME" $CONTAINER_BUILD_USER_ARGS \
+  if ! $CONTAINER_CMD run --name "$CONTAINER_NAME" $CONTAINER_RUN_USER_ARGS \
     -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     -v "$WORKSPACE/walletwasabi:/home/runner/work/WalletWasabi/WalletWasabi:Z" \
     -v "$WORKSPACE/inline-release-debian.sh:/workspace/inline-release-debian.sh:Z" \
