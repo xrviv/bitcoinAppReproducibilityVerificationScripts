@@ -2,7 +2,7 @@
 # ==============================================================================
 # wasabidesktop_build.sh - Wasabi Wallet Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:          v1.7.2
+# Version:          v1.8.0
 # Organization:     WalletScrutiny.com
 # Last modified by: Danny Garcia
 # Last modified on: 2026-08-07
@@ -23,7 +23,7 @@
 set -Eeuo pipefail
 
 # ---------- Script Metadata ----------
-SCRIPT_VERSION="v1.7.2"
+SCRIPT_VERSION="v1.8.0"
 APP_NAME="Wasabi Wallet"
 APP_ID="wasabi"
 
@@ -82,8 +82,6 @@ Parameters:
   --type <type>         deb (default), tarball, zip
   --binary <file>       Path to an official binary to compare against, instead of
                          downloading it from GitHub releases.
-  --apk <file>          Accepted for ABS cross-platform compatibility; not
-                         applicable to desktop builds, ignored.
   --help, -h             Show this help message
 
 Unknown parameters are accepted and ignored with a warning (never fatal), per
@@ -143,7 +141,6 @@ while [[ $# -gt 0 ]]; do
     --arch) [ $# -ge 2 ] || { log_error "--arch requires a value"; write_yaml "ftbfs" "  --arch requires a value."; exit 2; }; ARCH="$2"; shift 2 ;;
     --type) [ $# -ge 2 ] || { log_error "--type requires a value"; write_yaml "ftbfs" "  --type requires a value."; exit 2; }; TYPE="$2"; shift 2 ;;
     --binary) [ $# -ge 2 ] || { log_error "--binary requires a value"; write_yaml "ftbfs" "  --binary requires a value."; exit 2; }; BINARY_FILE="$2"; shift 2 ;;
-    --apk) log_info "--apk is not applicable to desktop builds; ignoring."; [ $# -ge 2 ] && shift 2 || shift ;;
     --help|-h) usage; exit 0 ;;
     *) log_warning "Unknown argument: $1 (ignored)"; shift ;;
   esac
@@ -813,6 +810,39 @@ else
   echo "Diff (first 5 lines -- full diff in $DIFF_FILE):"
   head -5 "$DIFF_FILE" 2>/dev/null || true
   [ "$DIFF_LINES" -gt 5 ] && echo "... ($DIFF_LINES lines total -- see $DIFF_FILE)"
+
+  # ---------- Archive Metadata Evidence (deb only; diagnostic, never changes the verdict) ----------
+  # The structural diff above extracts both packages and compares file CONTENTS. It cannot see
+  # ownership, permission bits, timestamps or member order -- a real ownership mismatch hid
+  # behind it on Wasabi 2.8.0 and 2.8.1 and was reported as absent. This step lists both
+  # archives with numeric owners and full timestamps, preserving member order (no sort), so a
+  # difference in those properties is recorded rather than inferred.
+  if [ "$TYPE" = "deb" ]; then
+    log_info "Comparing archive metadata (ownership, modes, timestamps, member order)..."
+    META_DIFF_FILE="$WORKSPACE/diff_archive_metadata.txt"
+    $CONTAINER_CMD run --rm $CONTAINER_RUN_USER_ARGS -v "$WORKSPACE:/workspace:Z" -w /workspace \
+      "$IMAGE_NAME" bash -c "
+        for side in official built; do
+          [ \$side = official ] && pkg=official-$EXPECTED_FILE || pkg=output/$EXPECTED_FILE
+          dpkg-deb --fsys-tarfile \"\$pkg\" | tar --numeric-owner --full-time -tvf - > listing-\$side-payload.txt 2>/dev/null
+          dpkg-deb --ctrl-tarfile \"\$pkg\" | tar --numeric-owner --full-time -tvf - > listing-\$side-control.txt 2>/dev/null
+        done
+        echo '--- payload archive (data.tar) ---'
+        diff listing-official-payload.txt listing-built-payload.txt && echo 'IDENTICAL'
+        echo '--- control archive (control.tar) ---'
+        diff listing-official-control.txt listing-built-control.txt && echo 'IDENTICAL'" \
+      > "$META_DIFF_FILE" 2>&1 || true
+    META_PAYLOAD_DIFFS=$(sed -n '/payload archive/,/control archive/p' "$META_DIFF_FILE" | grep -c '^[<>]' || true)
+    META_CONTROL_DIFFS=$(sed -n '/control archive/,$p' "$META_DIFF_FILE" | grep -c '^[<>]' || true)
+    echo "Archive metadata: payload ${META_PAYLOAD_DIFFS} differing entries, control ${META_CONTROL_DIFFS} -- full listing in $META_DIFF_FILE"
+    if [ "$META_PAYLOAD_DIFFS" -eq 0 ] && [ "$META_CONTROL_DIFFS" -eq 0 ]; then
+      log_success "Archive metadata identical: ownership, modes, timestamps and member order all match."
+      log_info "The package difference is therefore confined to file contents shown above."
+    else
+      log_warning "Archive metadata differs beyond file contents -- see $META_DIFF_FILE."
+      log_warning "This is diagnostic only and does not change the verdict, which rests on the artifact hash."
+    fi
+  fi
 fi
 
 # ---------- Generate COMPARISON_RESULTS.yaml (minimal 3-field format) ----------
@@ -853,6 +883,19 @@ else
   echo "BUILDS DO NOT MATCH BINARIES"
   echo "$EXPECTED_FILE - $ARCH - $BUILT_HASH - 0 (DOESN'T MATCH)"
   echo "Full diff: $DIFF_FILE"
+  if [ "$TYPE" = "deb" ] && [ -n "${META_DIFF_FILE:-}" ]; then
+    echo ""
+    echo "Archive metadata (diagnostic; does not affect the verdict above):"
+    if [ "${META_PAYLOAD_DIFFS:-0}" -eq 0 ] && [ "${META_CONTROL_DIFFS:-0}" -eq 0 ]; then
+      echo "  payload and control archives identical in ownership, modes, timestamps and member order"
+      echo "  the difference is confined to file contents shown in the diff above"
+    else
+      echo "  payload archive: ${META_PAYLOAD_DIFFS:-?} differing entries"
+      echo "  control archive: ${META_CONTROL_DIFFS:-?} differing entries"
+      echo "  compared with numeric owners, full timestamps and original member order"
+    fi
+    echo "  Full listing: $META_DIFF_FILE"
+  fi
 fi
 echo ""
 echo "SUMMARY"
