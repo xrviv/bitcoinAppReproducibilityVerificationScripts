@@ -2,17 +2,17 @@
 # ==============================================================================
 # wasabidesktop_build.sh - Wasabi Wallet Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:          v1.6.1
+# Version:          v1.7.0
 # Organization:     WalletScrutiny.com
 # Last modified by: Danny Garcia
-# Last modified on: 2026-07-15
+# Last modified on: 2026-08-07
 # Project:          https://github.com/WalletWasabi/WalletWasabi
 # ==============================================================================
 # MIT License. Provided as-is for reproducible-build verification and security
 # research, without warranty; you assume all risk and responsibility for lawful use.
 #
-# Inlines upstream Contrib/release.sh's "debian" target (source: tag v2.8.0,
-# https://github.com/WalletWasabi/WalletWasabi/blob/v2.8.0/Contrib/release.sh).
+# Inlines upstream Contrib/release.sh's "debian" target (source: tag v2.8.1,
+# https://github.com/WalletWasabi/WalletWasabi/blob/v2.8.1/Contrib/release.sh).
 # A transcription, not an improvement: re-justify any change against the source
 # file, and re-diff release.sh on every new upstream tag.
 #
@@ -23,7 +23,7 @@
 set -Eeuo pipefail
 
 # ---------- Script Metadata ----------
-SCRIPT_VERSION="v1.6.1"
+SCRIPT_VERSION="v1.7.0"
 APP_NAME="Wasabi Wallet"
 APP_ID="wasabi"
 
@@ -77,7 +77,7 @@ Usage:
   $(basename "$0") --version <version> [--arch <arch>] [--type <type>] [--binary <file>]
 
 Parameters:
-  --version <version>   Wasabi version to verify. THIS SCRIPT VERSION SUPPORTS 2.8.0 ONLY.
+  --version <version>   Wasabi version to verify. THIS SCRIPT VERSION SUPPORTS 2.8.1 ONLY.
   --arch <arch>         x86_64-linux-gnu (default, and the only supported value)
   --type <type>         deb (default), tarball, zip
   --binary <file>       Path to an official binary to compare against, instead of
@@ -93,8 +93,8 @@ Known limitations:
   - linux-arm64 is a real release artifact since v2.8.0 (Contrib/release.sh
     debian cross-builds it alongside x64 regardless) but is not yet exposed
     as a selectable --arch here; deliberately scoped out of this patch.
-  - Pinned to Wasabi 2.8.0 EXACTLY (exit 2 otherwise). The inlined release
-    logic is transcribed from Contrib/release.sh at tag v2.8.0 and the .NET SDK
+  - Pinned to Wasabi 2.8.1 EXACTLY (exit 2 otherwise). The inlined release
+    logic is transcribed from Contrib/release.sh at tag v2.8.1 and the .NET SDK
     pin (10.0.301-noble) was derived from that release's runner image. Both are
     release-specific: reusing them for another version could produce an invalid
     verdict. A new release needs the SDK pin re-derived, release.sh re-diffed
@@ -112,9 +112,9 @@ Known limitations:
     differ on that basis alone.
 
 Examples:
-  $(basename "$0") --version 2.8.0
-  $(basename "$0") --version 2.8.0 --arch x86_64-linux-gnu --type deb
-  $(basename "$0") --version 2.8.0 --arch x86_64-linux-gnu --type tarball --binary ~/Downloads/Wasabi-2.8.0-linux-x64.tar.gz
+  $(basename "$0") --version 2.8.1
+  $(basename "$0") --version 2.8.1 --arch x86_64-linux-gnu --type deb
+  $(basename "$0") --version 2.8.1 --arch x86_64-linux-gnu --type tarball --binary ~/Downloads/Wasabi-2.8.1-linux-x64.tar.gz
 
 Requirements:
   - Docker or Podman installed (only host dependency)
@@ -168,10 +168,10 @@ if ! [[ "$VERSION" =~ ^[vV]?[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
 fi
 
 # This script is pinned to ONE upstream release. It embeds logic transcribed from
-# Contrib/release.sh at v2.8.0 and an SDK chosen for v2.8.0's runner; both go stale the
+# Contrib/release.sh at v2.8.1 and an SDK chosen for v2.8.1's runner; both go stale the
 # moment upstream moves. Building another version with them would yield an authoritative
-# looking but invalid verdict, so refuse rather than guess. See changelog v1.6.1.
-SUPPORTED_VERSION="2.8.0"
+# looking but invalid verdict, so refuse rather than guess. See changelog v1.7.0.
+SUPPORTED_VERSION="2.8.1"
 if [ "${VERSION#[vV]}" != "$SUPPORTED_VERSION" ]; then
   log_error "This script version supports Wasabi ${SUPPORTED_VERSION} only; got: ${VERSION}"
   log_error "It embeds release logic transcribed from Contrib/release.sh at tag v${SUPPORTED_VERSION}"
@@ -241,7 +241,7 @@ else
 fi
 
 # ---------- Version Normalization ----------
-# Normalise leading V/v: "V2.8.0" would otherwise derive the bad tag "vV2.8.0".
+# Normalise leading V/v: "V2.8.1" would otherwise derive the bad tag "vV2.8.1".
 VERSION="${VERSION#[vV]}"
 GIT_TAG="v$VERSION"
 VERSION_NO_V="$VERSION"
@@ -285,13 +285,13 @@ if [ -n "$BINARY_FILE" ]; then
 fi
 
 # ---------- Generate Embedded Dockerfile ----------
-# Base image pin rationale (verified at the tag v2.8.0):
-# - global.json @ v2.8.0: sdk.version=10.0.100, rollForward=latestFeature
+# Base image pin rationale (verified at the tag v2.8.1):
+# - global.json @ v2.8.1: sdk.version=10.0.100, rollForward=latestFeature
 # - .github/workflows/release.yml job "debian-package-and-zips" runs on
 #   ubuntu-latest with NO explicit setup-dotnet step for Linux -- it resolves
 #   whichever preinstalled SDK satisfies global.json.
-# - The actual v2.8.0 release run (workflow run 28274724492, job 83779062333)
-#   ran on runner image ubuntu-24.04 release ubuntu24/20260622.220, which
+# - The actual v2.8.1 release run (workflow run 29929230669, job 88954227399)
+#   ran on runner image ubuntu-24.04 release ubuntu24/20260714.240, which
 #   ships .NET SDKs 10.0.109 / 10.0.204 / 10.0.301. Per documented
 #   rollForward=latestFeature semantics (highest feature band + highest patch
 #   within the same major.minor), 10.0.301 is the only self-consistent match.
@@ -307,7 +307,7 @@ fi
 # never root-owned -- but `apt-get install` needs root, so it cannot happen at
 # `run` time once user-mapping is in effect. One image build up front avoids
 # that conflict entirely instead of mixing root and mapped-user `run` calls.
-log_info "Generating embedded Dockerfile pinned to the SDK that built official v2.8.0..."
+log_info "Generating embedded Dockerfile pinned to the SDK that built official v2.8.1..."
 DOCKERFILE_PATH="$WORKSPACE/Dockerfile"
 cat > "$DOCKERFILE_PATH" <<'DOCKERFILE_EOF'
 FROM mcr.microsoft.com/dotnet/sdk:10.0.301-noble@sha256:ea8bde36c11b6e7eec2656d0e59101d4462f6bd630730f2c8201ed0572b295d5
@@ -371,7 +371,7 @@ log_info "SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH (source commit time)"
 # --mtime normalization natively, plus --sort=name/--owner=0/--group=0/PAX
 # header stripping our old patch never touched).
 
-# ---------- Check Git Tag Authenticity (v2.8.0's tag is lightweight and unsigned) ----------
+# ---------- Check Git Tag Authenticity (v2.8.1's tag is lightweight and unsigned) ----------
 log_info "Verifying Git tag / commit authenticity..."
 WASABI_GPG_FINGERPRINT="6FB3 872B 5D42 292F 5992  0797 8563 4832 8949 861E"
 GPG_VERIFICATION=$($CONTAINER_CMD run --rm $CONTAINER_RUN_USER_ARGS \
@@ -450,33 +450,43 @@ cleanup_container() { $CONTAINER_CMD rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || 
 trap 'cleanup_container' EXIT
 
   # ---------- Generate the inlined debian-target build script ----------
-  # Transcribed from Contrib/release.sh at tag v2.8.0 (see script header for
+  # Transcribed from Contrib/release.sh at tag v2.8.1 (see script header for
   # the full citation and fidelity rule). Single-quoted heredoc: no variable
   # expansion by THIS script -- every $VAR below is evaluated inside the
   # container by the generated script itself, exactly as in the source.
-  log_info "Generating inlined debian-target build script (from Contrib/release.sh @ v2.8.0)..."
+  log_info "Generating inlined debian-target build script (from Contrib/release.sh @ v2.8.1)..."
   cat > "$WORKSPACE/inline-release-debian.sh" <<'INLINE_EOF'
 #!/usr/bin/env bash
 # Transcribed from WalletWasabi Contrib/release.sh, "debian" target, tag
-# v2.8.0: https://github.com/WalletWasabi/WalletWasabi/blob/v2.8.0/Contrib/release.sh
+# v2.8.1: https://github.com/WalletWasabi/WalletWasabi/blob/v2.8.1/Contrib/release.sh
 # This is the code path GitHub Actions runs via
 # `sudo bash -x ./Contrib/release.sh debian` in .github/workflows/release.yml
 # job "debian-package-and-zips". The argument-dispatch scaffolding for the
 # other targets (wininstaller/dmg/releasenote/gpgsign) is removed below since
 # their guard variables are unconditionally "no" on this path in the source
-# and produce no side effects -- everything that DOES execute here is an
-# unmodified transcription. Do not "improve" this logic; any change must be
-# re-justified against the source file above.
+# and produce no side effects. Everything that DOES execute here is an unmodified
+# transcription, with one explicitly marked exception: the ClientVersion
+# postcondition below is a verifier fail-closed guard, not upstream code.
+# Do not "improve" this logic; any change must be re-justified against the
+# source file above.
 set -xe
-
-STASH_MESSAGE="Stashed changes for script execution"
-if [[ -n $(git status --porcelain) ]]; then
-  git stash push -m "$STASH_MESSAGE" --quiet
-fi
 
 LATEST_TAG=$(git describe --tags --abbrev=0)
 VERSION=${LATEST_TAG:1}
 SHORT_VERSION=${VERSION:0:${#VERSION}-2}
+
+CONSTANTS_FILE="./WalletWasabi/Helpers/Constants.cs"
+VERSION_ARGS=$(echo "$VERSION" | sed 's/\./, /g')
+sed -i "s/ClientVersion = new([0-9, ]*);/ClientVersion = new($VERSION_ARGS);/" "$CONSTANTS_FILE"
+
+# Verifier postcondition, NOT part of the upstream transcription: sed exits 0 when it
+# replaces nothing, so an upstream source-layout change would silently embed the wrong
+# client version and surface as a misleading not_reproducible. Fail closed instead.
+EXPECTED_CLIENT_VERSION="ClientVersion = new($VERSION_ARGS);"
+if [ "$(grep -Fc "$EXPECTED_CLIENT_VERSION" "$CONSTANTS_FILE" || true)" -ne 1 ]; then
+  echo "ERROR: ClientVersion rewrite did not yield exactly one '$EXPECTED_CLIENT_VERSION' in $CONSTANTS_FILE" >&2
+  exit 1
+fi
 
 DESKTOP="WalletWasabi.Fluent.Desktop"
 COORDINATOR="WalletWasabi.Coordinator"
@@ -689,10 +699,14 @@ echo "#!/usr/bin/env sh
 ${INSTALL_DIR}/${EXECUTABLE_NAME}d \$@" > ${DEBIAN_BIN}/${EXECUTABLE_NAME}d
 
 chmod 0755 ${DEBIAN_BIN}/wasabiwallet
-find ${DEBIAN_BIN}/wasabiwallet -type f -exec chmod 655 {} \;
+find ${DEBIAN_BIN}/wasabiwallet -type f -exec chmod 644 {} \;
 find ${DEBIAN_BIN}/wasabiwallet -type d -not -path ${DEBIAN_BIN}/wasabiwallet -exec chmod 755 {} \;
 chmod 0755 ${DEBIAN_BIN}/wasabiwallet/${EXECUTABLE_NAME}{,d}
 chmod 0755 ${DEBIAN_BIN}/${EXECUTABLE_NAME}{,d}
+
+DEBIAN_BUNDLED_BINARIES="${DEBIAN_BIN}/wasabiwallet/BundledApps/Binaries/${DEBIAN_FULL_PLATFORM_NAME}"
+chmod 0755 "${DEBIAN_BUNDLED_BINARIES}/hwi"
+chmod 0755 "${DEBIAN_BUNDLED_BINARIES}/Tor/tor"
 
 if [[ "$PACKAGE_COORDINATOR" == "yes" ]]; then
   echo "#!/usr/bin/env sh
@@ -707,18 +721,11 @@ dpkg-deb -Zxz --build "${DEBIAN_PACKAGE_DIR}" "$PACKAGES_DIR/${PACKAGE_FILE_NAME
 done
 fi
 
-# Unstash changes if there were any (present on every target in the source,
-# including debian -- transcribed for fidelity even though our fresh checkout
-# never has uncommitted changes to stash in the first place).
-if git stash list | head -1 | grep -q "$STASH_MESSAGE"; then
-  git stash pop
-  echo "Changes unstashed."
-fi
 INLINE_EOF
   log_success "Inlined build script generated"
 
   log_info "Running inlined debian-target build inside container..."
-  log_info "(inlined transcription of Contrib/release.sh @ v2.8.0 -- see script header)"
+  log_info "(inlined transcription of Contrib/release.sh @ v2.8.1 -- see script header)"
   # Build path must be GitHub's CI path: [CallerFilePath] bakes it into
   # Fluent.Desktop.dll, so building elsewhere breaks reproduction. See changelog v1.6.0.
   if ! $CONTAINER_CMD run --name "$CONTAINER_NAME" $CONTAINER_RUN_USER_ARGS \
@@ -728,7 +735,7 @@ INLINE_EOF
     "$IMAGE_NAME" \
     bash -c "cd /home/runner/work/WalletWasabi/WalletWasabi && bash /workspace/inline-release-debian.sh"; then
     log_error "Build failed inside container"
-    write_yaml "ftbfs" "  Inlined debian-target build (transcribed from Contrib/release.sh @ v2.8.0) failed to build from source at tag ${GIT_TAG} (commit ${ACTUAL_COMMIT})."
+    write_yaml "ftbfs" "  Inlined debian-target build (transcribed from Contrib/release.sh @ v2.8.1) failed to build from source at tag ${GIT_TAG} (commit ${ACTUAL_COMMIT})."
     exit 1
   fi
 
