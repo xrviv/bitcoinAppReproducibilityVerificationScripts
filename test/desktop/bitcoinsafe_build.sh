@@ -2,9 +2,9 @@
 # ======================================================================================
 # bitcoinsafe_build.sh - Bitcoin Safe Desktop Reproducible Build Verification
 # ======================================================================================
-# Version:       v0.8.16
+# Version:       v0.9.2
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-07-01
+# Last Modified: 2026-07-23
 # Project:       https://github.com/andreasgriffin/bitcoin-safe
 # ==============================================================================
 # LICENSE: MIT License
@@ -38,9 +38,16 @@ set -euo pipefail
 # ======================================================================================
 
 APP_ID="bitcoin.safe"
-SCRIPT_VERSION="v0.8.16"
+SCRIPT_VERSION="v0.9.2"
 REPO_URL="https://github.com/andreasgriffin/bitcoin-safe.git"
 RELEASE_BASE="https://github.com/andreasgriffin/bitcoin-safe/releases/download"
+
+# Release signing key, pinned by fingerprint. Published on the project website
+# (https://bitcoin-safe.org/en/download/) alongside every download link, which is a
+# different host from the GitHub release assets it signs.
+SIGNING_KEY_FPR="2759AA7148568ECCB03B76301D82124B440F612D"
+SIGNING_KEY_URL="https://keys.openpgp.org/vks/v1/by-fingerprint/${SIGNING_KEY_FPR}"
+SIG_STATUS="not checked"
 
 # Build configuration variables
 NEEDS_SIGNATURE_STRIP=false
@@ -292,7 +299,7 @@ bootstrap_container() {
     bash -c '
       # Install dependencies (as root)
       apt-get update -qq && apt-get install -y -qq \
-        git curl ca-certificates docker.io coreutils \
+        git curl ca-certificates docker.io coreutils gnupg \
         build-essential \
         osslsigncode \
         libglib2.0-0 libgl1 libegl1 libfontconfig1 \
@@ -529,10 +536,15 @@ prepare_repository() {
   (cd "$REPO_DIR" && git submodule update --init --recursive)
 
   SOURCE_COMMIT=$(cd "$REPO_DIR" && git rev-parse HEAD)
-  SOURCE_DATE_EPOCH=$(cd "$REPO_DIR" && git log -1 --format=%ct HEAD)
-  export SOURCE_DATE_EPOCH
   export SOURCE_COMMIT
-  log_info "SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH"
+  if [[ "${BUILD_TYPE:-}" == "deb" ]]; then
+    unset SOURCE_DATE_EPOCH
+    log_info "SOURCE_DATE_EPOCH: unset (deb converter fallback, as used by the official release)"
+  else
+    SOURCE_DATE_EPOCH=$(cd "$REPO_DIR" && git log -1 --format=%ct HEAD)
+    export SOURCE_DATE_EPOCH
+    log_info "SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH"
+  fi
   log_info "SOURCE_COMMIT: $SOURCE_COMMIT"
 }
 
@@ -540,11 +552,47 @@ prepare_repository() {
 # BUILD PROCESS
 # ======================================================================================
 
+# Fixed name of the container upstream tools/build.py uses for Windows/wine builds.
+readonly WINE_CONTAINER="bitcoin_safe-wine-builder-img-container"
+
+# Clears any leftover upstream Windows-build container and waits until Docker
+# confirms it is gone (it can wedge in "removal in progress"). See changelog.
+cleanup_wine_container() {
+  local waited=0 timeout=120 names
+  # A failed query must not be mistaken for "container absent".
+  if ! names=$(docker ps -a --format '{{.Names}}' 2>/dev/null); then
+    log_error "Unable to query Docker (daemon unreachable?); cannot verify build container state"
+    return 1
+  fi
+  grep -qx "$WINE_CONTAINER" <<<"$names" || return 0
+  log_info "Removing leftover Windows build container '$WINE_CONTAINER'..."
+  docker rm -f "$WINE_CONTAINER" >/dev/null 2>&1 || true
+  while true; do
+    if ! names=$(docker ps -a --format '{{.Names}}' 2>/dev/null); then
+      log_error "Unable to query Docker while waiting for container removal"
+      return 1
+    fi
+    grep -qx "$WINE_CONTAINER" <<<"$names" || break
+    if (( waited >= timeout )); then
+      log_error "Container '$WINE_CONTAINER' still present after ${timeout}s; Docker may be wedged (try: sudo systemctl restart docker)"
+      return 1
+    fi
+    sleep 3
+    waited=$(( waited + 3 ))
+  done
+  log_success "Leftover Windows build container cleared"
+  return 0
+}
+
 run_build() {
   log_info "Starting containerized build (this may take several minutes)..."
 
-  local start_ts end_ts
+  local start_ts end_ts build_rc
   start_ts=$(date +%s)
+
+  # Remove any artifact from a prior run so a stale binary can never be mistaken
+  # for a fresh build (the source tree is reused across runs).
+  rm -rf "$REPO_DIR/dist"
 
   (
     cd "$REPO_DIR"
@@ -588,16 +636,36 @@ run_build() {
         ;;
     esac
 
+    # Windows builds share one upstream container name; serialize concurrent
+    # setup/portable invocations and clear any leftover before building.
+    if [[ "$BUILD_TARGET" == "windows" ]]; then
+      # Serialize by locking the script's own file: it is bind-mounted at the
+      # same host path (read-only) into every bootstrap container, so all
+      # invocations share one inode. Advisory flock works on a read fd and
+      # creates no lock file (self-contained; nothing to .gitignore).
+      exec 9<"${BS_SCRIPT_PATH:-$0}"
+      flock -w 1800 9 || { log_error "Timed out waiting for another Windows build"; exit 1; }
+      cleanup_wine_container || exit 1
+    fi
+
     log_info "Running: poetry run python tools/build.py --targets ${build_targets} --commit None"
     poetry run python tools/build.py --targets ${build_targets} --commit None || {
       log_error "Build failed"
       exit 1
     }
   )
+  build_rc=$?
 
   end_ts=$(date +%s)
   BUILD_DURATION=$(( end_ts - start_ts ))
+
+  if [[ $build_rc -ne 0 ]]; then
+    log_error "Build failed after ${BUILD_DURATION}s"
+    return 1
+  fi
+
   log_success "Build completed in ${BUILD_DURATION}s"
+  return 0
 }
 
 # ======================================================================================
@@ -633,6 +701,52 @@ download_official() {
     log_error "Failed to download official artifact"
     return 1
   fi
+}
+
+verify_official_signature() {
+  # Verifies the downloaded release asset against the pinned signing key. Informational:
+  # it never changes the reproducibility verdict, so every failure path returns 0.
+  if [[ -n "$BINARY_FILE" ]]; then
+    SIG_STATUS="skipped (--binary supplied, not a release download)"
+    return 0
+  fi
+  if ! command_exists gpg; then
+    SIG_STATUS="skipped (gpg unavailable)"
+    return 0
+  fi
+
+  local sig="${OFFICIAL_FILE}.asc"
+  local key="$OFFICIAL_DIR/signing-key.asc"
+  local gpg_home="$OFFICIAL_DIR/gnupg"
+
+  log_info "Verifying release signature against ${SIGNING_KEY_FPR}"
+  if ! fetch_release_file "$VERSION" "${OFFICIAL_FILENAME}.asc" "$sig"; then
+    SIG_STATUS="no .asc published for this artifact"
+    log_warn "$SIG_STATUS"
+    return 0
+  fi
+  if ! curl -fLs "$SIGNING_KEY_URL" -o "$key"; then
+    SIG_STATUS="signing key fetch failed"
+    log_warn "$SIG_STATUS"
+    return 0
+  fi
+
+  rm -rf "$gpg_home"
+  mkdir -p -m700 "$gpg_home"
+  local out=""
+  gpg --homedir "$gpg_home" --batch --quiet --import "$key" >/dev/null 2>&1 || true
+  out="$(gpg --homedir "$gpg_home" --batch --status-fd 1 --verify "$sig" "$OFFICIAL_FILE" 2>/dev/null || true)"
+  rm -rf "$gpg_home"
+
+  # VALIDSIG carries the primary key fingerprint, so it is what pins the signer.
+  if grep -q '^\[GNUPG:\] GOODSIG ' <<<"$out" && grep -q "^\[GNUPG:\] VALIDSIG .*${SIGNING_KEY_FPR}" <<<"$out"; then
+    SIG_STATUS="good signature from ${SIGNING_KEY_FPR}"
+    log_success "$SIG_STATUS"
+  else
+    SIG_STATUS="SIGNATURE VERIFICATION FAILED (expected ${SIGNING_KEY_FPR})"
+    log_error "$SIG_STATUS"
+  fi
+  return 0
 }
 
 find_built_artifact() {
@@ -939,6 +1053,7 @@ script_version: ${SCRIPT_VERSION}
 verdict: ${VERDICT_STATUS}
 notes: |
   Bitcoin Safe uses Poetry + Docker to build cross-platform AppImage, DEB, Flatpak, and Windows executables.
+  Release signature of the downloaded artifact: ${SIG_STATUS}
   Expected differences that do not affect verdict:
   - AppImage tar.gz wrapper: non-deterministic tar metadata; raw AppImage inside is compared directly.
   - DEB control metadata: cosmetic package metadata differences; installed file content is what matters.
@@ -1010,7 +1125,8 @@ print_summary() {
   echo
   echo "Revision, tag (and its signature):"
   echo "Tag: ${CHECKED_OUT_TAG:-unknown} (checked out from git)"
-  echo "Note: Git signature verification not implemented"
+  echo "Note: Git tag/commit signature verification not implemented"
+  echo "Release signature (${OFFICIAL_FILENAME:-artifact}.asc): ${SIG_STATUS}"
   echo
   local diff_file="$WORKDIR/diff-appimage-contents.txt"
   if [[ -f "$diff_file" ]]; then
@@ -1071,6 +1187,8 @@ main() {
     generate_error_yaml "ftbfs" "Failed to obtain official release artifact"
     exit 1
   fi
+
+  verify_official_signature
 
   # Run build
   if ! run_build; then
