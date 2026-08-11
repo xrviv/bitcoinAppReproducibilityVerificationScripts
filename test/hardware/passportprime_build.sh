@@ -2,7 +2,10 @@
 #
 # passportprime_build.sh - Foundation Passport Prime (KeyOS) Reproducible Build Verifier
 #
-# Version: v0.3.2
+# Version: v0.3.3
+#
+# Last modified by: Danny Garcia
+# Last modified on: 2026-08-11
 #
 # Description:
 #   Reproducible build verification for the Foundation Passport Prime hardware
@@ -29,10 +32,10 @@
 #   manifests/assets; the complete per-member table is written to
 #   comparison-hashes.txt (evidence file).
 #
-#   Out of scope by vendor design: the bootloader (boot.cip / boot.bin) is
-#   encrypted with a secret key for the MCU's secure-boot feature and cannot
-#   be reproduced by third parties. It is excluded from the comparison and
-#   disclosed in the notes (root-of-trust caveat).
+#   Out of scope by vendor design: the bootloader. boot.bin is the plaintext
+#   build output carrying a secret 32-byte EXTRA_ENTROPY; boot.cip is the
+#   separately encrypted image that ships. Excluded because the production
+#   EXTRA_ENTROPY is not public, so there is no comparand.
 #
 #   Additional boundaries (disclosed in the YAML notes; 2026-07-29 review):
 #   the comparison covers file payloads only. It does NOT reproduce the raw
@@ -72,7 +75,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.3.2"
+SCRIPT_VERSION="v0.3.3"
 APP_ID="passportprime"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -82,8 +85,8 @@ EXIT_INVALID_PARAMS=2
 
 # Upstream URLs (KeyOS repo, KeyOS-Releases raw base) are set where they are
 # used: the Dockerfile heredoc (clone) and inner_build.sh (RAW_BASE, tree API).
-# Pinned Nix base image (single-user Nix; tag pinned for environment stability).
-NIX_IMAGE="docker.io/nixos/nix:2.31.5"
+# Pinned Nix base image (single-user Nix). Digest-pinned: a tag is mutable.
+NIX_IMAGE="docker.io/nixos/nix:2.31.5@sha256:4ae3542b89e38bf739a98d9e1ffd082c3c7b8a6455ec0c2331560b9440aec442"
 SUPPORTED_ARCH="armv7a"
 SUPPORTED_TYPE="firmware"
 
@@ -226,11 +229,15 @@ parse_arguments() {
         esac
     done
 
+    # Unexpected --arch/--type values warn and fall back; exiting 2 would kill an
+    # ABS run that passes a host arch rather than the firmware target.
     if [[ "${APP_ARCH}" != "${SUPPORTED_ARCH}" ]]; then
-        die_invalid "Unsupported --arch '${APP_ARCH}' (only ${SUPPORTED_ARCH})"
+        log_warn "--arch '${APP_ARCH}' ignored; firmware target is ${SUPPORTED_ARCH}"
+        APP_ARCH="${SUPPORTED_ARCH}"
     fi
     if [[ -n "${APP_TYPE}" && "${APP_TYPE}" != "${SUPPORTED_TYPE}" ]]; then
-        die_invalid "Unsupported --type '${APP_TYPE}' (only ${SUPPORTED_TYPE})"
+        log_warn "--type '${APP_TYPE}' ignored; only ${SUPPORTED_TYPE} is produced"
+        APP_TYPE="${SUPPORTED_TYPE}"
     fi
     if [[ -z "${APP_VERSION}" ]]; then
         die_invalid "--version is required (e.g. --version 1.2.1)"
@@ -399,9 +406,11 @@ RUN mkdir -p /etc/nix && \
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
 # Vendor source at the exact release tag, submodules included.
+# refs/tags/ is explicit: a bare ref name resolves a same-named branch first.
 RUN git clone --recurse-submodules https://github.com/Foundation-Devices/KeyOS.git /keyos && \
     cd /keyos && \
-    git checkout "${KEYOS_REF}" && \
+    git rev-parse --verify "refs/tags/${KEYOS_REF}" >/dev/null && \
+    git checkout "refs/tags/${KEYOS_REF}" && \
     git submodule update --init --recursive && \
     git rev-parse HEAD > /keyos_commit.txt && cat /keyos_commit.txt
 
@@ -515,8 +524,8 @@ echo "[BUILD] Extracted members: $(find "${EX}" -type f | wc -l) (mtools from ${
 # the built image is caught too — enumeration of built files alone cannot see
 # those.
 # Map an extracted member to its path under the KeyOS-Releases <version>/ dir.
-# The bootloader (boot.bin built / boot.cip released) is encrypted with a secret
-# key for secure boot and is excluded by vendor design (disclosed, not a mismatch).
+# The bootloader is excluded by vendor design (disclosed, not a mismatch):
+# boot.bin carries a secret EXTRA_ENTROPY, boot.cip is its encrypted form.
 # (release_path_for / is_signed / member_hash / provided_name_for /
 # closure_class_for are defined in comparison_lib.sh, sourced above.)
 
@@ -541,7 +550,7 @@ while IFS= read -r -d '' f; do
     rel="${f#"${EX}/${part}/"}"
     relp="$(release_path_for "${part}" "${rel}")"
     if [ -z "${relp}" ]; then
-        echo "EXCLUDED bootloader ${part}/${rel} (encrypted for secure boot, vendor design)" >> "${OUT}/comparison-hashes.txt"
+        echo "EXCLUDED bootloader ${part}/${rel} (secret EXTRA_ENTROPY, no public comparand; vendor design)" >> "${OUT}/comparison-hashes.txt"
         excluded=$((excluded+1)); continue
     fi
     COMPARED["${relp}"]=1
@@ -619,7 +628,7 @@ if curl -fsSL "${AUTH_ARGS[@]}" -o "${TREE_JSON}" \
                     *) continue ;;
                 esac
                 case "$(closure_class_for "${orel}")" in
-                    bootloader) continue ;;   # encrypted, excluded by vendor design
+                    bootloader) continue ;;   # secret EXTRA_ENTROPY, excluded by vendor design
                     out_of_scope)
                         echo "OUT_OF_SCOPE ${orel} (composite/OTA/companion artifact; disclosed verification boundary)" >> "${OUT}/comparison-hashes.txt"
                         oos_official=$((oos_official+1)); continue ;;
@@ -682,6 +691,7 @@ main() {
     WORK_DIR="$(mktemp -d "/tmp/passportprime_${safe_ver}_${APP_ARCH}_XXXXXX")"
     mkdir -p "${WORK_DIR}/out"
     log_info "Script version: ${SCRIPT_VERSION}"
+    log_info "Script sha256: $(sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1)"
     log_info "App: ${APP_ID} ${APP_VERSION} (${APP_ARCH}, ${APP_TYPE})"
     log_info "Work dir: ${WORK_DIR}"
 
@@ -755,7 +765,7 @@ main() {
     cat "${out}/comparison-hashes.txt"
     echo ""
     echo "Source-derived manifests & assets: ${A_MATCHED}/${A_TOTAL} matched (app permission manifests, fonts, icons, boot/UI assets)."
-    echo "Bootloader: excluded by vendor design (boot.bin/boot.cip encrypted for SAMA5D2 secure boot; not third-party verifiable)."
+    echo "Bootloader: excluded by vendor design. boot.bin is the plaintext build output carrying a secret 32-byte EXTRA_ENTROPY; boot.cip is its separately encrypted, shipped form. No public comparand, so it is not verified here."
     echo "Not covered: raw Factory image bytes (MBR/FAT metadata, layout), the distributed OTA update package (release.tar/Update.tar), packaged composite GitHub release assets."
     echo "Full per-member evidence table: ${out}/comparison-hashes.txt (sha256: $(sha256sum "${out}/comparison-hashes.txt" | cut -d' ' -f1))"
     echo "===== End Results ====="
@@ -776,7 +786,7 @@ main() {
     local notes="Vendor Nix recipe (REPRODUCIBILITY.md) run in a pinned ${NIX_IMAGE} container. All non-bootloader file members of the locally assembled boot.img compared against the corresponding loose files in the KeyOS-Releases version branch. ${closure_note}
 Compiled firmware: ${C_MATCHED}/${C_TOTAL} matched (app.bin, recovery.bin, app ELFs; hashed after the 2048-byte cosign2 header per vendor docs).
 Source-derived manifests & assets: ${A_MATCHED}/${A_TOTAL} matched. Provided (--binary) artifacts used as comparand: ${PROVIDED_USED:-0}.
-Not covered by this verdict: raw Factory image bytes (MBR/FAT metadata, partition layout), the user-distributed OTA update package (release.tar/Update.tar), and packaged composite GitHub release assets. Bootloader excluded by vendor design: encrypted with a secret key for SAMA5D2 secure boot, not third-party verifiable (root-of-trust caveat).
+Not covered by this verdict: raw Factory image bytes (MBR/FAT metadata, partition layout), the user-distributed OTA update package (release.tar/Update.tar), and packaged composite GitHub release assets. Bootloader excluded by vendor design: boot.bin is the plaintext build output carrying a secret 32-byte EXTRA_ENTROPY, and boot.cip is its separately encrypted shipped form; the production entropy is not public, so no comparand exists for either (root-of-trust caveat).
 Full per-member table: comparison-hashes.txt. On mismatch, vendor recommends an aarch64 rebuild before drawing conclusions."
     write_yaml "${verdict}" "${notes}"
     cleanup_image
