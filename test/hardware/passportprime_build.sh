@@ -2,66 +2,19 @@
 #
 # passportprime_build.sh - Foundation Passport Prime (KeyOS) Reproducible Build Verifier
 #
-# Version: v0.3.5
+# Version: v0.4.0
 #
 # Last modified by: Danny Garcia
 # Last modified on: 2026-08-11
 #
-# Description:
-#   Reproducible build verification for the Foundation Passport Prime hardware
-#   wallet firmware (KeyOS, Xous-based, armv7a / SAMA5D2). Follows the vendor's
-#   official Nix-based recipe (REPRODUCIBILITY.md in the KeyOS repository)
-#   inside a single pinned container image:
-#
-#     nix develop .#build
-#     scripts/generate-cosign2-dev-key.sh
-#     cargo xtask build-all --production-bootloader --production-firmware
-#
-#   It then extracts all non-bootloader filesystem members from the locally
-#   assembled firmware image (boot.img) and compares each against the
-#   corresponding loose file in the versioned branch of the KeyOS-Releases
-#   repository (forward direction). The branch's own file inventory (GitHub
-#   tree API) is then checked so an official member ABSENT from the built
-#   image is also caught (reverse closure):
-#     - Compiled firmware (app.bin, recovery.bin, app ELFs): signed binaries
-#       carry a non-deterministic 2048-byte cosign2 header, so they are hashed
-#       over the content AFTER the first 2048 bytes (tail -c +2049), per vendor.
-#     - Source-derived manifests + assets (app permission manifests, fonts,
-#       icons, boot/UI assets): hashed whole.
-#   The terminal prints the compiled-component table in full and summarises the
-#   manifests/assets; the complete per-member table is written to
-#   comparison-hashes.txt (evidence file).
-#
-#   Out of scope by vendor design: the bootloader. boot.bin is the plaintext
-#   build output carrying a secret 32-byte EXTRA_ENTROPY; boot.cip is the
-#   separately encrypted image that ships. Direct byte comparison is excluded
-#   because the production EXTRA_ENTROPY is not public.
-#
-#   Additional boundaries (disclosed in the YAML notes; 2026-07-29 review):
-#   the comparison covers file payloads only. It does NOT reproduce the raw
-#   Factory image bytes (MBR/FAT metadata, partition layout), the
-#   user-distributed OTA update package (release.tar / Update.tar), or the
-#   packaged composite assets on the KeyOS GitHub Releases page. Verifying
-#   the distributed OTA package is a separate phase pending a product/ABS
-#   decision — do not read a "reproducible" verdict here as covering it.
-#
-#   Exit codes are mechanical by policy (0 identical / 1 any difference or
-#   build failure / 2 invalid params; Danny 2025-10-30). NOTE: current ABS
-#   ingests COMPARISON_RESULTS.yaml only when the script exits 0
-#   (external/build_server/verifications.mjs:815-850,873), so negative
-#   verdicts from this script are not ABS-ingestable until that policy
-#   conflict is resolved with Luis. Run manually until then.
-#
-#   Architecture note: the vendor recommends aarch64 hosts for "perfect
-#   reproducibility", but an x86_64 build of v1.2.1 matched all 11 components
-#   (WalletScrutiny, 2026-06-12). A hash match on any architecture is valid
-#   evidence; on a mismatch, an aarch64 rerun is required before concluding
-#   not_reproducible.
-#
-#   Container note: the Nix build sandbox is disabled inside the container
-#   (rootless engines cannot grant it namespaces). Determinism comes from the
-#   vendor's flake.lock pinning plus the --production-firmware reproducible
-#   flags, and is checked by the hash comparison itself.
+# Builds KeyOS with the vendor's pinned Nix recipe, extracts boot.img members,
+# and compares them bidirectionally with one immutable KeyOS-Releases commit.
+# Signed compiled files are authenticated first, then hashed after their
+# non-deterministic 2048-byte cosign2 header; source-derived assets hash whole.
+# Scope excludes the raw Factory image, packaged OTA/composite artifacts, and
+# like-for-like bootloader comparison (no public plaintext production boot.bin).
+# A matching x86_64 build is valid; rerun mismatches on vendor-preferred aarch64.
+# Exit: 0 reproducible, 1 difference/failure/blocked verification, 2 bad input.
 #
 # Usage:
 #   passportprime_build.sh --version VERSION [--arch armv7a] [--type firmware]
@@ -75,7 +28,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.3.5"
+SCRIPT_VERSION="v0.4.0"
 APP_ID="passportprime"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -106,6 +59,7 @@ DOCKER_CMD="${DOCKER_CMD:-}"
 WORK_DIR=""
 IMAGE_TAG=""
 GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+NORMALIZE_OWNERSHIP=false
 
 # ----------------------------------------------------------------------------
 # Helpers
@@ -124,15 +78,34 @@ write_yaml() {
         echo "verdict: ${verdict}"
         if [[ -n "${notes}" ]]; then
             echo "notes: |"
-            echo "${notes}" | sed 's/^/  /'
+            printf '  %s\n' "${notes//$'\n'/$'\n  '}"
         fi
     } > "${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
     log_info "COMPARISON_RESULTS.yaml written to ${SCRIPT_DIR}"
 }
 
+comparison_verdict() { # total mismatched missing missing_in_build
+    if [[ "$1" -gt 0 && "$2" -eq 0 && "$3" -eq 0 && "$4" -eq 0 ]]; then
+        echo "reproducible"
+    else
+        echo "not_reproducible"
+    fi
+}
+
+publish_yaml() {
+    local verdict="$1" notes="$2" state="${3:-COMPLETE}"
+    if [[ "${state}" != "COMPLETE" ]]; then
+        rm -f "${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
+        log_fail "Publication blocked (${state}). No COMPARISON_RESULTS.yaml was written."
+        return 1
+    fi
+    write_yaml "${verdict}" "${notes}"
+}
+
 on_error() {
     local rc=$?
     trap - ERR
+    normalize_workspace || log_fail "Workspace ownership could not be normalized; see the path below."
     log_fail "Script failed (exit ${rc}). See output above."
     write_yaml "ftbfs" "Build or comparison step failed before a verdict could be computed. Work dir: ${WORK_DIR:-unset}"
     cleanup_image
@@ -144,6 +117,21 @@ cleanup_image() {
     # Remove run-specific tag only; layer cache is preserved for future runs.
     if [[ -n "${IMAGE_TAG}" ]] && [[ -n "${DOCKER_CMD}" ]]; then
         "${DOCKER_CMD}" rmi "${IMAGE_TAG}" >/dev/null 2>&1 || true
+    fi
+}
+
+normalize_workspace() {
+    [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" ]] || return 0
+    if [[ "${NORMALIZE_OWNERSHIP}" == true && -n "${IMAGE_TAG}" && -n "${DOCKER_CMD}" ]]; then
+        # shellcheck disable=SC2016 # $1/$2 expand inside the container.
+        "${DOCKER_CMD}" run --rm -v "${WORK_DIR}:/workspace" "${IMAGE_TAG}" \
+            bash -c 'chown -R "$1:$2" /workspace' _ "$(id -u)" "$(id -g)" >/dev/null
+    fi
+    local foreign
+    foreign="$(find "${WORK_DIR}" ! -uid "$(id -u)" -print -quit)"
+    if [[ -n "${foreign}" ]]; then
+        log_fail "Foreign-owned workspace entry: ${foreign}"
+        return 1
     fi
 }
 
@@ -170,6 +158,16 @@ detect_container_cmd() {
         die_invalid "Neither podman nor docker found in PATH (only host requirement)"
     fi
     log_info "Container engine: ${DOCKER_CMD}"
+
+    local engine rootless=""
+    engine="$(basename "${DOCKER_CMD}")"
+    if [[ "${engine}" == "docker" ]]; then
+        rootless="$("${DOCKER_CMD}" info --format '{{json .SecurityOptions}}' 2>/dev/null || true)"
+        [[ "${rootless}" == *rootless* ]] || NORMALIZE_OWNERSHIP=true
+    elif [[ "${engine}" == "podman" ]]; then
+        rootless="$("${DOCKER_CMD}" info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)"
+        [[ "${rootless}" == "true" ]] || NORMALIZE_OWNERSHIP=true
+    fi
 }
 
 usage() {
@@ -183,7 +181,7 @@ Usage:
 Parameters:
   --version VERSION   Firmware version without 'v' prefix (e.g. 1.2.1).
                       Source ref used: tag vVERSION. Official binaries:
-                      KeyOS-Releases branch VERSION, directory VERSION/.
+                      KeyOS-Releases branch VERSION, pinned once to a commit.
                       Required (firmware blobs carry no extractable version).
   --binary PATH       Optional official artifact(s) used as the comparand for
                       their matching members (components not provided are
@@ -343,6 +341,32 @@ is_signed() {          # only these carry the 2048-byte cosign2 header
     esac
 }
 
+# Trust policy copied from KeyOS commit 9056b480, utils/fw-utils/src/hash.rs
+# KNOWN_SIGNERS (lines 14-36). This proves consistency with KeyOS source, not
+# independent legal identity: github.com/Foundation-Devices/KeyOS/blob/9056b4805315cad3a8dd58f7c7d06a08e27a1a31/utils/fw-utils/src/hash.rs#L14-L36
+is_known_signer() {
+    case "$1" in
+        03bf014e1a37a113089bea7b50ee9bd7733189ecd6afb7e051a6e95f99b97da5e9|\
+        03040e47c1cde8978085bdc8b44df85e7c0b2e1ea586697b5d385e523d3f908bc3|\
+        038de8dd1cbad8bf1da7ff64b8a9b4a375f0205eff41f7f9dca8e91c4cf0951daa|\
+        03cb8e4219d3c8f269ab2ed3acb71a4b1722c76a0c348ea11fa79b4639bef45094) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_sha40() { [[ "$1" =~ ^[0-9a-f]{40}$ ]]; }
+
+signature_is_source_trusted() { # magic pubkey1 pubkey2
+    [[ "$1" == atsama5d27-keyos && "$2" != "$3" ]] && is_known_signer "$2" && is_known_signer "$3"
+}
+
+verification_state_for() { # authentication-failures unknown-official
+    if (( $1 > 0 )); then echo AUTHENTICATION_FAILED
+    elif (( $2 > 0 )); then echo SCOPE_REVIEW_REQUIRED
+    else echo COMPLETE
+    fi
+}
+
 member_hash() {        # $1=release-path $2=file ; signed -> after header, else whole
     if is_signed "$1"; then unsigned_sha256 "$2"; else sha256sum "$2" | cut -d' ' -f1; fi
 }
@@ -408,7 +432,7 @@ ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 RUN git clone --recurse-submodules https://github.com/Foundation-Devices/KeyOS.git /keyos && \
     cd /keyos && \
     git rev-parse --verify "refs/tags/${KEYOS_REF}" >/dev/null && \
-    git checkout "refs/tags/${KEYOS_REF}" && \
+    git checkout --detach "refs/tags/${KEYOS_REF}" && \
     git submodule update --init --recursive && \
     git rev-parse HEAD > /keyos_commit.txt && cat /keyos_commit.txt
 
@@ -446,7 +470,6 @@ set -euo pipefail
 
 OUT=/out
 TARGET_DIR="target/armv7a-unknown-xous-elf/release"
-RAW_BASE="https://raw.githubusercontent.com/Foundation-Devices/KeyOS-Releases/${KEYOS_VERSION}/${KEYOS_VERSION}"
 AUTH_ARGS=()
 [ -n "${GITHUB_TOKEN:-}" ] && AUTH_ARGS=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
 
@@ -461,6 +484,35 @@ if [ "${expected_commit}" != "${actual_commit}" ]; then
 fi
 echo "${actual_commit}" > "${OUT}/commit.txt"
 echo "[BUILD] Source: tag v${KEYOS_VERSION} = ${actual_commit}"
+
+block_verification() { # state detail
+    printf 'state=%s\ndetail=%s\n' "$1" "$2" > "${OUT}/verification-state.txt"
+    echo "[BUILD] BLOCKED ($1): $2"; exit 3
+}
+
+# A filtered, no-checkout clone avoids GitHub API quotas and obtains both the
+# immutable commit and complete tree inventory before the long firmware build.
+RELEASE_REPO="$(mktemp -d /tmp/keyos-releases.XXXXXX)"
+if ! git clone --quiet --filter=blob:none --no-checkout --depth 1 \
+        --branch "${KEYOS_VERSION}" --single-branch \
+        https://github.com/Foundation-Devices/KeyOS-Releases.git "${RELEASE_REPO}"; then
+    block_verification VERIFICATION_ERROR "could not resolve KeyOS-Releases branch ${KEYOS_VERSION}"
+fi
+RELEASE_COMMIT="$(git -C "${RELEASE_REPO}" rev-parse HEAD 2>/dev/null || true)"
+is_sha40 "${RELEASE_COMMIT}" || block_verification VERIFICATION_ERROR "invalid KeyOS-Releases commit"
+if ! git -C "${RELEASE_REPO}" ls-tree -r --name-only HEAD > "${OUT}/official-inventory.txt"; then
+    block_verification VERIFICATION_ERROR "could not read KeyOS-Releases inventory"
+fi
+[ -s "${OUT}/official-inventory.txt" ] || block_verification VERIFICATION_ERROR "empty KeyOS-Releases inventory"
+echo "${RELEASE_COMMIT}" > "${OUT}/keyos-releases-commit.txt"
+RAW_BASE="https://raw.githubusercontent.com/Foundation-Devices/KeyOS-Releases/${RELEASE_COMMIT}/${KEYOS_VERSION}"
+echo "[BUILD] Comparands: KeyOS-Releases ${KEYOS_VERSION} = ${RELEASE_COMMIT}"
+
+COSIGN_PROBE="${OUT}/cosign2-probe.bin"; printf x > "${COSIGN_PROBE}"
+if ! nix develop .#build --command cosign2 dump --input "${COSIGN_PROBE}" >/dev/null 2>&1; then
+    block_verification VERIFICATION_ERROR "vendor devshell does not provide cosign2"
+fi
+rm -f "${COSIGN_PROBE}"
 
 # --- [1/4] build (vendor recipe; throwaway signing key - comparison ignores
 #           the signature header, so the key does not affect the verdict) ---
@@ -517,8 +569,8 @@ echo "[BUILD] Extracted members: $(find "${EX}" -type f | wc -l) (mtools from ${
 # --- [4/4] compare every member to the official release (bidirectional) ---
 # Forward: every extracted built member is hashed and compared against the
 # corresponding official file (user-provided via --binary when available,
-# otherwise downloaded). Reverse: the version branch's own file inventory
-# (GitHub tree API) is checked afterwards, so an official member ABSENT from
+# otherwise downloaded). Reverse: the pinned release commit's git inventory
+# is checked afterwards, so an official member ABSENT from
 # the built image is caught too — enumeration of built files alone cannot see
 # those.
 # Map an extracted member to its path under the KeyOS-Releases <version>/ dir.
@@ -534,11 +586,33 @@ echo "[BUILD] Extracted members: $(find "${EX}" -type f | wc -l) (mtools from ${
 mkdir -p "${OUT}/official"
 c_total=0; c_match=0; c_mis=0; c_miss=0     # COMPILED (signed) components
 a_total=0; a_match=0; a_mis=0; a_miss=0     # ASSET (manifests + static assets)
-excluded=0; provided_used=0
+excluded=0; provided_used=0; signature_verified=0; authentication_failed=0
 declare -A COMPARED
 : > "${OUT}/comparison-hashes.txt"
 : > "${OUT}/provided-used.txt"
 : > "${OUT}/bootloader-hashes.txt"
+: > "${OUT}/signature-verification.txt"
+
+verify_official_signature() { # $1=release path $2=file
+    local relp="$1" file="$2" dump="" field value p1="" p2="" magic=""
+    if ! dump="$(nix develop .#build --command cosign2 dump --input "${file}" 2>&1)"; then
+        echo "FAILED ${relp} invalid_cosign2" >> "${OUT}/signature-verification.txt"
+        echo "[BUILD] AUTHENTICATION_FAILED: invalid cosign2 signature for ${relp}: ${dump}"; return 1
+    fi
+    while read -r field value _; do
+        case "${field}" in
+            magic) magic="${value}" ;;
+            pubkey1) p1="${value}" ;;
+            pubkey2) p2="${value}" ;;
+        esac
+    done <<< "${dump}"
+    if ! signature_is_source_trusted "${magic}" "${p1}" "${p2}"; then
+        echo "FAILED ${relp} magic=${magic:-missing} pubkey1=${p1:-missing} pubkey2=${p2:-missing}" >> "${OUT}/signature-verification.txt"
+        echo "[BUILD] AUTHENTICATION_FAILED: ${relp} is not signed by two distinct keys trusted by KeyOS source"; return 1
+    fi
+    echo "VERIFIED ${relp} pubkey1=${p1} pubkey2=${p2}" >> "${OUT}/signature-verification.txt"
+    signature_verified=$((signature_verified+1))
+}
 while IFS= read -r -d '' f; do
     # Determine partition via bash patterns (the minimal nix image has no sed).
     case "${f}" in
@@ -549,7 +623,7 @@ while IFS= read -r -d '' f; do
     rel="${f#"${EX}/${part}/"}"
     relp="$(release_path_for "${part}" "${rel}")"
     if [ -z "${relp}" ]; then
-        echo "EXCLUDED bootloader ${part}/${rel} (secret EXTRA_ENTROPY, no public comparand; vendor design)" >> "${OUT}/comparison-hashes.txt"
+        echo "EXCLUDED bootloader ${part}/${rel} (no like-for-like public plaintext production artifact)" >> "${OUT}/comparison-hashes.txt"
         # Reported for owner-side comparison against the device screen; never compared here.
         printf '%s %s %s\n' "${rel}" "$(stat -c%s "${f}")" "$(sha256sum "${f}" | cut -d' ' -f1)" >> "${OUT}/bootloader-hashes.txt"
         excluded=$((excluded+1)); continue
@@ -572,6 +646,12 @@ while IFS= read -r -d '' f; do
             echo "MISSING_OFFICIAL ${cls} ${relp} (${url})" >> "${OUT}/comparison-hashes.txt"
             if [ "${cls}" = COMPILED ]; then c_total=$((c_total+1)); c_miss=$((c_miss+1)); else a_total=$((a_total+1)); a_miss=$((a_miss+1)); fi
             continue
+        fi
+    fi
+    if is_signed "${relp}"; then
+        if ! verify_official_signature "${relp}" "${OUT}/official/${safe}"; then
+            echo "AUTHENTICATION_FAILED COMPILED ${relp} [${src}]" >> "${OUT}/comparison-hashes.txt"
+            c_total=$((c_total+1)); authentication_failed=$((authentication_failed+1)); continue
         fi
     fi
     official_hash="$(member_hash "${relp}" "${OUT}/official/${safe}")"
@@ -601,64 +681,43 @@ if [ -d "${OUT}/provided" ]; then
     done
 fi
 
-# Reverse closure: list the version branch's own files and flag official
-# members the built image does not contain. The POSITIVE classifier in
-# comparison_lib.sh decides what is a closure candidate: composite/OTA/
-# companion artifacts are a disclosed boundary (out_of_scope), unrecognized
-# paths are surfaced as UNKNOWN_OFFICIAL for human review — neither silently
-# fails a clean run. Network/API failure degrades to 'unverified' with a
-# warning; the YAML notes then downgrade the claim to forward-only.
+# Reverse closure uses the inventory captured before the build.
 missing_in_build=0
 oos_official=0
 unknown_official=0
-closure=unverified
-TREE_JSON="${OUT}/official-tree.json"
-if curl -fsSL "${AUTH_ARGS[@]}" -o "${TREE_JSON}" \
-        "https://api.github.com/repos/Foundation-Devices/KeyOS-Releases/git/trees/${KEYOS_VERSION}?recursive=1"; then
-    if [[ "$(tr -d ' \n' < "${TREE_JSON}")" == *'"truncated":true'* ]]; then
-        echo "[BUILD] WARN: tree listing truncated by API; reverse closure unverified"
-    else
-        # nix parses the JSON (no jq/sed in the minimal image). Trailing
-        # newline appended so the last entry survives the read loop.
-        nix eval --raw --impure --expr "let j = builtins.fromJSON (builtins.readFile \"${TREE_JSON}\"); in (builtins.concatStringsSep \"\n\" (map (e: e.path) (builtins.filter (e: e.type == \"blob\") j.tree))) + \"\n\"" > "${OUT}/official-inventory.txt" 2>/dev/null || true
-        if [ -s "${OUT}/official-inventory.txt" ]; then
-            closure=ok
-            while IFS= read -r opath || [ -n "${opath}" ]; do
-                case "${opath}" in
-                    "${KEYOS_VERSION}/"*) orel="${opath#"${KEYOS_VERSION}/"}" ;;
-                    *) continue ;;
-                esac
-                case "$(closure_class_for "${orel}")" in
-                    bootloader) continue ;;   # secret EXTRA_ENTROPY, excluded by vendor design
-                    out_of_scope)
-                        echo "OUT_OF_SCOPE ${orel} (composite/OTA/companion artifact; disclosed verification boundary)" >> "${OUT}/comparison-hashes.txt"
-                        oos_official=$((oos_official+1)); continue ;;
-                    unknown)
-                        echo "UNKNOWN_OFFICIAL ${orel} (unclassified release member; needs human review)" >> "${OUT}/comparison-hashes.txt"
-                        unknown_official=$((unknown_official+1)); continue ;;
-                esac
-                if [ -z "${COMPARED[${orel}]:-}" ]; then
-                    echo "MISSING_IN_BUILD ${orel} (official boot-image member absent from built image)" >> "${OUT}/comparison-hashes.txt"
-                    missing_in_build=$((missing_in_build+1))
-                fi
-            done < "${OUT}/official-inventory.txt"
-            # An unknown official member is a scope change the classifier
-            # cannot adjudicate — different from a network failure. Full
-            # closure is only 'ok' when every member is classified.
-            if [ "${unknown_official}" -gt 0 ]; then
-                closure=needs_review
-                echo "[BUILD] WARN: ${unknown_official} unclassified official member(s); closure set to needs_review — do not publish before classifying them"
-            fi
-        else
-            echo "[BUILD] WARN: could not parse tree listing; reverse closure unverified"
-        fi
+closure=ok
+while IFS= read -r opath || [ -n "${opath}" ]; do
+    case "${opath}" in "${KEYOS_VERSION}/"*) orel="${opath#"${KEYOS_VERSION}/"}" ;; *) continue ;; esac
+    case "$(closure_class_for "${orel}")" in
+        bootloader) continue ;;
+        out_of_scope)
+            echo "OUT_OF_SCOPE ${orel} (disclosed composite/OTA/companion boundary)" >> "${OUT}/comparison-hashes.txt"
+            oos_official=$((oos_official+1)); continue ;;
+        unknown)
+            echo "UNKNOWN_OFFICIAL ${orel} (unclassified; human review required)" >> "${OUT}/comparison-hashes.txt"
+            unknown_official=$((unknown_official+1)); continue ;;
+    esac
+    if [ -z "${COMPARED[${orel}]:-}" ]; then
+        echo "MISSING_IN_BUILD ${orel} (official boot-image member absent from build)" >> "${OUT}/comparison-hashes.txt"
+        missing_in_build=$((missing_in_build+1))
     fi
-else
-    echo "[BUILD] WARN: could not fetch KeyOS-Releases tree listing; reverse closure unverified (network/API)"
+done < "${OUT}/official-inventory.txt"
+if (( unknown_official > 0 )); then closure=needs_review; fi
+
+verification_state="$(verification_state_for "${authentication_failed}" "${unknown_official}")"
+if [ "${verification_state}" != COMPLETE ]; then
+    printf 'state=%s\nauthentication_failed=%s\nunknown_official=%s\n' \
+        "${verification_state}" "${authentication_failed}" "${unknown_official}" > "${OUT}/verification-state.txt"
+    while IFS= read -r evidence; do
+        case "${evidence}" in AUTHENTICATION_FAILED*|UNKNOWN_OFFICIAL*) echo "${evidence}" ;; esac
+    done < "${OUT}/comparison-hashes.txt" >> "${OUT}/verification-state.txt"
+    while IFS= read -r evidence; do case "${evidence}" in FAILED*) echo "${evidence}" ;; esac; done \
+        < "${OUT}/signature-verification.txt" >> "${OUT}/verification-state.txt"
 fi
 
 {
     echo "COMMIT=${actual_commit}"
+    echo "RELEASE_COMMIT=${RELEASE_COMMIT}"
     echo "C_TOTAL=${c_total}";  echo "C_MATCHED=${c_match}"; echo "C_MISMATCHED=${c_mis}"; echo "C_MISSING=${c_miss}"
     echo "A_TOTAL=${a_total}";  echo "A_MATCHED=${a_match}"; echo "A_MISMATCHED=${a_mis}"; echo "A_MISSING=${a_miss}"
     echo "EXCLUDED=${excluded}"
@@ -671,8 +730,11 @@ fi
     echo "OOS_OFFICIAL=${oos_official}"
     echo "UNKNOWN_OFFICIAL=${unknown_official}"
     echo "PROVIDED_USED=${provided_used}"
+    echo "SIGNATURE_VERIFIED=${signature_verified}"
+    echo "AUTHENTICATION_FAILED=${authentication_failed}"
+    echo "VERIFICATION_STATE=${verification_state}"
 } > "${OUT}/RESULT.env"
-echo "[BUILD] Compiled: ${c_match}/${c_total} matched | Assets: ${a_match}/${a_total} matched | excluded(bootloader): ${excluded} | mismatched=$((c_mis+a_mis)) missing=$((c_miss+a_miss)) | official-absent-from-build: ${missing_in_build} (closure: ${closure}; out-of-scope: ${oos_official}; unclassified: ${unknown_official}) | provided used: ${provided_used}"
+echo "[BUILD] Compiled: ${c_match}/${c_total} matched; authentication failed: ${authentication_failed} | Assets: ${a_match}/${a_total} matched | excluded(bootloader): ${excluded} | mismatched=$((c_mis+a_mis)) missing=$((c_miss+a_miss)) | official-absent-from-build: ${missing_in_build} (closure: ${closure}; out-of-scope: ${oos_official}; unclassified: ${unknown_official}) | provided used: ${provided_used}"
 echo "[BUILD] Evidence table sha256: $(sha256sum "${OUT}/comparison-hashes.txt" | cut -d' ' -f1)"
 echo "[BUILD] inner build complete"
 INNER_EOF
@@ -685,14 +747,21 @@ INNER_EOF
 
 main() {
     parse_arguments "$@"
+    # A failed/current run must never leave an earlier run's result in place.
+    rm -f "${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
     detect_container_cmd
 
     local safe_ver
     safe_ver="$(echo "${APP_VERSION}" | tr -c 'a-zA-Z0-9.' '-' | sed 's/-*$//')"
-    WORK_DIR="$(mktemp -d "/tmp/passportprime_${safe_ver}_${APP_ARCH}_XXXXXX")"
+    # Keep evidence inside the invocation directory so ABS owns its lifecycle.
+    WORK_DIR="$(mktemp -d "${PWD}/passportprime_${safe_ver}_${APP_ARCH}_XXXXXX")"
     mkdir -p "${WORK_DIR}/out"
     log_info "Script version: ${SCRIPT_VERSION}"
-    log_info "Script sha256: $(sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1)"
+    if command -v sha256sum >/dev/null 2>&1; then
+        log_info "Script sha256: $(sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1)"
+    else
+        log_warn "sha256sum unavailable on host; self-hash omitted (build runs in the pinned container)"
+    fi
     log_info "App: ${APP_ID} ${APP_VERSION} (${APP_ARCH}, ${APP_TYPE})"
     log_info "Work dir: ${WORK_DIR}"
 
@@ -717,15 +786,29 @@ main() {
     # the nixos/nix base image has no /bin/bash (it ships /bin/sh -> bash and
     # bash on PATH via the nix profile), so a direct exec of #!/bin/bash fails.
     log_info "Cargo parallelism capped at ${CARGO_JOBS} job(s) to bound peak RAM (override with CARGO_JOBS)"
-    "${DOCKER_CMD}" run --rm \
-        -v "${WORK_DIR}/out:/out" \
-        -e KEYOS_VERSION="${APP_VERSION}" \
-        -e GITHUB_TOKEN="${GITHUB_TOKEN}" \
-        -e CARGO_BUILD_JOBS="${CARGO_JOBS}" \
-        "${IMAGE_TAG}" bash /usr/local/bin/inner_build.sh
+    local run_args=(--rm -v "${WORK_DIR}/out:/out" -e "KEYOS_VERSION=${APP_VERSION}"
+        -e "GITHUB_TOKEN=${GITHUB_TOKEN}" -e "CARGO_BUILD_JOBS=${CARGO_JOBS}")
+    local container_rc=0
+    if [[ "${NORMALIZE_OWNERSHIP}" == true ]]; then
+        run_args+=(-e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)")
+        # shellcheck disable=SC2016 # variables expand inside the container.
+        if "${DOCKER_CMD}" run "${run_args[@]}" "${IMAGE_TAG}" bash -c \
+            'set +e; bash /usr/local/bin/inner_build.sh; rc=$?; chown -R "$HOST_UID:$HOST_GID" /out; own_rc=$?; [[ $rc -ne 0 ]] && exit "$rc"; exit "$own_rc"'; then :; else container_rc=$?; fi
+    else
+        if "${DOCKER_CMD}" run "${run_args[@]}" "${IMAGE_TAG}" bash /usr/local/bin/inner_build.sh; then :; else container_rc=$?; fi
+    fi
+    normalize_workspace
 
     # ---- verdict ----
     local out="${WORK_DIR}/out"
+    if (( container_rc != 0 )); then
+        if [[ -s "${out}/verification-state.txt" ]]; then
+            log_fail "Verification blocked before a verdict:"; cat "${out}/verification-state.txt"
+            rm -f "${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"; cleanup_image; exit "${EXIT_BUILD_FAILED}"
+        fi
+        write_yaml "ftbfs" "Firmware build failed before comparison completed. Work dir: ${WORK_DIR}"
+        cleanup_image; exit "${EXIT_BUILD_FAILED}"
+    fi
     if [[ ! -f "${out}/RESULT.env" ]]; then
         # Explicit exit paths bypass the ERR trap, so write the YAML here too.
         log_fail "RESULT.env missing"
@@ -736,22 +819,28 @@ main() {
     # shellcheck disable=SC1091
     source "${out}/RESULT.env"
 
-    local verdict
-    if [[ "${TOTAL}" -gt 0 && "${MISMATCHED}" -eq 0 && "${MISSING}" -eq 0 && "${MISSING_IN_BUILD:-0}" -eq 0 ]]; then
-        verdict="reproducible"
-    else
-        verdict="not_reproducible"
+    local verdict=""
+    if [[ "${VERIFICATION_STATE:-COMPLETE}" == COMPLETE ]]; then
+        verdict="$(comparison_verdict "${TOTAL}" "${MISMATCHED}" "${MISSING}" "${MISSING_IN_BUILD:-0}")"
     fi
 
     echo ""
     echo "===== Begin Results ====="
     echo "appId:          ${APP_ID}"
-    echo "signer:         Foundation Devices (KeyOS-Releases, branch ${APP_VERSION})"
+    echo "comparands:     KeyOS-Releases ${APP_VERSION}"
     echo "versionName:    ${APP_VERSION}"
     echo "arch:           ${APP_ARCH}"
     echo "type:           ${APP_TYPE}"
-    echo "verdict:        ${verdict}"
+    if [[ -n "${verdict}" ]]; then
+        echo "verdict:        ${verdict}"
+    else
+        echo "publication:    blocked"
+        echo "review_state:   ${VERIFICATION_STATE}"
+    fi
     echo "commit:         ${COMMIT}"
+    echo "release commit: ${RELEASE_COMMIT}"
+    echo "signature policy: KeyOS 9056b480 utils/fw-utils/src/hash.rs:14-36 (source consistency; not independent identity)"
+    echo "source-trusted signatures: ${SIGNATURE_VERIFIED:-0}/${C_TOTAL}; authentication failed: ${AUTHENTICATION_FAILED:-0}"
     echo "compiled:       ${C_MATCHED}/${C_TOTAL} matched (${C_MISMATCHED} mismatched, ${C_MISSING} missing)"
     echo "assets+manifests: ${A_MATCHED}/${A_TOTAL} matched (${A_MISMATCHED} mismatched, ${A_MISSING} missing)"
     echo "total verified: ${MATCHED}/${TOTAL} matched (${MISMATCHED} mismatched, ${MISSING} missing); excluded: ${EXCLUDED} (bootloader)"
@@ -766,9 +855,9 @@ main() {
     cat "${out}/comparison-hashes.txt"
     echo ""
     echo "Source-derived manifests & assets: ${A_MATCHED}/${A_TOTAL} matched (app permission manifests, fonts, icons, boot/UI assets)."
-    echo "Bootloader: excluded by vendor design. boot.bin is the plaintext build output carrying a secret 32-byte EXTRA_ENTROPY; boot.cip is its separately encrypted, shipped form. No public comparand, so it is not verified here."
+    echo "Bootloader: excluded. No like-for-like public plaintext production boot.bin is available; boot.cip is encrypted, while the device exposes a normalized hash."
     if [[ -s "${out}/bootloader-hashes.txt" ]]; then
-        echo "Bootloader hash of OUR REBUILD (informational, NOT compared, does not affect the verdict above):"
+        echo "Bootloader hash of OUR REBUILD (informational, NOT compared, does not affect publication):"
         while read -r bl_name bl_size bl_hash; do
             echo "  ${bl_name}  ${bl_size} bytes  sha256=${bl_hash}"
         done < "${out}/bootloader-hashes.txt"
@@ -785,19 +874,25 @@ main() {
     local closure_note
     case "${CLOSURE:-unverified}" in
         ok)
-            closure_note="Reverse closure ok: branch inventory checked, every member classified; boot-image members absent from build: ${MISSING_IN_BUILD:-0}; composite/OTA members out of scope by disclosed boundary: ${OOS_OFFICIAL:-0}." ;;
+            closure_note="Reverse closure ok: pinned release inventory checked, every member classified; boot-image members absent from build: ${MISSING_IN_BUILD:-0}; composite/OTA members out of scope by disclosed boundary: ${OOS_OFFICIAL:-0}." ;;
         needs_review)
             closure_note="Reverse closure NEEDS REVIEW: ${UNKNOWN_OFFICIAL:-0} unclassified official release member(s) (see UNKNOWN_OFFICIAL lines in the comparison table). Treat this result as forward-only; DO NOT publish until each unclassified member is reviewed and the classifier updated." ;;
         *)
             closure_note="Reverse closure UNVERIFIED (tree listing unavailable): this run establishes the forward comparison only — an official member absent from the build would not have been detected." ;;
     esac
 
-    local notes="Vendor Nix recipe (REPRODUCIBILITY.md) run in a pinned ${NIX_IMAGE} container. All non-bootloader file members of the locally assembled boot.img compared against the corresponding loose files in the KeyOS-Releases version branch. ${closure_note}
-Compiled firmware: ${C_MATCHED}/${C_TOTAL} matched (app.bin, recovery.bin, app ELFs; hashed after the 2048-byte cosign2 header per vendor docs).
+    local notes="Vendor Nix recipe (REPRODUCIBILITY.md) run in a pinned ${NIX_IMAGE} container. Source commit: ${COMMIT}. KeyOS-Releases branch ${APP_VERSION} was resolved once to commit ${RELEASE_COMMIT}; all downloads and inventory used that commit. All non-bootloader file members of the locally assembled boot.img were compared against its corresponding loose files. ${closure_note}
+Compiled firmware: ${C_MATCHED}/${C_TOTAL} matched (app.bin, recovery.bin, app ELFs; ${SIGNATURE_VERIFIED:-0} comparands signed by two distinct keys from KeyOS commit 9056b480, utils/fw-utils/src/hash.rs:14-36, then hashed after the 2048-byte cosign2 header). This checks source-to-release consistency, not signer identity through an independent trust channel.
 Source-derived manifests & assets: ${A_MATCHED}/${A_TOTAL} matched. Provided (--binary) artifacts used as comparand: ${PROVIDED_USED:-0}.
-Not covered by this verdict: raw Factory image bytes (MBR/FAT metadata, partition layout), the user-distributed OTA update package (release.tar/Update.tar), and packaged composite GitHub release assets. Bootloader excluded by vendor design: boot.bin is the plaintext build output carrying a secret 32-byte EXTRA_ENTROPY, and boot.cip is its separately encrypted shipped form; the production entropy is not public, so no comparand exists for either (root-of-trust caveat).
+Not covered by this verdict: raw Factory image bytes, the distributed OTA package, packaged composites, and like-for-like bootloader comparison. No public plaintext production boot.bin is available; boot.cip is encrypted and the device exposes a normalized hash.
 Full per-member table: comparison-hashes.txt. On mismatch, vendor recommends an aarch64 rebuild before drawing conclusions."
-    write_yaml "${verdict}" "${notes}"
+    if ! publish_yaml "${verdict}" "${notes}" "${VERIFICATION_STATE:-COMPLETE}"; then
+        normalize_workspace || true
+        cleanup_image
+        log_fail "Artifacts kept for review in ${WORK_DIR}/out"
+        exit "${EXIT_BUILD_FAILED}"
+    fi
+    normalize_workspace
     cleanup_image
 
     log_info "Artifacts kept in ${WORK_DIR}/out (hashes, comparison table, official binaries, vendor print-hashes output)"
