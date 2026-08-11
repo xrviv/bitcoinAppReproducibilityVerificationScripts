@@ -2,7 +2,7 @@
 #
 # passportprime_build.sh - Foundation Passport Prime (KeyOS) Reproducible Build Verifier
 #
-# Version: v0.3.4
+# Version: v0.3.5
 #
 # Last modified by: Danny Garcia
 # Last modified on: 2026-08-11
@@ -34,8 +34,8 @@
 #
 #   Out of scope by vendor design: the bootloader. boot.bin is the plaintext
 #   build output carrying a secret 32-byte EXTRA_ENTROPY; boot.cip is the
-#   separately encrypted image that ships. Excluded because the production
-#   EXTRA_ENTROPY is not public, so there is no comparand.
+#   separately encrypted image that ships. Direct byte comparison is excluded
+#   because the production EXTRA_ENTROPY is not public.
 #
 #   Additional boundaries (disclosed in the YAML notes; 2026-07-29 review):
 #   the comparison covers file payloads only. It does NOT reproduce the raw
@@ -75,7 +75,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.3.4"
+SCRIPT_VERSION="v0.3.5"
 APP_ID="passportprime"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -229,15 +229,13 @@ parse_arguments() {
         esac
     done
 
-    # Unexpected --arch/--type values warn and fall back; exiting 2 would kill an
-    # ABS run that passes a host arch rather than the firmware target.
+    # Fatal by design: silently rewriting these would let a run be published under
+    # an architecture/type it did not build.
     if [[ "${APP_ARCH}" != "${SUPPORTED_ARCH}" ]]; then
-        log_warn "--arch '${APP_ARCH}' ignored; firmware target is ${SUPPORTED_ARCH}"
-        APP_ARCH="${SUPPORTED_ARCH}"
+        die_invalid "Unsupported --arch '${APP_ARCH}' (only ${SUPPORTED_ARCH})"
     fi
     if [[ -n "${APP_TYPE}" && "${APP_TYPE}" != "${SUPPORTED_TYPE}" ]]; then
-        log_warn "--type '${APP_TYPE}' ignored; only ${SUPPORTED_TYPE} is produced"
-        APP_TYPE="${SUPPORTED_TYPE}"
+        die_invalid "Unsupported --type '${APP_TYPE}' (only ${SUPPORTED_TYPE})"
     fi
     if [[ -z "${APP_VERSION}" ]]; then
         die_invalid "--version is required (e.g. --version 1.2.1)"
@@ -774,8 +772,8 @@ main() {
         while read -r bl_name bl_size bl_hash; do
             echo "  ${bl_name}  ${bl_size} bytes  sha256=${bl_hash}"
         done < "${out}/bootloader-hashes.txt"
-        echo "  Passport Prime owners can compare this with Boot Menu > System Information > Bootloader."
-        echo "  Note: this run does not pin SOURCE_DATE_EPOCH, which the bootloader compiles in as its build date (boot/keyos-boot/build.rs falls back to the current time when it is unset)."
+        echo "  Passport Prime owners can compare this with Boot Menu > System Information > Bootloader, which shows a hash normalised over the public default EXTRA_ENTROPY."
+        echo "  Foundation's observed device value did not match a rebuild of this version (KeyOS issue #6), most likely because shipped units carry a different bootloader commit."
     fi
     echo "Not covered: raw Factory image bytes (MBR/FAT metadata, layout), the distributed OTA update package (release.tar/Update.tar), packaged composite GitHub release assets."
     echo "Full per-member evidence table: ${out}/comparison-hashes.txt (sha256: $(sha256sum "${out}/comparison-hashes.txt" | cut -d' ' -f1))"
