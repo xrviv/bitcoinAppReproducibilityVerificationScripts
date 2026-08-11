@@ -2,7 +2,7 @@
 #
 # passportprime_build.sh - Foundation Passport Prime (KeyOS) Reproducible Build Verifier
 #
-# Version: v0.4.0
+# Version: v0.4.1
 #
 # Last modified by: Danny Garcia
 # Last modified on: 2026-08-11
@@ -28,7 +28,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.4.0"
+SCRIPT_VERSION="v0.4.1"
 APP_ID="passportprime"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -591,6 +591,7 @@ declare -A COMPARED
 : > "${OUT}/comparison-hashes.txt"
 : > "${OUT}/provided-used.txt"
 : > "${OUT}/bootloader-hashes.txt"
+: > "${OUT}/official-downloaded-hashes.txt"
 : > "${OUT}/signature-verification.txt"
 
 verify_official_signature() { # $1=release path $2=file
@@ -653,6 +654,12 @@ while IFS= read -r -d '' f; do
             echo "AUTHENTICATION_FAILED COMPILED ${relp} [${src}]" >> "${OUT}/comparison-hashes.txt"
             c_total=$((c_total+1)); authentication_failed=$((authentication_failed+1)); continue
         fi
+    fi
+    if is_signed "${relp}"; then
+        # As-downloaded (wrapper included): the hash a reader can reproduce on
+        # the published file. member_hash strips the wrapper for comparison.
+        printf '%s %s %s\n' "${relp}" "$(stat -c%s "${OUT}/official/${safe}")" \
+            "$(sha256sum "${OUT}/official/${safe}" | cut -d' ' -f1)" >> "${OUT}/official-downloaded-hashes.txt"
     fi
     official_hash="$(member_hash "${relp}" "${OUT}/official/${safe}")"
     if [ "${built_hash}" = "${official_hash}" ]; then
@@ -855,6 +862,12 @@ main() {
     cat "${out}/comparison-hashes.txt"
     echo ""
     echo "Source-derived manifests & assets: ${A_MATCHED}/${A_TOTAL} matched (app permission manifests, fonts, icons, boot/UI assets)."
+    if [[ -s "${out}/official-downloaded-hashes.txt" ]]; then
+        echo "Official artifacts as downloaded (whole file, cosign2 wrapper INCLUDED) — the hash a reader reproduces on the published file; the comparison above uses the payload after byte 2048:"
+        while read -r od_name od_size od_hash; do
+            echo "  ${od_name}  ${od_size} bytes  sha256=${od_hash}"
+        done < "${out}/official-downloaded-hashes.txt"
+    fi
     echo "Bootloader: excluded. No like-for-like public plaintext production boot.bin is available; boot.cip is encrypted, while the device exposes a normalized hash."
     if [[ -s "${out}/bootloader-hashes.txt" ]]; then
         echo "Bootloader hash of OUR REBUILD (informational, NOT compared, does not affect publication):"
