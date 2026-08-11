@@ -2,7 +2,7 @@
 #
 # passportprime_build.sh - Foundation Passport Prime (KeyOS) Reproducible Build Verifier
 #
-# Version: v0.3.3
+# Version: v0.3.4
 #
 # Last modified by: Danny Garcia
 # Last modified on: 2026-08-11
@@ -75,7 +75,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.3.3"
+SCRIPT_VERSION="v0.3.4"
 APP_ID="passportprime"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -540,6 +540,7 @@ excluded=0; provided_used=0
 declare -A COMPARED
 : > "${OUT}/comparison-hashes.txt"
 : > "${OUT}/provided-used.txt"
+: > "${OUT}/bootloader-hashes.txt"
 while IFS= read -r -d '' f; do
     # Determine partition via bash patterns (the minimal nix image has no sed).
     case "${f}" in
@@ -551,6 +552,8 @@ while IFS= read -r -d '' f; do
     relp="$(release_path_for "${part}" "${rel}")"
     if [ -z "${relp}" ]; then
         echo "EXCLUDED bootloader ${part}/${rel} (secret EXTRA_ENTROPY, no public comparand; vendor design)" >> "${OUT}/comparison-hashes.txt"
+        # Reported for owner-side comparison against the device screen; never compared here.
+        printf '%s %s %s\n' "${rel}" "$(stat -c%s "${f}")" "$(sha256sum "${f}" | cut -d' ' -f1)" >> "${OUT}/bootloader-hashes.txt"
         excluded=$((excluded+1)); continue
     fi
     COMPARED["${relp}"]=1
@@ -766,6 +769,14 @@ main() {
     echo ""
     echo "Source-derived manifests & assets: ${A_MATCHED}/${A_TOTAL} matched (app permission manifests, fonts, icons, boot/UI assets)."
     echo "Bootloader: excluded by vendor design. boot.bin is the plaintext build output carrying a secret 32-byte EXTRA_ENTROPY; boot.cip is its separately encrypted, shipped form. No public comparand, so it is not verified here."
+    if [[ -s "${out}/bootloader-hashes.txt" ]]; then
+        echo "Bootloader hash of OUR REBUILD (informational, NOT compared, does not affect the verdict above):"
+        while read -r bl_name bl_size bl_hash; do
+            echo "  ${bl_name}  ${bl_size} bytes  sha256=${bl_hash}"
+        done < "${out}/bootloader-hashes.txt"
+        echo "  Passport Prime owners can compare this with Boot Menu > System Information > Bootloader."
+        echo "  Note: this run does not pin SOURCE_DATE_EPOCH, which the bootloader compiles in as its build date (boot/keyos-boot/build.rs falls back to the current time when it is unset)."
+    fi
     echo "Not covered: raw Factory image bytes (MBR/FAT metadata, layout), the distributed OTA update package (release.tar/Update.tar), packaged composite GitHub release assets."
     echo "Full per-member evidence table: ${out}/comparison-hashes.txt (sha256: $(sha256sum "${out}/comparison-hashes.txt" | cut -d' ' -f1))"
     echo "===== End Results ====="
