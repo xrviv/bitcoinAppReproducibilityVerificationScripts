@@ -2,9 +2,9 @@
 # ==============================================================================
 # bitcoinknotsdesktop_build.sh - Bitcoin Knots Reproducible Build Verification
 # ==============================================================================
-# Version:       v1.1.10
+# Version:       v1.1.11
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-06-27
+# Last Modified: 2026-08-12
 # Project:       https://github.com/bitcoinknots/bitcoin
 # ==============================================================================
 # LICENSE: MIT License
@@ -53,7 +53,7 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v1.1.10"
+SCRIPT_VERSION="v1.1.11"
 SCRIPT_NAME="bitcoinknotsdesktop_build.sh"
 APP_ID="bitcoinknots"
 APP_NAME="Bitcoin Knots"
@@ -855,17 +855,91 @@ verify_checksums() {
     
     # Copy built artifacts to /built inside container
     log_info "Organizing built artifacts inside container..."
-    ${CONTAINER_CMD} exec "$CONTAINER_NAME" bash -c "cp $build_dir/* /built/"
-    
-    # Create local directories for extraction
+    if ! ${CONTAINER_CMD} exec "$CONTAINER_NAME" bash -c "cp $build_dir/* /built/"; then
+        log_error "Failed to stage built artifacts inside container"
+        generate_error_yaml "${PWD}/COMPARISON_RESULTS.yaml" "Failed to stage built artifacts inside container"
+        return 1
+    fi
+
+    # Record in-container digests BEFORE anything leaves the container. These are the
+    # bytes this run actually produced and downloaded; the host copies are checked
+    # against them below so a stale or partial copy cannot pass unnoticed.
+    local container_built_hash=""
+    local container_official_hash=""
+    container_built_hash=$(${CONTAINER_CMD} exec "$CONTAINER_NAME" sha256sum "/built/${main_artifact}" 2>/dev/null | awk '{print $1}')
+    container_official_hash=$(${CONTAINER_CMD} exec "$CONTAINER_NAME" sha256sum "/official/${main_artifact}" 2>/dev/null | awk '{print $1}')
+
+    # Create local directories for extraction. Clear them first: they are never
+    # otherwise emptied, so a same-named artifact left by an earlier run could
+    # satisfy the comparison instead of this run's output.
     local official_dir="$PWD/official"
     local built_dir="$PWD/built"
+    local stale_dir
+    for stale_dir in "$official_dir" "$built_dir"; do
+        case "$stale_dir" in
+            */official|*/built)
+                rm -rf "$stale_dir"
+                ;;
+            *)
+                log_error "Refusing to clear unexpected staging path: $stale_dir"
+                generate_error_yaml "${PWD}/COMPARISON_RESULTS.yaml" "Unexpected staging path, refused to clear: $stale_dir"
+                return 1
+                ;;
+        esac
+    done
     mkdir -p "$official_dir" "$built_dir"
-    
-    # Copy artifacts from container to host for final comparison
-    ${CONTAINER_CMD} cp "$CONTAINER_NAME:/official/." "$official_dir/" 2>/dev/null || true
-    ${CONTAINER_CMD} cp "$CONTAINER_NAME:/built/." "$built_dir/"
-    
+
+    # The clear above can fail without aborting (errexit is off here), and on a
+    # rootful runtime the leftovers may be root-owned with no sudo available.
+    # Confirm both directories really are empty rather than assuming it.
+    for stale_dir in "$official_dir" "$built_dir"; do
+        if [[ -n "$(ls -A "$stale_dir" 2>/dev/null)" ]]; then
+            log_error "Staging directory not empty after clearing: $stale_dir"
+            log_error "Remove it manually before re-running; stale artifacts must not be compared."
+            generate_error_yaml "${PWD}/COMPARISON_RESULTS.yaml" "Could not clear staging directory: $stale_dir"
+            return 1
+        fi
+    done
+
+    # Copy artifacts from container to host for final comparison. Track real status:
+    # errexit is disabled inside this function (it is invoked left of ||), so a failed
+    # copy would otherwise continue silently.
+    COPY_SUCCESS="true"
+    if ! ${CONTAINER_CMD} cp "$CONTAINER_NAME:/official/." "$official_dir/" 2>/dev/null; then
+        log_warning "Official artifact copy to host failed"
+        COPY_SUCCESS="false"
+    fi
+    if ! ${CONTAINER_CMD} cp "$CONTAINER_NAME:/built/." "$built_dir/"; then
+        log_error "Built artifact copy to host failed"
+        COPY_SUCCESS="false"
+    fi
+
+    # Provenance check: what is on the host must be what was in the container.
+    if [[ -n "$container_built_hash" && -f "${built_dir}/${main_artifact}" ]]; then
+        local host_built_check
+        host_built_check=$(sha256sum "${built_dir}/${main_artifact}" | awk '{print $1}')
+        if [[ "$host_built_check" != "$container_built_hash" ]]; then
+            log_error "Built artifact on host does not match the container copy"
+            log_error "  In container: ${container_built_hash}"
+            log_error "  On host:      ${host_built_check}"
+            generate_error_yaml "${PWD}/COMPARISON_RESULTS.yaml" "Built artifact on host does not match in-container digest"
+            return 1
+        fi
+        log_success "Built artifact provenance verified against in-container digest"
+    fi
+    if [[ -n "$container_official_hash" && -f "${official_dir}/${main_artifact}" ]]; then
+        local host_official_check
+        host_official_check=$(sha256sum "${official_dir}/${main_artifact}" | awk '{print $1}')
+        if [[ "$host_official_check" != "$container_official_hash" ]]; then
+            log_error "Official artifact on host does not match the container copy"
+            log_error "  In container: ${container_official_hash}"
+            log_error "  On host:      ${host_official_check}"
+            generate_error_yaml "${PWD}/COMPARISON_RESULTS.yaml" "Official artifact on host does not match in-container digest"
+            return 1
+        fi
+        log_success "Official artifact provenance verified against in-container digest"
+    fi
+
     # Generate checksums and compare
     echo ""
     log_info "Comparing checksums..."
