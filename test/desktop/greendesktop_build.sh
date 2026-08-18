@@ -2,7 +2,7 @@
 #
 # greendesktop_build.sh - Blockstream Green Desktop (green_qt) Reproducible Build Verifier
 #
-# Version: v0.2.0
+# Version: v0.2.2
 #
 # Description:
 #   Reproducible build verification for Blockstream Green Desktop Linux AppImage.
@@ -12,9 +12,13 @@
 #   packages with pinned AppImage tools, and compares the extracted squashfs
 #   payload against the official release AppImage file-by-file.
 #
-#   Qt 6.11.1 is fetched as the official prebuilt via aqtinstall (token-free;
+#   Qt 6.11.0 is fetched as the official prebuilt via aqtinstall (token-free;
 #   binary-equivalence to the official online-installer Qt was confirmed by
-#   hash comparison during the 3.4.0 investigation).
+#   hash comparison during the 3.4.0 investigation). NOTE: upstream bumped Qt
+#   to 6.11.1 for Windows/macOS CI in the 3.4.1 release, but left the Linux
+#   x86_64 Dockerfile (ci/linux-x86_64/Dockerfile) pinned at 6.11.0 — verified
+#   by diffing the release_3.4.0..release_3.4.1 tags. Do not bump this to
+#   6.11.1 without re-checking that Dockerfile at the target release tag.
 #
 #   Known upstream limitations (documented, not worked around):
 #   - liblwk.so release builds are nondeterministic upstream
@@ -39,7 +43,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.2.0"
+SCRIPT_VERSION="v0.2.2"
 APP_ID="blockstreamgreen"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -259,9 +263,9 @@ FROM base0 AS base
 # WS modification: aqtinstall fetches the same prebuilt Qt packages token-free.
 RUN python3 -m venv /aqt-venv && \
     /aqt-venv/bin/pip install --no-cache-dir aqtinstall==3.3.0 && \
-    /aqt-venv/bin/aqt install-qt linux desktop 6.11.1 linux_gcc_64 --outputdir /qt \
+    /aqt-venv/bin/aqt install-qt linux desktop 6.11.0 linux_gcc_64 --outputdir /qt \
       -m qtwebengine qt5compat qtconnectivity qtmultimedia qtserialport qtpositioning qtwebview qtwebchannel
-ENV PATH="/qt/6.11.1/gcc_64/bin/:$PATH"
+ENV PATH="/qt/6.11.0/gcc_64/bin/:$PATH"
 
 FROM base AS hidapi
 COPY --from=src /green_qt/tools/buildlibusb.sh /green_qt/tools/buildhidapi.sh tools/
@@ -477,9 +481,10 @@ main() {
         detect_version_from_binary
     fi
 
-    local safe_ver
+    local safe_ver execution_dir
     safe_ver="$(echo "${APP_VERSION}" | tr -c 'a-zA-Z0-9.' '-' | sed 's/-*$//')"
-    WORK_DIR="$(mktemp -d "/tmp/greendesktop_${safe_ver}_${APP_ARCH}_XXXXXX")"
+    execution_dir="$(pwd)"
+    WORK_DIR="$(mktemp -d "${execution_dir}/greendesktop_${safe_ver}_${APP_ARCH}_XXXXXX")"
     mkdir -p "${WORK_DIR}/out"
     log_info "Script version: ${SCRIPT_VERSION}"
     log_info "App: ${APP_ID} ${APP_VERSION} (${APP_ARCH}, ${APP_TYPE})"
@@ -554,7 +559,7 @@ timestamps and unpinned AppImage tools (Blockstream/green_qt#187)."
     write_yaml "${verdict}" "${notes}"
     cleanup_image
 
-    log_info "Artifacts kept in ${WORK_DIR}/out (extracted trees, diffs, both AppImages)"
+    log_info "Artifacts kept in ${WORK_DIR}/out (extracted trees, diffs, both AppImages, RESULT.env) — persistent, not /tmp"
     if [[ "${verdict}" == "reproducible" ]]; then
         exit "${EXIT_SUCCESS}"
     fi
