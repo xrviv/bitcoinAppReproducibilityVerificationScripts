@@ -1,8 +1,8 @@
 #!/bin/bash
-# bitbanana_build.sh v0.1.0 — BitBanana Android reproducible build verification
+# bitbanana_build.sh v0.2.0 — BitBanana Android reproducible build verification
 # Organization: WalletScrutiny.com
 # Last modified by: Danny Garcia
-# Last modified on: 2026-08-14
+# Last modified on: 2026-08-18
 # Project: https://github.com/michaelWuensch/BitBanana
 # Scope: GitHub/F-Droid universal release APK. The Play Store AAB/split path is
 #        documented separately upstream (docs/REPRODUCE_PLAYSTORE.md) and is not
@@ -11,8 +11,11 @@
 set -euo pipefail
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.1.0"
+readonly SCRIPT_VERSION="v0.2.0"
 readonly SCRIPT_NAME="bitbanana_build.sh"
+SCRIPT_PATH="$(readlink -f "$0")"
+readonly SCRIPT_PATH
+SCRIPT_SHA256=""
 readonly APP_ID="app.michaelwuensch.bitbanana"
 readonly REPO_URL="https://github.com/michaelWuensch/BitBanana"
 readonly WS_CONTAINER="docker.io/walletscrutiny/android:5"
@@ -37,6 +40,11 @@ DIFF_COUNT=0
 ARSC_NOTE=""
 RESULT_DONE=false
 RESULT_EXIT_CODE=1
+
+sha256_local() {
+    [[ -f "$1" ]] || { echo "N/A"; return 0; }
+    sha256sum "$1" | awk '{print $1}'
+}
 
 log_info() { echo "[INFO] $1"; }
 log_pass() { echo "[PASS] $1"; }
@@ -435,6 +443,8 @@ print_results_block() {
     echo "verdict:        ${verdict}"
     echo "appHash:        ${OFFICIAL_APP_HASH:-N/A}"
     echo "commit:         ${COMMIT_HASH}"
+    echo "scriptVersion:  ${SCRIPT_VERSION}"
+    echo "scriptHash:     ${SCRIPT_SHA256}"
     echo ""
     echo "builtHash:      ${BUILT_HASH:-N/A}   (built APK, unsigned by design)"
     echo ""
@@ -492,6 +502,9 @@ result() {
 
 main() {
     log_info "Starting ${SCRIPT_NAME} script version ${SCRIPT_VERSION}"
+    SCRIPT_SHA256="$(sha256_local "$SCRIPT_PATH")"
+    log_info "Script:  $(basename "$SCRIPT_PATH") ${SCRIPT_VERSION}"
+    log_info "         sha256: ${SCRIPT_SHA256}"
     show_disclaimer
     require_non_root
     detect_container_runtime
