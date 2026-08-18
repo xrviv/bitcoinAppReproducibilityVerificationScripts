@@ -1,27 +1,6 @@
 #!/bin/bash
-# ==============================================================================
-# bitkey_build.sh - Bitkey Android Reproducible Build Verification
-# ==============================================================================
-# Version:       v0.2.27
-# Organization:  WalletScrutiny.com
-# Last Modified: 2026-05-15 (v0.2.27)
-# Project:       https://github.com/proto-at-block/bitkey
-# ==============================================================================
-# LICENSE: MIT License
-#
-# TECHNICAL DISCLAIMER:
-# This script is provided for technical analysis and reproducible build
-# verification purposes only. No warranty is provided regarding security,
-# functionality, or fitness for any particular purpose. Users assume all risks
-# associated with running this script and analyzing the software.
-#
-# LEGAL DISCLAIMER:
-# This script is designed for legitimate security research and reproducible build
-# verification. Users are responsible for ensuring compliance with all
-# applicable laws and regulations. The developers assume no liability for any
-# misuse or legal consequences arising from use. By using this script, you
-# acknowledge these disclaimers and accept full responsibility.
-# ==============================================================================
+# bitkey_build.sh v0.2.30 — Bitkey Android Play Store split APK verification
+# Organization: WalletScrutiny.com
 
 set -euo pipefail
 
@@ -29,25 +8,23 @@ EXEC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly EXEC_DIR
 LOG_DIR="${EXEC_DIR}/build-logs"
 
-CYAN='\033[1;36m'
-RED='\033[0;31m'
-NC='\033[0m'
-
-readonly SCRIPT_VERSION="v0.2.27"
+readonly SCRIPT_VERSION="v0.2.30"
 readonly SCRIPT_NAME="bitkey_build.sh"
 readonly APP_ID="world.bitkey.app"
 readonly REPO_URL="https://github.com/proto-at-block/bitkey.git"
 readonly DEFAULT_REF="main"
 readonly BUNDLETOOL_VERSION="1.15.6"
 readonly ANDROID_BUILD_TOOLS_VERSION="35.0.0"
+# Ubuntu archive snapshot near Bitkey's release date — restores the exact pinned
+# .debs after the live mirror retires them (keeps compiler/JDK pins faithful). Bump per release.
+readonly UBUNTU_SNAPSHOT="20260701T000000Z"
 readonly HELPER_GIT_IMAGE="docker.io/alpine/git:2.47.2"
 readonly WS_CONTAINER="docker.io/walletscrutiny/android:5"
 
 readonly EXIT_SUCCESS=0
 readonly EXIT_FAILED=1
 readonly EXIT_INVALID=2
-readonly BITKEY_KNOWN_SIGNER="c0d0f9da7158cde788d0281e9ebd07034178165584d635f7ce17f77c037d961a"
-readonly GITHUB_RELEASE_BASE="https://github.com/proto-at-block/bitkey/releases/download"
+
 
 VERSION=""
 ARCH=""
@@ -64,16 +41,6 @@ EXACT_BUILD_IMAGE=""
 RESULT_DONE=false
 OFFICIAL_INPUTS_PREPARED=false
 COMPARE_LOG_FILE=""
-TAG_REF=""
-TAG_TYPE="not checked"
-TAG_VERIFY_OUTPUT="(tag verification not available)"
-COMMIT_VERIFY_OUTPUT="(commit verification not available)"
-TAG_SIGNATURE_STATUS="[INFO] Not checked"
-COMMIT_SIGNATURE_STATUS="[INFO] Not checked"
-SIGNATURE_KEYS=""
-SIGNATURE_WARNINGS=""
-
-
 OFFICIAL_VERSION_NAME=""
 OFFICIAL_VERSION_CODE=""
 OFFICIAL_SDK_VERSION=""
@@ -83,38 +50,11 @@ OFFICIAL_APK_SIZE=""
 COMMIT_HASH=""
 GENERATED_ARCH=""
 COMPARE_STATUS=1
-SINGLE_APK_MODE=false
-SINGLE_APK_PATH=""
-SINGLE_APK_PKG_VERIFIED=false
-BUILT_APK_HASH=""
-BUILT_APK_SIZE=""
 
 log_info()  { echo "[INFO] $*" >&2; }
 log_pass()  { echo "[PASS] $*" >&2; }
 log_fail()  { echo "[FAIL] $*" >&2; }
 log_warn()  { echo "[WARNING] $*" >&2; }
-
-phase_header() {
-    local num="$1" name="$2"
-    echo -e "${CYAN}=====================================================${NC}"
-    echo -e "${CYAN}  PHASE ${num}: ${name}${NC}"
-    echo -e "${CYAN}=====================================================${NC}"
-}
-
-generate_filtered_build_log() {
-    local full_log="${LOG_DIR}/phase4-build-full.log"
-    local filtered_log="${LOG_DIR}/phase4-build.log"
-    [ -f "${full_log}" ] || return 0
-    {
-        echo "=== PHASE 4 BUILD LOG (FILTERED) ==="
-        echo "--- Errors and warnings ---"
-        grep -iE "error:|warning:|exception:|failed|daemon disappeared" "${full_log}" || true
-        echo "--- Key events ---"
-        grep -E "^\[INFO\]|\[DIAG\]|BUILD SUCCESSFUL|BUILD FAILED|Task :" "${full_log}" || true
-        echo "--- Last 30 lines ---"
-        tail -30 "${full_log}"
-    } > "${filtered_log}" 2>/dev/null || true
-}
 
 print_exit_code() {
     echo "Exit code: $1"
@@ -181,86 +121,6 @@ print_diff_preview() {
     fi
 }
 
-collect_git_signature_info() {
-    local tag_ref="$1"
-    TAG_REF="${tag_ref}"
-    TAG_TYPE="commit-only"
-    TAG_VERIFY_OUTPUT="No tag (build from commit ${COMMIT_HASH:-unknown})"
-    COMMIT_VERIFY_OUTPUT="(commit verification not available)"
-    TAG_SIGNATURE_STATUS="[INFO] No tag found"
-    COMMIT_SIGNATURE_STATUS="[WARNING] No valid signature found on commit"
-    SIGNATURE_KEYS=""
-    SIGNATURE_WARNINGS=""
-
-    [[ -z "${COMMIT_HASH:-}" ]] && return 0
-
-    if run_git_container "git -C 'repo-exact' rev-parse --verify 'refs/tags/${tag_ref}' >/dev/null 2>&1"; then
-        if [[ "$(run_git_container "git -C 'repo-exact' cat-file -t 'refs/tags/${tag_ref}' 2>/dev/null || true" | tr -d '\r\n')" == "tag" ]]; then
-            TAG_TYPE="annotated"
-            TAG_VERIFY_OUTPUT="$(run_git_container "git -C 'repo-exact' tag -v '${tag_ref}' 2>&1 || true")"
-            if echo "${TAG_VERIFY_OUTPUT}" | grep -q "Good signature"; then
-                local tag_key=""
-                TAG_SIGNATURE_STATUS="[OK] Good signature on annotated tag"
-                tag_key="$(echo "${TAG_VERIFY_OUTPUT}" | grep 'using .* key' | sed -E 's/.*using .* key ([A-F0-9]+).*/\1/' | tail -1)"
-                if [[ -n "${tag_key}" ]]; then
-                    SIGNATURE_KEYS="Tag signed with: ${tag_key}"
-                fi
-            else
-                TAG_SIGNATURE_STATUS="[WARNING] No valid signature found on annotated tag"
-                SIGNATURE_WARNINGS="- Annotated tag exists but is not signed or could not be verified"
-            fi
-        else
-            TAG_TYPE="lightweight"
-            TAG_VERIFY_OUTPUT="Tag: ${tag_ref} (lightweight, no signature possible)"
-            TAG_SIGNATURE_STATUS="[INFO] Tag is lightweight (cannot contain signature)"
-        fi
-    fi
-
-    COMMIT_VERIFY_OUTPUT="$(run_git_container "git -C 'repo-exact' verify-commit '${COMMIT_HASH}' 2>&1 || true")"
-    if echo "${COMMIT_VERIFY_OUTPUT}" | grep -q "Good signature"; then
-        local commit_key=""
-        COMMIT_SIGNATURE_STATUS="[OK] Good signature on commit"
-        commit_key="$(echo "${COMMIT_VERIFY_OUTPUT}" | grep 'using .* key' | sed -E 's/.*using .* key ([A-F0-9]+).*/\1/' | tail -1)"
-        if [[ -n "${commit_key}" ]]; then
-            if [[ -n "${SIGNATURE_KEYS}" ]]; then
-                SIGNATURE_KEYS="${SIGNATURE_KEYS}\nCommit signed with: ${commit_key}"
-            else
-                SIGNATURE_KEYS="Commit signed with: ${commit_key}"
-            fi
-        fi
-    else
-        COMMIT_SIGNATURE_STATUS="[WARNING] No valid signature found on commit"
-        if [[ -n "${SIGNATURE_WARNINGS}" ]]; then
-            SIGNATURE_WARNINGS="${SIGNATURE_WARNINGS}\n- Commit is not signed or could not be verified"
-        else
-            SIGNATURE_WARNINGS="- Commit is not signed or could not be verified"
-        fi
-    fi
-}
-
-print_signature_section() {
-    echo "Revision, tag (and its signature):"
-    printf '%s\n' "${TAG_VERIFY_OUTPUT:-No tag (build from commit ${COMMIT_HASH:-unknown})}"
-    echo
-    printf '%s\n' "${COMMIT_VERIFY_OUTPUT:-"(commit verification not available)"}"
-    echo
-    echo "Signature Summary:"
-    echo "Tag type: ${TAG_TYPE:-not checked}"
-    echo "${TAG_SIGNATURE_STATUS:-[INFO] Not checked}"
-    echo "${COMMIT_SIGNATURE_STATUS:-[INFO] Not checked}"
-
-    if [[ -n "${SIGNATURE_KEYS}" ]]; then
-        echo
-        echo "Keys used:"
-        echo -e "${SIGNATURE_KEYS}"
-    fi
-
-    if [[ -n "${SIGNATURE_WARNINGS}" ]]; then
-        echo
-        echo "Warnings:"
-        echo -e "${SIGNATURE_WARNINGS}"
-    fi
-}
 
 print_results_block() {
     local verdict_label="$1"
@@ -275,17 +135,6 @@ print_results_block() {
     echo
     print_diff_preview
     echo
-    print_signature_section
-
-    if [[ "${SINGLE_APK_MODE}" == "true" ]]; then
-        echo
-        echo "===== Also ===="
-        printf 'Single APK built hash: %s\n' "${BUILT_APK_HASH:-unknown}"
-        printf 'Single APK official hash: %s\n' "${OFFICIAL_HASH:-unknown}"
-        printf 'Single APK built size: %s bytes\n' "${BUILT_APK_SIZE:-unknown}"
-        printf 'Single APK official size: %s bytes\n' "${OFFICIAL_APK_SIZE:-unknown}"
-    fi
-
     echo "===== End Results ====="
     if [[ -f "$(comparison_dir)/diff-unzipped-apks.txt" ]]; then
         echo "Plain diff file: $(comparison_dir)/diff-unzipped-apks.txt"
@@ -333,9 +182,6 @@ cleanup_on_exit() {
     local exit_code=$?
     set +e
     { exec 1>&5 2>&6; } 2>/dev/null || true
-    if [[ "${exit_code}" -ne 0 && -n "${LOG_DIR:-}" && -d "${LOG_DIR}" ]]; then
-        generate_filtered_build_log || true
-    fi
     if [[ -n "${EXACT_BASE_IMAGE}" ]]; then
         ${CONTAINER_CMD:-docker} image rm -f "${EXACT_BASE_IMAGE}" >/dev/null 2>&1 || true
     fi
@@ -358,37 +204,11 @@ trap 'cleanup_on_exit' EXIT
 
 usage() {
     cat <<EOF
-Usage:
-  ${SCRIPT_NAME} --version <version> --binary <file|dir|zip|tar.gz> [OPTIONS]
-  ${SCRIPT_NAME} --binary <file|dir|zip|tar.gz> [OPTIONS]
-
-Inputs:
-  --binary <path>     Official Bitkey APK input. Accepts:
-                        - directory containing *.apk files (base.apk + config splits)
-                        - .apks or .zip archive containing the full split set
-                        - .tar.gz or .tar archive containing the full split set
-                        - single .apk file (GitHub release emergency APK)
-                      Alias: --apk
-
-Options:
-  --version <ver>     Bitkey app version, for example: 2026.2.1
-                      If omitted, the script reads versionName from base.apk.
-  --arch <arch>       Override supportedAbis in generated device-spec.json.
-                      Example: arm64-v8a
-  --type <type>       Accepted for ABS compatibility; unused.
-  -h, --help          Show this help.
-
-Examples:
-  ${SCRIPT_NAME} --version 2026.2.1 --binary ~/Downloads/bitkey-splits/
-  ${SCRIPT_NAME} --version 2026.2.1 --binary ~/Downloads/bitkey.apks
-  ${SCRIPT_NAME} --binary ~/Downloads/bitkey-splits/ --arch arm64-v8a
-  ${SCRIPT_NAME} --version 2026.2.1 --binary ~/Downloads/Bitkey-app-2026.2.1.apk
-
-Notes:
-  - Host prerequisite: podman or docker.
-  - No phone or ADB session is required.
-  - Bitkey upstream requires an x86_64 linux/amd64 build environment.
-  - Work directory is preserved at /tmp/test_world.bitkey.app_<version>_<arch>/ for diff inspection.
+Usage: ${SCRIPT_NAME} --binary <dir|apks|zip|tar.gz> [--version <ver>] [--arch <arch>]
+  --binary   Split APK set (directory, .apks, .zip, .tar.gz). Alias: --apk
+  --version  Bitkey version (e.g. 2026.2.1). Auto-detected from APK if omitted.
+  --arch     Override supportedAbis in device-spec.json (e.g. arm64-v8a).
+  --type     Accepted for ABS compatibility; unused.
 EOF
 }
 
@@ -430,10 +250,6 @@ repo_default_dir()        { printf '%s/repo-default\n' "${WORK_DIR}"; }
 repo_exact_dir()          { printf '%s/repo-exact\n' "${WORK_DIR}"; }
 outputs_dir()             { printf '%s/outputs\n' "${WORK_DIR}"; }
 
-official_single_apk() {
-    find "$(official_source_dir)" -maxdepth 1 -type f -name '*.apk' | sort | head -n1
-}
-
 find_base_apk_in_dir() {
     local dir="$1"
     if [[ -f "${dir}/base.apk" ]]; then
@@ -468,49 +284,11 @@ copy_input_apks_from_dir() {
     fi
 }
 
-fast_apk_pre_check() {
-    local apk_input="$1"
-    local apk_to_check=""
-
-    if [[ -f "${apk_input}" && "${apk_input}" == *.apk ]]; then
-        apk_to_check="${apk_input}"
-    elif [[ -d "${apk_input}" ]]; then
-        apk_to_check="$(find "${apk_input}" -maxdepth 1 \( -name 'base.apk' -o -name 'base-master.apk' \) | head -n1)"
-        [[ -z "${apk_to_check}" ]] && apk_to_check="$(find "${apk_input}" -maxdepth 1 -name '*.apk' | sort | head -n1)"
-    fi
-    [[ -z "${apk_to_check}" ]] && return 0  # archive or no apk found — skip
-
-    log_info "Package name pre-check (lightweight)..."
-    local pkg
-    pkg="$(${CONTAINER_CMD} run --rm \
-        --entrypoint sh \
-        ${CONTAINER_RUN_EXTRA} \
-        -v "${apk_to_check}:/tmp/check.apk:ro" \
-        "${HELPER_GIT_IMAGE}" \
-        -c "unzip -p /tmp/check.apk AndroidManifest.xml 2>/dev/null \
-            | grep -oa '[a-z][a-z0-9]*\(\.[a-z][a-z0-9]*\)\{2,\}' \
-            | head -n1" 2>/dev/null | tr -d '\r\n')"
-
-    [[ -z "${pkg}" ]] && return 0  # couldn't determine — container check will catch it
-
-    if [[ "${pkg}" != "${APP_ID}" ]]; then
-        log_fail "Package name mismatch: expected ${APP_ID}, got ${pkg}"
-        emit_failure_and_exit "Package name mismatch: expected ${APP_ID}, got ${pkg}. Wrong APK provided." "${EXIT_INVALID}"
-    fi
-    log_info "Package name pre-check passed: ${pkg}"
-}
-
 assert_package_name() {
     local image="$1"
-    [[ "${SINGLE_APK_PKG_VERIFIED:-false}" == "true" ]] && return 0
     local apk_path
-    if [[ "${SINGLE_APK_MODE}" == "true" ]]; then
-        apk_path="${SINGLE_APK_PATH}"
-    else
-        apk_path="$(official_base_apk 2>/dev/null || true)"
-        [[ -z "${apk_path}" ]] && apk_path="$(official_single_apk 2>/dev/null || true)"
-    fi
-    [[ -z "${apk_path}" ]] && return 0  # no APK to check yet, skip
+    apk_path="$(official_base_apk 2>/dev/null || true)"
+    [[ -z "${apk_path}" ]] && return 0
     local apk_rel="${apk_path#"${WORK_DIR}/"}"
     local pkg
     pkg="$(extract_apk_field "${image}" "${apk_rel}" packageName)"
@@ -519,52 +297,6 @@ assert_package_name() {
         emit_failure_and_exit "Package name mismatch: expected ${APP_ID}, got ${pkg}. Wrong APK provided." "${EXIT_INVALID}"
     fi
     log_info "Package name verified: ${pkg}"
-}
-
-detect_single_apk_type() {
-    local image="$1"
-    local apk_abs="$2"
-    local apk_rel="${apk_abs#"${WORK_DIR}/"}"
-
-    local meta
-    meta="$(container_exec "${image}" "
-        AAPT2='/opt/android-sdk/build-tools/${ANDROID_BUILD_TOOLS_VERSION}/aapt2'
-        APKSIGNER='/opt/android-sdk/build-tools/${ANDROID_BUILD_TOOLS_VERSION}/apksigner'
-        BADGING=\"\$(\"\${AAPT2}\" dump badging '${apk_rel}' 2>/dev/null)\"
-        SPLIT=\$(echo \"\${BADGING}\" | grep -m1 '^split=' || true)
-        PKG=\$(echo \"\${BADGING}\" | sed -n \"s/^package: name='\\([^']*\\)'.*/\\1/p\" | head -n1)
-        SIGNER=\$(\"\${APKSIGNER}\" verify --print-certs '${apk_rel}' 2>/dev/null \
-            | sed -n 's/.*Signer #1 certificate SHA-256 digest: //p' | head -n1)
-        printf 'SPLIT=%s\nPKG=%s\nSIGNER=%s\n' \"\${SPLIT}\" \"\${PKG}\" \"\${SIGNER}\"
-    " | tr -d '\r')"
-
-    local split_field pkg signer
-    split_field="$(echo "${meta}" | grep '^SPLIT=' | sed 's/^SPLIT=//')"
-    pkg="$(echo "${meta}" | grep '^PKG=' | sed 's/^PKG=//')"
-    signer="$(echo "${meta}" | grep '^SIGNER=' | sed 's/^SIGNER=//')"
-
-    if [[ -n "${split_field}" ]]; then
-        log_fail "Lone split APK detected (${split_field}). This is one slice of a Play Store split set."
-        log_fail "Provide the full split set as a directory or .apks/.zip, or provide the Bitkey GitHub release APK."
-        emit_failure_and_exit "Lone split APK detected. Provide the full split set or the GitHub release emergency APK." "${EXIT_INVALID}"
-    fi
-
-    log_info "APK type: full single APK (no split= field — treating as emergency APK)"
-
-    if [[ -n "${signer}" && "${signer}" != "${BITKEY_KNOWN_SIGNER}" ]]; then
-        log_warn "Signer mismatch: expected ${BITKEY_KNOWN_SIGNER}"
-        log_warn "                 got      ${signer}"
-        log_warn "This APK may not be an official Bitkey release artifact."
-    else
-        log_info "Signer matches known Bitkey certificate."
-    fi
-
-    if [[ -n "${pkg}" && "${pkg}" != "${APP_ID}" ]]; then
-        log_fail "Package name mismatch: expected ${APP_ID}, got ${pkg}"
-        emit_failure_and_exit "Package name mismatch: expected ${APP_ID}, got ${pkg}. Wrong APK provided." "${EXIT_INVALID}"
-    fi
-    log_info "Package name verified: ${pkg}"
-    SINGLE_APK_PKG_VERIFIED=true
 }
 
 detect_container_runtime() {
@@ -588,7 +320,6 @@ detect_container_runtime() {
 
 run_git_container() {
     local cmd="$1"
-    # alpine/git has ENTRYPOINT ["git"] — override it so we can run shell commands
     ${CONTAINER_CMD} run --rm \
         --entrypoint sh \
         ${CONTAINER_RUN_EXTRA} \
@@ -601,8 +332,6 @@ run_git_container() {
 container_exec() {
     local image="$1"
     local cmd="$2"
-    # Bitkey images use ENTRYPOINT ["/bin/bash", "-c"] — pass cmd directly as
-    # the single argument; Docker invokes: /bin/bash -c "${cmd}"
     ${CONTAINER_CMD} run --rm \
         --platform=linux/amd64 \
         ${CONTAINER_RUN_EXTRA} \
@@ -615,9 +344,6 @@ container_exec() {
 container_exec_build() {
     local image="$1"
     local cmd="$2"
-    # Gradle build containers must run without user remapping so they can write
-    # to /build (owned by root in the image). Each build function is responsible
-    # for chmod-ing its /work outputs so the host user can read them.
     ${CONTAINER_CMD} run --rm \
         --platform=linux/amd64 \
         --memory=32g \
@@ -630,47 +356,45 @@ container_exec_build() {
 patch_bitkey_dockerfile() {
     local src="$1"
     local dst="$2"
-    # curl=7.81.0-1ubuntu1.23 was superseded by 1ubuntu1.24 in Ubuntu Jammy repos;
-    # the pin breaks docker build. Strip it to the unversioned package name so future
-    # minor security bumps don't break the build again.
-    sed 's/curl=7\.81\.0-1ubuntu1\.[0-9]*/curl/' "${src}" > "${dst}"
+    # Repoint apt at the Ubuntu snapshot (exact pinned .debs keep the output-affecting pins
+    # faithful) + relax only utility pins git/curl/unzip/zip. ca-certificates is bootstrapped
+    # from the default mirror first so the snapshot HTTPS handshake works on the minimal image.
+    awk -v snap="${UBUNTU_SNAPSHOT}" '
+        /^RUN apt update$/ {
+            base = "https://snapshot.ubuntu.com/ubuntu/" snap
+            print "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \\"
+            print " && rm -f /etc/apt/sources.list \\"
+            print " && echo '\''deb [check-valid-until=no] " base " jammy main restricted universe multiverse'\'' >> /etc/apt/sources.list \\"
+            print " && echo '\''deb [check-valid-until=no] " base " jammy-updates main restricted universe multiverse'\'' >> /etc/apt/sources.list \\"
+            print " && echo '\''deb [check-valid-until=no] " base " jammy-security main restricted universe multiverse'\'' >> /etc/apt/sources.list"
+        }
+        {
+            gsub(/curl=7\.81\.0-1ubuntu1\.[0-9]+/, "curl")
+            gsub(/git=1:2\.34\.1-1ubuntu1\.[0-9]+/, "git")
+            gsub(/unzip=6\.0-26ubuntu3\.[0-9]+/, "unzip")
+            gsub(/zip=3\.0-12build2/, "zip")
+            print
+        }
+    ' "${src}" > "${dst}"
 }
 
-build_helper_image() {
-    local image="$1"
-    local repo_dir="$2"
-    local orig_df="${repo_dir}/app/verifiable-build/android/Dockerfile"
+build_bitkey_image() {
+    local image="$1" repo_dir="$2" target="$3" build_vars_file="${4:-}"
     local patched_df
+    local extra=()
+    if [[ -n "${build_vars_file}" ]]; then
+        extra=(--build-arg "REPRODUCIBLE_BUILD_VARIABLES=$(tr -d '\n' < "${build_vars_file}")")
+    fi
     patched_df="$(mktemp --suffix=.Dockerfile)"
-    patch_bitkey_dockerfile "${orig_df}" "${patched_df}"
-    log_info "Building Bitkey helper image: ${image}"
+    patch_bitkey_dockerfile "${repo_dir}/app/verifiable-build/android/Dockerfile" "${patched_df}"
+    log_info "Building Bitkey ${target} image: ${image}"
     ${CONTAINER_CMD} build \
         --platform=linux/amd64 \
         -f "${patched_df}" \
         -t "${image}" \
-        --target base \
-        "${repo_dir}" >/dev/null
-    rm -f "${patched_df}"
-}
-
-build_final_image() {
-    local image="$1"
-    local repo_dir="$2"
-    local build_vars_file="$3"
-    local build_vars_json
-    build_vars_json="$(tr -d '\n' < "${build_vars_file}")"
-    local orig_df="${repo_dir}/app/verifiable-build/android/Dockerfile"
-    local patched_df
-    patched_df="$(mktemp --suffix=.Dockerfile)"
-    patch_bitkey_dockerfile "${orig_df}" "${patched_df}"
-    log_info "Building Bitkey verification image: ${image}"
-    ${CONTAINER_CMD} build \
-        --platform=linux/amd64 \
-        -f "${patched_df}" \
-        -t "${image}" \
-        --target build \
-        --build-arg "REPRODUCIBLE_BUILD_VARIABLES=${build_vars_json}" \
-        "${repo_dir}" >/dev/null
+        --target "${target}" \
+        ${extra[@]+"${extra[@]}"} \
+        "${repo_dir}"
     rm -f "${patched_df}"
 }
 
@@ -743,7 +467,6 @@ prepare_official_inputs() {
         log_info "Copying official APKs from directory input"
         copy_input_apks_from_dir "${APK_INPUT}" "${src_dir}"
     elif [[ -f "${APK_INPUT}" ]]; then
-        # Detect archive type by content first — ABS may save any format as _downloaded.apk
         local _content_type="unknown"
         if file "${APK_INPUT}" | grep -q "Zip archive" && \
            unzip -l "${APK_INPUT}" 2>/dev/null | grep -q "\.apk"; then
@@ -798,12 +521,8 @@ prepare_official_inputs() {
                         find extracted-official -type f -name '*.apk' -exec cp {} official/source/ \\;
                     "
                 else
-                    log_info "Single .apk file input detected — checking APK type."
-                    local single_dest="${src_dir}/$(basename "${APK_INPUT}")"
-                    cp "${APK_INPUT}" "${single_dest}"
-                    detect_single_apk_type "${image}" "${single_dest}"
-                    SINGLE_APK_MODE=true
-                    SINGLE_APK_PATH="${single_dest}"
+                    log_fail "Single .apk input is not supported. Provide a split APK set (directory, .apks, .zip, or .tar.gz)."
+                    emit_failure_and_exit "Single .apk input not supported for Play Store verification." "${EXIT_INVALID}"
                 fi
                 ;;
             *)
@@ -1046,11 +765,7 @@ detect_version_from_binary() {
 collect_official_metadata() {
     local image="$1"
     local apk_path
-    if [[ "${SINGLE_APK_MODE}" == "true" ]]; then
-        apk_path="$(official_single_apk || true)"
-    else
-        apk_path="$(official_base_apk || true)"
-    fi
+    apk_path="$(official_base_apk || true)"
     if [[ -z "${apk_path}" ]]; then
         log_fail "No APK found in official input to collect metadata from."
         emit_failure_and_exit "No APK found in official input." "${EXIT_INVALID}"
@@ -1079,36 +794,22 @@ collect_official_metadata() {
 extract_reproducible_build_variables() {
     local image="$1"
     local out_file="${WORK_DIR}/reproducible-build-variables.json"
-
-    if [[ "${SINGLE_APK_MODE}" == "true" ]]; then
-        # Emergency APK: download build-variables-emergency-{version}.json from GitHub releases
-        local url="${GITHUB_RELEASE_BASE}/app/${VERSION}/build-variables-emergency-${VERSION}.json"
-        log_info "Downloading build variables for emergency APK: ${url}"
-        container_exec "${image}" "
-            set -euo pipefail
-            curl -fsSL '${url}' -o reproducible-build-variables.json
-        "
-        log_info "Downloaded build-variables-emergency-${VERSION}.json"
-    else
-        # Split APK (Play Store): extract from base.apk
-        container_exec "${image}" "
-            set -euo pipefail
-            found=0
-            for apk in official/metadata/*.apk official/source/*.apk; do
-                [ -f \"\$apk\" ] || continue
-                if unzip -p \"\$apk\" reproducible-build-variables.json > reproducible-build-variables.json 2>/dev/null; then
-                    found=1
-                    break
-                fi
-            done
-            if [ \"\$found\" -ne 1 ]; then
-                echo 'Could not extract reproducible-build-variables.json from official APKs.' >&2
-                exit 1
+    container_exec "${image}" "
+        set -euo pipefail
+        found=0
+        for apk in official/metadata/*.apk official/source/*.apk; do
+            [ -f \"\$apk\" ] || continue
+            if unzip -p \"\$apk\" reproducible-build-variables.json > reproducible-build-variables.json 2>/dev/null; then
+                found=1
+                break
             fi
-        "
-        log_info "Extracted reproducible-build-variables.json from official APKs"
-    fi
-
+        done
+        if [ \"\$found\" -ne 1 ]; then
+            echo 'Could not extract reproducible-build-variables.json from official APKs.' >&2
+            exit 1
+        fi
+    "
+    log_info "Extracted reproducible-build-variables.json from official APKs"
     printf '%s\n' "${out_file}"
 }
 
@@ -1157,8 +858,6 @@ generate_device_spec_json() {
 
     mapfile -t abi_list < <(printf '%s\n' "${abi_list[@]}" | awk '!seen[$0]++')
 
-    # If --arch was provided, validate it matches the detected splits.
-    # A mismatch means the supplied splits and the requested arch disagree — fail loudly.
     if [[ -n "${ARCH}" ]]; then
         local arch_found=false
         local a
@@ -1262,66 +961,6 @@ build_bitkey_aab() {
     log_info "Built normalized AAB: $(outputs_dir)/app-customer.aab"
 }
 
-build_bitkey_emergency_apk() {
-    local image="$1"
-    mkdir -p "$(outputs_dir)"
-    container_exec_build "${image}" "
-        set -euo pipefail
-        cd /build
-        source bin/activate-hermit
-        cd app
-        export UPLOAD_BUGSNAG_MAPPING=false
-        unset RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER
-        export SCCACHE_DISABLE=1
-        export CARGO_BUILD_JOBS=4
-        gradle :android:app:assembleEmergency \
-          --no-daemon \
-          --no-build-cache \
-          -Dcom.android.tools.r8.deterministicdebugging=true
-
-        # Bitkey's upstream release flow copies the emergency APK out of the
-        # Gradle outputs tree, where the artifact is typically unsigned.
-        build_outputs=''
-        for candidate in \
-          /build/app/android/app/_build/outputs \
-          /build/app/android/app/build/outputs; do
-            if [ -d \"\$candidate\" ]; then
-                build_outputs=\"\$candidate\"
-                break
-            fi
-        done
-        if [ -z \"\$build_outputs\" ]; then
-            echo 'Could not find Gradle outputs directory for emergency APK build.' >&2
-            exit 1
-        fi
-
-        apk_path=''
-        for candidate in \
-          \"\$build_outputs/apk/emergency/app-emergency-unsigned.apk\" \
-          \"\$build_outputs/apk/emergency/release/app-emergency-unsigned.apk\" \
-          \"\$build_outputs/apk/emergency/app-emergency.apk\" \
-          \"\$build_outputs/apk/emergency/release/app-emergency.apk\"; do
-            if [ -f \"\$candidate\" ]; then
-                apk_path=\"\$candidate\"
-                break
-            fi
-        done
-        if [ -z \"\$apk_path\" ]; then
-            apk_path=\"\$(find \"\$build_outputs\" -path '*/apk/emergency/*' -name '*.apk' \
-              2>/dev/null | sort | head -n1)\"
-        fi
-        if [ -z \"\$apk_path\" ]; then
-            echo 'Could not find built emergency APK in Gradle outputs.' >&2
-            echo \"Checked under: \$build_outputs\" >&2
-            find \"\$build_outputs\" -maxdepth 5 -type f -name '*.apk' 2>/dev/null | sort >&2 || true
-            exit 1
-        fi
-        cp \"\$apk_path\" /work/outputs/app-emergency.apk
-        printf '%s\n' \"\$apk_path\" > /work/outputs/app-emergency-source-path.txt
-        chmod -R a+rwX /work/outputs 2>/dev/null || true
-    "
-    log_info "Built emergency APK: $(outputs_dir)/app-emergency.apk"
-}
 
 extract_built_split_apks() {
     local image="$1"
@@ -1415,16 +1054,6 @@ run_excluded_files_report() {
         export AAPT2='/opt/android-sdk/build-tools/${ANDROID_BUILD_TOOLS_VERSION}/aapt2'
 
         {
-        echo '=== Excluded Files ==='
-        echo 'Files removed by Bitkey upstream normalize-apk-content before comparison:'
-        echo '  AndroidManifest.xml'
-        echo '  stamp-cert-sha256'
-        echo '  BNDLTOOL.RSA / BNDLTOOL.SF / MANIFEST.MF  (bundletool signing)'
-        echo '  EMERGENC.RSA / EMERGENC.SF                 (emergency APK signing)'
-        echo '  r8.json                                    (R8 optimizer metadata)'
-        echo '  res/xml/splits*.xml                        (bundletool split metadata)'
-        echo ''
-
         echo '=== AndroidManifest.xml Diffs ==='
         found_manifest=0
         for apk in official-work/normalized-names/*.apk; do
@@ -1447,35 +1076,7 @@ run_excluded_files_report() {
         done
         [ \"\$found_manifest\" -eq 0 ] && echo '(no AndroidManifest.xml found in any split APK)'
         echo ''
-
-        echo '=== r8.json ==='
-        echo 'Note: r8.json was removed from the built AAB before split generation.'
-        echo 'Note: r8.json is also excluded by upstream normalize-apk-content.'
-        echo ''
-        official_r8=\$(find official-work/unpacked -name r8.json 2>/dev/null | sort | head -5 || true)
-        if [ -n \"\$official_r8\" ]; then
-            echo 'Found in official unpacked splits:'
-            for f in \$official_r8; do
-                echo \"  \$f\"
-                cat \"\$f\" || true
-                echo ''
-            done
-        else
-            echo '(r8.json not present in official split APKs)'
-        fi
-        built_r8=\$(find built-work/unpacked -name r8.json 2>/dev/null | sort | head -5 || true)
-        if [ -n \"\$built_r8\" ]; then
-            echo 'Found in built unpacked splits:'
-            for f in \$built_r8; do echo \"  \$f\"; done
-        else
-            echo '(r8.json not present in built split APKs)'
-        fi
-        echo ''
-
         echo '=== resources.arsc (aapt2 diff) ==='
-        echo 'Note: resources.arsc is excluded from the raw diff above (Google Play reserved-byte issue).'
-        echo 'Semantic comparison via aapt2 diff (this is authoritative for resources):'
-        echo ''
         found_arsc=0
         for apk in official-work/normalized-names/*.apk; do
             [ -f \"\$apk\" ] || continue
@@ -1516,101 +1117,6 @@ run_bitkey_compare() {
     set -e
 }
 
-generate_dex_diff_log() {
-    local image="$1"
-    local dex_log_rel="comparison/diff-classes-dex.txt"
-    mkdir -p "$(comparison_dir)"
-    container_exec "${image}" "
-        set -euo pipefail
-        dexdump_bin='/opt/android-sdk/build-tools/${ANDROID_BUILD_TOOLS_VERSION}/dexdump'
-        official_dex='official-work/comparable/base/classes.dex'
-        built_dex='built-work/comparable/base/classes.dex'
-        {
-        echo '=== classes.dex diff ==='
-        if [ ! -f \"\$official_dex\" ] || [ ! -f \"\$built_dex\" ]; then
-            echo '(classes.dex not found in one or both comparable/base dirs)'
-        elif cmp -s \"\$official_dex\" \"\$built_dex\"; then
-            echo '(identical)'
-        else
-            echo 'SHA256:'
-            echo \"  official: \$(sha256sum \"\$official_dex\" | awk '{print \$1}')\"
-            echo \"  built:    \$(sha256sum \"\$built_dex\"    | awk '{print \$1}')\"
-            echo ''
-            if [ -x \"\$dexdump_bin\" ]; then
-                echo 'dexdump -f header diff (checksum, class/method/field counts):'
-                \"\$dexdump_bin\" -f \"\$official_dex\" > /tmp/ws_dex_official_hdr.txt 2>/dev/null || true
-                \"\$dexdump_bin\" -f \"\$built_dex\"    > /tmp/ws_dex_built_hdr.txt    2>/dev/null || true
-                diff /tmp/ws_dex_official_hdr.txt /tmp/ws_dex_built_hdr.txt || true
-            else
-                echo '(dexdump not available)'
-            fi
-        fi
-        } > '${dex_log_rel}' 2>&1
-        chmod -R a+rwX comparison 2>/dev/null || true
-    " || true
-}
-
-run_single_apk_compare() {
-    local image="$1"
-    local official_rel="${SINGLE_APK_PATH#"${WORK_DIR}/"}"
-    local built_rel="outputs/app-emergency.apk"
-    local built_apk_abs
-    built_apk_abs="$(outputs_dir)/app-emergency.apk"
-
-    mkdir -p "$(comparison_dir)"
-
-    if [[ -f "${built_apk_abs}" ]]; then
-        BUILT_APK_HASH="$(sha256sum "${built_apk_abs}" | awk '{print $1}')"
-        BUILT_APK_SIZE="$(stat -c '%s' "${built_apk_abs}" 2>/dev/null || echo unknown)"
-    else
-        BUILT_APK_HASH="unknown"
-        BUILT_APK_SIZE="unknown"
-    fi
-
-    COMPARE_LOG_FILE="$(comparison_dir)/compare-single-apk.txt"
-
-    container_exec "${image}" "
-        set -euo pipefail
-        rm -rf single-compare
-        mkdir -p single-compare/official-raw single-compare/built-raw single-compare/official-filtered single-compare/built-filtered
-        unzip -qq '${official_rel}' -d single-compare/official-raw
-        unzip -qq outputs/app-emergency.apk -d single-compare/built-raw
-        cp -a single-compare/official-raw/. single-compare/official-filtered/
-        cp -a single-compare/built-raw/. single-compare/built-filtered/
-        diff -qr single-compare/official-raw single-compare/built-raw > comparison/diff-unzipped-apks.txt 2>&1 || true
-        for dir in single-compare/official-filtered single-compare/built-filtered; do
-            find \"\$dir/META-INF\" -name '*.RSA' -delete 2>/dev/null || true
-            find \"\$dir/META-INF\" -name '*.SF'  -delete 2>/dev/null || true
-            rm -f \"\$dir/META-INF/MANIFEST.MF\" \"\$dir/stamp-cert-sha256\"
-        done
-        chmod -R a+rwX single-compare 2>/dev/null || true
-        chmod -R a+rwX comparison 2>/dev/null || true
-    "
-
-    set +e
-    container_exec "${image}" "
-        set -euo pipefail
-        export AAPT2='/opt/android-sdk/build-tools/${ANDROID_BUILD_TOOLS_VERSION}/aapt2'
-        overall=0
-
-        : > comparison/compare-single-apk.txt
-        diff -qr single-compare/official-filtered single-compare/built-filtered \
-          >> comparison/compare-single-apk.txt 2>&1 || overall=1
-
-        # aapt2 diff expects APK/ZIP inputs here, not raw resources.arsc files.
-        if [ -f '${official_rel}' ] && [ -f '${built_rel}' ]; then
-            if ! \"\${AAPT2}\" diff '${official_rel}' '${built_rel}' \
-              >> comparison/compare-single-apk.txt 2>&1; then
-                overall=1
-            fi
-        fi
-
-        chmod -R a+rwX comparison 2>/dev/null || true
-        exit \$overall
-    "
-    COMPARE_STATUS=$?
-    set -e
-}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1655,11 +1161,8 @@ APK_INPUT="$(realpath "${APK_INPUT}")"
 mkdir -p "${LOG_DIR}"
 exec 5>&1 6>&2
 
-# --- PHASE 1: PRE-FLIGHT ---
 exec > >(tee "${LOG_DIR}/phase1-preflight.log" >&5) 2>&1
-phase_header 1 "PRE-FLIGHT"
 detect_container_runtime
-fast_apk_pre_check "${APK_INPUT}"
 
 WORK_DIR_INITIAL="$(work_dir_for "${VERSION:-autoversion}" "${ARCH:-auto}")"
 WORK_DIR="${WORK_DIR_INITIAL}"
@@ -1668,9 +1171,7 @@ mkdir -p "${WORK_DIR}" "$(comparison_dir)" "$(outputs_dir)"
 log_info "Workspace: ${WORK_DIR}"
 exec 1>&5 2>&6
 
-# --- PHASE 2: RESOLVE ---
 exec > >(tee "${LOG_DIR}/phase2-resolve.log" >&5) 2>&1
-phase_header 2 "RESOLVE"
 if [[ -z "${VERSION}" ]]; then
     log_info "Version not provided. Detecting from --binary input (host aapt2 or WS container)."
     detect_version_from_binary
@@ -1679,21 +1180,17 @@ if [[ -z "${VERSION}" ]]; then
 fi
 
 clone_ref_into_repo "$(build_ref_from_version "${VERSION}")" "repo-exact" "false"
-# Only these two firmware submodules are required for the Android Rust build.
 log_info "Initializing required firmware submodules (nanopb, memfault-firmware-sdk)..."
 run_git_container "git -C 'repo-exact' submodule update --init --depth 1 \
     firmware/third-party/nanopb \
     firmware/third-party/memfault-firmware-sdk"
 COMMIT_HASH="$(git_commit_hash_from_repo "repo-exact")"
-collect_git_signature_info "$(build_ref_from_version "${VERSION}")"
 log_info "Resolved Bitkey commit: ${COMMIT_HASH}"
 exec 1>&5 2>&6
 
-# --- PHASE 3: PREPARE ---
 exec > >(tee "${LOG_DIR}/phase3-prepare.log" >&5) 2>&1
-phase_header 3 "PREPARE"
 EXACT_BASE_IMAGE="ws-bitkey-base-$(sanitize_path_component "${VERSION}")-$$"
-build_helper_image "${EXACT_BASE_IMAGE}" "$(repo_exact_dir)"
+build_bitkey_image "${EXACT_BASE_IMAGE}" "$(repo_exact_dir)" base
 
 if [[ "${OFFICIAL_INPUTS_PREPARED}" != "true" ]]; then
     prepare_official_inputs "${EXACT_BASE_IMAGE}"
@@ -1703,42 +1200,25 @@ collect_official_metadata "${EXACT_BASE_IMAGE}"
 BUILD_VARS_FILE="$(extract_reproducible_build_variables "${EXACT_BASE_IMAGE}")"
 
 EXACT_BUILD_IMAGE="ws-bitkey-build-$(sanitize_path_component "${VERSION}")-$$"
-build_final_image "${EXACT_BUILD_IMAGE}" "$(repo_exact_dir)" "${BUILD_VARS_FILE}"
+build_bitkey_image "${EXACT_BUILD_IMAGE}" "$(repo_exact_dir)" build "${BUILD_VARS_FILE}"
 exec 1>&5 2>&6
 
-# --- PHASE 4: BUILD ---
 exec > >(tee "${LOG_DIR}/phase4-build-full.log" >&5) 2>&1
-phase_header 4 "BUILD"
-if [[ "${SINGLE_APK_MODE}" == "true" ]]; then
-    log_info "Single APK (emergency) mode: building via assembleEmergency."
-    build_bitkey_emergency_apk "${EXACT_BUILD_IMAGE}"
-else
-    log_info "Split APK (Play Store) mode: building via bundleCustomer."
-    generate_device_spec_json "${WORK_DIR}/device-spec.json"
-    download_bundletool_jar "${EXACT_BUILD_IMAGE}"
-    build_bitkey_aab "${EXACT_BUILD_IMAGE}"
-fi
+log_info "Building via bundleCustomer (Play Store split APKs)."
+generate_device_spec_json "${WORK_DIR}/device-spec.json"
+download_bundletool_jar "${EXACT_BUILD_IMAGE}"
+build_bitkey_aab "${EXACT_BUILD_IMAGE}"
 exec 1>&5 2>&6
-generate_filtered_build_log
 
-# --- PHASE 5: COMPARE ---
 exec > >(tee "${LOG_DIR}/phase5-compare.log" >&5) 2>&1
-phase_header 5 "COMPARE"
-if [[ "${SINGLE_APK_MODE}" == "true" ]]; then
-    run_single_apk_compare "${EXACT_BUILD_IMAGE}"
-else
-    extract_built_split_apks "${EXACT_BUILD_IMAGE}"
-    run_upstream_normalization "${EXACT_BUILD_IMAGE}"
-    run_excluded_files_report "${EXACT_BUILD_IMAGE}"
-    write_plain_diff_file "${EXACT_BUILD_IMAGE}"
-    run_bitkey_compare "${EXACT_BUILD_IMAGE}"
-    generate_dex_diff_log "${EXACT_BUILD_IMAGE}"
-fi
+extract_built_split_apks "${EXACT_BUILD_IMAGE}"
+run_upstream_normalization "${EXACT_BUILD_IMAGE}"
+run_excluded_files_report "${EXACT_BUILD_IMAGE}"
+write_plain_diff_file "${EXACT_BUILD_IMAGE}"
+run_bitkey_compare "${EXACT_BUILD_IMAGE}"
 exec 1>&5 2>&6
 
-# --- PHASE 6: RESULTS ---
 exec > >(tee "${LOG_DIR}/phase6-results.log" >&5) 2>&1
-phase_header 6 "RESULTS"
 if [[ "${COMPARE_STATUS}" -eq 0 ]]; then
     VERDICT="reproducible"
     NOTES="Bitkey verification reported identical builds.
