@@ -1,5 +1,5 @@
 #!/bin/bash
-# bitbanana_build.sh v0.3.0 — BitBanana Android reproducible build verification
+# bitbanana_build.sh v0.3.1 — BitBanana Android reproducible build verification
 # Organization: WalletScrutiny.com
 # Last modified by: Danny Garcia
 # Last modified on: 2026-08-18
@@ -18,7 +18,7 @@
 set -euo pipefail
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.3.0"
+readonly SCRIPT_VERSION="v0.3.1"
 readonly SCRIPT_NAME="bitbanana_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 readonly SCRIPT_PATH
@@ -113,20 +113,64 @@ require_non_root() {
     fi
 }
 
-# Utility container helpers. The WS image carries aapt/apksigner/unzip.
+# Utility container helpers. The WS image carries apktool, unzip and a JRE.
 
 ws_run() {
     ${CONTAINER_RUNTIME} run --rm -v "${WORK_DIR}:/work" -w /work "${WS_CONTAINER}" bash -c "$1"
 }
 
-apk_badging_field() {
-    local rel="$1" field="$2"
-    ws_run "aapt dump badging \"${rel}\" 2>/dev/null | sed -n \"s/.*${field}='\\([^']*\\)'.*/\\1/p\" | head -n1" || true
+# The WS image ships apktool only — no aapt, no aapt2, no apksigner (verified
+# 2026-08-18 on nc-ph-3376: `command -v` found apktool alone). All metadata
+# therefore comes from one apktool decode, and the signer from keytool, which
+# the image has because apktool needs a JRE.
+
+APKTOOL_MANIFEST=""
+APKTOOL_YML=""
+
+decode_official_base() {
+    APKTOOL_MANIFEST="${WORK_DIR}/comparison/meta/AndroidManifest.xml"
+    APKTOOL_YML="${WORK_DIR}/comparison/meta/apktool.yml"
+    if ! ws_run 'set -e
+        rm -rf comparison/meta
+        apktool d -f -s -o comparison/meta official/base.apk'; then
+        log_fail "apktool could not decode base.apk."
+        generate_yaml "ftbfs" "apktool failed to decode the supplied base.apk."
+        exit 2
+    fi
+    [[ -f "$APKTOOL_MANIFEST" ]] || { log_fail "apktool produced no AndroidManifest.xml."; exit 2; }
+}
+
+# Anchored to the manifest's own package attribute. A greedy match on any
+# "name=" is wrong: an aapt badging line ends with compileSdkVersionCodename,
+# which such a pattern picks up instead of the package.
+manifest_package() {
+    grep -o 'package="[^"]*"' "$APKTOOL_MANIFEST" | head -n1 | cut -d'"' -f2
+}
+
+# apktool.yml values are sometimes quoted and sometimes not; strip either.
+yml_field() {
+    local key="$1"
+    [[ -f "$APKTOOL_YML" ]] || return 0
+    sed -n "s/^[[:space:]]*${key}:[[:space:]]*//p" "$APKTOOL_YML" \
+        | head -n1 | tr -d "'\"" | tr -d '\r'
 }
 
 apk_signer() {
-    local rel="$1"
-    ws_run "apksigner verify --print-certs \"${rel}\" 2>/dev/null | grep 'Signer #1 certificate SHA-256' | awk '{print \$6}'" || true
+    local rel="$1" out=""
+    out="$(ws_run "apksigner verify --print-certs \"${rel}\" 2>/dev/null | grep -m1 'Signer #1 certificate SHA-256' | awk '{print \$6}'" || true)"
+    if [[ -n "$out" ]]; then
+        log_info "Signer read with apksigner"
+        printf '%s' "$out"
+        return 0
+    fi
+    out="$(ws_run "keytool -printcert -jarfile \"${rel}\" 2>/dev/null | grep -m1 'SHA256:' | awk '{print \$2}' | tr -d ':' | tr 'A-F' 'a-f'" || true)"
+    if [[ -n "$out" ]]; then
+        log_info "Signer read with keytool (apksigner not in the image)"
+        printf '%s' "$out"
+        return 0
+    fi
+    log_warn "Neither apksigner nor keytool could read the certificate; signer reported as unknown."
+    printf ''
 }
 
 sha256_of() {
@@ -348,7 +392,7 @@ derive_device_spec() {
     SPEC_ABIS="$abis"
     SPEC_DENSITY="$density"
     SPEC_LOCALES="$locales"
-    SPEC_SDK="${SPEC_SDK:-35}"
+    [[ "${SPEC_SDK}" =~ ^[0-9]+$ ]] || { log_warn "targetSdkVersion unreadable; using 35."; SPEC_SDK=35; }
 
     cat > "${WORK_DIR}/device-spec.json" << SPEC_EOF
 {
@@ -397,10 +441,11 @@ prepare() {
     OFFICIAL_APP_HASH="$(sha256_of official/base.apk)"
     log_info "Official base.apk SHA256 (as supplied): ${OFFICIAL_APP_HASH}"
 
-    APP_ID_FROM_APK="$(apk_badging_field official/base.apk name)"
-    APK_VERSION_NAME="$(apk_badging_field official/base.apk versionName)"
-    APK_VERSION_CODE="$(apk_badging_field official/base.apk versionCode)"
-    SPEC_SDK="$(apk_badging_field official/base.apk targetSdkVersion)"
+    decode_official_base
+    APP_ID_FROM_APK="$(manifest_package)"
+    APK_VERSION_NAME="$(yml_field versionName)"
+    APK_VERSION_CODE="$(yml_field versionCode)"
+    SPEC_SDK="$(yml_field targetSdkVersion)"
     SIGNER_SHA256="$(apk_signer official/base.apk)"
 
     if [[ -z "$APP_ID_FROM_APK" ]]; then
@@ -408,6 +453,7 @@ prepare() {
         generate_yaml "ftbfs" "Package name unreadable from the supplied base.apk."
         exit 2
     fi
+    log_info "versionName=${APK_VERSION_NAME:-unset} versionCode=${APK_VERSION_CODE:-unset} targetSdk=${SPEC_SDK:-unset}"
     if [[ "$APP_ID_FROM_APK" != "$APP_ID" ]]; then
         log_fail "Wrong APK: package is '${APP_ID_FROM_APK}', expected '${APP_ID}'."
         generate_yaml "ftbfs" "Supplied APK is ${APP_ID_FROM_APK}, not ${APP_ID}."
