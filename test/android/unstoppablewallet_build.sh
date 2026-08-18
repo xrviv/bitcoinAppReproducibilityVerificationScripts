@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # unstoppablewallet_build.sh - Unstoppable Wallet Reproducible Build Verification
-# Version:       v0.3.2
+# Version:       v0.4.4
 # Organization:  WalletScrutiny.com
 # Project:       https://github.com/horizontalsystems/unstoppable-wallet-android
 # Host deps:     docker or podman only
@@ -10,7 +10,7 @@
 #                v0.49.0: zcash de-forked → external cash.z.ecc.android (not built); zano-kit-android
 #                built from source, but its ~290 MB prebuilt .a (Zano/Boost/OpenSSL) are trusted blobs.
 
-SCRIPT_VERSION="v0.3.2"
+SCRIPT_VERSION="v0.4.4"
 echo "Starting unstoppablewallet_build.sh ${SCRIPT_VERSION}"
 
 set -uo pipefail   # no -e: diff/cmp return 1 on differences
@@ -18,7 +18,6 @@ set -uo pipefail   # no -e: diff/cmp return 1 on differences
 SCRIPT_NAME="unstoppablewallet_build.sh"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_ID="io.horizontalsystems.bankwallet"
-WALLET_REPO="https://github.com/horizontalsystems/unstoppable-wallet-android.git"
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
 
@@ -112,7 +111,6 @@ fi
 
 # --binary must be a DIRECTORY of device-pulled split APKs (base.apk + split_config.*).
 # Unstoppable ships split-only; the universal single-APK path was removed in v0.3.0.
-SPLIT_MODE=true
 declare -a OFFICIAL_SPLITS=()
 if [[ ! -d "$apk_file" ]]; then
     log_error "--binary must be a DIRECTORY of split APKs (base.apk + split_config.*). Unstoppable is split-only."
@@ -163,22 +161,18 @@ printf "  %-12s OK  (%s)\n" "$CRUN" "$(command -v "$CRUN")"
 echo "  Host requirement satisfied."
 
 RUN_ID="unstoppable-$(date +%s)-$$"
-IMG_P2="ws-unstoppable-p2-${RUN_ID}"
-IMG_P3="ws-unstoppable-p3-${RUN_ID}"
+IMG_P3="ws-unstoppable-source-${RUN_ID}"
 CTR_P0="ws-unstoppable-p0-${RUN_ID}"
-CTR_P2="ws-unstoppable-p2-ctr-${RUN_ID}"
-CTR_P3="ws-unstoppable-p3-ctr-${RUN_ID}"
+CTR_P3="ws-unstoppable-source-ctr-${RUN_ID}"
 
 workspace="${execution_dir}/unstoppable_verification_${RUN_ID}"
-P0_DIR="${workspace}/phase0"
-P2_DIR="${workspace}/phase2"
-P3_DIR="${workspace}/phase3"
-P4_DIR="${workspace}/phase4"
-P5_DIR="${workspace}/phase5"
+P0_DIR="${workspace}/metadata"
+P3_DIR="${workspace}/source-build"
+P5_DIR="${workspace}/comparison"
 
-p2_ctx=""
 p3_ctx=""
 p0_ctx=""
+p5_ctx=""
 
 ensure_user_ownership() {
     local path="$1" image="$2"
@@ -215,25 +209,21 @@ EOF
 
 cleanup() {
     log_info "Cleaning up containers and images..."
-    $CRUN rm -f "$CTR_P2" 2>/dev/null || true
     $CRUN rm -f "$CTR_P3" 2>/dev/null || true
     local own_image=""
     if $CRUN image inspect "$IMG_P3" >/dev/null 2>&1; then
         own_image="$IMG_P3"
-    elif $CRUN image inspect "$IMG_P2" >/dev/null 2>&1; then
-        own_image="$IMG_P2"
     fi
     ensure_user_ownership "$workspace" "$own_image"
-    $CRUN rmi -f "$IMG_P2" 2>/dev/null || true
     $CRUN rmi -f "$IMG_P3" 2>/dev/null || true
-    [[ -n "$p2_ctx" ]] && rm -rf "$p2_ctx" 2>/dev/null || true
     [[ -n "$p3_ctx" ]] && rm -rf "$p3_ctx" 2>/dev/null || true
     [[ -n "$p0_ctx" ]] && rm -rf "$p0_ctx" 2>/dev/null || true
+    [[ -n "$p5_ctx" ]] && rm -rf "$p5_ctx" 2>/dev/null || true
     log_success "Cleanup complete."
 }
 trap cleanup EXIT
 
-mkdir -p "$P0_DIR" "$P2_DIR/jitpack-aars" "$P3_DIR/local-aars" "$P4_DIR" "$P5_DIR"
+mkdir -p "$P0_DIR" "$P3_DIR" "$P5_DIR"
 
 banner "UNSTOPPABLE WALLET REPRODUCIBLE BUILD VERIFICATION"
 echo "  Script:    ${SCRIPT_NAME} ${SCRIPT_VERSION}"
@@ -243,23 +233,24 @@ echo "  Runtime:   ${CRUN} ($($CRUN --version 2>&1 | head -1))"
 echo "  Workspace: ${workspace}"
 echo "  Date:      $(date)"
 
-# (Ubuntu 24.04, JDK 17, Android SDK — also used for Phase 0 metadata extraction)
-banner "PHASE 2A: BUILD JITPACK BASELINE IMAGE"
+# One image is used for metadata extraction, source builds, and split comparison.
+banner "SETUP: BUILD SHARED CONTAINER IMAGE"
 echo "  Started: $(date)"
 
-p2_ctx=$(mktemp -d)
+p3_ctx=$(mktemp -d)
 
-cat > "$p2_ctx/Dockerfile" <<'DOCKERFILE_P2'
+cat > "$p3_ctx/Dockerfile" <<'DOCKERFILE_P3'
 FROM ubuntu:24.04
 ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        openjdk-17-jdk-headless git unzip wget ca-certificates && \
+        openjdk-8-jdk-headless openjdk-17-jdk-headless \
+        git unzip wget ca-certificates cmake && \
     rm -rf /var/lib/apt/lists/*
 
 ENV ANDROID_HOME=/opt/android-sdk
 ENV ANDROID_SDK_ROOT=/opt/android-sdk
-ENV PATH="${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${ANDROID_HOME}/build-tools/36.0.0:${PATH}"
+ENV PATH="${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${PATH}"
 
 RUN mkdir -p ${ANDROID_HOME}/cmdline-tools && \
     cd ${ANDROID_HOME}/cmdline-tools && \
@@ -268,19 +259,29 @@ RUN mkdir -p ${ANDROID_HOME}/cmdline-tools && \
     unzip cmdline-tools.zip && rm cmdline-tools.zip && mv cmdline-tools latest
 
 RUN yes | sdkmanager --licenses && \
-    sdkmanager "platforms;android-36" "build-tools;36.0.0"
+    sdkmanager \
+        "platforms;android-33" "platforms;android-34" \
+        "platforms;android-35" "platforms;android-36" \
+        "build-tools;30.0.3" "build-tools;34.0.0" \
+        "build-tools;35.0.0" "build-tools;36.0.0" \
+        "ndk;23.1.7779620" "ndk;25.1.8937393" "ndk;29.0.14033849" \
+        "ndk;27.0.12077973" \
+        "cmake;3.22.1"
+
+ADD https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar /opt/bundletool.jar
+ADD https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar /opt/apktool.jar
 
 WORKDIR /build
-DOCKERFILE_P2
+DOCKERFILE_P3
 
-section "Building Phase 2 Docker image: ${IMG_P2}"
-if ! $CRUN build -t "$IMG_P2" -f "$p2_ctx/Dockerfile" "$p2_ctx"; then
-    log_error "Phase 2 image build failed"
-    generate_error_yaml "ftbfs" "Phase 2 container image build failed"
+section "Building source-build image: ${IMG_P3}"
+if ! $CRUN build -t "$IMG_P3" -f "$p3_ctx/Dockerfile" "$p3_ctx"; then
+    log_error "Source-build image failed"
+    generate_error_yaml "ftbfs" "Source-build container image failed"
     echo ""; echo "Exit code: 1"
     exit 1
 fi
-log_success "Phase 2 image built: ${IMG_P2}"
+log_success "Source-build image built: ${IMG_P3}"
 
 banner "PHASE 0: APK METADATA EXTRACTION"
 echo "  Extracting versionName, versionCode, signer from official APK..."
@@ -322,7 +323,7 @@ if ! $CRUN run \
     -v "${apk_file}:/input/official.apk:ro" \
     -v "${P0_DIR}:/output" \
     -v "${p0_ctx}/extract_meta.sh:/extract_meta.sh:ro" \
-    "$IMG_P2" \
+    "$IMG_P3" \
     bash /extract_meta.sh; then
     log_error "Phase 0 metadata extraction failed"
     generate_error_yaml "ftbfs" "APK metadata extraction failed"
@@ -347,131 +348,10 @@ log_success "APK metadata: v${wallet_version} (code ${version_code})"
 log_info    "Signer SHA-256: ${signer}"
 log_info    "Official APK SHA-256: ${app_hash}"
 
-banner "PHASE 2B: JITPACK BASELINE BUILD"
-echo "  Building wallet v${wallet_version} with JitPack deps."
-echo "  Capturing 28 prebuilt AARs/JARs from Gradle cache."
-echo "  Started: $(date)"
-
-# are substituted now; runtime container vars use \$ escape)
-cat > "$p2_ctx/build.sh" <<PHASE2_SCRIPT
-#!/bin/bash
-set -euxo pipefail
-
-echo "=== Phase 2 inner build started at \$(date) ==="
-
-git clone --depth 1 --branch ${wallet_version} ${WALLET_REPO} /build/wallet
-cd /build/wallet
-sed -i 's/org\.gradle\.jvmargs=.*/org.gradle.jvmargs=-Xmx4096M -Dkotlin.daemon.jvm.options="-Xmx4096M"/' gradle.properties
-
-./gradlew :app:assembleBaseRelease --no-daemon --max-workers=2
-
-cp "\$(find app/build/outputs/apk/base/release -name '*.apk' | sort | head -1)" /output/app-base-release.apk
-
-CACHE="\${HOME}/.gradle/caches/modules-2/files-2.1"
-mkdir -p /output/jitpack-aars
-
-find "\$CACHE" -maxdepth 1 -type d -name "com.github.horizontalsystems*" | \
-while read GROUP_DIR; do
-    GROUP=\$(basename "\$GROUP_DIR")
-    find "\$GROUP_DIR" -type f \( -name "*.aar" -o -name "*.jar" \) | \
-    grep -v "\-sources\.\|-javadoc\." | \
-    while read f; do
-        cp "\$f" "/output/jitpack-aars/\${GROUP}--\$(basename \$f)"
-    done
-done
-
-echo ""
-echo "=== Phase 2 captured artifacts ==="
-ls -lh /output/jitpack-aars/
-echo ""
-sha256sum /output/jitpack-aars/* | sort
-echo ""
-echo "=== Phase 2 APK ==="
-sha256sum /output/app-base-release.apk
-echo "=== Phase 2 complete at \$(date) ==="
-PHASE2_SCRIPT
-chmod +x "$p2_ctx/build.sh"
-
-$CRUN rm -f "$CTR_P2" 2>/dev/null || true
-
-section "Running Phase 2 build container (~60 min)"
-set +e
-$CRUN run \
-    --name "$CTR_P2" \
-    "${MEM_ARGS[@]}" \
-    -v "$P2_DIR:/output" \
-    -v "$p2_ctx/build.sh:/build/build.sh:ro" \
-    "$IMG_P2" \
-    bash /build/build.sh 2>&1 | tee "$P2_DIR/container-build.log"
-P2_EXIT=${PIPESTATUS[0]}
-set +e   # keep -e OFF (script uses set -uo pipefail without -e; see line 38)
-
-if [[ $P2_EXIT -ne 0 ]]; then
-    log_error "Phase 2 container exited with code $P2_EXIT"
-    generate_error_yaml "ftbfs" "Phase 2 JitPack baseline build failed (exit ${P2_EXIT})"
-    echo ""; echo "Exit code: 1"
-    exit 1
-fi
-$CRUN rm -f "$CTR_P2" 2>/dev/null || true
-
-section "Phase 2 results"
-P2_APK="$P2_DIR/app-base-release.apk"
-if [[ ! -f "$P2_APK" ]]; then
-    log_error "Phase 2 APK not found after successful container exit: $P2_APK"
-    generate_error_yaml "ftbfs" "Phase 2 APK missing after container exit"
-    echo ""; echo "Exit code: 1"
-    exit 1
-fi
-P2_APK_SHA=$(sha256of "$P2_APK")
-echo "  Phase 2 APK SHA-256:   $P2_APK_SHA"
-echo "  Official APK SHA-256:  $app_hash"
-P2_AAR_COUNT=$(find "$P2_DIR/jitpack-aars" -name "*.aar" 2>/dev/null | wc -l)
-P2_JAR_COUNT=$(find "$P2_DIR/jitpack-aars" -name "*.jar" 2>/dev/null | wc -l)
-echo "  Captured: $P2_AAR_COUNT AARs + $P2_JAR_COUNT JARs = $((P2_AAR_COUNT + P2_JAR_COUNT)) total"
-echo "  Finished: $(date)"
-
-# (Ubuntu 24.04, JDK 8 + JDK 17, Android SDK, NDK 23/25/29, CMake)
-banner "PHASE 3: BUILD DEPS FROM SOURCE + BUILD WALLET APK"
+banner "PHASE 1: BUILD DEPS FROM SOURCE + BUILD WALLET"
 echo "  Building horizontalsystems deps from source (zano: Kotlin/JNI wrapper only — links prebuilt .a blobs)."
 echo "  HS versions are derived from wallet app/build.gradle at runtime."
 echo "  Started: $(date)"
-
-p3_ctx=$(mktemp -d)
-
-cat > "$p3_ctx/Dockerfile" <<'DOCKERFILE_P3'
-FROM ubuntu:24.04
-ARG DEBIAN_FRONTEND=noninteractive
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        openjdk-8-jdk-headless openjdk-17-jdk-headless \
-        git unzip wget ca-certificates cmake && \
-    rm -rf /var/lib/apt/lists/*
-
-ENV ANDROID_HOME=/opt/android-sdk
-ENV ANDROID_SDK_ROOT=/opt/android-sdk
-ENV PATH="${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${PATH}"
-
-RUN mkdir -p ${ANDROID_HOME}/cmdline-tools && \
-    cd ${ANDROID_HOME}/cmdline-tools && \
-    wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
-        -O cmdline-tools.zip && \
-    unzip cmdline-tools.zip && rm cmdline-tools.zip && mv cmdline-tools latest
-
-RUN yes | sdkmanager --licenses && \
-    sdkmanager \
-        "platforms;android-33" "platforms;android-34" \
-        "platforms;android-35" "platforms;android-36" \
-        "build-tools;30.0.3" "build-tools;34.0.0" \
-        "build-tools;35.0.0" "build-tools;36.0.0" \
-        "ndk;23.1.7779620" "ndk;25.1.8937393" "ndk;29.0.14033849" \
-        "ndk;27.0.12077973" \
-        "cmake;3.22.1"
-
-# bundletool — regenerates device-matched split APKs from the built AAB (split mode)
-ADD https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar /opt/bundletool.jar
-
-WORKDIR /build
-DOCKERFILE_P3
 
 # __WALLET_VERSION__ is substituted by sed after the heredoc is written to file.
 cat > "$p3_ctx/build.sh" <<'BUILD_SCRIPT_END'
@@ -654,8 +534,11 @@ sed -i "s/from components.release/from components.release\\n                grou
 
 echo ""; echo "=== Step 4b: stellar-kit-android === $(date)"
 cd /build/deps/stellar-kit-android
-sed -i "/plugins {/a\\    id 'maven-publish'" stellarkit/build.gradle
-cat >> stellarkit/build.gradle <<STELLAR_PUB
+grep -qF "maven-publish" stellarkit/build.gradle || sed -i "/plugins {/a\\    id 'maven-publish'" stellarkit/build.gradle
+if grep -qF "release(MavenPublication)" stellarkit/build.gradle; then
+    sed -i "/artifactId = 'stellar-kit-android'/{n;s/version = '[^']*'/version = '$STELLAR_VER'/;}" stellarkit/build.gradle
+else
+    cat >> stellarkit/build.gradle <<STELLAR_PUB
 
 afterEvaluate {
     publishing {
@@ -670,6 +553,8 @@ afterEvaluate {
     }
 }
 STELLAR_PUB
+fi
+grep -qF "version = '$STELLAR_VER'" stellarkit/build.gradle || { echo "ERROR: stellar-kit publication version not set to $STELLAR_VER"; exit 1; }
 ./gradlew :stellarkit:publishToMavenLocal --no-daemon
 
 echo ""; echo "=== Step 4c: market-kit-android === $(date)"
@@ -694,11 +579,13 @@ sed -i "s/version = '1.0.0'/version = '$SOLANA_VER'/" solanakit/build.gradle
 echo ""; echo "=== Step 4f: zano-kit-android === $(date)"
 echo "  [BLOB CAVEAT] zano links prebuilt .a (Zano engine/Boost/OpenSSL) — not rebuilt from source"
 cd /build/deps/zano-kit-android
-sed -i "/plugins {/a\\    id 'maven-publish'" zanokit/build.gradle
-# AGP 8.11.1: components.release does not exist unless the library opts into publishing
-# the release variant. zano's build.gradle has no publishing block, so declare it.
+grep -qF "maven-publish" zanokit/build.gradle || sed -i "/plugins {/a\\    id 'maven-publish'" zanokit/build.gradle
+# AGP 8.11.1: components.release does not exist without the release-variant publishing opt-in.
 grep -qF "singleVariant('release')" zanokit/build.gradle || sed -i "/^android {/a\\    publishing { singleVariant('release') }" zanokit/build.gradle
-cat >> zanokit/build.gradle <<ZANO_PUB
+if grep -qF "release(MavenPublication)" zanokit/build.gradle; then
+    sed -i "/artifactId = 'zano-kit-android'/{n;s/version = '[^']*'/version = '$ZANO_VER'/;}" zanokit/build.gradle
+else
+    cat >> zanokit/build.gradle <<ZANO_PUB
 
 afterEvaluate {
     publishing {
@@ -713,6 +600,8 @@ afterEvaluate {
     }
 }
 ZANO_PUB
+fi
+grep -qF "version = '$ZANO_VER'" zanokit/build.gradle || { echo "ERROR: zano-kit publication version not set to $ZANO_VER"; exit 1; }
 ./gradlew :zanokit:publishToMavenLocal --no-daemon
 
 echo ""; echo "=== Step 5a: bitcoin-kit-android === $(date)"
@@ -751,8 +640,13 @@ sed -i "s/from components.release/from components.release\\n                grou
 echo ""; echo "=== Step 5d: monero-kit-android === $(date)"
 cd /build/deps/monero-kit-android
 sed -i '/maven.*jitpack/i\        mavenLocal()' settings.gradle
-sed -i "/plugins {/a\\    id 'maven-publish'" monerokit/build.gradle
-cat >> monerokit/build.gradle <<MONERO_PUB
+grep -qF "maven-publish" monerokit/build.gradle || sed -i "/plugins {/a\\    id 'maven-publish'" monerokit/build.gradle
+# monero-kit is AGP 8.11.1 like zano and declares no publishing opt-in of its own.
+grep -qF "singleVariant('release')" monerokit/build.gradle || sed -i "/^android {/a\\    publishing { singleVariant('release') }" monerokit/build.gradle
+if grep -qF "release(MavenPublication)" monerokit/build.gradle; then
+    sed -i "/artifactId = 'monero-kit-android'/{n;s/version = '[^']*'/version = '$MONERO_VER'/;}" monerokit/build.gradle
+else
+    cat >> monerokit/build.gradle <<MONERO_PUB
 
 afterEvaluate {
     publishing {
@@ -767,6 +661,8 @@ afterEvaluate {
     }
 }
 MONERO_PUB
+fi
+grep -qF "version = '$MONERO_VER'" monerokit/build.gradle || { echo "ERROR: monero-kit publication version not set to $MONERO_VER"; exit 1; }
 ./gradlew :monerokit:publishToMavenLocal --no-daemon
 
 echo ""; echo "=== Step 6: Build wallet === $(date)"
@@ -807,13 +703,6 @@ rm -rf ~/.gradle/caches/
     echo "=== built splits ==="; ls -lh /output/built-splits/
 
 echo ""; echo "=== Step 7: Collect outputs === $(date)"
-
-mkdir -p /output/local-aars
-find ~/.m2/repository/com/github/horizontalsystems -type f \
-    \( -name "*.aar" -o -name "*.jar" \) \
-    ! -name "*-sources.jar" ! -name "*-javadoc.jar" \
-    -exec cp {} /output/local-aars/ \;
-
 mkdir -p /output/patches
 for dep_dir in /build/deps/*/; do
     dep_name=$(basename "$dep_dir")
@@ -829,26 +718,24 @@ else
     echo "Tag __WALLET_VERSION__ is a ${tag_obj_type} (lightweight tag — GPG verification not possible; no signature to verify)" > /output/git-tag-verify.txt
 fi
 
-echo ""; echo "=== Phase 3 build output ==="
+echo ""; echo "=== Source-build output ==="
 sha256sum /output/built-splits/*.apk
-
-echo ""; echo "=== Phase 3 local AARs ==="
-ls -lh /output/local-aars/
-sha256sum /output/local-aars/* | sort
 
 echo ""; echo "=== Dependency resolution check ==="
 WLOG=/output/wallet-build.log
-# grep -c prints 0 on no match but EXITS 1 → under Phase 3 `set -e` a bare assignment aborts here.
+# grep -c prints 0 on no match but exits 1, so keep its output while neutralising the status.
 # `|| true` forces exit 0 while keeping grep's "0" on stdout (NOT `|| echo 0`, which appends a 2nd 0 → "0\n0").
 HS_LOCAL=$(grep -E "horizontalsystems" "$WLOG" 2>/dev/null | grep -Ec "\.m2/repository/com/github/horizontalsystems|mavenLocal" || true); HS_LOCAL=${HS_LOCAL:-0}
 HS_JITPACK=$(grep -Eci "Downloading https://jitpack\\.io/com/github/horizontalsystems|Downloaded from .*jitpack\\.io/com/github/horizontalsystems" "$WLOG" 2>/dev/null || true); HS_JITPACK=${HS_JITPACK:-0}
 echo "  HS packages from mavenLocal: $HS_LOCAL  (expected: >0)"
 echo "  HS packages from JitPack:    $HS_JITPACK (expected: 0)"
-if [[ "$HS_JITPACK" -gt 0 ]]; then
-    echo "  JitPack URLs detected:"
-    grep -Ei "Downloading https://jitpack\\.io/com/github/horizontalsystems|Downloaded from .*jitpack\\.io/com/github/horizontalsystems" "$WLOG" | sed 's/^/    /' || true
-    echo "ERROR: JitPack fallback detected ($HS_JITPACK hit(s)) — Phase 3 did not fully build from local sources"
-    echo "       APK verdict would be unreliable. Aborting."
+if [[ "$HS_LOCAL" -eq 0 || "$HS_JITPACK" -gt 0 ]]; then
+    if [[ "$HS_JITPACK" -gt 0 ]]; then
+        echo "  JitPack URLs detected:"
+        grep -Ei "Downloading https://jitpack\\.io/com/github/horizontalsystems|Downloaded from .*jitpack\\.io/com/github/horizontalsystems" "$WLOG" | sed 's/^/    /' || true
+    fi
+    echo "ERROR: dependency source check failed (mavenLocal=$HS_LOCAL, JitPack=$HS_JITPACK)"
+    echo "       The APK verdict would not prove a full source build. Aborting."
     exit 1
 fi
 
@@ -858,26 +745,15 @@ BUILD_SCRIPT_END
 sed -i "s/__WALLET_VERSION__/${wallet_version}/g" "$p3_ctx/build.sh"
 chmod +x "$p3_ctx/build.sh"
 
-section "Building Phase 3 Docker image: ${IMG_P3}"
-if ! $CRUN build -t "$IMG_P3" -f "$p3_ctx/Dockerfile" "$p3_ctx"; then
-    log_error "Phase 3 image build failed"
-    generate_error_yaml "ftbfs" "Phase 3 container image build failed"
-    echo ""; echo "Exit code: 1"
-    exit 1
-fi
-log_success "Phase 3 image built: ${IMG_P3}"
-
 $CRUN rm -f "$CTR_P3" 2>/dev/null || true
 
-section "Running Phase 3 build container (from source — ~120 min)"
+section "Running source build container (~120 min)"
 echo "  Started: $(date)"
-P3_EXTRA=(-e "SPLIT_MODE=${SPLIT_MODE}")
-[[ "$SPLIT_MODE" == "true" ]] && P3_EXTRA+=(-v "${OFFICIAL_DIR}:/official:ro")
 set +e
 $CRUN run \
     --name "$CTR_P3" \
     "${MEM_ARGS[@]}" \
-    "${P3_EXTRA[@]}" \
+    -v "${OFFICIAL_DIR}:/official:ro" \
     -v "$P3_DIR:/output" \
     -v "$p3_ctx/build.sh:/build/build.sh:ro" \
     "$IMG_P3" \
@@ -886,26 +762,23 @@ P3_EXIT=${PIPESTATUS[0]}
 set +e   # keep -e OFF (script uses set -uo pipefail without -e; see line 38)
 
 if [[ $P3_EXIT -ne 0 ]]; then
-    log_error "Phase 3 container exited with code $P3_EXIT"
-    generate_error_yaml "ftbfs" "Phase 3 from-source build failed (exit ${P3_EXIT})"
+    log_error "Source-build container exited with code $P3_EXIT"
+    generate_error_yaml "ftbfs" "From-source build failed (exit ${P3_EXIT})"
     echo ""; echo "Exit code: 1"
     exit 1
 fi
 $CRUN rm -f "$CTR_P3" 2>/dev/null || true
 
-section "Phase 3 results"
+section "Source-build results"
 P3_SPLITS_DIR="$P3_DIR/built-splits"
 P3_NSPLITS=$(find "$P3_SPLITS_DIR" -maxdepth 1 -name "*.apk" 2>/dev/null | wc -l)
 if [[ "$P3_NSPLITS" -eq 0 ]]; then
-    log_error "Phase 3 produced no built splits in $P3_SPLITS_DIR"
-    generate_error_yaml "ftbfs" "Phase 3 bundletool produced no split APKs"
+    log_error "Source build produced no splits in $P3_SPLITS_DIR"
+    generate_error_yaml "ftbfs" "Source build produced no split APKs"
     echo ""; echo "Exit code: 1"; exit 1
 fi
-echo "  Phase 3 built splits:  $P3_NSPLITS"
+echo "  Source-built splits:   $P3_NSPLITS"
 echo "  Official splits:       ${#OFFICIAL_SPLITS[@]}"
-P3_AAR=$(find "$P3_DIR/local-aars" -name "*.aar" 2>/dev/null | wc -l)
-P3_JAR=$(find "$P3_DIR/local-aars" -name "*.jar" 2>/dev/null | wc -l)
-echo "  Built: $P3_AAR AARs + $P3_JAR JARs = $((P3_AAR + P3_JAR)) total"
 echo "  Finished: $(date)"
 
 commit="unknown"
@@ -913,106 +786,7 @@ commit="unknown"
 git_tag_info=""
 [[ -f "$P3_DIR/git-tag-verify.txt" ]] && git_tag_info=$(cat "$P3_DIR/git-tag-verify.txt")
 
-banner "PHASE 4: DEP ARTIFACT EVIDENCE COLLECTION"
-echo "  Pairing JitPack vs locally-built artifacts dynamically by filename."
-echo "  Deep analysis of all differing artifacts."
-echo "  Started: $(date)"
-
-P2_AARS="$P2_DIR/jitpack-aars"
-P3_AARS="$P3_DIR/local-aars"
-
-PAIRS=()
-while IFS= read -r p2f; do
-    p2n="$(basename "$p2f")"
-    p3n="${p2n#*--}"
-    if [[ -f "$P3_AARS/$p3n" ]]; then
-        PAIRS+=("${p2n}|${p3n}")
-    else
-        echo "ERROR: Missing local artifact for JitPack baseline file: $p2n (expected local: $p3n)"
-        generate_error_yaml "ftbfs" "Phase 4 pair mapping failed: missing local artifact for ${p2n}"
-        echo ""; echo "Exit code: 1"
-        exit 1
-    fi
-done < <(find "$P2_AARS" -maxdepth 1 -type f \( -name "*.aar" -o -name "*.jar" \) | sort)
-
-if [[ "${#PAIRS[@]}" -eq 0 ]]; then
-    echo "ERROR: No Phase 4 artifact pairs found"
-    generate_error_yaml "ftbfs" "Phase 4 pair mapping failed: no artifact pairs found"
-    echo ""; echo "Exit code: 1"
-    exit 1
-fi
-
-section "Phase 4: SHA-256 Hash Comparison Table (${#PAIRS[@]} pairs)"
-
-P4_MATCH=0
-P4_DIFFER=0
-P4_DIFFER_PAIRS=()
-
-printf "\n%-52s  %-64s  %-64s  %s\n" "ARTIFACT" "SHA256_P2(JitPack)" "SHA256_P3(local)" "RESULT"
-printf "%-52s  %-64s  %-64s  %s\n" "--------" \
-    "----------------------------------------------------------------" \
-    "----------------------------------------------------------------" "------"
-
-for pair in "${PAIRS[@]}"; do
-    p2n="${pair%%|*}"; p3n="${pair##*|}"; label="${p3n%.*}"
-    p2f="$P2_AARS/$p2n"; p3f="$P3_AARS/$p3n"
-    h2=$(sha256of "$p2f"); h3=$(sha256of "$p3f")
-    if [[ "$h2" == "$h3" ]]; then
-        printf "%-52s  %s  %s  MATCH\n" "$label" "$h2" "$h3"
-        P4_MATCH=$(( P4_MATCH + 1 ))
-    else
-        printf "%-52s  %s  %s  DIFFER\n" "$label" "$h2" "$h3"
-        P4_DIFFER=$(( P4_DIFFER + 1 ))
-        P4_DIFFER_PAIRS+=("$pair")
-    fi
-done
-
-echo ""
-echo "  MATCH:  $P4_MATCH / ${#PAIRS[@]}"
-echo "  DIFFER: $P4_DIFFER / ${#PAIRS[@]}"
-
-# (Per-artifact forensic deep-analysis removed for size; conclusions retained in the summary below.)
-section "Phase 4: Summary Table"
-printf "\n  %-52s  %s\n" "ARTIFACT" "RESULT"
-printf "  %-52s  %s\n"   "--------" "------"
-
-P4_FINAL_MATCH=0; P4_FINAL_DIFFER=0
-for pair in "${PAIRS[@]}"; do
-    p2n="${pair%%|*}"; p3n="${pair##*|}"; label="${p3n%.*}"
-    h2=$(sha256of "$P2_AARS/$p2n"); h3=$(sha256of "$P3_AARS/$p3n")
-    if [[ "$h2" == "$h3" ]]; then
-        printf "  %-52s  MATCH\n" "$label"
-        P4_FINAL_MATCH=$(( P4_FINAL_MATCH + 1 ))
-    else
-        case "$label" in
-            bitcoin-kit-android-*|ethereum-kit-android-*)
-                p4_verdict="DIFFER — MANIFEST.MF metadata only (JitPack Built-By vs local Created-By field)" ;;
-            zano-kit-android-*)
-                p4_verdict="DIFFER — zano-kit artifact differs; note libzanokit.so links vendor-prebuilt Zano engine/Boost/OpenSSL .a blobs that were not rebuilt — see report blob caveat" ;;
-            hd-wallet-kit-android-*)
-                p4_verdict="DIFFER — ZIP metadata only (extracted content identical per diff -r)" ;;
-            dashkit-*)
-                p4_verdict="DIFFER — GNU build ID section only (20 bytes differ; NDK r25b, clang 14.0.6) — build paths match; .text identical" ;;
-            ton-kit-android-*)
-                p4_verdict="DIFFER — GNU build ID section only (20 bytes differ; NDK r29) — verify .text if needed" ;;
-            monero-kit-android-*)
-                p4_verdict="DIFFER — GNU build ID section only (20 bytes differ; NDK r23b) — verify .text if needed" ;;
-            *)
-                p4_verdict="DIFFER — unknown diff type; manual investigation required" ;;
-        esac
-        printf "  %-52s  %s\n" "$label" "$p4_verdict"
-        P4_FINAL_DIFFER=$(( P4_FINAL_DIFFER + 1 ))
-    fi
-done
-
-echo ""
-echo "  TOTAL:  ${#PAIRS[@]} artifact pairs"
-echo "  MATCH:  $P4_FINAL_MATCH  (SHA-256 identical)"
-echo "  DIFFER: $P4_FINAL_DIFFER  (see deep analysis above for details)"
-echo "  Finished: $(date)"
-
-if [[ "$SPLIT_MODE" == "true" ]]; then
-banner "PHASE 5: PER-SPLIT CONTENTS COMPARISON (PRIMARY VERDICT)"
+banner "PHASE 2: PER-SPLIT CONTENTS COMPARISON"
 echo "  Official split vs built split, paired by config identity; contents-only (signing ignored)."
 echo "  Started: $(date)"
 p5_ctx=$(mktemp -d)
@@ -1022,10 +796,28 @@ set -uo pipefail
 AAPT2=$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort | tail -1)
 # config identity from the APK manifest: base/master has no split= → "base"; configs → token
 cfg_of() { local s; s=$("$AAPT2" dump badging "$1" 2>/dev/null | sed -n "s/.*split='\([^']*\)'.*/\1/p" | head -1); s="${s#config.}"; [[ -z "$s" ]] && s="base"; printf '%s' "$s"; }
+classify_manifest_diff() {
+    local md="$1" cfg="$2" mch mnx
+    mch=$(printf '%s\n' "$md" | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)')
+    # Google Play injects these distribution/source-stamp entries after the developer
+    # build. Removing them can also turn an empty <application> pair into a self-closing
+    # tag, so accept only those exact wrapper lines alongside the three metadata names.
+    mnx=$(printf '%s\n' "$mch" | grep -vE \
+        '^[+-][[:space:]]*<meta-data android:name="(com\.android\.vending\.derived\.apk\.id|com\.android\.stamp\.source|com\.android\.stamp\.type)"[^>]*/>$|^[+-][[:space:]]*<application android:extractNativeLibs="true" android:hasCode="false"(/>|>)$|^[+-][[:space:]]*</application>$' \
+        | tr -d '\n\r')
+    if [[ -n "$mch" && -z "$mnx" ]]; then
+        echo "  AndroidManifest.xml: sole decoded changes are Google Play distribution metadata — acceptable"
+        acc=$((acc + 1))
+    else
+        echo "  AndroidManifest.xml: decoded XML DIFFERS ($(printf '%s\n' "$md" | grep -c '^') lines) — full diff: diff_manifest_${cfg}.txt"
+        printf '%s\n' "$mch" | head -5 | sed 's/^/    /'
+    fi
+}
 declare -A OFF BLT
 for f in /official/*.apk; do OFF["$(cfg_of "$f")"]="$f"; done
 for f in /built/*.apk;    do BLT["$(cfg_of "$f")"]="$f"; done
-T=0; M=0; N=0; MISS=0
+APKTOOL="java -jar /opt/apktool.jar"
+T=0; M=0; N=0; MISS=0; ACC=0
 : > /out/p5-summary.txt
 for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
     echo "━━━━ config: $cfg ━━━━"
@@ -1036,16 +828,71 @@ for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
     fi
     rm -rf /tmp/o /tmp/b; mkdir -p /tmp/o /tmp/b
     unzip -q -o "$o" -d /tmp/o; unzip -q -o "$b" -d /tmp/b
+    echo "  files compared: $(find /tmp/o -type f | wc -l) official, $(find /tmp/b -type f | wc -l) built"
+    while IFS= read -r so; do
+        rel="${so#/tmp/o/}"
+        if [[ -f "/tmp/b/$rel" ]]; then
+            ho=$(sha256sum "$so" | cut -d' ' -f1); hb=$(sha256sum "/tmp/b/$rel" | cut -d' ' -f1)
+            [[ "$ho" == "$hb" ]] && st=MATCH || st=DIFFER
+            echo "  native $st $rel"; echo "    official $ho"; echo "    built    $hb"
+        else
+            echo "  native MISSING-IN-BUILT $rel"
+        fi
+    done < <(find /tmp/o -name '*.so' -type f | sort)
     draw=$(diff -rq /tmp/o /tmp/b 2>/dev/null)
     printf '%s\n' "$draw"
     # Exclude Google Play SourceStamp (stamp-cert-sha256) from counted diffs — Play-injected artifact, not developer output
     cnt=$(printf '%s\n' "$draw" | grep -v 'stamp-cert-sha256')
     n=$(printf '%s\n' "$cnt" | grep -vc '^$'); m=$(printf '%s\n' "$cnt" | grep -Ec '\.(SF|RSA|DSA|EC)( |$)|MANIFEST\.MF( |$)'); nn=$((n - m))
-    echo "  diffs: $n total ($m META-INF, $nn non-META-INF; stamp-cert-sha256 excluded as Play SourceStamp)"
-    echo "$cfg $n $m $nn" >> /out/p5-summary.txt
-    T=$((T + n)); M=$((M + m)); N=$((N + nn))
+    acc=0
+    if printf '%s\n' "$cnt" | grep -qE 'resources\.arsc|AndroidManifest\.xml'; then
+        rm -rf /tmp/do /tmp/db
+        dec=1
+        $APKTOOL d -f --no-src --no-debug-info "$o" -o /tmp/do >/dev/null 2>&1 || dec=0
+        $APKTOOL d -f --no-src --no-debug-info "$b" -o /tmp/db >/dev/null 2>&1 || dec=0
+        # A failed decode must never read as "identical" — no acceptance without a verified decode.
+        [[ "$dec" -eq 1 ]] || echo "  DECODE FAILED — no semantic classification possible for this config"
+    else
+        dec=0
+    fi
+    if [[ "$dec" -eq 1 ]] && printf '%s\n' "$cnt" | grep -q 'resources\.arsc'; then
+        if [[ -d /tmp/do/res && -d /tmp/db/res ]]; then
+            rd=$(diff -r /tmp/do/res /tmp/db/res 2>/dev/null)
+            printf '%s\n' "$rd" > "/out/diff_resources_decoded_${cfg}.txt"
+            ch=$(printf '%s\n' "$rd" | grep -E '^[<>]')
+            nx=$(printf '%s\n' "$ch" | grep -v 'com.google.firebase.crashlytics.mapping_file_id' | tr -d '\n\r')
+            if [[ -z "$(printf '%s' "$rd" | tr -d '[:space:]')" ]]; then
+                echo "  resources.arsc: binary differs, decoded res/ IDENTICAL — non-semantic artifact, acceptable (WS #574)"
+                acc=$((acc + 1))
+            elif [[ -n "$ch" && -z "$nx" ]]; then
+                echo "  resources.arsc: sole decoded change is crashlytics.mapping_file_id — build-time ID, acceptable (WS #574)"
+                acc=$((acc + 1))
+            else
+                echo "  resources.arsc: decoded res/ DIFFERS ($(printf '%s\n' "$rd" | grep -c '^') lines) — full diff: diff_resources_decoded_${cfg}.txt"
+                printf '%s\n' "$rd" | head -5 | sed 's/^/    /'
+            fi
+        else
+            echo "  resources.arsc: decoded res/ missing on one side — not classified"
+        fi
+    fi
+    if [[ "$dec" -eq 1 ]] && printf '%s\n' "$cnt" | grep -q 'AndroidManifest\.xml'; then
+        if [[ -f /tmp/do/AndroidManifest.xml && -f /tmp/db/AndroidManifest.xml ]]; then
+            md=$(diff -u /tmp/do/AndroidManifest.xml /tmp/db/AndroidManifest.xml 2>/dev/null)
+            printf '%s\n' "$md" > "/out/diff_manifest_${cfg}.txt"
+            if [[ -z "$(printf '%s' "$md" | tr -d '[:space:]')" ]]; then
+                echo "  AndroidManifest.xml: binary differs, decoded XML IDENTICAL — binary-encoding artifact; NOT auto-accepted, human judgement per WS #574"
+            else
+                classify_manifest_diff "$md" "$cfg"
+            fi
+        else
+            echo "  AndroidManifest.xml: decoded manifest missing on one side — not classified"
+        fi
+    fi
+    echo "  diffs: $n total ($m META-INF, $nn non-META-INF; stamp-cert-sha256 excluded as Play SourceStamp; $acc acceptable per WS #574)"
+    echo "$cfg $n $m $nn $acc" >> /out/p5-summary.txt
+    T=$((T + n)); M=$((M + m)); N=$((N + nn)); ACC=$((ACC + acc))
 done
-echo "TOTALS $T $M $N $MISS" >> /out/p5-summary.txt
+echo "TOTALS $T $M $N $MISS $ACC" >> /out/p5-summary.txt
 echo "=== per-split comparison complete ==="
 P5_SPLIT_END
 $CRUN run --rm \
@@ -1056,27 +903,31 @@ $CRUN run --rm \
     "$IMG_P3" bash /p5.sh 2>&1 | tee "$P5_DIR/p5-split.log"
 P5_EXIT=${PIPESTATUS[0]}
 if [[ $P5_EXIT -ne 0 ]] || ! grep -q '^TOTALS' "$P5_DIR/p5-summary.txt" 2>/dev/null; then
-    log_error "Phase 5 comparison container failed (exit $P5_EXIT) or produced no summary"
-    generate_error_yaml "ftbfs" "Phase 5 per-split comparison container failed (exit ${P5_EXIT})"
+    log_error "Split comparison failed (exit $P5_EXIT) or produced no summary"
+    generate_error_yaml "ftbfs" "Per-split comparison failed (exit ${P5_EXIT})"
     echo ""; echo "Exit code: 1"; exit 1
 fi
-read -r _ diff_count diff_metainf_count diff_non_metainf_count missing_cfgs \
+read -r _ diff_count diff_metainf_count diff_non_metainf_count missing_cfgs accepted_count \
     < <(grep '^TOTALS' "$P5_DIR/p5-summary.txt")
 diff_count="${diff_count:-1}"; diff_metainf_count="${diff_metainf_count:-0}"
 diff_non_metainf_count="${diff_non_metainf_count:-1}"; missing_cfgs="${missing_cfgs:-1}"
-section "Phase 5: PRIMARY VERDICT (split — judged on non-signature diffs)"
+accepted_count="${accepted_count:-0}"
+material_count=$((diff_non_metainf_count - accepted_count))
+[[ "$material_count" -lt 0 ]] && material_count=0
+section "Phase 2: VERDICT (judged on non-signature diffs)"
 echo "  Totals: ${diff_count} diff(s) (${diff_metainf_count} META-INF, ${diff_non_metainf_count} non-META-INF), ${missing_cfgs} unmatched config(s)"
+echo "  Acceptable per WS #574 (decoded resources / Google Play manifest metadata): ${accepted_count}"
+echo "  Material (verdict-bearing) diffs: ${material_count}"
+echo "  Acceptable-diffs policy: https://gitlab.com/walletscrutiny/walletScrutinyCom/-/issues/574"
 if [[ "$missing_cfgs" -gt 0 ]]; then
-    log_warn "Phase 5 verdict: NOT_REPRODUCIBLE — ${missing_cfgs} config(s) present on only one side (incomplete set)"
-    P5_VERDICT="not_reproducible"; P5_MATCH="false"
-elif [[ "$diff_non_metainf_count" -eq 0 ]]; then
-    log_success "Phase 5 verdict: REPRODUCIBLE (all splits match; 0 non-signature diffs; ${diff_metainf_count} signing-only)"
-    P5_VERDICT="reproducible"; P5_MATCH="true"
+    log_warn "Verdict: NOT_REPRODUCIBLE — ${missing_cfgs} config(s) present on only one side"
+    P5_VERDICT="not_reproducible"
+elif [[ "$material_count" -eq 0 ]]; then
+    log_success "Verdict: REPRODUCIBLE (0 material diffs; ${diff_metainf_count} signing-only, ${accepted_count} acceptable per WS #574)"
+    P5_VERDICT="reproducible"
 else
-    log_warn "Phase 5 verdict: NOT_REPRODUCIBLE (${diff_non_metainf_count} non-signature diff(s))"
-    P5_VERDICT="not_reproducible"; P5_MATCH="false"
-fi
-echo "  Phase 5b skipped in split mode (Phase 2 universal baseline is shape-incompatible with splits)."
+    log_warn "Verdict: NOT_REPRODUCIBLE (${material_count} material diff(s))"
+    P5_VERDICT="not_reproducible"
 fi
 
 echo ""
@@ -1088,12 +939,15 @@ echo "apkVersionCode: ${version_code}"
 echo "verdict:        ${P5_VERDICT}"
 echo "appHash:        ${app_hash}"
 echo "commit:         ${commit}"
-echo "phase4:         ${P4_FINAL_MATCH} match / ${P4_FINAL_DIFFER} differ (dep artifacts)"
-echo "phase5diffs:    ${diff_count}"
+echo "comparisonDiffs: ${diff_count}"
+echo "acceptableDiffs: ${accepted_count} (WS #574)"
+echo "materialDiffs:  ${material_count}"
+echo "method:         source-built splits vs official Play splits"
+echo "jitpack:        no Horizontal Systems fallback allowed"
 [[ -n "${git_tag_info}" ]] && echo "${git_tag_info}"
 echo "===== End Results ====="
 
-generate_yaml "${P5_VERDICT}" "Phase 5 APK comparison: ${diff_count} total difference(s) (${diff_metainf_count} META-INF, ${diff_non_metainf_count} other). Official APK SHA-256: ${app_hash}. Dep artifact comparison: ${P4_FINAL_MATCH} match / ${P4_FINAL_DIFFER} differ (Phase 4, evidence only)."
+generate_yaml "${P5_VERDICT}" "Source-built split comparison: ${diff_count} total difference(s) (${diff_metainf_count} META-INF, ${diff_non_metainf_count} other), of which ${accepted_count} are acceptable per WS issue 574 (decoded-identical resources, crashlytics mapping ID, or decoded manifest changes limited to Google Play distribution metadata) and ${material_count} are material. Official APK SHA-256: ${app_hash}. Horizontal Systems dependencies were built locally; JitPack fallback was prohibited. The former JitPack baseline comparison was removed because commit artifacts are not durably available."
 
 echo ""
 echo "Exit code: 0"
