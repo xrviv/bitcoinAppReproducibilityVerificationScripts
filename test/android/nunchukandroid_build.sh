@@ -1,12 +1,12 @@
 #!/bin/bash
 # nunchukandroid_build.sh — Nunchuk Android Reproducible Build Verification
-# Version: v0.4.6
+# Version: v0.4.11
 # Organization: WalletScrutiny.com
 # License: MIT
 set -euo pipefail
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.4.6"
+readonly SCRIPT_VERSION="v0.4.11"
 readonly SCRIPT_NAME="nunchukandroid_build.sh"
 readonly APP_ID="io.nunchuk.android"
 readonly REPO_URL="https://github.com/nunchuk-io/nunchuk-android.git"
@@ -25,6 +25,7 @@ CONTAINER_RUN_EXTRA=""
 VOLUME_RO=":ro"
 VOLUME_RW=""
 REQUESTED_TAG=""
+REQUESTED_REV=""
 should_cleanup=false
 BUILD_MODE=""
 VERSION_SAFE=""
@@ -38,10 +39,13 @@ TOTAL_DIFFS=0
 SEMANTIC_UPGRADE="true"
 SEMANTIC_NOTES=""
 APK_INPUT_IS_DIR="false"
+IMAGE_TAG=""
+REF_SUFFIX=""
 log_info()  { echo "[INFO] $*"; }
 log_pass()  { echo "[PASS] $*"; }
 log_fail()  { echo "[FAIL] $*"; }
 log_warn()  { echo "[WARNING] $*"; }
+die_invalid() { log_fail "$*"; echo "Exit code: ${EXIT_INVALID}"; exit "${EXIT_INVALID}"; }
 safe_grep_count() {
     local grep_output
     grep_output="$("$@" 2>/dev/null || true)"
@@ -62,11 +66,12 @@ verdict: ${status}"
 }
 generate_comparison_yaml() {
     local verdict="$1"
-    local notes="$2"
+    local notes
+    notes="$(printf '%s' "$2" | sed 's/^/  /')"
     write_yaml_outputs "script_version: ${SCRIPT_VERSION}
 verdict: ${verdict}
 notes: |
-  ${notes}"
+${notes}"
     log_info "Generated COMPARISON_RESULTS.yaml (verdict: ${verdict})"
 }
 on_error() {
@@ -130,7 +135,7 @@ nunchuk_exec() {
         ${CONTAINER_RUN_EXTRA} \
         -v "${WORK_DIR}:/work${VOLUME_RW}" \
         -w /work \
-        "${NUNCHUK_IMAGE_BASE}:${VERSION_SAFE}" \
+        "${IMAGE_TAG}" \
         sh -c "$cmd"
 }
 container_sha256() {
@@ -180,6 +185,26 @@ container_aapt_version() {
             rm -rf "$tmpdir"
         ' 2>/dev/null || true
 }
+assert_package_name() {
+    local apk="$1" n pkg msg
+    n="$(basename "$apk")"; n="${n//[$'\r\n']/_}"
+    pkg="$(${CONTAINER_CMD} run --rm -v "$(dirname "$apk"):/apk${VOLUME_RO}" "${WS_CONTAINER}" \
+        sh -c 'a="/apk/$1"; x() { sed -n "s/^package: name=.\([^'"'"']*\).*/\1/p" | head -n1; }
+               p="$(aapt dump badging "$a" 2>/dev/null | x)"
+               [ -n "$p" ] || p="$(aapt2 dump badging "$a" 2>/dev/null | x)"
+               if [ -z "$p" ]; then d=$(mktemp -d)
+                 apktool d -f -s -o "$d/o" "$a" >/dev/null 2>&1 &&
+                   p="$(sed -n '"'"'s/.*package="\([^"]*\)".*/\1/p'"'"' "$d/o/AndroidManifest.xml" | head -n1)"
+                 rm -rf "$d"; fi
+               printf %s "$p"' sh "$n" 2>/dev/null | tr -d '\r\n')"
+    if [[ "${pkg}" != "${APP_ID}" ]]; then
+        msg="Package check failed for ${n}: expected ${APP_ID}, got '${pkg:-unreadable}'."
+        generate_comparison_yaml "ftbfs" "${msg}"
+        RESULT_DONE=true
+        die_invalid "${msg}"
+    fi
+    log_info "Package verified: ${pkg}"
+}
 canonicalize_split_apk_name() {
     local apk_name="$1"
     case "$apk_name" in
@@ -188,13 +213,6 @@ canonicalize_split_apk_name() {
         base-*.apk) echo "split_config.${apk_name#base-}" ;;
         *) echo "$apk_name" ;;
     esac
-}
-find_official_base_apk() {
-    local dir="${WORK_DIR}/official-split-apks"
-    if   [[ -f "${dir}/base.apk" ]];        then echo "${dir}/base.apk"; return; fi
-    if   [[ -f "${dir}/base-master.apk" ]]; then echo "${dir}/base-master.apk"; return; fi
-    local matches=("${dir}"/base*.apk)
-    [[ ${#matches[@]} -gt 0 && -f "${matches[0]}" ]] && echo "${matches[0]}" && return
 }
 resolve_built_split_apk() {
     local official_apk="$1"
@@ -212,47 +230,29 @@ resolve_built_split_apk() {
 }
 usage() {
     cat <<EOF
-NAME
-       ${SCRIPT_NAME} - Nunchuk Android reproducible build verification
 SYNOPSIS
-       ${SCRIPT_NAME} --binary <split.apk> [--version <version>] [OPTIONS]
-       ${SCRIPT_NAME} --version <version> [OPTIONS]
-       ${SCRIPT_NAME} --help
+       ${SCRIPT_NAME} --binary <file|dir> [--version <ver>] [OPTIONS]
+       ${SCRIPT_NAME} --version <ver> [OPTIONS]
 DESCRIPTION
-       Builds Nunchuk Android from source using Nunchuk's official
-       reproducible-builds/Dockerfile and compares against an official artifact.
-       split mode (--binary <file>):
-         Accepts one official split APK from Google Play (e.g. base.apk).
-         Fetches Nunchuk's Dockerfile from the matching tag, extends it with
-         bundletool, builds AAB via bundleProductionRelease (using disorderfs
-         for reproducible directory ordering), extracts splits with bundletool,
-         and compares the matching split.
-         Version is auto-detected from the APK unless --version is given.
-       github mode (--version <ver>, no --binary):
-         Downloads the official APK from Nunchuk GitHub releases. Builds via
-         assembleProductionRelease and runs a content diff.
+       Rebuilds Nunchuk Android with upstream's reproducible-builds/Dockerfile
+       and compares against the official artifact.
 OPTIONS
-       --binary <file|dir>        Directory of official Play Store split APKs
-                                  (ALL splits verified — recommended), or one
-                                  split APK (single-split scope). Alias: --apk.
-       --version <version>        Version to verify (e.g. 1.9.47). Required in
-                                  github mode; optional in split mode (auto-detect).
-       --arch <arch>              Target architecture for device-spec.json.
-                                  Supported: arm64-v8a, armeabi-v7a, x86_64, x86.
-                                  Default: arm64-v8a.
-       --type <type>              Accepted for build server compatibility; unused.
-       --tag <ref>                Override git tag (default: android.<version>).
-       --cleanup                  Remove work directory after completion.
-       --script-version           Print script version and exit.
-       --help                     Show this help and exit.
+       --binary <file|dir>  Dir of official Play Store splits (all verified;
+                            recommended) or one split APK. Alias: --apk.
+       --version <ver>      Version (e.g. 1.9.47). Required in github mode;
+                            auto-detected in split mode.
+       --arch <arch>        arm64-v8a (default), armeabi-v7a, x86_64, x86.
+       --type <type>        Accepted for build server compatibility; unused.
+       --tag <ref>          Override git tag (default: android.<version>).
+       --revision <sha>     Pin an untagged commit. Full 40-hex SHA, split mode
+                            only. Alias: --revision-override.
+       --cleanup            Remove work directory after completion.
+       --script-version     Print script version and exit.
+       --help               Show this help and exit.
 EXIT CODES
-       0    Reproducible (only META-INF differences, or identical)
-       1    Differences found or build failure
-       2    Invalid parameters
+       0 reproducible   1 differences or build failure   2 invalid parameters
 EXAMPLES
-       ${SCRIPT_NAME} --binary ~/apks/base.apk
-       ${SCRIPT_NAME} --binary ~/apks/base.apk --version 1.9.47
-       ${SCRIPT_NAME} --version 1.9.47
+       ${SCRIPT_NAME} --binary ~/apks/ --version 2.7.5 --revision <40-hex-sha>
 EOF
 }
 parse_arguments() {
@@ -262,7 +262,12 @@ parse_arguments() {
             --apk|--binary)   APK_INPUT="${2:-}";       shift ;;
             --arch)           ARCH="${2:-}";            shift ;;
             --type)           TYPE="${2:-}";            shift ;;
-            --tag)            REQUESTED_TAG="${2:-}";   shift ;;
+            --tag)
+                [[ "${2:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || die_invalid "--tag has invalid characters."
+                REQUESTED_TAG="$2"; shift ;;
+            --revision|--revision-override)
+                [[ "${2:-}" =~ ^[0-9a-fA-F]{40}$ ]] || die_invalid "--revision needs a full 40-hex SHA."
+                REQUESTED_REV="$2"; shift ;;
             --cleanup)        should_cleanup=true ;;
             --script-version) echo "${SCRIPT_NAME} ${SCRIPT_VERSION}"; echo "Exit code: ${EXIT_SUCCESS}"; exit "${EXIT_SUCCESS}" ;;
             --help|-h)        usage; echo "Exit code: ${EXIT_SUCCESS}"; exit "${EXIT_SUCCESS}" ;;
@@ -271,28 +276,28 @@ parse_arguments() {
         shift
     done
     if [[ "$(id -u)" -eq 0 ]]; then
-        echo "[ERROR] Do not run this script as root."
-        echo "Exit code: ${EXIT_INVALID}"
-        exit "${EXIT_INVALID}"
+        die_invalid "Do not run this script as root."
+    fi
+    if [[ -n "${REQUESTED_REV}" && -n "${REQUESTED_TAG}" ]]; then
+        die_invalid "--revision and --tag are mutually exclusive."
+    fi
+    if [[ -n "${REQUESTED_REV}" && -z "${APK_INPUT}" ]]; then
+        die_invalid "--revision requires --binary (split mode)."
     fi
     if [[ -n "${APK_INPUT}" ]]; then
         BUILD_MODE="split"
         if [[ -d "${APK_INPUT}" ]]; then
             if [[ ! -f "${APK_INPUT%/}/base.apk" ]]; then
-                echo "[ERROR] --binary directory contains no base.apk: ${APK_INPUT}"
                 generate_error_yaml "ftbfs"
-                echo "Exit code: ${EXIT_INVALID}"
-                exit "${EXIT_INVALID}"
+                die_invalid "--binary directory contains no base.apk: ${APK_INPUT}"
             fi
             APK_INPUT="${APK_INPUT%/}"
             APK_INPUT_IS_DIR="true"
             log_info "--binary is a directory; ALL split APKs in it will be verified"
         fi
         if [[ "${APK_INPUT_IS_DIR}" != "true" && ! -f "${APK_INPUT}" ]]; then
-            echo "[ERROR] --binary file not found: ${APK_INPUT}"
             generate_error_yaml "ftbfs"
-            echo "Exit code: ${EXIT_INVALID}"
-            exit "${EXIT_INVALID}"
+            die_invalid "--binary file not found: ${APK_INPUT}"
         fi
         [[ "${APK_INPUT}" != /* ]] && APK_INPUT="${EXEC_DIR}/${APK_INPUT}"
         ARCH="${ARCH:-arm64-v8a}"
@@ -300,9 +305,7 @@ parse_arguments() {
         BUILD_MODE="github"
         ARCH="${ARCH:-arm64-v8a}"
     else
-        echo "[ERROR] Provide --binary <split.apk> (split mode) or --version <version> (github mode)."
-        echo "Exit code: ${EXIT_INVALID}"
-        exit "${EXIT_INVALID}"
+        die_invalid "Provide --binary (split mode) or --version (github mode)."
     fi
     case "${ARCH}" in
         arm64-v8a|armeabi-v7a|x86_64|x86) ;;
@@ -315,7 +318,9 @@ parse_arguments() {
     esac
     VERSION_SAFE="${VERSION:-provided}"
     ARCH_SAFE="${ARCH//-/_}"
-    WORK_DIR="/tmp/test_${APP_ID}_${VERSION_SAFE}_${ARCH_SAFE}"
+    REF_SUFFIX="${REQUESTED_REV:-${REQUESTED_TAG:-}}"; REF_SUFFIX="${REF_SUFFIX//[^A-Za-z0-9._-]/_}"
+    IMAGE_TAG="${NUNCHUK_IMAGE_BASE}:${VERSION_SAFE}${REF_SUFFIX:+-${REF_SUFFIX}}"
+    WORK_DIR="/tmp/test_${APP_ID}_${VERSION_SAFE}_${ARCH_SAFE}${REF_SUFFIX:+_${REF_SUFFIX}}"
     log_info "${SCRIPT_NAME} ${SCRIPT_VERSION}"
     log_info "Build mode: ${BUILD_MODE}"
     log_info "Work directory: ${WORK_DIR}"
@@ -370,8 +375,10 @@ DOCKERFILE_EOF
     log_info "Extended Dockerfile written to ${output_path}"
 }
 ensure_build_image() {
-    local image_tag="${NUNCHUK_IMAGE_BASE}:${VERSION_SAFE}"
-    if ${CONTAINER_CMD} image inspect "${image_tag}" >/dev/null 2>&1; then
+    local image_tag="${IMAGE_TAG}"
+    if [[ -n "${REF_SUFFIX}" ]]; then
+        log_info "Explicit ref: rebuilding image."
+    elif ${CONTAINER_CMD} image inspect "${image_tag}" >/dev/null 2>&1; then
         if ${CONTAINER_CMD} run --rm "${image_tag}" \
             sh -c 'test -f /tmp/bundletool.jar && test -f /tmp/apktool.jar' >/dev/null 2>&1; then
             log_info "Build image ${image_tag} already exists, skipping build."
@@ -435,7 +442,7 @@ extract_split_apks_from_aab() {
     local aab_path="$1"
     local device_spec_path="$2"
     local output_dir="$3"
-    local image_tag="${NUNCHUK_IMAGE_BASE}:${VERSION_SAFE}"
+    local image_tag="${IMAGE_TAG}"
     mkdir -p "${output_dir}"
     local aab_rel device_spec_rel apks_rel output_rel
     aab_rel="${aab_path#"${WORK_DIR}/"}"
@@ -818,8 +825,7 @@ prepare() {
             log_info "Collected ${split_count} official split APK(s) for verification"
             OFFICIAL_APK="${WORK_DIR}/official-split-apks/base.apk"
         else
-            log_warn "Single-split mode: ONLY $(basename "${APK_INPUT}") will be verified."
-            log_warn "The installed split set is NOT fully covered — pass the directory of splits for full coverage."
+            log_warn "Single-split mode: ONLY $(basename "${APK_INPUT}") verified; pass the splits dir for full coverage."
             original_name="$(basename "${APK_INPUT}")"
             canonical_name="$(canonicalize_split_apk_name "${original_name}")"
             cp "${APK_INPUT}" "${WORK_DIR}/official-split-apks/${canonical_name}"
@@ -829,6 +835,7 @@ prepare() {
             OFFICIAL_APK="${WORK_DIR}/official-split-apks/${canonical_name}"
         fi
         OFFICIAL_BASE_APK="${OFFICIAL_APK}"
+        assert_package_name "${OFFICIAL_APK}"
         if [[ -z "${VERSION}" ]]; then
             log_info "Auto-detecting version from APK content..."
             VERSION="$(container_aapt_version "${OFFICIAL_APK}" "versionName" || true)"
@@ -838,6 +845,7 @@ prepare() {
             fi
             log_info "Version detected: ${VERSION}"
             VERSION_SAFE="${VERSION}"
+            IMAGE_TAG="${NUNCHUK_IMAGE_BASE}:${VERSION_SAFE}${REF_SUFFIX:+-${REF_SUFFIX}}"
         fi
         create_device_spec "${WORK_DIR}/device-spec.json" "${ARCH}"
     fi
@@ -845,32 +853,30 @@ prepare() {
 }
 build() {
     log_info "=== BUILD PHASE ==="
-    GIT_TAG="${REQUESTED_TAG:-}"
+    GIT_TAG="${REQUESTED_REV:-${REQUESTED_TAG:-}}"
     if [[ -z "${GIT_TAG}" ]]; then
         if ! resolve_git_tag "${VERSION}"; then
-            echo ""
-            echo "======================================================"
-            echo "  SOURCE NOT FOUND FOR VERSION ${VERSION}"
-            echo "  Nunchuk has not published a tagged release for this"
-            echo "  version in the repository. Cannot verify."
-            echo "  Repository: ${REPO_URL}"
-            echo "======================================================"
-            echo ""
+            log_fail "No tag for ${VERSION} (tried android.${VERSION}, v${VERSION}, ${VERSION})."
+            log_fail "If untagged, pin the commit with --revision <sha>."
             generate_comparison_yaml "ftbfs" \
-                "Tag not found for version ${VERSION}. Tried: android.${VERSION}, v${VERSION}, ${VERSION}. Source code for this version has not been published in the Nunchuk repository."
+                "No tag for ${VERSION}. If the source exists untagged, re-run with --revision <sha>."
             RESULT_DONE=true
             echo "Exit code: ${EXIT_FAILED}"
             exit "${EXIT_FAILED}"
         fi
     fi
-    log_info "Git tag: ${GIT_TAG}"
+    log_info "Git ref: ${GIT_TAG}${REQUESTED_REV:+ (untagged commit, pinned)}"
     ensure_build_image
-    local image_tag="${NUNCHUK_IMAGE_BASE}:${VERSION_SAFE}"
+    local image_tag="${IMAGE_TAG}"
     local gradle_task
     if [[ "${BUILD_MODE}" == "split" ]]; then
         gradle_task="bundleProductionRelease"
     else
         gradle_task="assembleProductionRelease"
+    fi
+    local clone_cmd="git clone --depth 1 --branch '${GIT_TAG}' '${REPO_URL}' /workspace/app"
+    if [[ -n "${REQUESTED_REV}" ]]; then
+        clone_cmd="git init -q /workspace/app && cd /workspace/app && git remote add origin '${REPO_URL}' && git fetch -q --depth 1 origin '${GIT_TAG}' && git checkout -q FETCH_HEAD"
     fi
     log_info "Cloning + building in container (this may take 20-40 minutes)..."
     log_info "NOTE: Requires --privileged for disorderfs (FUSE)."
@@ -882,7 +888,7 @@ build() {
         "${image_tag}" \
         bash -c "set -euo pipefail
             echo '[INFO] Cloning ${REPO_URL} at ${GIT_TAG}...'
-            git clone --depth 1 --branch '${GIT_TAG}' '${REPO_URL}' /workspace/app
+            ${clone_cmd}
             cd /workspace/app
             git rev-parse HEAD > /workspace/commit.txt
             echo '[INFO] Commit: \$(cat /workspace/commit.txt)'
