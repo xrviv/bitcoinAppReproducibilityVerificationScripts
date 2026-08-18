@@ -1,51 +1,21 @@
 #!/bin/bash
-# ==============================================================================
-# metamask_build.sh - MetaMask Android Reproducible Build Verification
-# ==============================================================================
-# Version:       v0.1.46
-# Organization:  WalletScrutiny.com
-# Last Modified: 2026-03-17 (v0.1.46)
-# Project:       https://github.com/MetaMask/metamask-mobile
-# ==============================================================================
-# LICENSE: MIT License
-#
-# TECHNICAL DISCLAIMER:
-# This script is provided for technical analysis and reproducible build verification purposes only.
-# No warranty is provided regarding the security, functionality, or fitness for any particular purpose.
-# Users assume all risks associated with running this script and analyzing the software.
-# This script performs containerized builds and split APK comparisons - review all operations before execution.
-#
-# LEGAL DISCLAIMER:
-# This script is designed for legitimate security research and reproducible build verification.
-# Users are responsible for ensuring compliance with all applicable laws and regulations.
-# The developers assume no liability for any misuse or legal consequences arising from use.
-# By using this script, you acknowledge these disclaimers and accept full responsibility.
-#
-# SCRIPT SUMMARY:
-# - Uses official split APKs as the comparison baseline (AAB distribution)
-# - Accepts official splits via --binary as either a directory or one split APK
-# - Clones source code repository and checks out the exact release tag/commit
-# - Performs containerized AAB build using embedded Dockerfile
-# - Extracts split APKs with bundletool and a device-spec.json
-# - Compares hashes and unzipped contents for each split APK
-# - Generates COMPARISON_RESULTS.yaml for build server automation
-# - Preserves diff artifacts for manual inspection
-
+# metamask_build.sh v0.2.6 — MetaMask Android reproducible build verification
+# Organization: WalletScrutiny.com
+# Last modified by: Danny Garcia
+# Last modified on: 2026-08-14
+# Project: https://github.com/MetaMask/metamask-mobile
+# License: MIT. No warranty. For security research only. Use at your own risk.
 set -euo pipefail
-
-# Capture execution directory before anything can change CWD
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-
-# Script metadata
-readonly SCRIPT_VERSION="v0.1.46"
+readonly SCRIPT_VERSION="v0.2.6"
 readonly SCRIPT_NAME="metamask_build.sh"
 readonly APP_ID="io.metamask"
 readonly REPO_URL="https://github.com/MetaMask/metamask-mobile"
 readonly GITHUB_API_BASE="https://api.github.com/repos/MetaMask/metamask-mobile/releases/tags"
 readonly WS_CONTAINER="docker.io/walletscrutiny/android:5"
 
-# Global variables (set by argument parsing)
+# Globals
 VERSION=""
 ARCH=""
 TYPE=""
@@ -67,16 +37,13 @@ APK_VERSION_NAME=""
 APK_VERSION_CODE=""
 SIGNER_SHA256=""
 COMMIT_HASH=""
-TAG_NAME=""
 AGGREGATED_DIFFS=""
 BUILD_MODE=""  # "split" (--binary provided: compare vs Google Play splits)
                # "aab"   (--version only: download official AAB, extract splits, compare)
 TARGET_SPLIT_APK=""
 RESULT_DONE=false  # set to true by result() after writing the comparison YAML
 
-###############################################################################
 # Helper Functions
-###############################################################################
 
 log_info() { echo "[INFO] $1"; }
 log_pass() { echo "[PASS] $1"; }
@@ -112,7 +79,6 @@ container_sha256() {
     container_exec "sha256sum \"$rel_path\" | awk '{print \$1}'"
 }
 
-# Zeus-pattern: aapt -> aapt2 -> apktool fallback (never uses filename/path)
 container_aapt_version() {
     local apk_path="$1"
     local field="$2"
@@ -229,7 +195,6 @@ collect_official_metadata() {
     fi
 
     if [[ -n "$IMAGE_NAME" ]]; then
-        # Zeus-pattern: aapt -> aapt2 -> apktool fallback, never uses filename
         local version_name_from_apk
         local version_code_from_apk
         version_name_from_apk="$(container_aapt_version "$OFFICIAL_BASE_APK" "versionName" || true)"
@@ -257,18 +222,11 @@ collect_official_metadata() {
 
 collect_build_metadata() {
     local commit_file="$WORK_DIR/built-aab/commit.txt"
-    local tag_file="$WORK_DIR/built-aab/tag.txt"
 
     if [[ -f "$commit_file" ]]; then
         IFS= read -r COMMIT_HASH < "$commit_file"
     else
         COMMIT_HASH="unknown"
-    fi
-
-    if [[ -f "$tag_file" ]]; then
-        IFS= read -r TAG_NAME < "$tag_file"
-    else
-        TAG_NAME="none"
     fi
 }
 
@@ -299,75 +257,14 @@ aggregate_diff_output() {
 print_results_block() {
     local verdict="$1"
     local should_cleanup="${2:-false}"
-
     collect_official_metadata
     collect_build_metadata
     aggregate_diff_output
-
-    local app_id_value="${APP_ID_FROM_APK:-$APP_ID}"
-
-    # Parse tag/signature verification output
     local tag_verify_output
     tag_verify_output="$(cat "${WORK_DIR}/built-aab/tag_verify.txt" 2>/dev/null || true)"
-
-    local tag_type="unknown"
-    local tag_signature_status="[WARNING] Tag signature not checked"
-    local commit_signature_status="[WARNING] No valid signature found on commit"
-    local signature_keys=""
-    local signature_warnings=""
-
-    if echo "${tag_verify_output}" | grep -q "TAG_TYPE=tag"; then
-        tag_type="annotated"
-        if echo "${tag_verify_output}" | grep -q "Good signature"; then
-            tag_signature_status="[OK] Good signature on annotated tag"
-            local tag_key
-            tag_key="$(echo "${tag_verify_output}" | grep 'using .* key' | sed -E 's/.*using .* key ([A-F0-9a-f]+).*/\1/' | tail -1)"
-            [[ -n "${tag_key}" ]] && signature_keys="Tag signed with: ${tag_key}"
-        else
-            tag_signature_status="[WARNING] No valid signature found on annotated tag"
-            signature_warnings="- Annotated tag exists but is not signed"
-        fi
-    elif echo "${tag_verify_output}" | grep -q "LIGHTWEIGHT_TAG"; then
-        tag_type="lightweight"
-        tag_signature_status="[INFO] Tag is lightweight (cannot contain signature)"
-    elif echo "${tag_verify_output}" | grep -qE "TAG_TYPE=missing|NO_TAG"; then
-        tag_type="missing"
-        tag_signature_status="[WARNING] Tag not found in repository"
-    fi
-
-    local commit_section
-    commit_section="$(echo "${tag_verify_output}" | sed -n '/---COMMIT---/,$p')"
-    if echo "${commit_section}" | grep -q "Good signature"; then
-        commit_signature_status="[OK] Good signature on commit"
-        local commit_key
-        commit_key="$(echo "${commit_section}" | grep 'using .* key' | sed -E 's/.*using .* key ([A-F0-9a-f]+).*/\1/' | tail -1)"
-        if [[ -n "${commit_key}" ]]; then
-            [[ -n "${signature_keys}" ]] && \
-                signature_keys="${signature_keys}\nCommit signed with: ${commit_key}" || \
-                signature_keys="Commit signed with: ${commit_key}"
-        fi
-    else
-        commit_signature_status="[WARNING] No valid signature found on commit"
-        [[ -z "${signature_warnings}" ]] && \
-            signature_warnings="- Commit is not signed" || \
-            signature_warnings="${signature_warnings}\n- Commit is not signed"
-    fi
-
-    # Build diff guide
-    local diff_guide=""
-    if [[ "${should_cleanup}" != "true" ]]; then
-        diff_guide="
-Run a full
-diff --recursive ${WORK_DIR}/comparison/official_* ${WORK_DIR}/comparison/built_*
-meld ${WORK_DIR}/official-split-apks ${WORK_DIR}/built-split-apks
-or
-diffoscope ${WORK_DIR}/official-split-apks ${WORK_DIR}/built-split-apks
-for more details."
-    fi
-
     echo ""
     echo "===== Begin Results ====="
-    echo "appId:          ${app_id_value}"
+    echo "appId:          ${APP_ID_FROM_APK:-$APP_ID}"
     echo "signer:         ${SIGNER_SHA256}"
     echo "apkVersionName: ${APK_VERSION_NAME}"
     echo "apkVersionCode: ${APK_VERSION_CODE}"
@@ -377,42 +274,23 @@ for more details."
     echo ""
     echo "Diff:"
     if [[ -n "${AGGREGATED_DIFFS}" ]]; then
-        # Show first 20 lines of aggregated diffs, truncate if long
-        local diff_line_count
-        diff_line_count="$(echo "${AGGREGATED_DIFFS}" | grep -c '^' || true)"
-        local diff_preview
-        diff_preview="$(echo "${AGGREGATED_DIFFS}" | head -20 || true)"
-        echo "${diff_preview}"
-        if [[ "${diff_line_count}" -gt 20 ]]; then
-            echo "... (${diff_line_count} total lines — full diffs in: ${WORK_DIR}/comparison/)"
-        fi
+        local cnt
+        cnt="$(grep -c '^' <<< "${AGGREGATED_DIFFS}" || true)"
+        head -5 <<< "${AGGREGATED_DIFFS}" || true
+        [[ "${cnt}" -gt 5 ]] && echo "... (${cnt} lines — full diffs: ${WORK_DIR}/comparison/)"
     else
         echo "(no comparison performed)"
     fi
     echo ""
     echo "Revision, tag (and its signature):"
-    echo "${tag_verify_output}" | grep -v '^TAG_TYPE=' | grep -v '^---COMMIT---' || true
-    echo ""
-    echo "Signature Summary:"
-    echo "Tag type: ${tag_type}"
-    echo "${tag_signature_status}"
-    echo "${commit_signature_status}"
-    if [[ -n "${signature_keys}" ]]; then
-        echo ""
-        echo "Keys used:"
-        echo -e "${signature_keys}"
-    fi
-    if [[ -n "${signature_warnings}" ]]; then
-        echo ""
-        echo "Warnings:"
-        echo -e "${signature_warnings}"
-    fi
+    grep -vE '^TAG_TYPE=|^---COMMIT---' <<< "${tag_verify_output}" || true
     echo ""
     echo "===== End Results ====="
-    echo "${diff_guide}"
+    [[ "${should_cleanup}" != "true" ]] && \
+        printf 'Full diffs: diff -r %s/comparison/official_* %s/comparison/built_*\n' \
+            "${WORK_DIR}" "${WORK_DIR}"
 }
 
-# Detect container runtime (podman preferred, then docker)
 detect_container_runtime() {
     if command -v podman >/dev/null 2>&1; then
         CONTAINER_RUNTIME="podman"
@@ -426,60 +304,20 @@ detect_container_runtime() {
     fi
 }
 
-# Print usage information
 usage() {
     cat << EOF
-NAME
-       ${SCRIPT_NAME} - MetaMask Android reproducible build verification
-
-SYNOPSIS
-       ${SCRIPT_NAME} --binary <split_apk_dir_or_file> [OPTIONS]
+Usage: ${SCRIPT_NAME} --binary <split_apk_dir_or_file> [OPTIONS]
        ${SCRIPT_NAME} --version <version> --arch <arch> [OPTIONS]
-       ${SCRIPT_NAME} --help
-
-DESCRIPTION
-       Builds MetaMask from source (AAB via bundleProdRelease) and compares
-       against official artifacts via split APK comparison using bundletool.
-
-       --binary mode: compares built AAB splits against Google Play split APKs
-         provided by the user (extracted from a device or downloaded via
-         apkpure/etc.). The path may be a directory of splits or a single
-         split APK file. Version is auto-detected from the provided APK content.
-
-       --version mode: downloads the official AAB from GitHub releases, extracts
-         splits from both the official and built AAB using bundletool with the
-         given device spec (--arch), then compares split by split.
-
-OPTIONS
-       --binary <path>     Directory containing official Google Play split APKs,
-                           or a single official split APK file.
-                           Version auto-detected from APK content.
-       --apk <path>        Alias for --binary.
-       --version <version> Version to build (e.g. 7.69.0). Required when
-                           --binary is not provided.
-       --arch <arch>       Target architecture for device spec (bundletool).
-                           Required when --binary is not provided.
-                           Supported: arm64-v8a, armeabi-v7a, x86_64, x86.
-                           Default (--binary mode): arm64-v8a.
-       --type <type>       Accepted for build server compatibility.
-       --script-version    Print script version and exit.
-       --help              Show this help and exit.
-
-EXIT CODES
-       0    Reproducible (only META-INF signing differences across all splits)
-       1    Differences found or build failure
-       2    Invalid parameters
-
-EXAMPLES
-       ${SCRIPT_NAME} --binary ~/apks/io.metamask/7.69.0/
-       ${SCRIPT_NAME} --binary ~/apks/io.metamask/7.69.0/split_config.arm64_v8a.apk
-       ${SCRIPT_NAME} --version 7.69.0 --arch arm64-v8a
-       ${SCRIPT_NAME} --version 7.69.0 --arch arm64-v8a --type release
+  --binary <path>      Official Google Play split APK dir or single file. Alias: --apk
+  --version <version>  Version to build (e.g. 7.69.0). Required without --binary.
+  --arch <arch>        Target ABI: arm64-v8a (default), armeabi-v7a, x86_64, x86.
+  --type <type>        Accepted for ABS compatibility; unused.
+  --script-version     Print script version and exit.
+  Requires: podman or docker. Exit: 0=reproducible 1=not_reproducible/ftbfs 2=invalid
 EOF
     exit 0
 }
 
-# Parse command-line arguments
 parse_arguments() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -493,41 +331,36 @@ parse_arguments() {
         esac
     done
 
-    # At least one of --binary or --version must be provided
     if [[ -z "$APK_DIR" && -z "$VERSION" ]]; then
         log_fail "Provide --binary <path> (Google Play splits dir or single split APK) or --version <version> (auto-download AAB)"
         echo "Run '${SCRIPT_NAME} --help' for usage."
         exit 2
     fi
 
-    # Determine build mode
     if [[ -n "$APK_DIR" ]]; then
         BUILD_MODE="split"
         if [[ -d "$APK_DIR" ]]; then
             APK_INPUT_KIND="dir"
         elif [[ -f "$APK_DIR" ]]; then
-            APK_INPUT_KIND="file"
+            local _m; _m="$(od -An -N2 -tx1 "$APK_DIR" 2>/dev/null | tr -d ' \n')"
+            [[ "$_m" == "1f8b" ]] && APK_INPUT_KIND="tar" || { [[ "$APK_DIR" == *.zip ]] && APK_INPUT_KIND="zip" || APK_INPUT_KIND="file"; }
         else
             log_fail "--binary path not found: $APK_DIR"
             generate_comparison_yaml "ftbfs" "--binary path not found: $APK_DIR"
             exit 2
         fi
         log_info "Using official split input as ${APK_INPUT_KIND}: $APK_DIR"
-        # --arch defaults to arm64-v8a in split mode (used for built AAB extraction)
         if [[ -z "$ARCH" ]]; then
             ARCH="arm64-v8a"
             log_info "Using default architecture for built AAB extraction: $ARCH"
         fi
     else
         BUILD_MODE="aab"
-        # --arch is required in aab mode (defines the device spec for both extractions)
         if [[ -z "$ARCH" ]]; then
             log_fail "--arch is required when --binary is not provided (e.g. --arch arm64-v8a)"
             exit 2
         fi
     fi
-
-    # Validate architecture
     case "$ARCH" in
         arm64-v8a|armeabi-v7a|x86_64|x86) ;;
         *)
@@ -538,7 +371,6 @@ parse_arguments() {
 
     TYPE_SAFE=$(sanitize_tag "${TYPE:-default}")
     ARCH_SAFE=$(sanitize_tag "$ARCH")
-    # VERSION may be empty in split mode until auto-detected from APK content in prepare()
     VERSION_SAFE=$(sanitize_tag "${VERSION:-provided}")
     SCRIPT_VERSION_SAFE=$(sanitize_tag "$SCRIPT_VERSION")
 
@@ -549,7 +381,6 @@ parse_arguments() {
     log_info "Container image tag: $IMAGE_NAME"
 }
 
-# Cleanup function for error handling
 cleanup_on_error() {
     local exit_code=$?
     if [[ $exit_code -ne 0 ]]; then
@@ -579,12 +410,6 @@ on_error() {
 trap 'on_error $LINENO' ERR
 trap cleanup_on_error EXIT
 
-###############################################################################
-# Firebase Configuration (extracted from official APK)
-###############################################################################
-
-# Firebase config extracted from MetaMask 7.63.0 official APK
-# These values are public and visible in the APK's strings.xml
 create_google_services_json() {
     local output_path="$1"
 
@@ -617,30 +442,16 @@ FIREBASE_EOF
     log_info "Created google-services.json with Firebase config"
 }
 
-###############################################################################
-# Dockerfile Generation (embedded for standalone operation)
-###############################################################################
-
 create_dockerfile() {
     local dockerfile_path="$1"
     local version="$2"
 
     cat > "$dockerfile_path" << 'DOCKERFILE_EOF'
-# MetaMask Android Build Environment
-# Based on forensic analysis of version 7.63.0
-
-FROM node:20-bookworm
-
-LABEL maintainer="WalletScrutiny"
-LABEL description="MetaMask Android reproducible build environment"
-
+FROM node:24.16.0-bookworm
 ENV DEBIAN_FRONTEND=noninteractive
 ENV ANDROID_HOME=/opt/android-sdk
 ENV ANDROID_SDK_ROOT=/opt/android-sdk
-ENV PATH="${PATH}:${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${ANDROID_HOME}/build-tools/35.0.0"
-
-# Install system dependencies
-# Note: cmake required by some RN native modules with C++ code
+ENV PATH="${PATH}:${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${ANDROID_HOME}/build-tools/36.0.0"
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     ca-certificates-java \
@@ -658,22 +469,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ninja-build \
     && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-
-# Set JAVA_HOME
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 ENV JAVA_TOOL_OPTIONS="-Dhttps.protocols=TLSv1.2"
-
-# Install Android SDK command-line tools
 RUN mkdir -p ${ANDROID_HOME}/cmdline-tools && \
     cd ${ANDROID_HOME}/cmdline-tools && \
     wget https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O cmdline-tools.zip && \
     unzip cmdline-tools.zip && \
     rm cmdline-tools.zip && \
     mv cmdline-tools latest
-
-# Accept Android SDK licenses and install components
-# Note: Various RN modules target different SDK versions (legacy modules need 24-27)
-# Pre-install all to avoid Gradle auto-install failures (SDK dir not writable)
 RUN yes | sdkmanager --licenses && \
     sdkmanager "platform-tools" \
                "platforms;android-24" \
@@ -688,56 +491,38 @@ RUN yes | sdkmanager --licenses && \
                "platforms;android-33" \
                "platforms;android-34" \
                "platforms;android-35" \
+               "platforms;android-36" \
                "build-tools;34.0.0" \
                "build-tools;35.0.0" \
-               "ndk;26.1.10909125"
-
-ENV ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/26.1.10909125
-
-# AGP requires cmake;3.22.1 by name. sdkmanager cmake binaries are built for older Linux
-# and may not install reliably on Debian 12 Bookworm. cmake is already installed via apt above
-# (cmake 3.25.x, natively compiled for Bookworm). Stub it into the exact SDK path AGP expects:
-# AGP auto-discovers cmake versions under $ANDROID_HOME/cmake/ and will find 3.22.1/bin/cmake.
+               "build-tools;36.0.0" \
+               "ndk;27.1.12297006"
+ENV ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/27.1.12297006
 RUN mkdir -p ${ANDROID_HOME}/cmake/3.22.1/bin && \
     for tool in cmake ctest cpack; do \
         ln -sf "$(which $tool)" "${ANDROID_HOME}/cmake/3.22.1/bin/$tool"; \
     done && \
     echo "SDK cmake 3.22.1 stub using system cmake:" && \
     ${ANDROID_HOME}/cmake/3.22.1/bin/cmake --version
-RUN test -f ${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake && \
-    echo "NDK toolchain verified at ${ANDROID_NDK_HOME}" || \
+RUN test -f ${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake || \
     (echo "ERROR: NDK toolchain not found at ${ANDROID_NDK_HOME}" && exit 1)
-
-# MetaMask production builds look for Bitrise's NDK path.
-# Mirror our installed NDK there so upstream Gradle logic resolves the same path.
 RUN mkdir -p /usr/local/share/android-sdk && \
     ln -sfn "${ANDROID_NDK_HOME}" /usr/local/share/android-sdk/ndk-bundle
-
-# Enable Yarn via corepack
-RUN corepack enable && corepack prepare yarn@4.10.3 --activate
-
-# Create build user (non-root)
+RUN corepack enable && corepack prepare yarn@4.14.1 --activate
 RUN useradd -m -s /bin/bash builder
 USER builder
 WORKDIR /home/builder
-
-# Clone repository (version will be checked out by build script)
 ARG REPO_URL
 ARG VERSION
-RUN git clone --depth 1 ${REPO_URL} metamask-mobile || \
-    git clone ${REPO_URL} metamask-mobile
-
+RUN git clone --depth 1 --branch "v${VERSION}" ${REPO_URL} metamask-mobile \
+    || git clone --depth 1 --branch "${VERSION}" ${REPO_URL} metamask-mobile \
+    || git clone --depth 1 ${REPO_URL} metamask-mobile
 WORKDIR /home/builder/metamask-mobile
-
-# Build script will handle checkout and build
 DOCKERFILE_EOF
 
     log_info "Created Dockerfile for MetaMask build"
 }
 
-###############################################################################
 # Build Script (runs inside container)
-###############################################################################
 
 create_build_script() {
     local script_path="$1"
@@ -756,32 +541,22 @@ echo "Target extraction architecture: \$TARGET_ARCH"
 echo "React Native build architectures: \$OFFICIAL_REACT_NATIVE_ARCHES"
 
 cd /home/builder/metamask-mobile
-
-# Fetch all tags and find the correct one
-git fetch --all --tags --prune
-
-# Try different tag formats
 TAG=""
-for tag_format in "v\${VERSION}" "\${VERSION}" "release/\${VERSION}"; do
-    if git rev-parse "\$tag_format"; then
-        TAG="\$tag_format"
-        break
-    fi
+for tag_fmt in "v\${VERSION}" "\${VERSION}" "release/\${VERSION}"; do
+    git rev-parse "\$tag_fmt" >/dev/null 2>&1 && TAG="\$tag_fmt" && break || true
 done
-
 if [[ -z "\$TAG" ]]; then
-    echo "Tag not found, searching commits..."
-    COMMIT=\$(git log --all --oneline --grep="\$VERSION" | head -1 | awk '{print \$1}')
-    if [[ -n "\$COMMIT" ]]; then
-        git checkout "\$COMMIT"
-    else
-        echo "ERROR: Cannot find version \$VERSION in repository"
-        exit 1
-    fi
-else
-    echo "Found tag: \$TAG"
-    git checkout "\$TAG"
+    for tag_fmt in "v\${VERSION}" "\${VERSION}"; do
+        git fetch --depth=1 origin "refs/tags/\${tag_fmt}:refs/tags/\${tag_fmt}" 2>/dev/null \
+            && git rev-parse "\$tag_fmt" >/dev/null 2>&1 && TAG="\$tag_fmt" && break || true
+    done
 fi
+if [[ -z "\$TAG" ]]; then
+    echo "ERROR: Cannot find version \${VERSION} in repository"
+    exit 1
+fi
+echo "Found tag: \$TAG"
+git checkout "\$TAG"
 
 COMMIT=\$(git rev-parse HEAD)
 echo "Checked out commit: \$COMMIT"
@@ -789,7 +564,6 @@ echo "Checked out commit: \$COMMIT"
 mkdir -p /output
 echo "\$COMMIT" > /output/commit.txt
 
-# Tag and signature verification
 TAG_TYPE=\$(git cat-file -t "refs/tags/\${TAG}" 2>/dev/null || echo "missing")
 printf "TAG_TYPE=%s\n" "\${TAG_TYPE}" > /output/tag_verify.txt
 if [ "\${TAG_TYPE}" = "tag" ]; then
@@ -802,39 +576,46 @@ fi
 printf '%s\n' "---COMMIT---" >> /output/tag_verify.txt
 git verify-commit HEAD >> /output/tag_verify.txt 2>&1 || true
 
-if git describe --tags --exact-match 2>/dev/null; then
-    echo "\$(git describe --tags --exact-match)" > /output/tag.txt
-else
-    echo "none" > /output/tag.txt
+echo "=== Environment assertions ==="
+ndk_want=\$(sed -n 's/.*ndkVersion = "\([^"]*\)".*/\1/p' android/build.gradle | head -1)
+sdk_want=\$(sed -n 's/.*compileSdkVersion = \([0-9]*\).*/\1/p' android/build.gradle | head -1)
+bt_want=\$(sed -n 's/.*buildToolsVersion = "\([^"]*\)".*/\1/p' android/build.gradle | head -1)
+if [ -z "\$ndk_want" ] || [ -z "\$sdk_want" ] || [ -z "\$bt_want" ]; then
+    echo "ERROR: could not parse toolchain requirements from android/build.gradle"
+    echo "  ndkVersion='\$ndk_want' compileSdkVersion='\$sdk_want' buildToolsVersion='\$bt_want'"
+    exit 1
 fi
+assert_sdk_component() {
+    if [ ! -d "\${ANDROID_HOME}/\$1" ]; then
+        echo "ERROR: repo v\${VERSION} requires \$2, not installed in this container."
+        echo "  Installed NDK:         \$(ls \${ANDROID_HOME}/ndk 2>/dev/null | tr '\n' ' ')"
+        echo "  Installed platforms:   \$(ls \${ANDROID_HOME}/platforms 2>/dev/null | tr '\n' ' ')"
+        echo "  Installed build-tools: \$(ls \${ANDROID_HOME}/build-tools 2>/dev/null | tr '\n' ' ')"
+        echo "  Update the Dockerfile block in metamask_build.sh and bump the script version."
+        exit 1
+    fi
+}
+assert_sdk_component "ndk/\${ndk_want}" "NDK \${ndk_want}"
+assert_sdk_component "platforms/android-\${sdk_want}" "compileSdk \${sdk_want}"
+assert_sdk_component "build-tools/\${bt_want}" "build-tools \${bt_want}"
+echo "Toolchain OK: NDK \${ndk_want}, compileSdk \${sdk_want}, build-tools \${bt_want}"
 
-# Copy google-services.json if provided
-if [[ -f /build-config/google-services.json ]]; then
-    cp /build-config/google-services.json android/app/google-services.json
-    echo "Copied google-services.json"
-fi
-
-# Set up environment
+for env_file in .js.env .android.env; do
+    if [[ ! -f "\$env_file" && -f "\${env_file}.example" ]]; then
+        cp "\${env_file}.example" "\$env_file"
+        echo "Created \$env_file from \${env_file}.example"
+    fi
+done
 export METAMASK_BUILD_TYPE="main"
 export METAMASK_ENVIRONMENT="production"
 export NODE_OPTIONS="--max-old-space-size=4096"
 export METRO_MAX_WORKERS="4"
 export CI="true"
-# Disable Sentry uploads (no auth in reproducible build container)
 export SENTRY_DISABLE_AUTO_UPLOAD=true
 export WS_DISABLE_SENTRY_UPLOAD=true
-# Prevent Gradle from re-downloading Boost
-export WS_DISABLE_BOOST_DOWNLOAD=true
-export WS_DISABLE_BOOST_PREPARE=true
-
-# Copy CI gradle properties
 if [[ -f android/gradle.properties.github ]]; then
     cp android/gradle.properties.github android/gradle.properties
 fi
-
-# MetaMask production builds compile all four ABIs into the AAB.
-# Keep the upstream ABI list for the build, then use TARGET_ARCH only when
-# extracting device-specific split APKs from the finished AAB.
 if [[ -f android/gradle.properties ]]; then
     if grep -q '^reactNativeArchitectures=' android/gradle.properties; then
         sed -i "s/^reactNativeArchitectures=.*/reactNativeArchitectures=\${OFFICIAL_REACT_NATIVE_ARCHES}/" android/gradle.properties
@@ -844,8 +625,6 @@ if [[ -f android/gradle.properties ]]; then
 else
     printf '%s\n' "reactNativeArchitectures=\${OFFICIAL_REACT_NATIVE_ARCHES}" > android/gradle.properties
 fi
-
-# Ensure Gradle has enough memory for large builds
 if [[ -f android/gradle.properties ]]; then
     if ! grep -q "org.gradle.jvmargs" android/gradle.properties; then
         echo "org.gradle.jvmargs=-Xmx4096m -XX:+HeapDumpOnOutOfMemoryError" >> android/gradle.properties
@@ -853,23 +632,17 @@ if [[ -f android/gradle.properties ]]; then
 else
     echo "org.gradle.jvmargs=-Xmx4096m -XX:+HeapDumpOnOutOfMemoryError" > android/gradle.properties
 fi
-
-# Install dependencies
 echo "Installing dependencies..."
 yarn install --immutable || yarn install
-
-# Run setup if available (avoid broken pipe from grep -q)
 YARN_RUN_LOG=\$(mktemp)
 yarn run 2>&1 | tee "\$YARN_RUN_LOG" || true
 if grep -q "setup:github-ci" "\$YARN_RUN_LOG"; then
     yarn setup:github-ci || true
 fi
 rm -f "\$YARN_RUN_LOG"
-
-# Disable Sentry upload tasks (container-only patch)
+echo "Runtime: node \$(node -v), yarn \$(yarn -v), RN \$(node -p "require('./node_modules/react-native/package.json').version" 2>/dev/null || echo unknown)"
 sentry_gradle="node_modules/@sentry/react-native/sentry.gradle"
 if [[ -f "\$sentry_gradle" ]]; then
-    echo "Disabling Sentry upload tasks in sentry.gradle..."
     if ! grep -q "WS_DISABLE_SENTRY_UPLOAD" "\$sentry_gradle"; then
         cat << 'SENTRY_PATCH' > /tmp/ws-sentry-disable.groovy
 if (System.getenv("WS_DISABLE_SENTRY_UPLOAD") == "true") {
@@ -887,179 +660,70 @@ SENTRY_PATCH
     fi
 fi
 
-# Patch ALL deprecated Gradle dependency configurations in node_modules
-# Gradle 8.x removed these deprecated configurations:
-#   compile -> implementation
-#   testCompile -> testImplementation
-#   androidTestCompile -> androidTestImplementation
-#   provided -> compileOnly
-#   apk -> runtimeOnly
-# Global patch prevents whack-a-mole fixes for each module.
-echo "NOTE: Patches are applied inside the container only; host repo is unchanged."
-echo "Patching all node_modules build.gradle files (deprecated configs)..."
-find node_modules -name "build.gradle" -type f 2>/dev/null | while read -r gradle_file; do
-    if grep -qE "^[[:space:]]*(compile|testCompile|androidTestCompile|provided|apk)[[:space:]]+" "\$gradle_file" 2>/dev/null; then
-        echo "  Patching: \$gradle_file"
-        sed -i -E '
-            s/^([[:space:]]*)androidTestCompile([[:space:]]+)/\1androidTestImplementation\2/
-            s/^([[:space:]]*)testCompile([[:space:]]+)/\1testImplementation\2/
-            s/^([[:space:]]*)compile([[:space:]]+)/\1implementation\2/
-            s/^([[:space:]]*)provided([[:space:]]+)/\1compileOnly\2/
-            s/^([[:space:]]*)apk([[:space:]]+)/\1runtimeOnly\2/
-        ' "\$gradle_file"
-    fi
-done
-echo "Gradle dependency configuration patches complete."
-
-# Patch low compileSdkVersion in node_modules to satisfy Java 9+ compilation
-echo "Patching node_modules compileSdkVersion < 30..."
-find node_modules -name "build.gradle" -type f 2>/dev/null | while read -r gradle_file; do
-    if grep -qE "compileSdkVersion[[:space:]]*=?[[:space:]]*[0-2][0-9]" "\$gradle_file" 2>/dev/null; then
-        echo "  Updating compileSdkVersion in: \$gradle_file"
-        sed -i -E '
-            s/(compileSdkVersion[[:space:]]*=?[[:space:]]*)([0-2][0-9])([^0-9])/\130\3/g
-            s/(compileSdkVersion[[:space:]]*=?[[:space:]]*)([0-2][0-9])$/\130/g
-        ' "\$gradle_file"
-    fi
-done
-echo "compileSdkVersion patch complete."
-
-# Resolve ReactAndroid layout across React Native versions
-react_android_dir=""
-react_native_gradle_root=""
-if [[ -d node_modules/react-native/packages/react-native/ReactAndroid ]]; then
-    react_android_dir="node_modules/react-native/packages/react-native/ReactAndroid"
-    react_native_gradle_root="node_modules/react-native/packages/react-native"
-elif [[ -d node_modules/react-native/ReactAndroid ]]; then
-    react_android_dir="node_modules/react-native/ReactAndroid"
-    react_native_gradle_root="node_modules/react-native"
-else
-    echo "ERROR: Could not locate ReactAndroid directory under node_modules/react-native"
-    exit 1
-fi
-
-# Refresh Boost tarball to avoid corrupt downloads
-boost_dir="\${react_android_dir}/build/downloads"
-boost_tar="\$boost_dir/boost_1_83_0.tar.gz"
-boost_url=""
-if [[ -f "\$boost_tar" ]]; then
-    echo "Removing cached Boost tarball to force re-download..."
-    rm -f "\$boost_tar"
-fi
-boost_url=\$(grep -R "boost_1_83_0.tar.gz" -n "\$react_android_dir" 2>/dev/null | \
-    sed -n 's/.*\\(https[^\"'"'"']*boost_1_83_0.tar.gz\\).*/\\1/p' | head -1 || true)
-boost_urls=()
-if [[ -n "\$boost_url" ]]; then
-    boost_urls+=("\$boost_url")
-fi
-boost_urls+=("https://archives.boost.io/release/1.83.0/source/boost_1_83_0.tar.gz")
-boost_urls+=("https://boostorg.jfrog.io/artifactory/main/release/1.83.0/source/boost_1_83_0.tar.gz")
-
-mkdir -p "\$boost_dir"
-download_ok=0
-for url in "\${boost_urls[@]}"; do
-    echo "Downloading Boost from: \$url"
-    if curl -fL --retry 5 --retry-delay 3 --connect-timeout 20 -o "\$boost_tar" "\$url"; then
-        if tar -tzf "\$boost_tar" >/dev/null 2>&1; then
-            download_ok=1
-            break
-        fi
-    fi
-    rm -f "\$boost_tar"
-done
-
-if [[ "\$download_ok" -ne 1 ]]; then
-    echo "ERROR: Boost tarball verification failed"
-    exit 1
-fi
-echo "Repacking Boost tarball for Gradle compatibility..."
-tmp_boost_dir=\$(mktemp -d)
-tar -xzf "\$boost_tar" -C "\$tmp_boost_dir"
-rm -f "\$boost_tar"
-tar -czf "\$boost_tar" -C "\$tmp_boost_dir" .
-rm -rf "\$tmp_boost_dir"
-
-# Pre-extract Boost to expected build directory and skip prepareBoost
-boost_extract_dir="\${react_android_dir}/build/third-party-ndk/boost_1_83_0"
-rm -rf "\$boost_extract_dir"
-mkdir -p "\$boost_extract_dir"
-tar -xzf "\$boost_tar" -C "\$boost_extract_dir" --strip-components=1
-
-# Disable Gradle Boost download task to avoid overwriting verified tarball
-boost_gradle="\${react_android_dir}/build.gradle"
-if [[ -f "\$boost_gradle" ]]; then
-    if ! grep -q "WS_DISABLE_BOOST_DOWNLOAD" "\$boost_gradle"; then
-        cat << 'BOOST_PATCH' >> "\$boost_gradle"
-if (System.getenv("WS_DISABLE_BOOST_DOWNLOAD") == "true") {
-    tasks.matching { it.name.toLowerCase().contains("downloadboost") }.configureEach { t ->
-        t.enabled = false
-    }
-}
-if (System.getenv("WS_DISABLE_BOOST_PREPARE") == "true") {
-    tasks.matching { it.name.toLowerCase().contains("prepareboost") }.configureEach { t ->
-        t.enabled = false
-    }
-}
-BOOST_PATCH
-    fi
-fi
-
-# Write local.properties for the app build and all react-native included-build roots.
-# cmake.dir points to the system cmake stub we created in the Dockerfile at the SDK cmake
-# path. Unlike v0.1.32 (dangling symlink), this stub contains a working cmake binary.
-# We write to four locations:
-#   1. android/local.properties          — root Android project
-#   2. node_modules/react-native/        — included build ROOT (includeBuild path in settings.gradle)
-#   3. react_native_gradle_root/         — packages/react-native subproject
-#   4. react_android_dir/                — ReactAndroid subproject
 write_local_properties() {
     local target_file="\$1"
     mkdir -p "\$(dirname "\$target_file")"
     {
         printf '%s\n' "sdk.dir=\${ANDROID_HOME}"
-        printf '%s\n' "ndk.dir=\${ANDROID_NDK_HOME}"
         printf '%s\n' "cmake.dir=\${ANDROID_HOME}/cmake/3.22.1"
     } > "\$target_file"
 }
+if [[ -f .js.env ]]; then
+    eval "\$(tr -d '\r' < .js.env)"
+fi
+if [[ -f .android.env ]]; then
+    source .android.env
+fi
+export METAMASK_BUILD_TYPE="main"
+export METAMASK_ENVIRONMENT="production"
+echo "Env: MM_FOX_CODE='\${MM_FOX_CODE:-}' MM_BRAZE_SDK_ENDPOINT='\${MM_BRAZE_SDK_ENDPOINT:-}' MM_INFURA_PROJECT_ID='\${MM_INFURA_PROJECT_ID:-}'"
+mkdir -p android/app/src/main/assets/fonts
+cp -rf app/core/InpageBridgeWeb3.js android/app/src/main/assets/.
+cp -rf ./app/fonts/Metamask.ttf ./android/app/src/main/assets/fonts/Metamask.ttf
+if [[ -f /build-config/google-services.json ]]; then
+    GOOGLE_SERVICES_B64_ANDROID="\$(base64 -w0 -i /build-config/google-services.json)"
+    export GOOGLE_SERVICES_B64_ANDROID
+fi
+if [[ -n "\${GOOGLE_SERVICES_B64_ANDROID:-}" ]]; then
+    echo -n "\$GOOGLE_SERVICES_B64_ANDROID" | base64 -d > ./android/app/google-services.json
+    chmod 664 ./android/app/google-services.json
+    echo "google-services.json has been created successfully."
+else
+    echo "ERROR: GOOGLE_SERVICES_B64_ANDROID is not set"
+    exit 1
+fi
 
 write_local_properties android/local.properties
-write_local_properties "node_modules/react-native/local.properties"
-write_local_properties "\${react_native_gradle_root}/local.properties"
-write_local_properties "\${react_android_dir}/local.properties"
-
-echo "=== cmake discovery ==="
-ls -la "\${ANDROID_HOME}/cmake/" 2>/dev/null || echo "no cmake dir in SDK"
-ls -la "\${ANDROID_HOME}/cmake/3.22.1/bin/" 2>/dev/null || echo "no cmake 3.22.1 stub"
-"\${ANDROID_HOME}/cmake/3.22.1/bin/cmake" --version 2>/dev/null || echo "cmake stub not executable"
-echo "NDK selected for build:"
-printf '%s\n' "\${ANDROID_NDK_HOME}"
-ls -ld /usr/local/share/android-sdk/ndk-bundle
-test -f /usr/local/share/android-sdk/ndk-bundle/source.properties && echo "Bitrise NDK shim ready"
-
-# Build the AAB
+mkdir -p android/keystores
+export BITRISEIO_ANDROID_KEYSTORE_PASSWORD="walletscrutiny"
+export BITRISEIO_ANDROID_KEYSTORE_ALIAS="walletscrutiny"
+export BITRISEIO_ANDROID_KEYSTORE_PRIVATE_KEY_PASSWORD="walletscrutiny"
+keytool -genkeypair -v \\
+    -keystore android/keystores/release.keystore \\
+    -storetype PKCS12 \\
+    -storepass "\$BITRISEIO_ANDROID_KEYSTORE_PASSWORD" \\
+    -keypass "\$BITRISEIO_ANDROID_KEYSTORE_PRIVATE_KEY_PASSWORD" \\
+    -alias "\$BITRISEIO_ANDROID_KEYSTORE_ALIAS" \\
+    -keyalg RSA -keysize 2048 -validity 10000 \\
+    -dname "CN=WalletScrutiny, OU=Verification, O=WalletScrutiny, C=PH"
 echo "Building Android AAB..."
 cd android
+GRADLE_LOG="/output/gradle-build.log"
+set +o pipefail
 ./gradlew bundleProdRelease \
     --no-daemon \
     --stacktrace \
-    --info \
-    -PreactNativeArchitectures="\${OFFICIAL_REACT_NATIVE_ARCHES}" || {
-    echo "=== BUILD FAILED — cmake config logs ==="
-    find .. -path '*/.cxx*' \( -name "*.txt" -o -name "*.log" -o -name "cmake_server_log*" \) 2>/dev/null \
-        | head -20 \
-        | while IFS= read -r f; do
-            echo "--- \$f ---"
-            cat "\$f" 2>/dev/null
-        done
-    echo "=== cmake prefab logs ==="
-    find .. -path '*/prefab*' -name "*.json" 2>/dev/null | head -5 | while IFS= read -r f; do
-        echo "--- \$f ---"
-        cat "\$f" 2>/dev/null
-    done
+    -PreactNativeArchitectures="\${OFFICIAL_REACT_NATIVE_ARCHES}" 2>&1 | tee "\${GRADLE_LOG}"
+GRADLE_EXIT=\${PIPESTATUS[0]}
+set -o pipefail
+if [[ "\${GRADLE_EXIT}" -ne 0 ]]; then
+    echo "=== BUILD FAILED — last 100 lines of gradle-build.log ==="
+    tail -100 "\${GRADLE_LOG}"
+    echo "=== ERROR LINES ==="
+    grep -n "error:\|FAILED\|CXX[0-9]\|Exception\|BUILD FAILED\|> Task.*FAILED" "\${GRADLE_LOG}" | tail -30 || true
     exit 1
-}
+fi
 
-echo "Build complete!"
 ls -la app/build/outputs/bundle/prodRelease/ || ls -la app/build/outputs/bundle/*/
 
 BUILDSCRIPT_EOF
@@ -1068,15 +732,10 @@ BUILDSCRIPT_EOF
     log_info "Created build script"
 }
 
-###############################################################################
-# Device Spec Generation
-###############################################################################
-
 create_device_spec() {
     local spec_path="$1"
     local arch="$2"
 
-    # Convert architecture name to ABI format
     local abi="$arch"
     case "$arch" in
         arm64-v8a) abi="arm64-v8a" ;;
@@ -1096,10 +755,6 @@ DEVICESPEC_EOF
 
     log_info "Created device-spec.json for architecture: $arch"
 }
-
-###############################################################################
-# Split APK Extraction using bundletool
-###############################################################################
 
 extract_split_apks_from_aab() {
     local aab_path="$1"
@@ -1188,9 +843,7 @@ unzip_apk_in_container() {
         "
 }
 
-###############################################################################
 # APK Comparison
-###############################################################################
 
 compare_split_apks() {
     local official_dir="$1"
@@ -1204,9 +857,7 @@ compare_split_apks() {
     local total_diffs=0
     local total_meta_only=0
     FILES_YAML=""
-    COMPARISON_TXT=""
 
-    # Process each official APK
     for official_apk in "$official_dir"/*.apk; do
         [[ ! -f "$official_apk" ]] && continue
 
@@ -1222,12 +873,10 @@ compare_split_apks() {
             FILES_YAML+="      - filename: $comparison_name\n"
             FILES_YAML+="        hash: missing\n"
             FILES_YAML+="        match: false\n"
-            COMPARISON_TXT+="$comparison_name - $ARCH - missing - 0\n"
-            ((total_diffs++))
+            total_diffs=$((total_diffs + 1))
             continue
         fi
 
-        # Calculate hashes (inside container)
         local official_hash
         local built_hash
         official_hash=$(container_sha256 "$official_apk")
@@ -1237,14 +886,12 @@ compare_split_apks() {
         log_info "  Official: $official_hash"
         log_info "  Built:    $built_hash"
 
-        # Unzip and compare contents (in container)
         local official_unzip="$results_dir/official_${comparison_name%.apk}"
         local built_unzip="$results_dir/built_${comparison_name%.apk}"
 
         unzip_apk_in_container "$official_apk" "$official_unzip"
         unzip_apk_in_container "$built_apk" "$built_unzip"
 
-        # Run diff (inside container)
         local diff_file="$results_dir/diff_${comparison_name%.apk}.txt"
         local official_rel
         local built_rel
@@ -1254,15 +901,12 @@ compare_split_apks() {
         diff_rel=$(container_relpath "$diff_file")
         container_exec "diff -r \"$official_rel\" \"$built_rel\" 2>&1 | tee \"$diff_rel\" || true"
 
-        # Count non-META-INF differences using Leo's precise regex
-        # Filters ONLY root-level META-INF; nested META-INF differences still count
         local non_meta_diffs=0
         if [[ -s "$diff_file" ]]; then
-            non_meta_diffs=$(grep -cvE '^Only in [^/:]+: META-INF$|^Only in [^/:]+/META-INF:|^Files [^/]+/META-INF/' \
+            non_meta_diffs=$(grep -cvE '^Only in [^:]+/(official|built)_[^:/]+: META-INF$|^Only in [^:]+/(official|built)_[^:/]+/META-INF:|^Files [^ ]+/(official|built)_[^ /]+/META-INF/' \
                 "$diff_file" 2>/dev/null || true)
-            # Subtract blank lines
             local blank_lines
-            blank_lines=$(grep -c '^$' "$diff_file" 2>/dev/null || echo 0)
+            blank_lines=$(grep -c '^$' "$diff_file" 2>/dev/null || true)
             non_meta_diffs=$(( non_meta_diffs - blank_lines ))
             [[ "${non_meta_diffs}" -lt 0 ]] && non_meta_diffs=0
         fi
@@ -1274,29 +918,22 @@ compare_split_apks() {
         elif [[ "$non_meta_diffs" -eq 0 ]]; then
             match="true"
             log_pass "$comparison_name: Only META-INF differences (expected)"
-            ((total_meta_only++))
+            total_meta_only=$((total_meta_only + 1))
         else
             log_warn "$comparison_name: $non_meta_diffs non-META-INF differences"
-            ((total_diffs++))
+            total_diffs=$((total_diffs + 1))
         fi
 
         FILES_YAML+="      - filename: $comparison_name\n"
         FILES_YAML+="        hash: $built_hash\n"
         FILES_YAML+="        match: $match\n"
-        if [[ "$match" == "true" ]]; then
-            COMPARISON_TXT+="$comparison_name - $ARCH - $built_hash - 1\n"
-        else
-            COMPARISON_TXT+="$comparison_name - $ARCH - $built_hash - 0\n"
-        fi
     done
 
     export TOTAL_DIFFS="$total_diffs"
     export TOTAL_META_ONLY="$total_meta_only"
 }
 
-###############################################################################
-# Generate COMPARISON_RESULTS.yaml (minimal 3-field format per Luis 2026-03-12)
-###############################################################################
+# Generate COMPARISON_RESULTS.yaml
 
 write_yaml_outputs() {
     local yaml_content="$1"
@@ -1328,12 +965,6 @@ notes: |
     log_info "Generated COMPARISON_RESULTS.yaml"
 }
 
-###############################################################################
-# Version detection from APK content (split mode, --binary only)
-# Uses WS_CONTAINER (walletscrutiny/android:5) — no build image needed yet.
-# Zeus-pattern: aapt -> aapt2 -> apktool fallback. Never reads filename/path.
-###############################################################################
-
 _detect_version_from_apk() {
     local apk_path="$1"
     local apk_dir apk_name
@@ -1359,12 +990,6 @@ _detect_version_from_apk() {
             rm -rf "$tmpdir"
         '
 }
-
-###############################################################################
-# Download official AAB from GitHub releases (aab mode, --version only)
-# Queries the GitHub API to find the AAB asset for the given version tag,
-# then downloads it into $WORK_DIR/official-aab/.
-###############################################################################
 
 download_official_aab() {
     local api_url="${GITHUB_API_BASE}/v${VERSION}"
@@ -1413,22 +1038,34 @@ print(aabs[0]['browser_download_url'] if aabs else '')
     log_info "Downloaded: ${OFFICIAL_AAB}"
 }
 
-###############################################################################
-# Main Build Process
-###############################################################################
-
 prepare() {
     log_info "=== PREPARATION PHASE ==="
 
     mkdir -p "$WORK_DIR"/{official-split-apks,official-aab,built-split-apks,comparison,build-config,built-aab}
-    chmod 777 "$WORK_DIR/built-aab"
+    chmod 777 "$WORK_DIR" "$WORK_DIR/built-aab" "$WORK_DIR/comparison"
+
+    rm -f "$WORK_DIR/built-aab"/*.aab
+    rm -f "$WORK_DIR/comparison"/diff_*.txt
 
     create_google_services_json "$WORK_DIR/build-config/google-services.json"
     create_device_spec "$WORK_DIR/device-spec.json" "$ARCH"
 
     if [[ "$BUILD_MODE" == "split" ]]; then
-        # Copy Google Play split APKs provided via --binary
-        if [[ "$APK_INPUT_KIND" == "dir" ]]; then
+        rm -f "$WORK_DIR/official-split-apks"/*.apk
+        if [[ "$APK_INPUT_KIND" == "tar" || "$APK_INPUT_KIND" == "zip" ]]; then
+            local _xd="$WORK_DIR/archive-extracted"
+            rm -rf "$WORK_DIR/archive-extracted"
+            mkdir -p "$_xd"
+            [[ "$APK_INPUT_KIND" == "tar" ]] \
+                && { log_info "Extracting tar: $(basename "$APK_DIR")"; tar -xf "$APK_DIR" -C "$_xd"; } \
+                || { log_info "Extracting zip: $(basename "$APK_DIR")"; unzip -q "$APK_DIR" -d "$_xd"; }
+            shopt -s nullglob; local _ex=("$_xd"/*.apk); shopt -u nullglob
+            [[ ${#_ex[@]} -eq 0 ]] && { log_fail "No APKs in archive"; generate_error_yaml "ftbfs"; exit 1; }
+            log_info "${#_ex[@]} APK(s) extracted; copying to official-split-apks/"
+            cp "${_ex[@]}" "$WORK_DIR/official-split-apks/"
+            OFFICIAL_BASE_APK=$(find_official_base_apk)
+            [[ -z "$OFFICIAL_BASE_APK" ]] && { log_fail "No base APK in archive"; exit 2; }
+        elif [[ "$APK_INPUT_KIND" == "dir" ]]; then
             log_info "Copying official Google Play split APKs from directory: $APK_DIR"
             shopt -s nullglob
             local apk_files=("$APK_DIR"/*.apk)
@@ -1459,20 +1096,18 @@ prepare() {
             OFFICIAL_BASE_APK="$WORK_DIR/official-split-apks/$canonical_name"
         fi
 
-        # Auto-detect VERSION from the provided official APK content (never from filename)
         if [[ -z "$VERSION" ]]; then
-            log_info "Auto-detecting version from official APK content..."
+            log_info "Auto-detecting version from APK content..."
             VERSION="$(_detect_version_from_apk "$OFFICIAL_BASE_APK")"
             if [[ -z "$VERSION" ]]; then
-                log_fail "Could not detect version from APK content. Pass --version explicitly."
-                exit 2
+                local _v="${APK_DIR##*/${APP_ID}_}"; _v="${_v%%_*}"
+                [[ "$_v" =~ ^[0-9]+\.[0-9] ]] && VERSION="$_v" && log_info "Version from filename: $VERSION"
             fi
+            [[ -z "$VERSION" ]] && { log_fail "Cannot detect version. Pass --version explicitly."; exit 2; }
             log_info "Version auto-detected: $VERSION"
         fi
 
     else
-        # aab mode: download official AAB from GitHub releases
-        # Splits will be extracted from it in extract_and_compare() after build image is ready
         download_official_aab
     fi
 
@@ -1482,15 +1117,9 @@ prepare() {
 build() {
     log_info "=== BUILD PHASE ==="
 
-    # Create Dockerfile
     create_dockerfile "$WORK_DIR/Dockerfile" "$VERSION"
-
-    # Create build script
     create_build_script "$WORK_DIR/build.sh" "$VERSION" "$ARCH"
-
-    # Build container image
     log_info "Building container image (no cache): $IMAGE_NAME"
-
     $CONTAINER_RUNTIME build \
         --no-cache \
         --build-arg VERSION="$VERSION" \
@@ -1499,7 +1128,6 @@ build() {
         -f "$WORK_DIR/Dockerfile" \
         "$WORK_DIR"
 
-    # Run build in container
     log_info "Running build in container..."
     $CONTAINER_RUNTIME run --rm \
         -v "$WORK_DIR/build-config:/build-config:ro" \
@@ -1515,7 +1143,6 @@ build() {
             ls -la /output/
         "
 
-    # Find the built AAB (inside container)
     local aab_rel
     aab_rel=$(container_exec "ls -1 built-aab/*.aab | tee /dev/stderr | head -1" || true)
     if [[ -z "$aab_rel" ]]; then
@@ -1535,13 +1162,10 @@ extract_and_compare() {
         exit 1
     fi
 
-    # Extract splits from built AAB (same for both modes)
     log_info "Extracting splits from built AAB..."
     extract_split_apks_from_aab "$BUILT_AAB" "$WORK_DIR/built-split-apks" "$WORK_DIR/device-spec.json"
 
     if [[ "$BUILD_MODE" == "aab" ]]; then
-        # Extract splits from official AAB (downloaded in prepare())
-        # Build image is now available so bundletool can run inside it
         log_info "Extracting splits from official AAB..."
         extract_split_apks_from_aab "$OFFICIAL_AAB" "$WORK_DIR/official-split-apks" "$WORK_DIR/device-spec.json"
 
@@ -1581,7 +1205,7 @@ result() {
     if [[ "$BUILD_MODE" == "split" && "$APK_INPUT_KIND" == "file" && -n "$TARGET_SPLIT_APK" ]]; then
         yaml_scope="Compared single split: ${TARGET_SPLIT_APK}."
     fi
-    local yaml_notes="Build environment: node:20-bookworm, JDK 17, Yarn 4.10.3, Android SDK 35, NDK 26.1.10909125. Architecture: ${ARCH}. Split APK comparison via bundletool. ${yaml_scope}"
+    local yaml_notes="Build environment: node:24.16.0-bookworm, JDK 17, Yarn 4.14.1, Android SDK 36, NDK 27.1.12297006. Architecture: ${ARCH}. Split APK comparison via bundletool. AAB finalized with a disposable PKCS12 key (upstream keystore is a CI secret, not in the public source); built splits are bundletool debug-signed, so signatures differ from the Play-signed official splits by design. ${yaml_scope}"
 
     generate_comparison_yaml "${yaml_verdict}" "${yaml_notes}"
     RESULT_DONE=true
@@ -1595,27 +1219,24 @@ result() {
     return ${exit_code}
 }
 
-###############################################################################
 # Main Entry Point
-###############################################################################
 
 main() {
     log_info "Starting ${SCRIPT_NAME} script version ${SCRIPT_VERSION}"
 
     show_disclaimer
-
-    # Detect container runtime
     detect_container_runtime
-
-    # Parse arguments
     parse_arguments "$@"
-
-    # Run build phases
     prepare
     build
     extract_and_compare
-    result
-}
 
-# Run main function
+    local rc=0
+    result || rc=$?
+    if [[ "${RESULT_DONE}" == "true" ]]; then
+        trap - ERR
+        trap - EXIT
+    fi
+    exit "${rc}"
+}
 main "$@"
