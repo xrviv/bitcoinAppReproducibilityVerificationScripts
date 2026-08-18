@@ -1,5 +1,5 @@
 #!/bin/bash
-# bitbanana_build.sh v0.6.0 — BitBanana Android reproducible build verification
+# bitbanana_build.sh v0.7.0 — BitBanana Android reproducible build verification
 # Organization: WalletScrutiny.com
 # Last modified by: Danny Garcia
 # Last modified on: 2026-08-18
@@ -19,7 +19,7 @@
 set -euo pipefail
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.6.0"
+readonly SCRIPT_VERSION="v0.7.0"
 readonly SCRIPT_NAME="bitbanana_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 readonly SCRIPT_PATH
@@ -55,7 +55,14 @@ SPEC_SDK=""
 DIFF_COUNT=0
 MISSING_NOTE=""
 ARSC_SUMMARY=""
+ACCEPTED_SUMMARY=""
 LOCALE_ALIGN=true
+# The only AndroidManifest.xml entries Google Play is allowed to add. An entry
+# outside this list, or ANY entry present only on the built side, fails the
+# manifest assessment and is counted as a real difference.
+readonly PLAY_MANIFEST_KEYS='com\.android\.stamp\.source|com\.android\.stamp\.type|com\.android\.vending\.derived\.apk\.id'
+declare -A ARSC_STATE=()
+declare -A MF_STATE=()
 RESULT_DONE=false
 RESULT_EXIT_CODE=1
 declare -a OFFICIAL_SPLITS=()
@@ -631,8 +638,84 @@ assess_split_arsc() {
             log_fail "${tag}: decoded res/ differs semantically (${residual} lines)"
         fi
     fi
+    ARSC_STATE[$tag]="$verdict"
     ARSC_SUMMARY="${ARSC_SUMMARY}  ${tag}: ${verdict} — ${detail}
 "
+}
+
+# Normalise a decoded AndroidManifest.xml so that only substantive content
+# remains: drop the Play-injected meta-data entries, and neutralise the
+# self-closing <application/> form, which appears purely because those entries
+# were the element's only children. Both sides get identical treatment, so a
+# real difference cannot be normalised away.
+normalise_manifest() {
+    sed -E \
+        -e "/<meta-data[^>]*android:name=\"(${PLAY_MANIFEST_KEYS})\"/d" \
+        -e '/^[[:space:]]*<\/application>[[:space:]]*$/d' \
+        -e 's#/>#>#g' \
+        -e 's/[[:space:]]+/ /g' \
+        -e 's/[[:space:]]+>/>/g' \
+        -e 's/^[[:space:]]+//' \
+        -e 's/[[:space:]]+$//' \
+        "$1"
+}
+
+# Decide whether a split's AndroidManifest.xml difference is nothing but Play
+# distribution metadata. Fail-closed: anything unexpected, any built-only line,
+# or a failed decode leaves the difference counted.
+assess_split_manifest() {
+    local name="$1" tag="$2"
+    local off="comparison/arsc_${tag}_official" bui="comparison/arsc_${tag}_built"
+    if [[ ! -f "${WORK_DIR}/${off}/AndroidManifest.xml" ]]; then
+        log_info "${tag}: decoding both APKs to compare manifests"
+        ws_run "set -e
+            rm -rf ${off} ${bui}
+            apktool d -f -s -o ${off} official/${name} >/dev/null 2>&1
+            apktool d -f -s -o ${bui} built/splits/${name} >/dev/null 2>&1" || true
+    fi
+    local o="${WORK_DIR}/${off}/AndroidManifest.xml"
+    local b="${WORK_DIR}/${bui}/AndroidManifest.xml"
+    if [[ ! -f "$o" || ! -f "$b" ]]; then
+        MF_STATE[$tag]="decode failed"
+        log_warn "${tag}: manifest decode failed; difference stays counted"
+        return 0
+    fi
+    # These entries are injected by Google Play. Our build must never produce one.
+    # Without this guard the normalisation would strip such an entry from both
+    # sides and quietly call the difference acceptable.
+    if grep -qE "<meta-data[^>]*android:name=\"(${PLAY_MANIFEST_KEYS})\"" "$b"; then
+        MF_STATE[$tag]="semantic"
+        log_fail "${tag}: the BUILT manifest carries Play distribution metadata; that should never happen"
+        return 0
+    fi
+
+    local no="${WORK_DIR}/comparison/mf_${tag}_official.norm"
+    local nb="${WORK_DIR}/comparison/mf_${tag}_built.norm"
+    normalise_manifest "$o" > "$no"
+    normalise_manifest "$b" > "$nb"
+    if diff -q "$no" "$nb" >/dev/null 2>&1; then
+        MF_STATE[$tag]="play-metadata-only"
+        log_pass "${tag}: manifest differs only by Play distribution metadata"
+    else
+        MF_STATE[$tag]="semantic"
+        diff "$no" "$nb" > "${WORK_DIR}/comparison/diff_manifest_${tag}.txt" 2>&1 || true
+        log_fail "${tag}: manifest differs beyond Play distribution metadata"
+    fi
+    return 0
+}
+
+# Move one class of line from the counted set into the accepted set, recording
+# why. Nothing is ever dropped silently: everything excluded is printed.
+accept_lines() {
+    local counted="$1" pattern="$2" tag="$3" reason="$4"
+    local hits
+    hits=$(grep -cE "$pattern" "$counted" 2>/dev/null || true)
+    [[ "${hits:-0}" -gt 0 ]] || return 0
+    grep -vE "$pattern" "$counted" > "${counted}.keep" 2>/dev/null || true
+    mv "${counted}.keep" "$counted"
+    ACCEPTED_SUMMARY="${ACCEPTED_SUMMARY}  ${tag}: ${hits} x ${reason}
+"
+    return 0
 }
 
 # Per-split comparison. Leo's rule (2025-10-30): filter root-level META-INF only,
@@ -673,14 +756,39 @@ compare() {
             "$brief" > "$filtered" 2>/dev/null || true
         sed -i '/^$/d' "$filtered" 2>/dev/null || true
 
-        local cnt
-        cnt=$(grep -c '^' "$filtered" 2>/dev/null || true)
-        cnt="${cnt:-0}"
-        DIFF_COUNT=$((DIFF_COUNT + cnt))
-
-        if [[ "$cnt" -gt 0 ]] && grep -q 'resources\.arsc' "$filtered"; then
+        # Gather evidence before deciding what may be excluded.
+        if grep -q 'resources\.arsc' "$filtered"; then
             assess_split_arsc "$name" "$tag"
         fi
+        if grep -q 'AndroidManifest\.xml' "$filtered"; then
+            assess_split_manifest "$name" "$tag"
+        fi
+
+        # Acceptable-diff exclusion, per review-notes/verification-reproducibility-guidelines.md
+        # and the resources.arsc policy. Precedent for excluding this class at all:
+        # bitkit_build.sh:327. Difference from that precedent: bitkit excludes
+        # AndroidManifest.xml and resources.arsc by FILENAME, unconditionally. Here each
+        # exclusion has to be earned by evidence from the decode, so a genuine manifest or
+        # resource change is still counted. Tangem 5.39.1 is why: its resources.arsc decoded
+        # to a real difference in one split while another split's was pure packing noise.
+        local counted="${WORK_DIR}/comparison/counted_${tag}.txt"
+        cp "$filtered" "$counted"
+
+        accept_lines "$counted" 'stamp-cert-sha256' "$tag" \
+            "stamp-cert-sha256 (Play SourceStamp, official only)"
+        if [[ "${ARSC_STATE[$tag]:-}" == "binary-only" ]]; then
+            accept_lines "$counted" 'resources\.arsc' "$tag" \
+                "resources.arsc (binary only; decoded res/ identical)"
+        fi
+        if [[ "${MF_STATE[$tag]:-}" == "play-metadata-only" ]]; then
+            accept_lines "$counted" 'AndroidManifest\.xml' "$tag" \
+                "AndroidManifest.xml (Play distribution metadata only)"
+        fi
+
+        local cnt
+        cnt=$(grep -c '^' "$counted" 2>/dev/null || true)
+        cnt="${cnt:-0}"
+        DIFF_COUNT=$((DIFF_COUNT + cnt))
 
         printf '=== %s ===\n' "$tag" >> "$aggregate"
         if [[ -s "$brief" ]]; then
@@ -691,9 +799,9 @@ compare() {
         printf '\n' >> "$aggregate"
 
         if [[ "$cnt" -eq 0 ]]; then
-            log_pass "${tag}: no differences outside root META-INF/"
+            log_pass "${tag}: no differences beyond the accepted classes"
         else
-            log_warn "${tag}: ${cnt} differences outside root META-INF/"
+            log_warn "${tag}: ${cnt} unaccounted differences"
         fi
     done
 
@@ -710,7 +818,7 @@ compare() {
     done
     shopt -u nullglob
 
-    log_info "Total differences outside root META-INF/: ${DIFF_COUNT}"
+    log_info "Total unaccounted differences: ${DIFF_COUNT}"
 }
 
 print_results_block() {
@@ -751,6 +859,12 @@ print_results_block() {
         cat "$aggregate"
     else
         echo "(no comparison performed)"
+    fi
+    if [[ -n "$ACCEPTED_SUMMARY" ]]; then
+        echo "Accepted differences (excluded from the verdict, per split):"
+        printf '%s' "$ACCEPTED_SUMMARY"
+        echo "  all splits: root META-INF/ (signing material; the built splits are unsigned)"
+        echo ""
     fi
     if [[ -n "$ARSC_SUMMARY" ]]; then
         echo "resources.arsc (decoded, per split):"
@@ -797,7 +911,7 @@ result() {
     else
         experiment_note="Locale alignment disabled via --no-locale-align. "
     fi
-    local notes="${experiment_note}Google Play AAB path. Build environment inlined from upstream reproducible-builds/Dockerfile: debian:bookworm-slim, JDK 17, Gradle 8.14, Android SDK 35, build-tools 35.0.0, NDK 27.2.12479018, built through disorderfs with sorted directory entries per docs/REPRODUCE_PLAYSTORE.md. Splits materialised with bundletool ${BUNDLETOOL_VERSION} against a device spec derived from the supplied Play splits, not from a connected device. Only root-level META-INF/ is excluded from the count, per Leo's 2025-10-30 rule; Play SourceStamp (stamp-cert-sha256), the three com.android.stamp/vending manifest meta-data entries and resources.arsc are expected on a Play comparison and are left for a human to categorise in the report. Built splits are unsigned because upstream declares no signingConfig. ${MISSING_NOTE}${ARSC_SUMMARY:+ resources.arsc decoded per split: ${ARSC_SUMMARY}}"
+    local notes="${experiment_note}Google Play AAB path. Build environment inlined from upstream reproducible-builds/Dockerfile: debian:bookworm-slim, JDK 17, Gradle 8.14, Android SDK 35, build-tools 35.0.0, NDK 27.2.12479018, built through disorderfs with sorted directory entries per docs/REPRODUCE_PLAYSTORE.md. Splits materialised with bundletool ${BUNDLETOOL_VERSION} against a device spec derived from the supplied Play splits, not from a connected device. Only root-level META-INF/ is excluded from the count, per Leo's 2025-10-30 rule; Play SourceStamp (stamp-cert-sha256), the three com.android.stamp/vending manifest meta-data entries and resources.arsc are expected on a Play comparison and are left for a human to categorise in the report. Built splits are unsigned because upstream declares no signingConfig. ${ACCEPTED_SUMMARY:+Accepted differences excluded from the verdict: ${ACCEPTED_SUMMARY}}${MISSING_NOTE}${ARSC_SUMMARY:+ resources.arsc decoded per split: ${ARSC_SUMMARY}}"
     generate_yaml "${yaml_verdict}" "${notes}"
     RESULT_DONE=true
     log_info "Generated COMPARISON_RESULTS.yaml"
