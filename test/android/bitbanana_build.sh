@@ -1,5 +1,5 @@
 #!/bin/bash
-# bitbanana_build.sh v0.3.1 — BitBanana Android reproducible build verification
+# bitbanana_build.sh v0.4.0 — BitBanana Android reproducible build verification
 # Organization: WalletScrutiny.com
 # Last modified by: Danny Garcia
 # Last modified on: 2026-08-18
@@ -11,14 +11,15 @@
 # Steps: parse args -> read metadata from the official base.apk -> derive a device
 #        spec from the supplied splits -> build image (upstream recipe, inlined) ->
 #        gradle bundleRelease under disorderfs -> bundletool build-apks ->
-#        rename to Play naming -> unzip and diff per split -> verdict -> YAML.
+#        rename to Play naming -> unzip and diff per split -> decode
+#        resources.arsc for any split that differs -> verdict -> YAML.
 # No smartphone is required: the device spec is derived from the supplied splits,
 # never from `bundletool --connected-device`.
 # License: MIT. No warranty. For security research only. Use at your own risk.
 set -euo pipefail
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.3.1"
+readonly SCRIPT_VERSION="v0.4.0"
 readonly SCRIPT_NAME="bitbanana_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 readonly SCRIPT_PATH
@@ -53,6 +54,7 @@ SPEC_LOCALES=""
 SPEC_SDK=""
 DIFF_COUNT=0
 MISSING_NOTE=""
+ARSC_SUMMARY=""
 RESULT_DONE=false
 RESULT_EXIT_CODE=1
 declare -a OFFICIAL_SPLITS=()
@@ -228,10 +230,13 @@ generate_yaml() {
     local verdict="$1" notes="${2:-}"
     local content="script_version: ${SCRIPT_VERSION}
 verdict: ${verdict}"
+    # Every line is indented, not just the first: the per-split resources.arsc
+    # summary is multi-line, and an unindented continuation line silently breaks
+    # the block scalar.
     if [[ -n "$notes" ]]; then
         content="${content}
 notes: |
-  ${notes}"
+$(printf '%s\n' "$notes" | sed 's/^/  /')"
     fi
     printf '%s\n' "$content" > "${EXEC_DIR}/COMPARISON_RESULTS.yaml"
     if [[ -n "${WORK_DIR:-}" && -d "${WORK_DIR}" ]]; then
@@ -554,6 +559,53 @@ build() {
     for f in "${built[@]}"; do log_info "  $(basename "$f")"; done
 }
 
+# resources.arsc evidence, per ws-notes/review-notes/resources.arsc.md and the
+# 2026-08-18 precedent survey. A binary arsc difference is not self-explanatory:
+# in 18 of 19 recorded cases the decoded res/ trees matched, but Tangem 5.39.1
+# proved a real semantic change can hide there — and proved it split by split,
+# with one split benign and another genuinely different in the same run. So this
+# runs per split and only produces evidence: it never changes DIFF_COUNT or the
+# verdict. The human categorises in the report.
+assess_split_arsc() {
+    local name="$1" tag="$2"
+    log_info "${tag}: resources.arsc differs; decoding both APKs to compare resources"
+    ws_run "set -e
+        rm -rf comparison/arsc_${tag}_official comparison/arsc_${tag}_built
+        apktool d -f -s -o comparison/arsc_${tag}_official official/${name} >/dev/null 2>&1
+        apktool d -f -s -o comparison/arsc_${tag}_built built/splits/${name} >/dev/null 2>&1
+        diff -r comparison/arsc_${tag}_official/res comparison/arsc_${tag}_built/res \
+            > comparison/diff_resources_decoded_${tag}.txt 2>&1 || true" || true
+
+    local decoded="${WORK_DIR}/comparison/diff_resources_decoded_${tag}.txt"
+    local verdict detail=""
+    if [[ ! -f "$decoded" ]]; then
+        verdict="decode failed"
+        detail="apktool produced no decoded comparison; assess by hand."
+        log_warn "${tag}: resources.arsc decode failed"
+    elif [[ ! -s "$decoded" ]]; then
+        verdict="binary-only"
+        detail="decoded res/ trees are identical; the arsc difference carries no resource change."
+        log_pass "${tag}: decoded res/ identical — arsc difference is non-semantic"
+    else
+        local changed residual
+        changed=$(grep -cE '^[<>]' "$decoded" 2>/dev/null || true)
+        residual=$(grep -E '^[<>]' "$decoded" 2>/dev/null \
+            | grep -vc 'com.google.firebase.crashlytics.mapping_file_id' || true)
+        changed="${changed:-0}"; residual="${residual:-0}"
+        if [[ "$residual" -eq 0 && "$changed" -gt 0 ]]; then
+            verdict="crashlytics-only"
+            detail="decoded res/ differs only in com.google.firebase.crashlytics.mapping_file_id, an R8 mapping UUID regenerated per build. Accepted class per policy; still counted here."
+            log_warn "${tag}: decoded res/ differs only in the Crashlytics mapping id"
+        else
+            verdict="semantic"
+            detail="decoded res/ differs in ${residual} lines beyond any accepted key. This is a real resource difference."
+            log_fail "${tag}: decoded res/ differs semantically (${residual} lines)"
+        fi
+    fi
+    ARSC_SUMMARY="${ARSC_SUMMARY}  ${tag}: ${verdict} — ${detail}
+"
+}
+
 # Per-split comparison. Leo's rule (2025-10-30): filter root-level META-INF only,
 # nothing else. Play's SourceStamp, manifest meta-data and resources.arsc all
 # count towards the mechanical verdict; a human categorises them in the report.
@@ -596,6 +648,10 @@ compare() {
         cnt=$(grep -c '^' "$filtered" 2>/dev/null || true)
         cnt="${cnt:-0}"
         DIFF_COUNT=$((DIFF_COUNT + cnt))
+
+        if [[ "$cnt" -gt 0 ]] && grep -q 'resources\.arsc' "$filtered"; then
+            assess_split_arsc "$name" "$tag"
+        fi
 
         printf '=== %s ===\n' "$tag" >> "$aggregate"
         if [[ -s "$brief" ]]; then
@@ -662,6 +718,11 @@ print_results_block() {
     else
         echo "(no comparison performed)"
     fi
+    if [[ -n "$ARSC_SUMMARY" ]]; then
+        echo "resources.arsc (decoded, per split):"
+        printf '%s' "$ARSC_SUMMARY"
+        echo ""
+    fi
     echo "Revision, tag (and its signature):"
     echo "Built from tag v${VERSION} at commit ${COMMIT_HASH}."
     echo "No git tag signature check is performed by this script."
@@ -696,7 +757,7 @@ result() {
         log_warn "VERDICT: NOT REPRODUCIBLE (${DIFF_COUNT} differences)"
     fi
 
-    local notes="Google Play AAB path. Build environment inlined from upstream reproducible-builds/Dockerfile: debian:bookworm-slim, JDK 17, Gradle 8.14, Android SDK 35, build-tools 35.0.0, NDK 27.2.12479018, built through disorderfs with sorted directory entries per docs/REPRODUCE_PLAYSTORE.md. Splits materialised with bundletool ${BUNDLETOOL_VERSION} against a device spec derived from the supplied Play splits, not from a connected device. Only root-level META-INF/ is excluded from the count, per Leo's 2025-10-30 rule; Play SourceStamp (stamp-cert-sha256), the three com.android.stamp/vending manifest meta-data entries and resources.arsc are expected on a Play comparison and are left for a human to categorise in the report. Built splits are unsigned because upstream declares no signingConfig. ${MISSING_NOTE}"
+    local notes="Google Play AAB path. Build environment inlined from upstream reproducible-builds/Dockerfile: debian:bookworm-slim, JDK 17, Gradle 8.14, Android SDK 35, build-tools 35.0.0, NDK 27.2.12479018, built through disorderfs with sorted directory entries per docs/REPRODUCE_PLAYSTORE.md. Splits materialised with bundletool ${BUNDLETOOL_VERSION} against a device spec derived from the supplied Play splits, not from a connected device. Only root-level META-INF/ is excluded from the count, per Leo's 2025-10-30 rule; Play SourceStamp (stamp-cert-sha256), the three com.android.stamp/vending manifest meta-data entries and resources.arsc are expected on a Play comparison and are left for a human to categorise in the report. Built splits are unsigned because upstream declares no signingConfig. ${MISSING_NOTE}${ARSC_SUMMARY:+ resources.arsc decoded per split: ${ARSC_SUMMARY}}"
     generate_yaml "${yaml_verdict}" "${notes}"
     RESULT_DONE=true
     log_info "Generated COMPARISON_RESULTS.yaml"
