@@ -2,9 +2,9 @@
 # ======================================================================================
 # bitcoinsafe_build.sh - Bitcoin Safe Desktop Reproducible Build Verification
 # ======================================================================================
-# Version:       v0.9.2
+# Version:       v0.9.3
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-07-23
+# Last Modified: 2026-08-11
 # Project:       https://github.com/andreasgriffin/bitcoin-safe
 # ==============================================================================
 # LICENSE: MIT License
@@ -38,7 +38,7 @@ set -euo pipefail
 # ======================================================================================
 
 APP_ID="bitcoin.safe"
-SCRIPT_VERSION="v0.9.2"
+SCRIPT_VERSION="v0.9.3"
 REPO_URL="https://github.com/andreasgriffin/bitcoin-safe.git"
 RELEASE_BASE="https://github.com/andreasgriffin/bitcoin-safe/releases/download"
 
@@ -315,6 +315,20 @@ bootstrap_container() {
       groupadd -g "$DOCKER_SOCK_GID" dockerhost 2>/dev/null || true
       useradd -m -u "$HOST_UID" -g "$HOST_GID" builder 2>/dev/null || true
       usermod -aG dockerhost builder 2>/dev/null || true
+
+      # Nested build containers can write root-owned files into the bind-mounted
+      # workspace. Restore ownership from this outer root context on every exit.
+      WORKSPACE_PATH="$PWD/bitcoinsafe_${BS_VERSION}_${BS_ARCH}_${BS_TYPE}"
+      restore_workspace_ownership() {
+        local exit_status=$?
+        trap - EXIT
+        if [[ -e "$WORKSPACE_PATH" ]] && ! chown -R "$HOST_UID:$HOST_GID" "$WORKSPACE_PATH"; then
+          echo "ERROR: Failed to restore workspace ownership: $WORKSPACE_PATH" >&2
+          [[ "$exit_status" -ne 0 ]] || exit_status=1
+        fi
+        exit "$exit_status"
+      }
+      trap restore_workspace_ownership EXIT
 
       # Re-invoke script as builder user (pass --binary if provided)
       su -p builder -c "export HOME=/home/builder && export PATH=\"/home/builder/.local/bin:\$PATH\" && cd \"$PWD\" && bash \"$BS_SCRIPT_PATH\" --version \"$BS_VERSION\" --arch \"$BS_ARCH\" --type \"$BS_TYPE\"${BS_BINARY:+ --binary \"$BS_BINARY\"}"
