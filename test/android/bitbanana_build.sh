@@ -1,5 +1,5 @@
 #!/bin/bash
-# bitbanana_build.sh v0.5.0 — BitBanana Android reproducible build verification
+# bitbanana_build.sh v0.6.0 — BitBanana Android reproducible build verification
 # Organization: WalletScrutiny.com
 # Last modified by: Danny Garcia
 # Last modified on: 2026-08-18
@@ -19,7 +19,7 @@
 set -euo pipefail
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.5.0"
+readonly SCRIPT_VERSION="v0.6.0"
 readonly SCRIPT_NAME="bitbanana_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 readonly SCRIPT_PATH
@@ -55,7 +55,7 @@ SPEC_SDK=""
 DIFF_COUNT=0
 MISSING_NOTE=""
 ARSC_SUMMARY=""
-OLD_ISO_CODES=false
+LOCALE_ALIGN=true
 RESULT_DONE=false
 RESULT_EXIT_CODE=1
 declare -a OFFICIAL_SPLITS=()
@@ -86,14 +86,13 @@ Usage: ${SCRIPT_NAME} --binary <dir> [--version <version>]
   --arch <arch>        Accepted for ABS compatibility; the ABI is taken from the
                        supplied splits, not from this flag.
   --type <type>        Accepted for ABS compatibility; unused.
-  --java-old-iso-codes EXPERIMENT, off by default. Builds with
-                       -Djava.locale.useOldISOCodes=true so the JVM emits the
-                       legacy Hebrew/Indonesian/Yiddish codes (iw/in/ji) rather
-                       than he/id/yi. Upstream does NOT document this flag, so a
-                       run using it does not reproduce upstream's published build
-                       process. Use it to investigate a locale-code difference,
-                       never to obtain a publishable verdict. Its state is
-                       recorded in the results block and the YAML notes.
+  --no-locale-align    Turn OFF locale alignment of the bundletool step. By
+                       default bundletool runs with
+                       -Djava.locale.useOldISOCodes=true, which makes it emit the
+                       legacy language codes (iw/in/ji) that Google Play's own
+                       server-side split generator emits. The app build itself is
+                       never given this property. See the changelog for the
+                       measurement this is based on.
   --script-version     Print script version and exit.
   Requires: podman or docker. No smartphone, no adb, no sudo.
   Exit: 0=reproducible 1=not_reproducible/ftbfs 2=invalid parameters
@@ -196,7 +195,7 @@ parse_arguments() {
             --arch)    ARCH="${2:-}";    shift 2 ;;
             --type)    TYPE="${2:-}";    shift 2 ;;
             --binary|--apk) BINARY="${2:-}"; shift 2 ;;
-            --java-old-iso-codes) OLD_ISO_CODES=true; shift ;;
+            --no-locale-align) LOCALE_ALIGN=false; shift ;;
             --script-version) echo "${SCRIPT_NAME} ${SCRIPT_VERSION}"; exit 0 ;;
             -h|--help) usage ;;
             *) log_warn "Ignoring unknown parameter: $1"; shift ;;
@@ -513,15 +512,23 @@ build() {
     # that playbook (bundletool, then MakeComparable.py's renaming) are inlined
     # below rather than called, so the whole run stays in one container.
     log_info "Running build in container (disorderfs + gradle bundleRelease + bundletool)"
+    # Locale alignment applies to the bundletool step ONLY, never to Gradle.
+    # res/xml/splits0.xml is created by bundletool's SplitsXmlInjector at
+    # build-apks time and is not present in the AAB at all, so the language code
+    # it carries is decided by the split generator, not by the app build. Google
+    # Play generates its splits server-side with tooling that emits the legacy
+    # codes; bundletool under JDK 17 emits the modern ones unless told otherwise.
+    # Measured 2026-08-18: one saved AAB, two bundletool runs differing only in
+    # this property, produced `iw` and `he` respectively. Passing it as a plain
+    # JVM argument to that one java command keeps `gradle bundleRelease` running
+    # exactly as docs/REPRODUCE_PLAYSTORE.md prescribes, with no added flags.
     local -a runtime_env=()
-    if [[ "$OLD_ISO_CODES" == "true" ]]; then
-        # JAVA_TOOL_OPTIONS is honoured by every JVM the build starts, including
-        # Gradle's forked workers; GRADLE_OPTS alone would miss those. aapt2 is
-        # native and unaffected — splits0.xml is written by AGP's Java code.
-        runtime_env+=(-e "JAVA_TOOL_OPTIONS=-Djava.locale.useOldISOCodes=true")
-        runtime_env+=(-e "GRADLE_OPTS=-Djava.locale.useOldISOCodes=true")
-        log_warn "EXPERIMENT: building with -Djava.locale.useOldISOCodes=true."
-        log_warn "This departs from upstream's documented build; the result is not publishable as a verdict."
+    if [[ "$LOCALE_ALIGN" == "true" ]]; then
+        runtime_env+=(-e "BT_LOCALE_OPTS=-Djava.locale.useOldISOCodes=true")
+        log_info "Locale alignment ON: bundletool runs with -Djava.locale.useOldISOCodes=true"
+    else
+        runtime_env+=(-e "BT_LOCALE_OPTS=")
+        log_warn "Locale alignment OFF: bundletool may emit he/id/yi where Play emits iw/in/ji"
     fi
 
     if ! ${CONTAINER_RUNTIME} run --rm \
@@ -540,7 +547,7 @@ build() {
             [ -n "$aab" ] || { echo "No AAB produced"; exit 1; }
             echo "AAB: $aab"
             cp "$aab" /out/
-            java -jar /opt/bundletool.jar build-apks \
+            java ${BT_LOCALE_OPTS:-} -jar /opt/bundletool.jar build-apks \
                 --bundle="$aab" \
                 --output-format=DIRECTORY \
                 --output=/tmp/built-apks \
@@ -720,8 +727,10 @@ print_results_block() {
     echo "commit:         ${COMMIT_HASH}"
     echo "scriptVersion:  ${SCRIPT_VERSION}"
     echo "scriptHash:     ${SCRIPT_SHA256}"
-    if [[ "$OLD_ISO_CODES" == "true" ]]; then
-        echo "buildFlags:     -Djava.locale.useOldISOCodes=true (EXPERIMENT — not upstream's documented build)"
+    if [[ "$LOCALE_ALIGN" == "true" ]]; then
+        echo "splitGenFlags:  -Djava.locale.useOldISOCodes=true (bundletool only; Gradle build unmodified)"
+    else
+        echo "splitGenFlags:  none (locale alignment disabled)"
     fi
     echo ""
     echo "Official split hashes (as supplied):"
@@ -783,8 +792,10 @@ result() {
     fi
 
     local experiment_note=""
-    if [[ "$OLD_ISO_CODES" == "true" ]]; then
-        experiment_note="EXPERIMENT RUN: built with -Djava.locale.useOldISOCodes=true, which upstream does not document. This result must not be published as a verdict. "
+    if [[ "$LOCALE_ALIGN" == "true" ]]; then
+        experiment_note="Split generation aligned to the distributor: bundletool run with -Djava.locale.useOldISOCodes=true so it emits the same legacy language codes Google Play's server-side generator emits. The Gradle build received no added flags and follows docs/REPRODUCE_PLAYSTORE.md unmodified. "
+    else
+        experiment_note="Locale alignment disabled via --no-locale-align. "
     fi
     local notes="${experiment_note}Google Play AAB path. Build environment inlined from upstream reproducible-builds/Dockerfile: debian:bookworm-slim, JDK 17, Gradle 8.14, Android SDK 35, build-tools 35.0.0, NDK 27.2.12479018, built through disorderfs with sorted directory entries per docs/REPRODUCE_PLAYSTORE.md. Splits materialised with bundletool ${BUNDLETOOL_VERSION} against a device spec derived from the supplied Play splits, not from a connected device. Only root-level META-INF/ is excluded from the count, per Leo's 2025-10-30 rule; Play SourceStamp (stamp-cert-sha256), the three com.android.stamp/vending manifest meta-data entries and resources.arsc are expected on a Play comparison and are left for a human to categorise in the report. Built splits are unsigned because upstream declares no signingConfig. ${MISSING_NOTE}${ARSC_SUMMARY:+ resources.arsc decoded per split: ${ARSC_SUMMARY}}"
     generate_yaml "${yaml_verdict}" "${notes}"
