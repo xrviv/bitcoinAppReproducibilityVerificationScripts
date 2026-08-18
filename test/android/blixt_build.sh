@@ -773,7 +773,8 @@ compare_one_split() {
     if [[ -s "${diff_file}" ]]; then
         total_lines="$(wc -l < "${diff_file}")"
         # Count distinct file differences: Binary files, text diff headers (diff -r),
-        # Only-in-one-side, and brief-mode Files lines — excluding META-INF entries.
+        # Only-in-one-side, and brief-mode Files lines.
+        # Exclude Google Play signing/source-stamp metadata that local unsigned builds do not produce.
         # Uses wc -l (always exits 0) to avoid the grep -c exit-1 / || echo 0 double-output crash.
         non_meta_count="$(grep -E '^Only in |^Binary files |^diff -r |^Files ' "${diff_file}" \
             | grep -vE 'META-INF|stamp-cert-sha256' | wc -l)"
@@ -1005,14 +1006,14 @@ main() {
 
     # Verdict + YAML
     if [[ "${TOTAL_DIFFS}" -eq 0 ]]; then
-        log_pass "All splits are identical (excluding META-INF signing artifacts)."
+        log_pass "All splits are identical (excluding Google Play signing/source-stamp metadata)."
         write_yaml "script_version: ${SCRIPT_VERSION}
 verdict: reproducible
 notes: |
   Blixt Wallet v${VERSION} (${APP_ID}) ${ARCH}.
   Built AAB from source tag v${VERSION} (commit ${BUILD_COMMIT}) using Bun ${BUN_VERSION}, Node ${NODE_VERSION}, NDK ${NDK_VERSION}.
   Splits extracted via bundletool ${BUNDLETOOL_VERSION}.
-  All splits matched (META-INF excluded from verdict).
+  All splits matched (META-INF and stamp-cert-sha256 excluded from verdict).
   Note: liblnd.so is a pre-built binary downloaded from react-native-turbo-lnd GitHub releases (v0.0.20)."
         RESULT_DONE=true
         FINAL_EXIT="${EXIT_SUCCESS}"
