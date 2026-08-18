@@ -2,10 +2,10 @@
 # ==============================================================================
 # coldcard_build.sh - Coldcard (Mk4 / Mk5 / Q) Reproducible Build Verifier
 # ==============================================================================
-# Version: v4.1.1
+# Version: v4.1.4
 # Organization: WalletScrutiny.com
 # Last modified by: Daniel Garcia
-# Last modified on: 2026-08-05
+# Last modified on: 2026-08-06
 # Project: https://github.com/Coldcard/firmware
 # ==============================================================================
 #
@@ -63,7 +63,7 @@
 
 set -eEuo pipefail
 
-SCRIPT_VERSION="v4.1.1"
+SCRIPT_VERSION="v4.1.4"
 APP_ID="coldcard"
 REPO_URL="https://github.com/Coldcard/firmware.git"
 DOWNLOAD_BASE="https://coldcard.com/downloads"
@@ -410,8 +410,9 @@ checkout_and_probe() {
 
 resolve_official_filename() {
   # Coldcard's published filename has changed shape over time (mk4 -> mk at
-  # v5.5.0), so the exact name is looked up in releases/signatures.txt rather
-  # than assembled from a template. Lines are "<sha256>  <filename>".
+  # v5.5.0) and its date prefix is the build time, not the tag time, so the
+  # exact name is taken from releases/signatures.txt rather than assembled from
+  # any template. Lines are "<sha256>  <filename>".
   local sig="${WORK_DIR}/repo/releases/signatures.txt"
   if [[ ! -f "${sig}" ]]; then
     log_fail "releases/signatures.txt is absent at ${TAG}."
@@ -424,7 +425,7 @@ resolve_official_filename() {
   while read -r hash name _rest; do
     [[ -z "${name:-}" ]] && continue
     [[ "${name}" == *factory* ]] && continue
-    if [[ "${name}" == "${TAG_PREFIX}"*"-v${SHORT_VERSION}-${HW_MODEL}-coldcard.dfu" ]]; then
+    if [[ "${name}" == *"-v${SHORT_VERSION}-${HW_MODEL}-coldcard.dfu" ]]; then
       ((match_count += 1))
       if (( match_count == 1 )); then
         DFU_FILENAME="${name}"
@@ -626,7 +627,7 @@ if [ -n "$UPSTREAM_RNG_O" ] && [ -n "$BOARD_RNG_O" ]; then
         RNG_DETAIL="arm-none-eabi-nm failed (upstream rc=$UPSTREAM_NM_RC, board rc=$BOARD_NM_RC) - no conclusion drawn"
     elif [ "$UPSTREAM_SYM_COUNT" -eq 0 ] && [ "$HAS_RNG_GET" = yes ]; then
         RNG_SOURCE=hardware-TRNG
-        RNG_DETAIL="board rng.o defines global rng_get and micropython rng.o defines no symbols, so the Yasmarang PRNG is not linked in"
+        RNG_DETAIL="board rng.o defines global rng_get and micropython rng.o defines no symbols, so MicroPython's Yasmarang fallback is not linked in"
     elif [ "$UPSTREAM_SYM_COUNT" -gt 0 ] && [ "$HAS_RNG_GET" = no ]; then
         RNG_SOURCE=micropython-PRNG
         RNG_DETAIL="micropython rng.o defines $UPSTREAM_SYM_COUNT symbols and board rng.o has no global rng_get - the pre-fix pattern"
@@ -811,7 +812,7 @@ print_results() {
     hardware-TRNG)
       echo "rngSource:      hardware-TRNG" ;;
     micropython-PRNG)
-      echo "rngSource:      micropython-PRNG  *** WEAK SEED - see advisory 2026-07-30 ***" ;;
+      echo -e "rngSource:      micropython-PRNG  ${RED}*** WEAK SEED - see advisory 2026-07-30 ***${NC}" ;;
     *)
       echo "rngSource:      ${RNG_SOURCE:-unknown}" ;;
   esac
