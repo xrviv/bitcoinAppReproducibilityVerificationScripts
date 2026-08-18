@@ -1,8 +1,8 @@
 #!/bin/bash
-# bitbox02_build.sh v3.11.0 - WalletScrutiny verification script for BitBox02
+# bitbox02_build.sh v3.12.0 - WalletScrutiny verification script for BitBox02
 # Organization: WalletScrutiny.com
 # Last modified by: Daniel Garcia
-# Date last modified: 2026-07-15 (v3.11.0)
+# Date last modified: 2026-08-18 (v3.12.0)
 # Usage: bitbox02_build.sh --version VERSION [--type TYPE] [--binary PATH] [--arch ARCH]
 #
 # Verifies BitBox02 firmware reproducibility: builds from source via the upstream
@@ -13,8 +13,11 @@
 set -eE
 
 # ---- Globals ----------------------------------------------------------------
-SCRIPT_VERSION="v3.11.0"
+SCRIPT_VERSION="v3.12.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# readlink -f, not $0: a relative or symlinked invocation would otherwise hash nothing.
+SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_SHA256=""
 RESULTS_FILE="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
 repo="https://github.com/BitBoxSwiss/bitbox02-firmware"
 
@@ -34,6 +37,13 @@ YELLOW='\033[1;33m'
 GREEN='\033[1;32m'
 RED='\033[1;31m'
 NC='\033[0m'
+
+# ---- Self-identification ----------------------------------------------------
+# Never fails the run: a hashing problem is not a build outcome.
+sha256_of() {
+  [[ -f "$1" ]] || { echo "N/A"; return 0; }
+  sha256sum "$1" | awk '{print $1}'
+}
 
 # ---- Results writer (single-line notes, minimal 3-field YAML) ---------------
 write_results() {
@@ -77,6 +87,14 @@ echo "security vulnerabilities. Use at your own risk."
 echo "=============================================================================="
 echo -e "${NC}"
 sleep 2
+echo
+
+# ---- Announce script identity ----------------------------------------------
+# Before argument parsing and before any container/network work, so even a run
+# that exits early records which script bytes produced it.
+SCRIPT_SHA256="$(sha256_of "$SCRIPT_PATH")"
+echo "Script:  $(basename "$SCRIPT_PATH") ${SCRIPT_VERSION}"
+echo "         sha256: ${SCRIPT_SHA256}"
 echo
 
 # ---- Container runtime detection --------------------------------------------
@@ -492,6 +510,8 @@ echo "monotonic:    $monotonicVersion"
 echo "repository:   $repo"
 echo "tag:          $GIT_TAG"
 echo "commit:       $commit"
+echo "scriptVersion: ${SCRIPT_VERSION}"
+echo "scriptHash:    ${SCRIPT_SHA256}"
 echo "===== End Results ====="
 
 # ---- Write COMPARISON_RESULTS.yaml ------------------------------------------
