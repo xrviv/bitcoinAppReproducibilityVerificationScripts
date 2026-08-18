@@ -1,5 +1,5 @@
 #!/bin/bash
-# bitbanana_build.sh v0.4.0 — BitBanana Android reproducible build verification
+# bitbanana_build.sh v0.5.0 — BitBanana Android reproducible build verification
 # Organization: WalletScrutiny.com
 # Last modified by: Danny Garcia
 # Last modified on: 2026-08-18
@@ -19,7 +19,7 @@
 set -euo pipefail
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.4.0"
+readonly SCRIPT_VERSION="v0.5.0"
 readonly SCRIPT_NAME="bitbanana_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 readonly SCRIPT_PATH
@@ -55,6 +55,7 @@ SPEC_SDK=""
 DIFF_COUNT=0
 MISSING_NOTE=""
 ARSC_SUMMARY=""
+OLD_ISO_CODES=false
 RESULT_DONE=false
 RESULT_EXIT_CODE=1
 declare -a OFFICIAL_SPLITS=()
@@ -85,6 +86,14 @@ Usage: ${SCRIPT_NAME} --binary <dir> [--version <version>]
   --arch <arch>        Accepted for ABS compatibility; the ABI is taken from the
                        supplied splits, not from this flag.
   --type <type>        Accepted for ABS compatibility; unused.
+  --java-old-iso-codes EXPERIMENT, off by default. Builds with
+                       -Djava.locale.useOldISOCodes=true so the JVM emits the
+                       legacy Hebrew/Indonesian/Yiddish codes (iw/in/ji) rather
+                       than he/id/yi. Upstream does NOT document this flag, so a
+                       run using it does not reproduce upstream's published build
+                       process. Use it to investigate a locale-code difference,
+                       never to obtain a publishable verdict. Its state is
+                       recorded in the results block and the YAML notes.
   --script-version     Print script version and exit.
   Requires: podman or docker. No smartphone, no adb, no sudo.
   Exit: 0=reproducible 1=not_reproducible/ftbfs 2=invalid parameters
@@ -121,10 +130,10 @@ ws_run() {
     ${CONTAINER_RUNTIME} run --rm -v "${WORK_DIR}:/work" -w /work "${WS_CONTAINER}" bash -c "$1"
 }
 
-# The WS image ships apktool only — no aapt, no aapt2, no apksigner (verified
-# 2026-08-18 on nc-ph-3376: `command -v` found apktool alone). All metadata
-# therefore comes from one apktool decode, and the signer from keytool, which
-# the image has because apktool needs a JRE.
+# The WS image has no aapt and no aapt2 (checked 2026-08-18: `command -v` found
+# neither). All metadata therefore comes from one apktool decode. apksigner IS
+# present and is tried first for the certificate; keytool is the fallback, and
+# the image has it because apktool needs a JRE.
 
 APKTOOL_MANIFEST=""
 APKTOOL_YML=""
@@ -161,17 +170,17 @@ apk_signer() {
     local rel="$1" out=""
     out="$(ws_run "apksigner verify --print-certs \"${rel}\" 2>/dev/null | grep -m1 'Signer #1 certificate SHA-256' | awk '{print \$6}'" || true)"
     if [[ -n "$out" ]]; then
-        log_info "Signer read with apksigner"
+        log_info "Signer read with apksigner" >&2
         printf '%s' "$out"
         return 0
     fi
     out="$(ws_run "keytool -printcert -jarfile \"${rel}\" 2>/dev/null | grep -m1 'SHA256:' | awk '{print \$2}' | tr -d ':' | tr 'A-F' 'a-f'" || true)"
     if [[ -n "$out" ]]; then
-        log_info "Signer read with keytool (apksigner not in the image)"
+        log_info "Signer read with keytool" >&2
         printf '%s' "$out"
         return 0
     fi
-    log_warn "Neither apksigner nor keytool could read the certificate; signer reported as unknown."
+    log_warn "Neither apksigner nor keytool could read the certificate; signer reported as unknown." >&2
     printf ''
 }
 
@@ -187,6 +196,7 @@ parse_arguments() {
             --arch)    ARCH="${2:-}";    shift 2 ;;
             --type)    TYPE="${2:-}";    shift 2 ;;
             --binary|--apk) BINARY="${2:-}"; shift 2 ;;
+            --java-old-iso-codes) OLD_ISO_CODES=true; shift ;;
             --script-version) echo "${SCRIPT_NAME} ${SCRIPT_VERSION}"; exit 0 ;;
             -h|--help) usage ;;
             *) log_warn "Ignoring unknown parameter: $1"; shift ;;
@@ -503,10 +513,22 @@ build() {
     # that playbook (bundletool, then MakeComparable.py's renaming) are inlined
     # below rather than called, so the whole run stays in one container.
     log_info "Running build in container (disorderfs + gradle bundleRelease + bundletool)"
+    local -a runtime_env=()
+    if [[ "$OLD_ISO_CODES" == "true" ]]; then
+        # JAVA_TOOL_OPTIONS is honoured by every JVM the build starts, including
+        # Gradle's forked workers; GRADLE_OPTS alone would miss those. aapt2 is
+        # native and unaffected — splits0.xml is written by AGP's Java code.
+        runtime_env+=(-e "JAVA_TOOL_OPTIONS=-Djava.locale.useOldISOCodes=true")
+        runtime_env+=(-e "GRADLE_OPTS=-Djava.locale.useOldISOCodes=true")
+        log_warn "EXPERIMENT: building with -Djava.locale.useOldISOCodes=true."
+        log_warn "This departs from upstream's documented build; the result is not publishable as a verdict."
+    fi
+
     if ! ${CONTAINER_RUNTIME} run --rm \
         --device /dev/fuse --cap-add SYS_ADMIN \
         -v "${WORK_DIR}/built:/out" \
         -v "${WORK_DIR}/device-spec.json:/device-spec.json:ro" \
+        "${runtime_env[@]}" \
         "${IMAGE_NAME}" \
         bash -c 'set -euo pipefail
             cp /commit.txt /out/commit.txt
@@ -698,6 +720,9 @@ print_results_block() {
     echo "commit:         ${COMMIT_HASH}"
     echo "scriptVersion:  ${SCRIPT_VERSION}"
     echo "scriptHash:     ${SCRIPT_SHA256}"
+    if [[ "$OLD_ISO_CODES" == "true" ]]; then
+        echo "buildFlags:     -Djava.locale.useOldISOCodes=true (EXPERIMENT — not upstream's documented build)"
+    fi
     echo ""
     echo "Official split hashes (as supplied):"
     local f
@@ -757,7 +782,11 @@ result() {
         log_warn "VERDICT: NOT REPRODUCIBLE (${DIFF_COUNT} differences)"
     fi
 
-    local notes="Google Play AAB path. Build environment inlined from upstream reproducible-builds/Dockerfile: debian:bookworm-slim, JDK 17, Gradle 8.14, Android SDK 35, build-tools 35.0.0, NDK 27.2.12479018, built through disorderfs with sorted directory entries per docs/REPRODUCE_PLAYSTORE.md. Splits materialised with bundletool ${BUNDLETOOL_VERSION} against a device spec derived from the supplied Play splits, not from a connected device. Only root-level META-INF/ is excluded from the count, per Leo's 2025-10-30 rule; Play SourceStamp (stamp-cert-sha256), the three com.android.stamp/vending manifest meta-data entries and resources.arsc are expected on a Play comparison and are left for a human to categorise in the report. Built splits are unsigned because upstream declares no signingConfig. ${MISSING_NOTE}${ARSC_SUMMARY:+ resources.arsc decoded per split: ${ARSC_SUMMARY}}"
+    local experiment_note=""
+    if [[ "$OLD_ISO_CODES" == "true" ]]; then
+        experiment_note="EXPERIMENT RUN: built with -Djava.locale.useOldISOCodes=true, which upstream does not document. This result must not be published as a verdict. "
+    fi
+    local notes="${experiment_note}Google Play AAB path. Build environment inlined from upstream reproducible-builds/Dockerfile: debian:bookworm-slim, JDK 17, Gradle 8.14, Android SDK 35, build-tools 35.0.0, NDK 27.2.12479018, built through disorderfs with sorted directory entries per docs/REPRODUCE_PLAYSTORE.md. Splits materialised with bundletool ${BUNDLETOOL_VERSION} against a device spec derived from the supplied Play splits, not from a connected device. Only root-level META-INF/ is excluded from the count, per Leo's 2025-10-30 rule; Play SourceStamp (stamp-cert-sha256), the three com.android.stamp/vending manifest meta-data entries and resources.arsc are expected on a Play comparison and are left for a human to categorise in the report. Built splits are unsigned because upstream declares no signingConfig. ${MISSING_NOTE}${ARSC_SUMMARY:+ resources.arsc decoded per split: ${ARSC_SUMMARY}}"
     generate_yaml "${yaml_verdict}" "${notes}"
     RESULT_DONE=true
     log_info "Generated COMPARISON_RESULTS.yaml"
