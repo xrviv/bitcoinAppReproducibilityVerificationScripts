@@ -1,17 +1,24 @@
 #!/bin/bash
-# bitbanana_build.sh v0.2.0 — BitBanana Android reproducible build verification
+# bitbanana_build.sh v0.3.0 — BitBanana Android reproducible build verification
 # Organization: WalletScrutiny.com
 # Last modified by: Danny Garcia
 # Last modified on: 2026-08-18
 # Project: https://github.com/michaelWuensch/BitBanana
-# Scope: GitHub/F-Droid universal release APK. The Play Store AAB/split path is
-#        documented separately upstream (docs/REPRODUCE_PLAYSTORE.md) and is not
-#        covered by this script.
+# Scope: Google Play AAB / split-APK delivery. Builds the app bundle from source,
+#        materialises a device-specific APK set with bundletool, and compares it
+#        against the official Play split APKs supplied with --binary/--apk.
+#        The GitHub/F-Droid universal APK path is a separate variant script.
+# Steps: parse args -> read metadata from the official base.apk -> derive a device
+#        spec from the supplied splits -> build image (upstream recipe, inlined) ->
+#        gradle bundleRelease under disorderfs -> bundletool build-apks ->
+#        rename to Play naming -> unzip and diff per split -> verdict -> YAML.
+# No smartphone is required: the device spec is derived from the supplied splits,
+# never from `bundletool --connected-device`.
 # License: MIT. No warranty. For security research only. Use at your own risk.
 set -euo pipefail
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.2.0"
+readonly SCRIPT_VERSION="v0.3.0"
 readonly SCRIPT_NAME="bitbanana_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 readonly SCRIPT_PATH
@@ -19,6 +26,11 @@ SCRIPT_SHA256=""
 readonly APP_ID="app.michaelwuensch.bitbanana"
 readonly REPO_URL="https://github.com/michaelWuensch/BitBanana"
 readonly WS_CONTAINER="docker.io/walletscrutiny/android:5"
+# bundletool pin. 1.18.0 is the version used for our published v0.9.8 verification
+# (0-reports .../0.9.8/app.michaelwuensch.bitbanana.sh). bundletool decides split
+# naming and packaging, so it is a build input and is pinned by hash, not floated.
+readonly BUNDLETOOL_VERSION="1.18.0"
+readonly BUNDLETOOL_SHA256="78343764d2e79c8f55710378b04981fcb1e46daebfc3b5dc577778082e6a98fd"
 
 VERSION=""
 ARCH=""
@@ -27,19 +39,23 @@ BINARY=""
 WORK_DIR=""
 CONTAINER_RUNTIME=""
 IMAGE_NAME=""
-OFFICIAL_APK=""
+OFFICIAL_DIR=""
+OFFICIAL_BASE=""
 OFFICIAL_APP_HASH=""
-BUILT_APK=""
-BUILT_HASH=""
 APP_ID_FROM_APK=""
 APK_VERSION_NAME=""
 APK_VERSION_CODE=""
 SIGNER_SHA256=""
 COMMIT_HASH=""
+SPEC_ABIS=""
+SPEC_DENSITY=""
+SPEC_LOCALES=""
+SPEC_SDK=""
 DIFF_COUNT=0
-ARSC_NOTE=""
+MISSING_NOTE=""
 RESULT_DONE=false
 RESULT_EXIT_CODE=1
+declare -a OFFICIAL_SPLITS=()
 
 sha256_local() {
     [[ -f "$1" ]] || { echo "N/A"; return 0; }
@@ -57,15 +73,19 @@ sanitize_tag() {
 
 usage() {
     cat << EOF
-Usage: ${SCRIPT_NAME} --version <version> [OPTIONS]
-       ${SCRIPT_NAME} --binary <apk> [--version <version>]
-  --version <version>  Release version to build (e.g. 1.0.1).
-  --binary <path>      Official APK to compare against. Alias: --apk.
-                       Omitted: downloaded from the GitHub release for --version.
-  --arch <arch>        Accepted for ABS compatibility; the release APK is universal.
+Usage: ${SCRIPT_NAME} --binary <dir> [--version <version>]
+  --binary <path>      Directory holding the official Play split APKs
+                       (base.apk plus split_config.*.apk). A path to base.apk
+                       itself is accepted; its directory is then used.
+                       Alias: --apk. Required — Play splits cannot be downloaded.
+  --version <version>  Release version to build (e.g. 1.0.1). Omitted: read from
+                       the official base.apk.
+  --arch <arch>        Accepted for ABS compatibility; the ABI is taken from the
+                       supplied splits, not from this flag.
   --type <type>        Accepted for ABS compatibility; unused.
   --script-version     Print script version and exit.
-  Requires: podman or docker. Exit: 0=reproducible 1=not_reproducible/ftbfs 2=invalid
+  Requires: podman or docker. No smartphone, no adb, no sudo.
+  Exit: 0=reproducible 1=not_reproducible/ftbfs 2=invalid parameters
 EOF
     exit 0
 }
@@ -93,7 +113,7 @@ require_non_root() {
     fi
 }
 
-# Utility container helpers. The WS image carries aapt/apktool/apksigner/unzip.
+# Utility container helpers. The WS image carries aapt/apksigner/unzip.
 
 ws_run() {
     ${CONTAINER_RUNTIME} run --rm -v "${WORK_DIR}:/work" -w /work "${WS_CONTAINER}" bash -c "$1"
@@ -127,26 +147,33 @@ parse_arguments() {
         esac
     done
 
-    if [[ -n "$BINARY" && ! -f "$BINARY" ]]; then
-        log_fail "--binary not found: $BINARY"
-        generate_yaml "ftbfs" "--binary path not found."
+    if [[ -z "$BINARY" ]]; then
+        log_fail "Provide --binary <dir> with the official Play split APKs."
+        log_fail "Play splits are device-specific and cannot be downloaded; supply them."
+        echo "Run '${SCRIPT_NAME} --help' for usage."
         exit 2
     fi
 
-    if [[ -z "$VERSION" && -z "$BINARY" ]]; then
-        log_fail "Provide --version <version>, or --binary <apk> to compare a local file."
-        echo "Run '${SCRIPT_NAME} --help' for usage."
+    # A directory is the documented ABS form for multi-file artifacts. Accept a
+    # path to base.apk too and fall back to its directory.
+    if [[ -d "$BINARY" ]]; then
+        OFFICIAL_DIR="$(readlink -f "$BINARY")"
+    elif [[ -f "$BINARY" ]]; then
+        OFFICIAL_DIR="$(dirname "$(readlink -f "$BINARY")")"
+        log_info "--binary is a file; using its directory: ${OFFICIAL_DIR}"
+    else
+        log_fail "--binary not found: $BINARY"
         exit 2
     fi
 
     local v_safe t_safe a_safe s_safe
     v_safe=$(sanitize_tag "${VERSION:-provided}")
     t_safe=$(sanitize_tag "${TYPE:-default}")
-    a_safe=$(sanitize_tag "${ARCH:-universal}")
+    a_safe=$(sanitize_tag "${ARCH:-splits}")
     s_safe=$(sanitize_tag "$SCRIPT_VERSION")
 
     WORK_DIR="/tmp/test_${APP_ID}_${v_safe}_${a_safe}_${t_safe}"
-    IMAGE_NAME="bitbanana-build-${v_safe}-${a_safe}-${t_safe}-${s_safe}"
+    IMAGE_NAME="bitbanana-aab-${v_safe}-${a_safe}-${t_safe}-${s_safe}"
     log_info "Work directory: ${WORK_DIR}"
     log_info "Container image tag: ${IMAGE_NAME}"
 }
@@ -196,10 +223,12 @@ on_exit() {
 trap on_exit EXIT
 
 create_dockerfile() {
-    # Inlined from upstream reproducible-builds/Dockerfile at tag v${VERSION}
-    # (read at v1.0.1). Upstream mounts the working tree from the host; we clone
-    # inside the image instead, per WS guidelines. Version strings below are
-    # upstream's own and must be re-checked against the tag on every bump.
+    # Inlined from upstream reproducible-builds/Dockerfile (read at v1.0.1;
+    # byte-identical on master at 14a4bb56, checked 2026-08-18). Upstream mounts
+    # the working tree from the host; we clone inside the image instead, per WS
+    # guidelines. Version strings below are upstream's own and must be re-checked
+    # against the tag on every bump. bundletool is added by us — upstream's
+    # docs/REPRODUCE_PLAYSTORE.md expects it on the host.
     cat > "$1" << 'DOCKERFILE_EOF'
 FROM docker.io/debian:bookworm-slim
 RUN set -ex; \
@@ -237,6 +266,12 @@ RUN set -ex; \
     unzip -q /tmp/gradle.zip -d /opt; \
     rm /tmp/gradle.zip; \
     ln -s "/opt/gradle-${GRADLE_VERSION}/bin/gradle" /usr/local/bin/gradle
+ARG BUNDLETOOL_VERSION
+ARG BUNDLETOOL_SHA256
+RUN set -ex; \
+    curl -fSL "https://github.com/google/bundletool/releases/download/${BUNDLETOOL_VERSION}/bundletool-all-${BUNDLETOOL_VERSION}.jar" \
+        -o /opt/bundletool.jar; \
+    echo "${BUNDLETOOL_SHA256}  /opt/bundletool.jar" | sha256sum -c -
 ARG REPO_URL
 ARG VERSION
 RUN git clone --depth 1 --branch "v${VERSION}" ${REPO_URL} /app-src \
@@ -244,43 +279,133 @@ RUN git clone --depth 1 --branch "v${VERSION}" ${REPO_URL} /app-src \
 WORKDIR /app-src
 RUN git rev-parse HEAD > /commit.txt
 DOCKERFILE_EOF
-    log_info "Created Dockerfile (upstream reproducible-builds recipe, clone inside image)"
+    log_info "Created Dockerfile (upstream reproducible-builds recipe + pinned bundletool)"
+}
+
+# Screen-density bucket names as used in Play split filenames, mapped to the dpi
+# integers bundletool expects in a device spec.
+density_to_dpi() {
+    case "$1" in
+        ldpi) echo 120 ;;
+        mdpi) echo 160 ;;
+        tvdpi) echo 213 ;;
+        hdpi) echo 240 ;;
+        xhdpi) echo 320 ;;
+        xxhdpi) echo 480 ;;
+        xxxhdpi) echo 640 ;;
+        *) echo "" ;;
+    esac
+}
+
+# Derive the device spec from the split filenames Play actually delivered.
+# This replaces `bundletool --connected-device` from upstream's playbook, which
+# ABS rule 3 forbids (no smartphone may be required).
+derive_device_spec() {
+    log_info "=== DEVICE SPEC ==="
+    local abis="" locales="" density="" name suffix dpi
+
+    for f in "${OFFICIAL_SPLITS[@]}"; do
+        name="$(basename "$f")"
+        [[ "$name" == "base.apk" ]] && continue
+        [[ "$name" == split_config.* ]] || continue
+        suffix="${name#split_config.}"
+        suffix="${suffix%.apk}"
+
+        dpi="$(density_to_dpi "$suffix")"
+        if [[ -n "$dpi" ]]; then
+            density="$dpi"
+            log_info "Density split: ${suffix} -> ${dpi} dpi"
+            continue
+        fi
+        case "$suffix" in
+            arm64_v8a|armeabi_v7a|x86_64|x86|mips|mips64)
+                # Play writes ABIs with underscores; bundletool wants hyphens,
+                # except x86_64 which keeps its underscore.
+                local abi="$suffix"
+                [[ "$abi" == "arm64_v8a" ]] && abi="arm64-v8a"
+                [[ "$abi" == "armeabi_v7a" ]] && abi="armeabi-v7a"
+                abis="${abis:+${abis}, }\"${abi}\""
+                log_info "ABI split: ${suffix} -> ${abi}"
+                ;;
+            *)
+                # Anything left over of the form xx or xx_YY is a language split.
+                locales="${locales:+${locales}, }\"${suffix//_/-}\""
+                log_info "Language split: ${suffix}"
+                ;;
+        esac
+    done
+
+    if [[ -z "$abis" ]]; then
+        log_fail "No ABI split found among the supplied APKs; cannot derive a device spec."
+        generate_yaml "ftbfs" "Supplied splits contain no split_config.<abi>.apk."
+        exit 2
+    fi
+    [[ -z "$density" ]] && { density=480; log_warn "No density split supplied; defaulting to 480 dpi (xxhdpi)."; }
+    # Upstream sets bundle { language.enableSplit = false }, so a language split
+    # is not expected. en-US keeps the spec valid when none is present.
+    [[ -z "$locales" ]] && locales='"en-US"'
+
+    SPEC_ABIS="$abis"
+    SPEC_DENSITY="$density"
+    SPEC_LOCALES="$locales"
+    SPEC_SDK="${SPEC_SDK:-35}"
+
+    cat > "${WORK_DIR}/device-spec.json" << SPEC_EOF
+{
+  "supportedAbis": [${SPEC_ABIS}],
+  "supportedLocales": [${SPEC_LOCALES}],
+  "screenDensity": ${SPEC_DENSITY},
+  "sdkVersion": ${SPEC_SDK}
+}
+SPEC_EOF
+    log_info "Device spec derived from the supplied splits:"
+    cat "${WORK_DIR}/device-spec.json"
 }
 
 prepare() {
     log_info "=== PREPARATION PHASE ==="
     mkdir -p "${WORK_DIR}"/{official,built,comparison}
     chmod 777 "${WORK_DIR}" "${WORK_DIR}/built" "${WORK_DIR}/comparison"
-    rm -f "${WORK_DIR}/built"/*.apk "${WORK_DIR}/comparison"/diff_*.txt
+    rm -rf "${WORK_DIR}/official"/*.apk "${WORK_DIR}/built"/* "${WORK_DIR}/comparison"/*
 
-    if [[ -n "$BINARY" ]]; then
-        log_info "Using supplied official APK: $(basename "$BINARY")"
-        cp "$BINARY" "${WORK_DIR}/official/official.apk"
-    else
-        local url="${REPO_URL}/releases/download/v${VERSION}/bitbanana-${VERSION}-release.apk"
-        log_info "Downloading official APK: ${url}"
-        if ! ${CONTAINER_RUNTIME} run --rm -v "${WORK_DIR}/official:/dl" "${WS_CONTAINER}" \
-            sh -c "curl -fsSL -o /dl/official.apk '${url}'"; then
-            log_fail "Could not download the official APK for v${VERSION}."
-            log_fail "Check ${REPO_URL}/releases/tag/v${VERSION}"
-            generate_yaml "ftbfs" "Official APK download failed for v${VERSION}."
-            exit 1
-        fi
+    shopt -s nullglob
+    local supplied=("${OFFICIAL_DIR}"/*.apk)
+    shopt -u nullglob
+    if [[ ${#supplied[@]} -eq 0 ]]; then
+        log_fail "No .apk files in ${OFFICIAL_DIR}"
+        generate_yaml "ftbfs" "No APKs found in the supplied --binary directory."
+        exit 2
     fi
-    OFFICIAL_APK="${WORK_DIR}/official/official.apk"
+    cp "${supplied[@]}" "${WORK_DIR}/official/"
 
-    # appHash is the official artifact exactly as downloaded.
-    OFFICIAL_APP_HASH="$(sha256_of official/official.apk)"
-    log_info "Official APK SHA256 (as downloaded): ${OFFICIAL_APP_HASH}"
+    shopt -s nullglob
+    OFFICIAL_SPLITS=("${WORK_DIR}/official"/*.apk)
+    shopt -u nullglob
+    OFFICIAL_BASE="${WORK_DIR}/official/base.apk"
+    if [[ ! -f "$OFFICIAL_BASE" ]]; then
+        log_fail "base.apk not found in ${OFFICIAL_DIR}; a Play split set must include it."
+        generate_yaml "ftbfs" "Supplied split set has no base.apk."
+        exit 2
+    fi
+    log_info "Official splits supplied: ${#OFFICIAL_SPLITS[@]}"
+    local f
+    for f in "${OFFICIAL_SPLITS[@]}"; do log_info "  $(basename "$f")"; done
 
-    APP_ID_FROM_APK="$(apk_badging_field official/official.apk name)"
-    APK_VERSION_NAME="$(apk_badging_field official/official.apk versionName)"
-    APK_VERSION_CODE="$(apk_badging_field official/official.apk versionCode)"
-    SIGNER_SHA256="$(apk_signer official/official.apk)"
+    # appHash is the official artifact exactly as supplied. base.apk carries the
+    # manifest and the app identity, so it is the one published as appHash; the
+    # per-split hashes are printed alongside it, never in place of it.
+    OFFICIAL_APP_HASH="$(sha256_of official/base.apk)"
+    log_info "Official base.apk SHA256 (as supplied): ${OFFICIAL_APP_HASH}"
+
+    APP_ID_FROM_APK="$(apk_badging_field official/base.apk name)"
+    APK_VERSION_NAME="$(apk_badging_field official/base.apk versionName)"
+    APK_VERSION_CODE="$(apk_badging_field official/base.apk versionCode)"
+    SPEC_SDK="$(apk_badging_field official/base.apk targetSdkVersion)"
+    SIGNER_SHA256="$(apk_signer official/base.apk)"
 
     if [[ -z "$APP_ID_FROM_APK" ]]; then
-        log_fail "Could not read the package name from the official APK."
-        generate_yaml "ftbfs" "Package name unreadable from the supplied APK."
+        log_fail "Could not read the package name from base.apk."
+        generate_yaml "ftbfs" "Package name unreadable from the supplied base.apk."
         exit 2
     fi
     if [[ "$APP_ID_FROM_APK" != "$APP_ID" ]]; then
@@ -293,14 +418,16 @@ prepare() {
     if [[ -z "$VERSION" ]]; then
         VERSION="${APK_VERSION_NAME}"
         [[ -z "$VERSION" ]] && { log_fail "Cannot detect version; pass --version."; exit 2; }
-        log_info "Version detected from APK: ${VERSION}"
+        log_info "Version detected from base.apk: ${VERSION}"
     elif [[ -n "$APK_VERSION_NAME" && "$APK_VERSION_NAME" != "$VERSION" ]]; then
-        log_warn "Official APK reports ${APK_VERSION_NAME}, --version says ${VERSION}. Building ${VERSION}."
+        log_warn "base.apk reports ${APK_VERSION_NAME}, --version says ${VERSION}. Building ${VERSION}."
     fi
 
     APK_VERSION_NAME="${APK_VERSION_NAME:-$VERSION}"
     APK_VERSION_CODE="${APK_VERSION_CODE:-unknown}"
     SIGNER_SHA256="${SIGNER_SHA256:-unknown}"
+
+    derive_device_spec
     log_pass "Preparation complete"
 }
 
@@ -312,128 +439,152 @@ build() {
     ${CONTAINER_RUNTIME} build --no-cache \
         --build-arg VERSION="${VERSION}" \
         --build-arg REPO_URL="${REPO_URL}" \
+        --build-arg BUNDLETOOL_VERSION="${BUNDLETOOL_VERSION}" \
+        --build-arg BUNDLETOOL_SHA256="${BUNDLETOOL_SHA256}" \
         -t "${IMAGE_NAME}" -f "${WORK_DIR}/Dockerfile" "${WORK_DIR}"
 
-    # Upstream docs/REPRODUCE_GITHUB.md builds through disorderfs with sorted
+    mkdir -p "${WORK_DIR}/built/splits"
+    chmod 777 "${WORK_DIR}/built/splits"
+
+    # Upstream docs/REPRODUCE_PLAYSTORE.md builds through disorderfs with sorted
     # directory entries; that ordering is the reproducibility mechanism, so it is
-    # reproduced here rather than building the tree directly.
-    log_info "Running build in container (disorderfs + gradle assembleRelease)"
+    # reproduced here rather than building the tree directly. Steps 5 and 7 of
+    # that playbook (bundletool, then MakeComparable.py's renaming) are inlined
+    # below rather than called, so the whole run stays in one container.
+    log_info "Running build in container (disorderfs + gradle bundleRelease + bundletool)"
     if ! ${CONTAINER_RUNTIME} run --rm \
         --device /dev/fuse --cap-add SYS_ADMIN \
         -v "${WORK_DIR}/built:/out" \
+        -v "${WORK_DIR}/device-spec.json:/device-spec.json:ro" \
         "${IMAGE_NAME}" \
         bash -c 'set -euo pipefail
             cp /commit.txt /out/commit.txt
             mkdir -p /app
             disorderfs --sort-dirents=yes --reverse-dirents=no /app-src/ /app/
             cd /app
-            gradle clean assembleRelease --no-daemon
-            cp app/build/outputs/apk/release/*-release-unsigned.apk /out/ 2>/dev/null \
-                || cp app/build/outputs/apk/release/*.apk /out/
-            ls -la /out/'; then
+            gradle clean bundleRelease --no-daemon
+            aab="$(find app/build/outputs/bundle/release -name "*.aab" | head -n1)"
+            [ -n "$aab" ] || { echo "No AAB produced"; exit 1; }
+            echo "AAB: $aab"
+            cp "$aab" /out/
+            java -jar /opt/bundletool.jar build-apks \
+                --bundle="$aab" \
+                --output-format=DIRECTORY \
+                --output=/tmp/built-apks \
+                --device-spec=/device-spec.json
+            # MakeComparable.py naming: base-master.apk -> base.apk, and every
+            # other base-<x>.apk -> split_config.<x>.apk.
+            for f in /tmp/built-apks/splits/*.apk; do
+                b="$(basename "$f")"
+                case "$b" in
+                    base-master.apk) n="base.apk" ;;
+                    base-*.apk)      n="split_config.${b#base-}" ;;
+                    *)               n="$b" ;;
+                esac
+                cp "$f" "/out/splits/$n"
+            done
+            ls -la /out/splits/'; then
         log_fail "Build failed."
-        generate_yaml "ftbfs" "gradle assembleRelease failed for v${VERSION}."
+        generate_yaml "ftbfs" "gradle bundleRelease or bundletool failed for v${VERSION}."
         exit 1
     fi
 
     shopt -s nullglob
-    local built=("${WORK_DIR}/built"/*.apk)
+    local built=("${WORK_DIR}/built/splits"/*.apk)
     shopt -u nullglob
     if [[ ${#built[@]} -eq 0 ]]; then
-        log_fail "No APK produced by the build."
-        generate_yaml "ftbfs" "Build produced no APK."
+        log_fail "bundletool produced no split APKs."
+        generate_yaml "ftbfs" "No splits materialised from the AAB."
         exit 1
     fi
-    BUILT_APK="${built[0]}"
-    BUILT_HASH="$(sha256_of "built/$(basename "$BUILT_APK")")"
 
     if [[ -f "${WORK_DIR}/built/commit.txt" ]]; then
         IFS= read -r COMMIT_HASH < "${WORK_DIR}/built/commit.txt"
     fi
     COMMIT_HASH="${COMMIT_HASH:-unknown}"
 
-    log_pass "Build complete: $(basename "$BUILT_APK")"
-    log_info "Built APK SHA256:  ${BUILT_HASH}"
+    log_pass "Build complete: ${#built[@]} split APKs"
+    local f
+    for f in "${built[@]}"; do log_info "  $(basename "$f")"; done
 }
 
-# resources.arsc decode-and-assess, per ws-notes/review-notes/resources.arsc.md.
-# Decode both APKs and diff the decoded res/ trees. A binary arsc difference is
-# only acceptable when the decoded resources agree AND nothing else differs.
-assess_resources_arsc() {
-    log_info "resources.arsc differs; decoding both APKs to compare resources semantically"
-    ws_run 'set -e
-        rm -rf comparison/official-decoded comparison/built-decoded
-        apktool d -f --no-src --no-debug-info -o comparison/official-decoded official/official.apk >/dev/null 2>&1
-        apktool d -f --no-src --no-debug-info -o comparison/built-decoded built/*.apk >/dev/null 2>&1
-        diff -r comparison/official-decoded/res comparison/built-decoded/res \
-            > comparison/diff_resources_decoded.txt 2>&1 || true' || true
-
-    local decoded="${WORK_DIR}/comparison/diff_resources_decoded.txt"
-    if [[ ! -s "$decoded" ]]; then
-        ARSC_NOTE="resources.arsc differs in binary form but the decoded res/ trees are identical."
-        log_info "${ARSC_NOTE}"
-        return 0
-    fi
-
-    local residual
-    residual=$(grep -E '^[<>]' "$decoded" 2>/dev/null \
-        | grep -v 'com.google.firebase.crashlytics.mapping_file_id' | grep -c '^' || true)
-    if [[ "${residual:-0}" -eq 0 ]]; then
-        ARSC_NOTE="Decoded res/ differs only in the Crashlytics mapping_file_id, an accepted build-time ID."
-        log_info "${ARSC_NOTE}"
-        return 0
-    fi
-    ARSC_NOTE="Decoded res/ trees differ in ${residual} lines; the resources.arsc difference is semantic."
-    log_warn "${ARSC_NOTE}"
-    return 1
-}
-
+# Per-split comparison. Leo's rule (2025-10-30): filter root-level META-INF only,
+# nothing else. Play's SourceStamp, manifest meta-data and resources.arsc all
+# count towards the mechanical verdict; a human categorises them in the report.
 compare() {
     log_info "=== COMPARISON PHASE ==="
-    local built_name
-    built_name="$(basename "$BUILT_APK")"
+    local aggregate="${WORK_DIR}/comparison/diff_all.txt"
+    : > "$aggregate"
+    DIFF_COUNT=0
 
-    ws_run "set -e
-        rm -rf comparison/official-unzipped comparison/built-unzipped
-        mkdir -p comparison/official-unzipped comparison/built-unzipped
-        unzip -qo official/official.apk -d comparison/official-unzipped
-        unzip -qo \"built/${built_name}\" -d comparison/built-unzipped
-        diff -r comparison/official-unzipped comparison/built-unzipped \
-            > comparison/diff_apk.txt 2>&1 || true"
+    local f name built_apk
+    for f in "${OFFICIAL_SPLITS[@]}"; do
+        name="$(basename "$f")"
+        built_apk="${WORK_DIR}/built/splits/${name}"
+        local tag="${name%.apk}"
+        tag="${tag#split_config.}"
 
-    local diff_file="${WORK_DIR}/comparison/diff_apk.txt"
-
-    # Filter only root-level signature material and the Play SourceStamp file.
-    # Leo's rule: root META-INF only, never META-INF anywhere in the tree.
-    local filtered="${WORK_DIR}/comparison/diff_filtered.txt"
-    grep -vE '^Only in [^:]+/(official|built)-unzipped: META-INF$|^Only in [^:]+/(official|built)-unzipped/META-INF:|^Files [^ ]+/(official|built)-unzipped/META-INF/|^Only in [^:]+/(official|built)-unzipped: stamp-cert-sha256$' \
-        "$diff_file" > "$filtered" 2>/dev/null || true
-    sed -i '/^$/d' "$filtered" 2>/dev/null || true
-
-    DIFF_COUNT=$(grep -c '^' "$filtered" 2>/dev/null || true)
-    DIFF_COUNT="${DIFF_COUNT:-0}"
-
-    local arsc_only=false
-    if [[ "$DIFF_COUNT" -gt 0 ]] && grep -q 'resources\.arsc' "$filtered"; then
-        local non_arsc
-        non_arsc=$(grep -vc 'resources\.arsc' "$filtered" 2>/dev/null || true)
-        [[ "${non_arsc:-0}" -eq 0 ]] && arsc_only=true
-        if assess_resources_arsc; then
-            if [[ "$arsc_only" == "true" ]]; then
-                log_pass "resources.arsc is the only difference and is non-semantic"
-                DIFF_COUNT=0
-            else
-                log_warn "resources.arsc is non-semantic, but other differences remain"
-            fi
+        if [[ ! -f "$built_apk" ]]; then
+            log_warn "Split present in official but not built: ${name}"
+            MISSING_NOTE="${MISSING_NOTE}Missing in built: ${name}. "
+            DIFF_COUNT=$((DIFF_COUNT + 1))
+            printf '=== %s ===\n(missing from the built APK set)\n\n' "$tag" >> "$aggregate"
+            continue
         fi
-    fi
 
-    log_info "Differences after excluding root META-INF/ and stamp-cert-sha256: ${DIFF_COUNT}"
+        ws_run "set -e
+            rm -rf comparison/official-unzipped/${tag} comparison/built-unzipped/${tag}
+            mkdir -p comparison/official-unzipped/${tag} comparison/built-unzipped/${tag}
+            unzip -qo official/${name} -d comparison/official-unzipped/${tag}
+            unzip -qo built/splits/${name} -d comparison/built-unzipped/${tag}
+            diff -qr comparison/official-unzipped/${tag} comparison/built-unzipped/${tag} \
+                > comparison/diff_${tag}.txt 2>&1 || true"
+
+        local brief="${WORK_DIR}/comparison/diff_${tag}.txt"
+        local filtered="${WORK_DIR}/comparison/filtered_${tag}.txt"
+        grep -vE '^Only in [^:]+/(official|built)-unzipped/[^/:]+: META-INF$|^Only in [^:]+/(official|built)-unzipped/[^/:]+/META-INF:|^Files [^ ]+/(official|built)-unzipped/[^/]+/META-INF/' \
+            "$brief" > "$filtered" 2>/dev/null || true
+        sed -i '/^$/d' "$filtered" 2>/dev/null || true
+
+        local cnt
+        cnt=$(grep -c '^' "$filtered" 2>/dev/null || true)
+        cnt="${cnt:-0}"
+        DIFF_COUNT=$((DIFF_COUNT + cnt))
+
+        printf '=== %s ===\n' "$tag" >> "$aggregate"
+        if [[ -s "$brief" ]]; then
+            cat "$brief" >> "$aggregate"
+        else
+            printf '(no differences)\n' >> "$aggregate"
+        fi
+        printf '\n' >> "$aggregate"
+
+        if [[ "$cnt" -eq 0 ]]; then
+            log_pass "${tag}: no differences outside root META-INF/"
+        else
+            log_warn "${tag}: ${cnt} differences outside root META-INF/"
+        fi
+    done
+
+    # A split the official set does not have is also a mismatch.
+    shopt -s nullglob
+    local b
+    for b in "${WORK_DIR}/built/splits"/*.apk; do
+        name="$(basename "$b")"
+        if [[ ! -f "${WORK_DIR}/official/${name}" ]]; then
+            log_warn "Split present in built but not official: ${name}"
+            MISSING_NOTE="${MISSING_NOTE}Extra in built: ${name}. "
+            DIFF_COUNT=$((DIFF_COUNT + 1))
+        fi
+    done
+    shopt -u nullglob
+
+    log_info "Total differences outside root META-INF/: ${DIFF_COUNT}"
 }
 
 print_results_block() {
     local verdict="$1"
-    local filtered="${WORK_DIR}/comparison/diff_filtered.txt"
+    local aggregate="${WORK_DIR}/comparison/diff_all.txt"
     echo ""
     echo "===== Begin Results ====="
     echo "appId:          ${APP_ID_FROM_APK:-$APP_ID}"
@@ -446,31 +597,42 @@ print_results_block() {
     echo "scriptVersion:  ${SCRIPT_VERSION}"
     echo "scriptHash:     ${SCRIPT_SHA256}"
     echo ""
-    echo "builtHash:      ${BUILT_HASH:-N/A}   (built APK, unsigned by design)"
+    echo "Official split hashes (as supplied):"
+    local f
+    for f in "${OFFICIAL_SPLITS[@]}"; do
+        echo "  $(basename "$f")  $(sha256_local "$f")"
+    done
+    echo ""
+    echo "Built split hashes:"
+    shopt -s nullglob
+    for f in "${WORK_DIR}/built/splits"/*.apk; do
+        echo "  $(basename "$f")  $(sha256_local "$f")"
+    done
+    shopt -u nullglob
     echo ""
     echo "Diff:"
-    if [[ -s "$filtered" ]]; then
-        local cnt
-        cnt=$(grep -c '^' "$filtered" 2>/dev/null || true)
-        head -5 "$filtered" || true
-        [[ "${cnt:-0}" -gt 5 ]] && \
-            echo "... (${cnt} lines; full diff: ${WORK_DIR}/comparison/diff_filtered.txt)"
+    if [[ -s "$aggregate" ]]; then
+        cat "$aggregate"
     else
-        echo "(no differences outside root META-INF/ and stamp-cert-sha256)"
+        echo "(no comparison performed)"
     fi
-    if [[ -n "$ARSC_NOTE" ]]; then
-        echo ""
-        echo "resources.arsc: ${ARSC_NOTE}"
-    fi
-    echo ""
     echo "Revision, tag (and its signature):"
     echo "Built from tag v${VERSION} at commit ${COMMIT_HASH}."
     echo "No git tag signature check is performed by this script."
+    if [[ -n "$MISSING_NOTE" ]]; then
+        echo ""
+        echo "===== Also ===="
+        echo "${MISSING_NOTE}"
+    fi
     echo ""
     echo "===== End Results ====="
+    echo ""
+    echo "Hash legend: appHash is base.apk exactly as supplied and is the value to"
+    echo "publish. The per-split hashes above are context and must never be published"
+    echo "as appHash. The built splits are unsigned; upstream declares no signingConfig."
     printf 'Run a full\ndiff --recursive %s/comparison/official-unzipped %s/comparison/built-unzipped\nmeld %s/comparison/official-unzipped %s/comparison/built-unzipped\nor\ndiffoscope "%s" "%s"\nfor more details.\n' \
         "${WORK_DIR}" "${WORK_DIR}" "${WORK_DIR}" "${WORK_DIR}" \
-        "${OFFICIAL_APK}" "${BUILT_APK}"
+        "${WORK_DIR}/official/base.apk" "${WORK_DIR}/built/splits/base.apk"
 }
 
 result() {
@@ -488,7 +650,7 @@ result() {
         log_warn "VERDICT: NOT REPRODUCIBLE (${DIFF_COUNT} differences)"
     fi
 
-    local notes="Build environment inlined from upstream reproducible-builds/Dockerfile: debian:bookworm-slim, JDK 17, Gradle 8.14, Android SDK 35, build-tools 35.0.0, NDK 27.2.12479018, built through disorderfs with sorted directory entries per docs/REPRODUCE_GITHUB.md. Universal release APK from the GitHub/F-Droid channel; the Play Store AAB path is not covered. The built APK is unsigned because upstream declares no signingConfig, so root-level META-INF/ and stamp-cert-sha256 are excluded from the comparison. ${ARSC_NOTE}"
+    local notes="Google Play AAB path. Build environment inlined from upstream reproducible-builds/Dockerfile: debian:bookworm-slim, JDK 17, Gradle 8.14, Android SDK 35, build-tools 35.0.0, NDK 27.2.12479018, built through disorderfs with sorted directory entries per docs/REPRODUCE_PLAYSTORE.md. Splits materialised with bundletool ${BUNDLETOOL_VERSION} against a device spec derived from the supplied Play splits, not from a connected device. Only root-level META-INF/ is excluded from the count, per Leo's 2025-10-30 rule; Play SourceStamp (stamp-cert-sha256), the three com.android.stamp/vending manifest meta-data entries and resources.arsc are expected on a Play comparison and are left for a human to categorise in the report. Built splits are unsigned because upstream declares no signingConfig. ${MISSING_NOTE}"
     generate_yaml "${yaml_verdict}" "${notes}"
     RESULT_DONE=true
     log_info "Generated COMPARISON_RESULTS.yaml"
