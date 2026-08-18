@@ -2,9 +2,10 @@
 # ==============================================================================
 # bitcoincore_build.sh - Bitcoin Core Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.5.0
-# Organization:  WalletScrutiny.com
-# Last Modified: 2026-07-18
+# Version:          v0.6.0
+# Organization:     WalletScrutiny.com
+# Last Modified:    2026-07-27
+# Last modified by: Danny Garcia
 # Project:       https://github.com/bitcoin/bitcoin
 # ==============================================================================
 # LICENSE: MIT License
@@ -51,7 +52,7 @@ sleep 2
 echo
 
 # Script metadata
-SCRIPT_VERSION="v0.5.0"
+SCRIPT_VERSION="v0.6.0"
 SCRIPT_NAME="bitcoincore_build.sh"
 APP_NAME="Bitcoin Core"
 APP_ID="bitcoincore"
@@ -802,6 +803,23 @@ fetch_guix_sigs_hashes() {
     echo "$result" | grep -E '^[a-f0-9]{64}$' || true
 }
 
+# Fetch the official SHA256SUMS entry for a single artifact from bitcoincore.org.
+# Bitcoin Core publishes checksums for the UNSIGNED Windows artifacts in the same
+# manifest as the Linux tarballs, so those builds can be compared against an
+# official published value instead of only against third-party attestations.
+fetch_official_sha256sums_hash() {
+    local version="$1"
+    local artifact="$2"
+    local sums_url="https://bitcoincore.org/bin/bitcoin-core-${version}/SHA256SUMS"
+    local result
+
+    result=$(${container_cmd} exec "$CONTAINER_NAME" bash -c "
+        curl -fsSL '${sums_url}' 2>/dev/null | awk -v f='${artifact}' '\$2==f {print \$1}'
+    " 2>/dev/null)
+
+    echo "$result" | grep -E '^[a-f0-9]{64}$' | head -n 1 || true
+}
+
 # Extract and verify checksums
 verify_checksums() {
     local version="$1"
@@ -909,17 +927,50 @@ verify_checksums() {
     if [[ "$use_guix_sigs" == "true" ]]; then
         if [[ -f "${built_dir}/${main_artifact}" ]]; then
             built_hash=$(sha256sum "${built_dir}/${main_artifact}" | awk '{print $1}')
+
+            log_info "Fetching official SHA256SUMS..."
+            official_sums_hash=$(fetch_official_sha256sums_hash "$clean_version" "$main_artifact") || official_sums_hash=""
+
             attestation_hashes=$(fetch_guix_sigs_hashes "$clean_version" "$main_artifact") || attestation_hashes=""
-            if [[ -n "$attestation_hashes" ]]; then
-                official_hash=$(echo "$attestation_hashes" | head -n 1)
-                if echo "$attestation_hashes" | grep -Fxq "$built_hash"; then
-                    generate_comparison_yaml "reproducible" "Artifact ${main_artifact}: built SHA256 ${built_hash} matches a guix.sigs attestation (no single official checksum exists for unsigned Windows artifacts)."
+            local sigs_note=""
+            if [[ -n "$attestation_hashes" ]] && echo "$attestation_hashes" | grep -Fxq "$built_hash"; then
+                sigs_note=" A guix.sigs attestation independently records the same hash."
+            elif [[ -n "$attestation_hashes" ]]; then
+                sigs_note=" Note: no guix.sigs attestation records this hash."
+            else
+                sigs_note=" No guix.sigs attestation was retrieved."
+            fi
+
+            if [[ -n "$official_sums_hash" ]]; then
+                # Primary comparison: Bitcoin Core's own published checksum manifest.
+                official_hash="$official_sums_hash"
+                log_success "Official SHA256SUMS entry found for ${main_artifact}"
+                if [[ "$built_hash" == "$official_hash" ]]; then
+                    generate_comparison_yaml "reproducible" "Artifact ${main_artifact}: built SHA256 ${built_hash} matches the official SHA256SUMS entry published at https://bitcoincore.org/bin/bitcoin-core-${clean_version}/SHA256SUMS.${sigs_note}"
                     match_count=$((match_count + 1))
                     verdict="reproducible"
                     log_success "Match: ${main_artifact}"
                     log_success "Hash: ${built_hash}"
                 else
-                    generate_comparison_yaml "not_reproducible" "Artifact ${main_artifact}: built SHA256 ${built_hash} does not match any guix.sigs attestation (attested example: ${official_hash})."
+                    generate_comparison_yaml "not_reproducible" "Artifact ${main_artifact}: built SHA256 ${built_hash} does not match the official SHA256SUMS entry ${official_hash}.${sigs_note}"
+                    diff_count=$((diff_count + 1))
+                    verdict="not_reproducible"
+                    log_warn "Difference: ${main_artifact}"
+                    log_warn "Built:    ${built_hash}"
+                    log_warn "Official: ${official_hash}"
+                fi
+            elif [[ -n "$attestation_hashes" ]]; then
+                # Fallback: no official manifest entry, compare against attestations only.
+                log_warn "No official SHA256SUMS entry for ${main_artifact}; falling back to guix.sigs attestations"
+                official_hash=$(echo "$attestation_hashes" | head -n 1)
+                if echo "$attestation_hashes" | grep -Fxq "$built_hash"; then
+                    generate_comparison_yaml "reproducible" "Artifact ${main_artifact}: built SHA256 ${built_hash} matches a guix.sigs attestation. No official SHA256SUMS entry was found for this artifact, so this rests on attestation evidence only: the attestor is not identified, the number of agreeing attestors is not recorded, and no signature over the attestation was verified."
+                    match_count=$((match_count + 1))
+                    verdict="reproducible"
+                    log_success "Match: ${main_artifact}"
+                    log_success "Hash: ${built_hash}"
+                else
+                    generate_comparison_yaml "not_reproducible" "Artifact ${main_artifact}: built SHA256 ${built_hash} does not match any guix.sigs attestation (attested example: ${official_hash}), and no official SHA256SUMS entry was found."
                     diff_count=$((diff_count + 1))
                     verdict="not_reproducible"
                     log_warn "Difference: ${main_artifact}"
@@ -930,7 +981,7 @@ verify_checksums() {
                 generate_error_yaml "not_reproducible"
                 diff_count=$((diff_count + 1))
                 verdict="not_reproducible"
-                log_warn "No guix.sigs attestation found - manual verification required"
+                log_warn "Neither an official SHA256SUMS entry nor a guix.sigs attestation found - manual verification required"
                 log_info "Built hash: ${built_hash}"
             fi
         else
