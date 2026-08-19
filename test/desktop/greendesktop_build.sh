@@ -2,34 +2,45 @@
 #
 # greendesktop_build.sh - Blockstream Green Desktop (green_qt) Reproducible Build Verifier
 #
-# Version: v0.2.2
+# Version: v0.3.0
 #
 # Description:
 #   Reproducible build verification for Blockstream Green Desktop Linux AppImage.
 #   Builds green_qt and its full native dependency chain (GDK, LWK, GLSDK,
-#   breakpad, crashpad, countly, zxing, hidapi, libusb, kdsingleapplication,
+#   sentry-native/crashpad, countly, zxing, hidapi, libusb, kdsingleapplication,
 #   libserialport, gpgme, leveldb) from source inside a single container image,
-#   packages with pinned AppImage tools, and compares the extracted squashfs
-#   payload against the official release AppImage file-by-file.
+#   packages via upstream's own tools/appimage.sh, and compares the extracted
+#   squashfs payload against the official release AppImage file-by-file.
 #
 #   Qt 6.11.0 is fetched as the official prebuilt via aqtinstall (token-free;
 #   binary-equivalence to the official online-installer Qt was confirmed by
 #   hash comparison during the 3.4.0 investigation). NOTE: upstream bumped Qt
-#   to 6.11.1 for Windows/macOS CI in the 3.4.1 release, but left the Linux
-#   x86_64 Dockerfile (ci/linux-x86_64/Dockerfile) pinned at 6.11.0 — verified
-#   by diffing the release_3.4.0..release_3.4.1 tags. Do not bump this to
-#   6.11.1 without re-checking that Dockerfile at the target release tag.
+#   to 6.11.1 for Windows/macOS CI in the 3.4.1 release and has kept the Linux
+#   x86_64 Dockerfile (ci/linux-x86_64/Dockerfile) at 6.11.0 through 3.5.0 —
+#   verified by diffing release_3.4.0..3.4.1 and release_3.4.1..3.5.0. The
+#   6.11.1 PATH in ci/linux-x86_64.yml points at a directory that does not
+#   exist in the image and is silently skipped. Do not bump this without
+#   re-checking that specific Dockerfile at the target release tag.
+#
+#   From 3.5.0 the build mirrors upstream CI more closely: it drives
+#   tools/ci/build.sh (qt-cmake --preset ci, --parallel 4) and packages with
+#   tools/appimage.sh --plugin-qt, both taken from the pinned checkout. The
+#   AppImage packaging tools are pinned and SHA256-checked by upstream's own
+#   ci/linux-x86_64/download-appimage-binaries.sh, so this script no longer
+#   carries its own pins.
 #
 #   Known upstream limitations (documented, not worked around):
 #   - liblwk.so release builds are nondeterministic upstream
 #     (https://github.com/Blockstream/lwk/issues/165)
 #   - libglsdk.so (Greenlight SDK, added in 3.4.1) is a Rust cdylib; assumed
 #     nondeterministic until upstream confirms otherwise (same pattern as liblwk)
-#   - Official CI embeds checkout-time QML mtimes and an OpenSSL build
-#     timestamp, and uses unpinned 'continuous' AppImage tools
-#     (https://github.com/Blockstream/green_qt/issues/187)
-#   A not_reproducible verdict is therefore expected until upstream changes
-#   land; the diff files this script produces are the evidence for human review.
+#   - https://github.com/Blockstream/green_qt/issues/187 reported checkout-time
+#     QML mtimes, an OpenSSL build timestamp, and unpinned 'continuous' AppImage
+#     tools. As of 3.5.0 upstream has addressed the mtimes (SOURCE_DATE_EPOCH +
+#     git ls-files touch, replicated below) and the tool pinning (SHA256 checks).
+#     The OpenSSL timestamp is unconfirmed either way at 3.5.0 — check the diff.
+#   A not_reproducible verdict is still expected while lwk#165 is open; the diff
+#   files this script produces are the evidence for human review.
 #
 # Usage:
 #   greendesktop_build.sh --version VERSION [--arch x86_64-linux-gnu] [--type appimage]
@@ -43,7 +54,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.2.2"
+SCRIPT_VERSION="v0.3.0"
 APP_ID="blockstreamgreen"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -56,14 +67,13 @@ APPIMAGE_NAME="Blockstream-x86_64.AppImage"
 SUPPORTED_ARCH="x86_64-linux-gnu"
 SUPPORTED_TYPE="appimage"
 
-# Pinned AppImage packaging tools (closest versioned releases to the 3.4.0 CI
-# image date 2026-06-01; upstream CI itself uses unpinned 'continuous' tags).
-LINUXDEPLOY_URL="https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage"
-LINUXDEPLOY_SHA="c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d"
-PLUGINQT_URL="https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/1-alpha-20250213-1/linuxdeploy-plugin-qt-x86_64.AppImage"
-PLUGINQT_SHA="15106be885c1c48a021198e7e1e9a48ce9d02a86dd0a1848f00bdbf3c1c92724"
-APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
-APPIMAGETOOL_SHA="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+# AppImage packaging tools are pinned and SHA256-verified by upstream's own
+# ci/linux-x86_64/download-appimage-binaries.sh, run in the final image stage
+# and taken from the pinned checkout. This script carries no pins of its own.
+# NOTE: upstream fetches those tools from the rolling 'continuous' release tag
+# and verifies recorded hashes. If the continuous assets are rebuilt upstream,
+# that hash check fails and the image build FTBFSes — which is the correct,
+# loud failure. Hashes recorded at release_3.5.0 were confirmed live 2026-08-19.
 
 APP_VERSION=""
 APP_ARCH="${SUPPORTED_ARCH}"
@@ -291,19 +301,15 @@ FROM base AS libserialport
 COPY --from=src /green_qt/tools/buildlibserialport.sh tools/
 RUN tools/buildlibserialport.sh --disable-shared
 
-FROM base AS crashpad
+FROM base AS sentry
 COPY --from=gdk /build/gdk/build-gcc/external_deps/ /depends/linux-x86_64/
 ENV OPENSSL_ROOT_DIR=$PREFIX
 COPY --from=src /green_qt/tools/buildlibcurl.sh tools/
 RUN tools/buildlibcurl.sh
 ENV CMAKE_PREFIX_PATH=$PREFIX
-COPY --from=src /green_qt/tools/buildcrashpad.sh tools/
-RUN tools/buildcrashpad.sh
-
-FROM base AS breakpad
-COPY --from=src /green_qt/tools/buildbreakpad.sh tools/
-COPY --from=src /green_qt/tools/breakpad.patch tools/
-RUN tools/buildbreakpad.sh
+COPY --from=src /green_qt/tools/patches/ tools/patches/
+COPY --from=src /green_qt/tools/buildsentry.sh tools/
+RUN tools/buildsentry.sh
 
 FROM base AS gpgme
 COPY --from=src /green_qt/tools/buildgpgme.sh tools/
@@ -328,14 +334,17 @@ COPY --from=zxing /depends /depends
 COPY --from=gdk /depends /depends
 COPY --from=kdsa /depends /depends
 COPY --from=libserialport /depends /depends
-COPY --from=crashpad /depends /depends
-COPY --from=breakpad /depends /depends
+COPY --from=sentry /depends /depends
 COPY --from=gpgme /depends /depends
 COPY --from=leveldb /depends /depends
 COPY --from=lwk /depends /depends
 COPY --from=glsdk /depends /depends
 COPY --from=src /green_qt /green_qt
 COPY --from=src /green_qt_commit.txt /green_qt_commit.txt
+# Upstream's own pinned + SHA256-checked AppImage tools; tools/appimage.sh
+# expects them at image root (it does `cp /linuxdeploy-x86_64.AppImage .`).
+COPY --from=src /green_qt/ci/linux-x86_64/download-appimage-binaries.sh .
+RUN ./download-appimage-binaries.sh
 COPY inner_build.sh /usr/local/bin/inner_build.sh
 RUN chmod +x /usr/local/bin/inner_build.sh
 DOCKERFILE_EOF
@@ -349,10 +358,11 @@ DOCKERFILE_EOF
 write_inner_script() {
     cat > "${WORK_DIR}/inner_build.sh" <<'INNER_EOF'
 #!/bin/bash
-# Runs inside the build image. Inputs (env): GREEN_VERSION, LINUXDEPLOY_URL/SHA,
-# PLUGINQT_URL/SHA, APPIMAGETOOL_URL/SHA, GITHUB_TOKEN (optional).
+# Runs inside the build image. Inputs (env): GREEN_VERSION, GITHUB_TOKEN (optional).
 # /out must be mounted; if /out/official-<name> exists it is used (user-provided
 # --binary), otherwise the official AppImage is downloaded from GitHub releases.
+# AppImage packaging tools are already baked into the image at / by upstream's
+# ci/linux-x86_64/download-appimage-binaries.sh (pinned + SHA256-checked there).
 set -euo pipefail
 
 OUT=/out
@@ -380,20 +390,39 @@ else
     echo "[BUILD] Using provided official AppImage"
 fi
 
-# --- [2/6] extract official + SENTRY_KEY ---
+# --- [2/6] extract official + sentry DSN (key + project) ---
 rm -rf official-extracted squashfs-root
 chmod +x "official-${APPIMAGE_NAME}"
 "./official-${APPIMAGE_NAME}" --appimage-extract >/dev/null
 mv squashfs-root official-extracted
 bin_path="official-extracted/usr/bin/blockstream"
 [ -f "${bin_path}" ] || bin_path="$(find official-extracted -name blockstream -type f | head -1 || true)"
-SENTRY_KEY="$(strings "${bin_path}" 2>/dev/null | grep -o 'sentry_key=[^",) ]*' | head -1 | cut -d= -f2 || true)"
-if [ -n "${SENTRY_KEY}" ]; then
-    echo "[BUILD] SENTRY_KEY extracted from official binary"
-    SENTRY_FLAGS="-DENABLE_SENTRY=ON -DSENTRY_KEY=${SENTRY_KEY}"
+# From 3.5.0 the app needs BOTH SENTRY_KEY and SENTRY_PROJECT: cmake/AppOptions.cmake
+# FATAL_ERRORs if either is empty while ENABLE_SENTRY=ON. src/main.cpp builds the DSN
+# from three adjacent string literals, which the compiler folds into one constant:
+#   "https://" SENTRY_KEY "@sentry.blockstream.io/" SENTRY_PROJECT
+# so a single regex over `strings` recovers both.
+SENTRY_DSN="$(strings "${bin_path}" 2>/dev/null | grep -oE 'https://[0-9a-zA-Z]+@sentry\.blockstream\.io/[0-9A-Za-z._-]+' | head -1 || true)"
+SENTRY_KEY=""
+SENTRY_PROJECT=""
+if [ -n "${SENTRY_DSN}" ]; then
+    SENTRY_KEY="${SENTRY_DSN#https://}"; SENTRY_KEY="${SENTRY_KEY%%@*}"
+    SENTRY_PROJECT="${SENTRY_DSN##*/}"
+fi
+# Pre-3.5.0 fallback: older binaries carried a bare `sentry_key=` string.
+if [ -z "${SENTRY_KEY}" ]; then
+    SENTRY_KEY="$(strings "${bin_path}" 2>/dev/null | grep -o 'sentry_key=[^",) ]*' | head -1 | cut -d= -f2 || true)"
+fi
+if [ -n "${SENTRY_KEY}" ] && [ -n "${SENTRY_PROJECT}" ]; then
+    echo "[BUILD] SENTRY_KEY + SENTRY_PROJECT extracted from official binary (project=${SENTRY_PROJECT})"
+    export ENABLE_SENTRY_BUILD=1
+elif [ -n "${SENTRY_KEY}" ]; then
+    echo "[BUILD] WARNING: SENTRY_KEY found but SENTRY_PROJECT missing; cmake would FATAL_ERROR."
+    echo "[BUILD] WARNING: building ENABLE_SENTRY=OFF (will not match official)"
+    export ENABLE_SENTRY_BUILD=0
 else
-    echo "[BUILD] WARNING: SENTRY_KEY not found; building ENABLE_SENTRY=OFF (will not match official)"
-    SENTRY_FLAGS="-DENABLE_SENTRY=OFF"
+    echo "[BUILD] WARNING: no sentry DSN found; building ENABLE_SENTRY=OFF (will not match official)"
+    export ENABLE_SENTRY_BUILD=0
 fi
 
 # --- [3/6] clean clone + cmake build (release config from .gitlab-ci.yml) ---
@@ -414,34 +443,42 @@ echo "[BUILD] Source commit: ${actual_commit}"
 export CMAKE_PREFIX_PATH="${PREFIX}"
 export PATH="${PREFIX}/bin:${PATH}"
 
-qt-cmake -S . -B build \
-    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-    -DGREEN_ENV=Production \
-    -DGREEN_BUILD_ID='' \
-    -DGREEN_LOG_FILE='' \
-    ${SENTRY_FLAGS}
+# Upstream CI normalises all tracked file mtimes to the release commit timestamp
+# before building (ci/linux-x86_64.yml build-appimage job). This is upstream's fix
+# for the checkout-time QML mtimes reported in green_qt#187 — replicate it exactly
+# or the packaged QML will carry our clone times instead.
+SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+export SOURCE_DATE_EPOCH
+git ls-files -z | xargs -0 touch -d "@${SOURCE_DATE_EPOCH}"
+echo "[BUILD] SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} ($(date -u -d "@${SOURCE_DATE_EPOCH}" '+%Y-%m-%dT%H:%M:%SZ'))"
 
-cmake --build build --parallel "$(nproc)"
+# Drive upstream's own build entrypoint rather than re-deriving its flags.
+# tools/ci/build.sh derives GREEN_ENV=Production and GREEN_BUILD_ID='' from a
+# release_* ref, then runs `qt-cmake --preset ci` + `cmake --build build --parallel 4`.
+# The ci preset reads GREEN_LOG_FILE from CI_COMMIT_BRANCH, which is empty on a tag
+# pipeline. --parallel 4 is upstream's value and is kept deliberately: job count is a
+# plausible codegen-ordering input, so it is matched rather than assumed harmless.
+export CI_COMMIT_REF_NAME="release_${GREEN_VERSION}"
+export CI_COMMIT_BRANCH=""
+export SENTRY_KEY SENTRY_PROJECT
+if [ "${ENABLE_SENTRY_BUILD}" = "1" ]; then
+    tools/ci/build.sh
+else
+    # Same preset, sentry forced off because the DSN could not be recovered.
+    export GREEN_ENV=Production
+    export GREEN_BUILD_ID=""
+    qt-cmake --preset ci -DENABLE_SENTRY=OFF
+    cmake --build build --parallel 4
+fi
 mv build/blockstream .
 
-# --- [4/6] AppImage packaging: pinned + SHA256-verified tools ---
-curl -sL "${AUTH_ARGS[@]}" -o linuxdeploy-x86_64.AppImage "${LINUXDEPLOY_URL}"
-curl -sL "${AUTH_ARGS[@]}" -o linuxdeploy-plugin-qt-x86_64.AppImage "${PLUGINQT_URL}"
-curl -sL "${AUTH_ARGS[@]}" -o appimagetool-x86_64.AppImage "${APPIMAGETOOL_URL}"
-sha256sum -c <<SUMS
-${LINUXDEPLOY_SHA}  linuxdeploy-x86_64.AppImage
-${PLUGINQT_SHA}  linuxdeploy-plugin-qt-x86_64.AppImage
-${APPIMAGETOOL_SHA}  appimagetool-x86_64.AppImage
-SUMS
-chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-qt-x86_64.AppImage appimagetool-x86_64.AppImage
-
-./linuxdeploy-x86_64.AppImage --desktop-file=/work/green_qt/blockstream.desktop \
-    --appdir=blockstream.AppDir --executable=blockstream \
-    --icon-file=/work/green_qt/assets/icons/linux_production.png
-export EXTRA_QT_MODULES="waylandcompositor"
-export EXTRA_PLATFORM_PLUGINS="libqwayland.so"
-env QML_SOURCES_PATHS=/work/green_qt/qml ./linuxdeploy-plugin-qt-x86_64.AppImage --appdir blockstream.AppDir
-./appimagetool-x86_64.AppImage --no-appstream blockstream.AppDir "${APPIMAGE_NAME}"
+# --- [4/6] AppImage packaging via upstream's own tools/appimage.sh ---
+# From 3.5.0 this also bundles crashpad_handler as a second --executable and copies
+# the shared libcurl next to it (crashpad's uploader dlopen()s libcurl.so.4, so it is
+# not a NEEDED dep and linuxdeploy will not pick it up by itself). Hand-rolling the
+# linuxdeploy invocation would silently omit both. The three packaging tools are
+# already at image root, pinned and SHA256-checked by upstream's downloader script.
+tools/appimage.sh --plugin-qt /work/green_qt
 cp "${APPIMAGE_NAME}" "${OUT}/built-${APPIMAGE_NAME}"
 
 # --- [5/6] extraction + comparison ---
@@ -508,12 +545,6 @@ main() {
     "${DOCKER_CMD}" run --rm \
         -v "${WORK_DIR}/out:/out" \
         -e GREEN_VERSION="${APP_VERSION}" \
-        -e LINUXDEPLOY_URL="${LINUXDEPLOY_URL}" \
-        -e LINUXDEPLOY_SHA="${LINUXDEPLOY_SHA}" \
-        -e PLUGINQT_URL="${PLUGINQT_URL}" \
-        -e PLUGINQT_SHA="${PLUGINQT_SHA}" \
-        -e APPIMAGETOOL_URL="${APPIMAGETOOL_URL}" \
-        -e APPIMAGETOOL_SHA="${APPIMAGETOOL_SHA}" \
         -e GITHUB_TOKEN="${GITHUB_TOKEN}" \
         "${IMAGE_TAG}" /usr/local/bin/inner_build.sh
 
@@ -553,9 +584,12 @@ main() {
 
     local notes="Payload compared file-by-file after --appimage-extract of both AppImages.
 Full diffs: diff-appimage-payload.txt, diff-appimage-metadata.txt in ${out}.
+Built with upstream's own tools/ci/build.sh and tools/appimage.sh from the pinned
+checkout, with SOURCE_DATE_EPOCH mtime normalisation as upstream CI does it.
 Known upstream nondeterminism: liblwk (Blockstream/lwk#165); libglsdk (Rust cdylib,
-added in 3.4.1, assumed nondeterministic until upstream confirms otherwise); CI
-timestamps and unpinned AppImage tools (Blockstream/green_qt#187)."
+added in 3.4.1, assumed nondeterministic until upstream confirms otherwise). As of
+3.5.0 upstream fixed the QML mtimes and pinned the AppImage tools it was asked about
+in Blockstream/green_qt#187; the OpenSSL build timestamp from that issue is unconfirmed."
     write_yaml "${verdict}" "${notes}"
     cleanup_image
 
