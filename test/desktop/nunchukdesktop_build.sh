@@ -2,7 +2,7 @@
 #
 # nunchukdesktop_build.sh - Nunchuk Desktop Reproducible Build Verifier
 #
-# Version: v0.1.8
+# Version: v0.1.9
 #
 # Description:
 #   Reproducible build verification for Nunchuk Desktop (Linux x86_64 AppImage).
@@ -10,19 +10,18 @@
 #   the upstream reproducible_linux.yml execution model, then compares the built
 #   AppImage against the official release at the extracted-squashfs level.
 #
-#   Upstream embeds three OAuth values at compile time, and its workflow does not
-#   publish the Actions artifact as the GitHub release asset. These limitations are
-#   reported as context when substantive extracted-content differences are found.
+#   Upstream embeds three OAuth values at compile time, and its workflow does not publish the
+#   Actions artifact as the GitHub release asset. Both are reported as context when
+#   substantive extracted-content differences are found.
 #
-#   Whole-AppImage hashes will always differ because appimagetool embeds wall-clock
-#   time in the squashfs superblock and no SOURCE_DATE_EPOCH is set upstream.
-#   Comparison is therefore done by extracting both AppImages with unsquashfs and
-#   running diff -r on the resulting directory trees.
+#   Whole-AppImage hashes always differ: appimagetool embeds wall-clock time in the squashfs
+#   superblock and upstream sets no SOURCE_DATE_EPOCH. Comparison is therefore done by
+#   extracting both AppImages with unsquashfs and running diff -r on the trees.
 #
-#   The distributed artifact is a ZIP wrapping the AppImage, so two different hashes are
-#   meaningful. appHash is the artifact EXACTLY AS DOWNLOADED (the ZIP) per
-#   verification-result-summary-format.md; the AppImage's own hash is printed alongside it
-#   as the payload that was compared. See the hash legend printed before the results block.
+#   The distributed artifact is a ZIP wrapping the AppImage, so two hashes are meaningful.
+#   appHash is the artifact EXACTLY AS DOWNLOADED (the ZIP) per
+#   verification-result-summary-format.md; the AppImage's own hash is printed alongside it as
+#   the payload compared. See the hash legend printed before the results block.
 #
 #   Provenance is checked in-script: the SHA256SUMS signature is verified against a PINNED
 #   release-key fingerprint, and the measured digest cross-checked against that signed
@@ -46,7 +45,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.8"
+SCRIPT_VERSION="v0.1.9"
 APP_ID="nunchuk"
 APP_NAME="Nunchuk Desktop"
 GH_REPO="nunchuk-io/nunchuk-desktop"
@@ -801,10 +800,14 @@ compare_appimages() {
         die_build "diff -rq failed with exit code $brief_exit"
     fi
 
-    local differing_files official_only built_only
+    local differing_files official_only built_only path_diffs
     differing_files="$(grep -c '^Files ' "$brief_diff_file" || true)"
     official_only="$(grep -F -c "Only in ${official_dir}" "$brief_diff_file" || true)"
     built_only="$(grep -F -c "Only in ${built_dir}" "$brief_diff_file" || true)"
+    # Headline figure = differing PATHS, from `diff -rq`. Through v0.1.8 it was `wc -l` of the full
+    # `diff -r`, which also counts CONTENT lines of differing TEXT files: v2.6.5 reported "199 diff
+    # lines" for 157 paths, and that inflated figure reached the published notes.
+    path_diffs=$(( differing_files + official_only + built_only ))
 
     local context_note=""
     if [[ "$brief_exit" -eq 1 ]]; then
@@ -812,24 +815,15 @@ compare_appimages() {
         {
             echo "WHY NOT REPRODUCIBLE"
             echo "Reason: the extracted official and rebuilt AppImages contain substantive differences."
-            printf 'Differing files: %s; official-only entries: %s; rebuilt-only entries: %s\n' \
-                "$differing_files" "$official_only" "$built_only"
+            printf 'Differing paths: %s (differing files: %s; official-only: %s; rebuilt-only: %s)\n' \
+                "$path_diffs" "$differing_files" "$official_only" "$built_only"
             echo "AppImage size delta: ${size_delta} bytes"
             echo "Context: $context_note"
             echo ""
-            echo "Differing executables:"
-            grep -E '^Files .*/bin/' "$brief_diff_file" | sed "s#${WORK_DIR}/##g" || echo "(none)"
-            echo ""
-            echo "Differing shared libraries:"
-            grep -E '^Files .*/lib/' "$brief_diff_file" | sed "s#${WORK_DIR}/##g" || echo "(none)"
-            echo ""
-            echo "Official-only entries:"
-            grep -F "Only in ${official_dir}" "$brief_diff_file" | sed "s#${WORK_DIR}/##g" || echo "(none)"
-            echo ""
-            echo "Rebuilt-only entries:"
-            grep -F "Only in ${built_dir}" "$brief_diff_file" | sed "s#${WORK_DIR}/##g" || echo "(none)"
-            echo ""
-            echo "All brief differences:"
+            # One complete list rather than per-directory greps: the old `/bin/` and `/lib/`
+            # sections silently omitted root-level entries, which is where v2.6.5's AppRun and
+            # nunchuk.desktop differences appeared.
+            echo "All differing paths:"
             sed "s#${WORK_DIR}/##g" "$brief_diff_file"
         } > "$reason_file"
         log_info "Reason summary: $reason_file"
@@ -851,7 +845,7 @@ compare_appimages() {
     else
         head -5 "$diff_file"
         if [[ "$total_lines" -gt 5 ]]; then
-            echo "... ($total_lines lines total)"
+            echo "... (${total_lines} lines of full diff output; ${path_diffs} differing paths)"
         fi
     fi
     echo ""
@@ -869,10 +863,10 @@ compare_appimages() {
     else
         local context_note
         context_note="$(comparison_context_note)"
-        log_warn "Squashfs contents DIFFER ($total_lines diff lines; size delta $size_delta bytes)"
+        log_warn "Squashfs contents DIFFER (${path_diffs} differing paths; size delta $size_delta bytes)"
         log_warn "$context_note"
         write_yaml "not_reproducible" \
-            "Substantive squashfs differences found: ${total_lines} diff lines; AppImage size delta: ${size_delta} bytes. ${context_note} See diff_squashfs.txt."
+            "Substantive squashfs differences found: ${path_diffs} differing paths (${differing_files} files differ, ${official_only} only in the official artifact, ${built_only} only in the rebuild); AppImage size delta: ${size_delta} bytes. ${context_note}"
         return 1
     fi
 }
@@ -905,9 +899,9 @@ print_hash_legend() {
     echo "                   sha256sum on the file they downloaded."
     echo "  appImageHash     sha256 of the AppImage extracted from that artifact: the payload the"
     echo "                   comparison ran against. DO NOT publish it."
-    echo "  builtAppImageHash sha256 of our rebuilt AppImage. For the record only — it is never"
-    echo "                   expected to match, because appimagetool embeds wall-clock time in the"
-    echo "                   squashfs superblock and upstream sets no SOURCE_DATE_EPOCH."
+    echo "  builtAppImageHash sha256 of our rebuilt AppImage. For the record only — never expected"
+    echo "                   to match: appimagetool embeds wall-clock time in the squashfs"
+    echo "                   superblock and upstream sets no SOURCE_DATE_EPOCH."
     echo "  scriptHash       sha256 of this script, identifying which tooling produced these results."
 }
 
