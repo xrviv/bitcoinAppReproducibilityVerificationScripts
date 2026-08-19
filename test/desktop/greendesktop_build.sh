@@ -2,7 +2,7 @@
 #
 # greendesktop_build.sh - Blockstream Green Desktop (green_qt) Reproducible Build Verifier
 #
-# Version: v0.3.0
+# Version: v0.3.1
 #
 # Description:
 #   Reproducible build verification for Blockstream Green Desktop Linux AppImage.
@@ -32,8 +32,9 @@
 #   Known upstream limitations (documented, not worked around):
 #   - liblwk.so release builds are nondeterministic upstream
 #     (https://github.com/Blockstream/lwk/issues/165)
-#   - libglsdk.so (Greenlight SDK, added in 3.4.1) is a Rust cdylib; assumed
-#     nondeterministic until upstream confirms otherwise (same pattern as liblwk)
+#   (libglsdk.so, the Greenlight SDK Rust cdylib added in 3.4.1, was previously
+#   assumed nondeterministic by analogy with liblwk. That is retired: it reproduced
+#   byte-for-byte with an identical GNU Build ID at both 3.4.1 and 3.5.0.)
 #   - https://github.com/Blockstream/green_qt/issues/187 reported checkout-time
 #     QML mtimes, an OpenSSL build timestamp, and unpinned 'continuous' AppImage
 #     tools. As of 3.5.0 upstream has addressed the mtimes (SOURCE_DATE_EPOCH +
@@ -54,7 +55,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.3.0"
+SCRIPT_VERSION="v0.3.1"
 APP_ID="blockstreamgreen"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -271,10 +272,14 @@ ENV CMAKE_INSTALL_PREFIX=$PREFIX
 
 FROM base0 AS base
 # WS modification: aqtinstall fetches the same prebuilt Qt packages token-free.
+# qtshadertools is listed explicitly because aqtinstall does not resolve transitive
+# module dependencies, while upstream's online installer appears to pull it in on its
+# own: libQt6ShaderTools.so.6 was present in the official 3.4.0/3.4.1/3.5.0 AppImages
+# and absent from our rebuilds until v0.3.1.
 RUN python3 -m venv /aqt-venv && \
     /aqt-venv/bin/pip install --no-cache-dir aqtinstall==3.3.0 && \
     /aqt-venv/bin/aqt install-qt linux desktop 6.11.0 linux_gcc_64 --outputdir /qt \
-      -m qtwebengine qt5compat qtconnectivity qtmultimedia qtserialport qtpositioning qtwebview qtwebchannel
+      -m qtwebengine qt5compat qtconnectivity qtmultimedia qtserialport qtpositioning qtwebview qtwebchannel qtshadertools
 ENV PATH="/qt/6.11.0/gcc_64/bin/:$PATH"
 
 FROM base AS hidapi
@@ -586,10 +591,10 @@ main() {
 Full diffs: diff-appimage-payload.txt, diff-appimage-metadata.txt in ${out}.
 Built with upstream's own tools/ci/build.sh and tools/appimage.sh from the pinned
 checkout, with SOURCE_DATE_EPOCH mtime normalisation as upstream CI does it.
-Known upstream nondeterminism: liblwk (Blockstream/lwk#165); libglsdk (Rust cdylib,
-added in 3.4.1, assumed nondeterministic until upstream confirms otherwise). As of
-3.5.0 upstream fixed the QML mtimes and pinned the AppImage tools it was asked about
-in Blockstream/green_qt#187; the OpenSSL build timestamp from that issue is unconfirmed."
+Known upstream nondeterminism: liblwk (Blockstream/lwk#165). libglsdk reproduces
+byte-for-byte, verified at 3.4.1 and 3.5.0. As of 3.5.0 upstream resolved all three
+items raised in Blockstream/green_qt#187: QML mtimes, the OpenSSL build timestamp
+(both via SOURCE_DATE_EPOCH) and the unpinned AppImage packaging tools."
     write_yaml "${verdict}" "${notes}"
     cleanup_image
 
