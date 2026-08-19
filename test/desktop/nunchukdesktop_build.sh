@@ -2,7 +2,7 @@
 #
 # nunchukdesktop_build.sh - Nunchuk Desktop Reproducible Build Verifier
 #
-# Version: v0.1.7
+# Version: v0.1.8
 #
 # Description:
 #   Reproducible build verification for Nunchuk Desktop (Linux x86_64 AppImage).
@@ -24,6 +24,10 @@
 #   verification-result-summary-format.md; the AppImage's own hash is printed alongside it
 #   as the payload that was compared. See the hash legend printed before the results block.
 #
+#   Provenance is checked in-script: the SHA256SUMS signature is verified against a PINNED
+#   release-key fingerprint, and the measured digest cross-checked against that signed
+#   manifest. Both are verdict-neutral.
+#
 # Usage:
 #   nunchukdesktop_build.sh --version VERSION [--arch ARCH] [--type TYPE] [--binary FILE]
 #
@@ -42,7 +46,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.7"
+SCRIPT_VERSION="v0.1.8"
 APP_ID="nunchuk"
 APP_NAME="Nunchuk Desktop"
 GH_REPO="nunchuk-io/nunchuk-desktop"
@@ -61,6 +65,19 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256=""
 MISSING_OAUTH_INPUTS=""
+
+# Release-manifest signature verification. The fingerprint is PINNED: a good signature from some
+# other key is not a pass. Authority for this fingerprint is upstream's own nunchuk-io/docs
+# repository, so it establishes continuity of control, not identity — see the report limitation.
+NUNCHUK_RELEASE_KEY_FPR="8C8ECD3F660CA53CD878792A6E38A462ED2EF525"
+SIG_MANIFEST_STATUS="[WARNING] Manifest signature not checked"
+SIG_DIGEST_STATUS="[WARNING] Digest not checked against a signed manifest"
+SIG_KEY_USED=""
+SIG_TAG_TYPE="unknown"
+RESOLVED_COMMIT="unknown"
+SIG_TAG_STATUS="[WARNING] Tag signature not checked by this script"
+SIG_WARNINGS=""
+PROVENANCE_FATAL=""
 
 # Artifact identity. OFFICIAL_ARTIFACT_* describes the file exactly as distributed (the release
 # ZIP, or whatever --binary pointed at); OFFICIAL_APPIMAGE_SHA256 is the payload actually compared.
@@ -89,6 +106,19 @@ die_invalid() {
 die_build() {
     log_error "$1"
     write_yaml "ftbfs" "$1"
+    exit "${EXIT_DIFF}"
+}
+
+# The manifest carries a good signature from the pinned key, and the artifact we downloaded is NOT
+# the one it covers. No verdict about that file could be honest, and no allowed verdict means "could
+# not validly check" — so emit NO COMPARISON_RESULTS.yaml and REMOVE any stale one. ABS treats a
+# missing/verdict-less YAML as publish-nothing (verifications.mjs:873-877) and searches recursively,
+# so a leftover from an earlier run would otherwise be published in this run's name.
+die_provenance() {
+    log_error "PROVENANCE FAILURE: $1"
+    log_error "No verdict is emitted: the artifact compared is not the file upstream signed."
+    rm -f "${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
+    log_info "COMPARISON_RESULTS.yaml removed; nothing will be published for this run."
     exit "${EXIT_DIFF}"
 }
 
@@ -322,6 +352,184 @@ setup_workdir() {
     WORK_DIR="/tmp/nunchuk_${suffix}"
     mkdir -p "$WORK_DIR"
     log_info "Work directory: $WORK_DIR"
+}
+
+add_sig_warning() {
+    SIG_WARNINGS="${SIG_WARNINGS}
+- $1"
+}
+
+# A provenance check that could not be performed. Never fatal.
+sig_skip() {
+    SIG_MANIFEST_STATUS="[WARNING] $1"
+    add_sig_warning "$2"
+    log_warn "$1 (verdict unaffected)"
+}
+
+# Verify the release manifest signature, then cross-check the measured digest against the manifest
+# that signature covers: a good signature alone does not say we compared the signed file. A failure
+# here is fatal only when the signature is good AND the file disagrees (see die_provenance);
+# everything else is advisory. Rationale: changelog v0.1.8.
+verify_official_signature() {
+    local sums_url="https://github.com/${GH_REPO}/releases/download/${APP_VERSION}/SHA256SUMS"
+    local sums="${WORK_DIR}/SHA256SUMS"
+    local asc="${WORK_DIR}/SHA256SUMS.asc"
+
+    echo ""
+    log_info "Verifying release manifest signature..."
+
+    if ! command -v gpg >/dev/null 2>&1; then
+        sig_skip "gpg not installed; manifest signature not verified" \
+                 "gpg is not installed here, so the manifest signature was not checked."
+        return 0
+    fi
+
+    local dl=(wget -q ${GITHUB_TOKEN:+--header="Authorization: token ${GITHUB_TOKEN}"})
+    if ! "${dl[@]}" -O "$sums" "$sums_url" 2>/dev/null; then
+        sig_skip "SHA256SUMS not published for ${APP_VERSION}" \
+                 "No SHA256SUMS asset was retrievable for ${APP_VERSION}."
+        return 0
+    fi
+    if ! "${dl[@]}" -O "$asc" "${sums_url}.asc" 2>/dev/null; then
+        sig_skip "SHA256SUMS.asc not published for ${APP_VERSION}" \
+                 "SHA256SUMS was published but SHA256SUMS.asc was not; the manifest is unsigned as far as this run established."
+        check_digest_against_manifest "$sums" "unsigned"
+        return 0
+    fi
+
+    # Throwaway keyring: a locally trusted key must not silently make this pass.
+    local gnupg_home="${WORK_DIR}/gnupg"
+    mkdir -p "$gnupg_home"; chmod 700 "$gnupg_home"
+
+    # Plain HTTPS, not `gpg --recv-keys`: the latter needs dirmngr, which fails on hosts allowing
+    # ordinary HTTPS but not dirmngr's own network path.
+    # Not keys.openpgp.org: it serves this key with user IDs stripped; gpg skips such a key.
+    local imported=false
+    local keyfile="${WORK_DIR}/release-key.asc"
+    local src="https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x${NUNCHUK_RELEASE_KEY_FPR}"
+    if timeout 60 wget -qO "$keyfile" "$src" 2>/dev/null \
+            && grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$keyfile" 2>/dev/null \
+            && GNUPGHOME="$gnupg_home" gpg --batch --quiet --import "$keyfile" >/dev/null 2>&1 \
+            && GNUPGHOME="$gnupg_home" gpg --batch --with-colons --fingerprint 2>/dev/null \
+                 | grep -q "^fpr:::::::::${NUNCHUK_RELEASE_KEY_FPR}:"; then
+        # The fingerprint check confirms the pinned key actually landed: a lookup service returning
+        # some other key must not silently become trusted.
+        imported=true
+        log_ok "Release key ${NUNCHUK_RELEASE_KEY_FPR} imported"
+    fi
+    if [[ "$imported" != true ]]; then
+        sig_skip "Release key ${NUNCHUK_RELEASE_KEY_FPR} could not be retrieved" \
+                 "The pinned release key could not be fetched (offline or blocked); signature not verified."
+        check_digest_against_manifest "$sums" "unverified"
+        return 0
+    fi
+
+    # SHA256SUMS.asc is CLEARSIGNED (2.6.4/2.6.5): the digests it covers are INSIDE it; the
+    # separate SHA256SUMS is unsigned. Detached form still handled.
+    local gpg_out="" gpg_rc=0 sig_form="clearsigned"
+    local verified_manifest="${WORK_DIR}/SHA256SUMS.verified"
+
+    gpg_out="$(GNUPGHOME="$gnupg_home" gpg --batch --status-fd 1 --output "$verified_manifest" \
+                  --decrypt "$asc" 2>/dev/null)" || gpg_rc=$?
+    if ! grep -q "^\[GNUPG:\] \(GOODSIG\|BADSIG\|EXPKEYSIG\|REVKEYSIG\|ERRSIG\) " <<<"$gpg_out"; then
+        # Not clearsigned: retry as a detached signature over the separate manifest.
+        sig_form="detached"
+        gpg_rc=0
+        gpg_out="$(GNUPGHOME="$gnupg_home" gpg --batch --status-fd 1 \
+                      --verify "$asc" "$sums" 2>/dev/null)" || gpg_rc=$?
+        cp "$sums" "$verified_manifest" 2>/dev/null || true
+    fi
+
+    # GOODSIG alone accepts any imported key, so require VALIDSIG on the pinned fingerprint.
+    # VALIDSIG names the SIGNING key in field 3 and the PRIMARY last; matching only field 3 would
+    # falsely reject a legitimate signing subkey. Accept either, report what signed.
+    local sig_key="" pri_key="" vline
+    vline="$(grep -m1 "^\[GNUPG:\] VALIDSIG " <<<"$gpg_out" || true)"
+    if [[ -n "$vline" ]]; then
+        sig_key="$(awk '{print $3}' <<<"$vline")"
+        pri_key="$(awk '{print $NF}' <<<"$vline")"
+    fi
+
+    if [[ $gpg_rc -eq 0 ]] && grep -q "^\[GNUPG:\] GOODSIG " <<<"$gpg_out" \
+            && { [[ "$sig_key" == "$NUNCHUK_RELEASE_KEY_FPR" ]] || [[ "$pri_key" == "$NUNCHUK_RELEASE_KEY_FPR" ]]; }; then
+        SIG_MANIFEST_STATUS="[OK] Good ${sig_form} signature on SHA256SUMS from pinned key ${NUNCHUK_RELEASE_KEY_FPR}"
+        if [[ -n "$sig_key" && "$sig_key" != "$NUNCHUK_RELEASE_KEY_FPR" ]]; then
+            SIG_KEY_USED="Manifest signed with: subkey ${sig_key} of pinned primary ${NUNCHUK_RELEASE_KEY_FPR}"
+        else
+            SIG_KEY_USED="Manifest signed with: ${NUNCHUK_RELEASE_KEY_FPR}"
+        fi
+        log_ok "Good ${sig_form} signature on SHA256SUMS from the pinned release key"
+        check_digest_against_manifest "$verified_manifest" "signed"
+    elif grep -q "^\[GNUPG:\] GOODSIG " <<<"$gpg_out"; then
+        SIG_MANIFEST_STATUS="[WARNING] SHA256SUMS signed by ${sig_key:-an unexpected key}, not the pinned ${NUNCHUK_RELEASE_KEY_FPR}"
+        SIG_KEY_USED="Manifest signed with: ${sig_key:-unknown}"
+        add_sig_warning "The manifest is signed by a key other than the pinned fingerprint. Treat the key as rotated or the artifact as suspect until upstream confirms which."
+        log_warn "Manifest signed by an unexpected key: ${sig_key:-unknown}"
+        # Valid, just not OUR key — the payload it covers is still what to cross-check against.
+        check_digest_against_manifest "$verified_manifest" "unverified"
+    else
+        SIG_MANIFEST_STATUS="[WARNING] No valid signature on SHA256SUMS"
+        add_sig_warning "gpg reported no valid signature over the release manifest."
+        log_warn "No valid signature on SHA256SUMS"
+        check_digest_against_manifest "$sums" "unverified"
+    fi
+
+    # Any clearsigned run, whoever signed: flag a split between unsigned asset and signed payload.
+    if [[ "$sig_form" == "clearsigned" && -s "$verified_manifest" ]] \
+            && ! diff -q "$sums" "$verified_manifest" >/dev/null 2>&1; then
+        add_sig_warning "The unsigned SHA256SUMS asset does not match the signed payload in SHA256SUMS.asc; the signed payload was used."
+        log_warn "SHA256SUMS differs from the signed payload inside SHA256SUMS.asc"
+    fi
+}
+
+# Cross-check the measured digest against the manifest entry for our filename. $2 carries the
+# manifest's standing so the line never reads stronger than its backing, and gates PROVENANCE_FATAL.
+# Sets globals — capturing with $() would run add_sig_warning in a subshell and discard warnings.
+check_digest_against_manifest() {
+    local sums="$1" manifest_state="$2"
+    local want="${OFFICIAL_ARTIFACT_SHA256:-}" name="${OFFICIAL_ARTIFACT_NAME:-}"
+
+    if [[ -z "$want" || -z "$name" || ! -r "$sums" ]]; then
+        SIG_DIGEST_STATUS="[WARNING] No readable manifest, or no measured digest, to compare"
+        return 0
+    fi
+    # EXACT equality, never a regex: `$2 ~ "^[*]?" name "$"` treated the name as a pattern, so
+    # "nunchuk-linux-v2x6y5azip" matched "nunchuk-linux-v2.6.5.zip" and reported [OK]. Collecting
+    # ALL entries matters too — taking the first accepted a conflicting duplicate.
+    local matches count listed
+    matches="$(awk -v n="$name" '$2 == n || $2 == "*" n {print $1}' "$sums" 2>/dev/null || true)"
+    count="$(printf '%s\n' "$matches" | grep -c . || true)"
+
+    if [[ "${count:-0}" -eq 0 ]]; then
+        add_sig_warning "The manifest does not list ${name}; its digest was not cross-checked."
+        SIG_DIGEST_STATUS="[WARNING] ${name} is not listed in the manifest"
+        [[ "$manifest_state" == "signed" ]] && PROVENANCE_FATAL="the signed manifest does not list ${name}"
+        return 0
+    fi
+    if [[ "${count:-0}" -gt 1 ]]; then
+        add_sig_warning "The manifest lists ${name} ${count} times; ambiguous, treat as unverified."
+        SIG_DIGEST_STATUS="[WARNING] The manifest lists ${name} more than once"
+        [[ "$manifest_state" == "signed" ]] && PROVENANCE_FATAL="the signed manifest lists ${name} ${count} times"
+        return 0
+    fi
+    listed="$(printf '%s\n' "$matches" | head -1)"
+    if [[ ! "$listed" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        add_sig_warning "The manifest entry for ${name} is not a sha256 digest."
+        SIG_DIGEST_STATUS="[WARNING] Malformed manifest entry for ${name}"
+        return 0
+    fi
+
+    if [[ "${listed,,}" == "${want,,}" ]]; then
+        case "$manifest_state" in
+            signed)   SIG_DIGEST_STATUS="[OK] Measured digest of ${name} matches the signed manifest" ;;
+            unsigned) SIG_DIGEST_STATUS="[INFO] Measured digest of ${name} matches the manifest, but it is unsigned" ;;
+            *)        SIG_DIGEST_STATUS="[INFO] Measured digest of ${name} matches the manifest, signature unverified" ;;
+        esac
+    else
+        add_sig_warning "The artifact digest does NOT match the manifest entry for ${name}. Do not publish a verdict from this run."
+        SIG_DIGEST_STATUS="[WARNING] Measured digest of ${name} does NOT match the manifest entry"
+        [[ "$manifest_state" == "signed" ]] && PROVENANCE_FATAL="measured digest of ${name} does not match the signed manifest"
+    fi
 }
 
 prepare_official() {
@@ -671,12 +879,19 @@ compare_appimages() {
 
 # Resolve the git commit that tag APP_VERSION points at (dereferences annotated tags).
 # Network is already required for the build, so a remote lookup here is acceptable.
+# Resolves the tag to a commit AND classifies it, from one `git ls-remote`: an annotated tag answers
+# on both peeled (`^{}`) and unpeeled refs, a lightweight tag only once. Sets globals — a command
+# substitution would run this in a subshell and lose SIG_TAG_TYPE.
 resolve_commit() {
-    local ref
-    ref="$(git ls-remote "https://github.com/${GH_REPO}.git" \
-              "refs/tags/${APP_VERSION}^{}" "refs/tags/${APP_VERSION}" 2>/dev/null \
-              | awk 'END{print $1}')"
-    [[ "$ref" =~ ^[0-9a-f]{40}$ ]] && echo "$ref" || echo "unknown"
+    local out ref n
+    out="$(git ls-remote "https://github.com/${GH_REPO}.git" \
+              "refs/tags/${APP_VERSION}^{}" "refs/tags/${APP_VERSION}" 2>/dev/null || true)"
+    n="$(printf '%s\n' "$out" | grep -c . || true)"
+    ref="$(printf '%s\n' "$out" | awk 'END{print $1}')"
+    [[ "$ref" =~ ^[0-9a-f]{40}$ ]] && RESOLVED_COMMIT="$ref" || RESOLVED_COMMIT="unknown"
+    if [[ "${n:-0}" -ge 2 ]]; then SIG_TAG_TYPE="annotated"
+    elif [[ "${n:-0}" -eq 1 ]]; then SIG_TAG_TYPE="lightweight"
+    else SIG_TAG_TYPE="unknown"; fi
 }
 
 # Plain-language legend for the several meaningful hashes this app produces. Kept OUTSIDE the
@@ -688,13 +903,12 @@ print_hash_legend() {
     echo "  appHash          sha256 of ${OFFICIAL_ARTIFACT_NAME:-the official artifact} exactly as"
     echo "                   distributed. THIS is the hash to publish — a user reproduces it with"
     echo "                   sha256sum on the file they downloaded."
-    echo "  appImageHash     sha256 of the AppImage extracted from that artifact. This is the"
-    echo "                   payload the comparison actually ran against. DO NOT publish it."
-    echo "  builtAppImageHash sha256 of our rebuilt AppImage. Recorded for the record only; it is"
-    echo "                   never expected to match, because appimagetool embeds wall-clock time"
-    echo "                   in the squashfs superblock and upstream sets no SOURCE_DATE_EPOCH."
-    echo "  scriptHash       sha256 of this verification script, so a reader can confirm which"
-    echo "                   revision of the tooling produced these results."
+    echo "  appImageHash     sha256 of the AppImage extracted from that artifact: the payload the"
+    echo "                   comparison ran against. DO NOT publish it."
+    echo "  builtAppImageHash sha256 of our rebuilt AppImage. For the record only — it is never"
+    echo "                   expected to match, because appimagetool embeds wall-clock time in the"
+    echo "                   squashfs superblock and upstream sets no SOURCE_DATE_EPOCH."
+    echo "  scriptHash       sha256 of this script, identifying which tooling produced these results."
 }
 
 # Standardized WalletScrutiny verification summary (verification-result-summary-format.md).
@@ -708,7 +922,7 @@ emit_verification_summary() {
         ftbfs)            summary_verdict="" ;;
         *)                summary_verdict="$yaml_verdict" ;;
     esac
-    commit="$(resolve_commit)"
+    resolve_commit; commit="$RESOLVED_COMMIT"
 
     print_hash_legend
 
@@ -718,7 +932,7 @@ emit_verification_summary() {
     echo ""
     echo "===== Begin Results ====="
     echo "appId:          ${APP_ID}"
-    echo "signer:         N/A (unsigned AppImage)"
+    echo "signer:         N/A"
     echo "apkVersionName: ${APP_VERSION}"
     echo "apkVersionCode: N/A"
     echo "verdict:        ${summary_verdict}"
@@ -741,6 +955,29 @@ emit_verification_summary() {
     else
         echo "(no differences)"
     fi
+
+    # Section 4 of verification-result-summary-format.md. The meaningful signature here is over the
+    # release manifest, not the AppImage (unsigned), so the manifest line leads.
+    echo ""
+    echo "Revision, tag (and its signature):"
+    echo "tag:            ${APP_VERSION}"
+    echo "commit:         ${commit}"
+    echo ""
+    echo "Signature Summary:"
+    echo "Tag type: ${SIG_TAG_TYPE}"
+    echo "${SIG_MANIFEST_STATUS}"
+    echo "${SIG_DIGEST_STATUS}"
+    echo "${SIG_TAG_STATUS}"
+    echo "[WARNING] Commit signature not checked by this script"
+    echo ""
+    echo "Keys used:"
+    if [[ -n "$SIG_KEY_USED" ]]; then
+        echo "${SIG_KEY_USED}"
+    else
+        echo "None established"
+    fi
+    echo ""
+    printf 'Warnings:%s\n' "${SIG_WARNINGS:-}"
     echo ""
     echo "===== End Results ====="
 }
@@ -769,6 +1006,10 @@ main() {
     echo ""
 
     prepare_official
+    # Provenance checks run after the digest is measured and before the build, so a signature
+    # problem shows up early in the recording. Neither can change the verdict.
+    verify_official_signature
+    [[ -n "$PROVENANCE_FATAL" ]] && die_provenance "$PROVENANCE_FATAL"
     check_build_inputs
 
     local verdict_exit=0
