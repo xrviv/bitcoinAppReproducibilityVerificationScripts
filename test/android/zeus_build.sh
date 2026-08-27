@@ -2,9 +2,9 @@
 # ==============================================================================
 # zeus_build.sh - Zeus Lightning Wallet Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.13
+# Version:       v0.3.1
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-03-12
+# Last Modified: 2026-08-27
 # Project:       https://github.com/ZeusLN/zeus
 # ==============================================================================
 # LICENSE: MIT License
@@ -30,7 +30,10 @@
 # - Clones Zeus repository inside a container (no host git dependency)
 # - Builds using Zeus' official build.sh (Docker)
 # - Compares built APK against official release using unzip-based binary analysis and manifest/resource summaries
-# - Treats Google Play distribution artifacts (GOOGPLAY.* / stamp-cert-sha256 / derived.apk.id) as acceptable by default
+# - Treats Google Play distribution artifacts (root META-INF signing files / stamp-cert-sha256 /
+#   derived.apk.id) as acceptable by default. Signing files are matched by NAME, never by the
+#   META-INF/ path prefix: that directory also carries services/ bindings, version-control-info
+#   and androidx.*.version markers, which are app payload and are counted.
 # - Supports multiple architectures (universal, arm64-v8a, armeabi-v7a, x86, x86_64)
 # - Generates COMPARISON_RESULTS.yaml and standardized verification summary output
 
@@ -39,7 +42,7 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 # Constants
 # ------------------------------------------------------------------------------
-SCRIPT_VERSION="v0.2.13"
+SCRIPT_VERSION="v0.3.1"
 APP_ID="app.zeusln.zeus"
 REPO_URL="https://github.com/ZeusLN/zeus.git"
 WS_CONTAINER="docker.io/walletscrutiny/android:5"
@@ -53,6 +56,16 @@ EXIT_INVALID=2
 
 execution_dir="$(pwd)"
 script_name="$(basename "$0")"
+
+# --- Self-identification (script-notes/script-version-and-hash.md, 2026-08-17) ---
+# Hash THIS file before doing anything else, so a reader can tie a verdict to exact bytes.
+script_path="$(readlink -f "$0")"
+if [[ -f "${script_path}" ]]; then
+  script_sha256="$(sha256sum "${script_path}" | awk '{print $1}')"
+else
+  script_sha256="unknown"
+fi
+printf '%s %s sha256:%s\n' "${script_name}" "${SCRIPT_VERSION}" "${script_sha256}"
 
 should_cleanup=false
 downloaded_apk=""
@@ -757,8 +770,25 @@ diff_brief="$($CONTAINER_CMD run --rm \
   "$WS_CONTAINER" \
   sh -c "diff -qr '$(basename "${from_play_unzipped}")' '$(basename "${from_build_unzipped}")' || true")"
 
-# Filter META-INF differences (Leo's regex)
-filtered_diff="$(echo "${diff_brief}" | grep -vE '^Only in [^/:]+: META-INF$|^Only in [^/:]+/META-INF:|^Files [^/]+/META-INF/' || true)"
+# Filter root META-INF SIGNING files only, by NAME.
+# NEVER filter the META-INF/ directory as a whole: it also carries services/ ServiceLoader
+# bindings, version-control-info.textproto, com/android/build/gradle/app-metadata.properties
+# and ~88 androidx.*.version markers, all of which are application payload or build provenance
+# and must be counted. See ws-notes/script-notes/meta-inf-filter-scope.md (2026-08-27).
+# Two shapes to match, both anchored to a file DIRECTLY under root META-INF/:
+#   Only in <dir>/META-INF: CERT.SF        (exactly one path segment before META-INF:
+#   Files <dir>/META-INF/CERT.SF and <dir>/META-INF/CERT.SF differ
+#   a META-INF nested inside a bundled jar/aar is that artifact's content, and is counted)
+#
+# DIRECTION MATTERS. An "Only in" signing file is expected on the OFFICIAL side only: the local
+# build is unsigned. A signing-named file present only in OUR build means something signed it,
+# which is material and must never be filtered. So the "Only in" exclusion is anchored to the
+# official directory by name; the built directory is never exempted.
+SIGN_NAME='[^/]*(\.(SF|RSA|DSA|EC)|MANIFEST\.MF)'
+official_dir_re="$(basename "${from_play_unzipped}" | sed 's/[][\.^$*+?(){}|\/]/\\&/g')"
+filtered_diff="$(echo "${diff_brief}" \
+  | grep -vE "^Only in ${official_dir_re}/META-INF: ${SIGN_NAME}$" \
+  | grep -vE "^Files [^/ ]+/META-INF/${SIGN_NAME} and " || true)"
 filtered_diff_compact="$(echo "${filtered_diff}" | tr -d '\n\r')"
 if [[ -z "${diff_brief}" || -z "${filtered_diff_compact}" ]]; then
   diff_count=0
@@ -889,6 +919,8 @@ echo "apkVersionCode: ${version_code}"
 echo "verdict:        ${verdict}"
 echo "appHash:        ${app_hash}"
 echo "commit:         ${commit_hash}"
+echo "scriptVersion:  ${SCRIPT_VERSION}"
+echo "scriptHash:     ${script_sha256}"
 echo ""
 echo "Diff:"
 echo "${diff_display}"
