@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # sparrowdesktop_build.sh - Sparrow Desktop Reproducible Build Verifier
-# Version: v0.19.1
+# Version: v0.19.2
 #
 # Linux (tarball/deb/rpm) builds run containerized via Docker/Podman;
 # Windows (msi/zip) builds run via GitHub Actions.
@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.19.1"
+SCRIPT_VERSION="v0.19.2"
 
 GH_REPO="xrviv/WalletScrutinyCom"
 GH_WORKFLOW="sparrow-build.yml"
@@ -634,6 +634,22 @@ fi
 EXTRA_OK=true
 [[ "$EXTRA_MATCH" == "false" ]] && EXTRA_OK=false
 
+# Whole-artifact comparison: recorded, not gated on.
+ARCHIVE_MATCH="n/a"
+if [[ -f /built/ARCHIVE_SHA256 && -f /official/ARCHIVE_SHA256 ]]; then
+    ab=$(cat /built/ARCHIVE_SHA256); ao=$(cat /official/ARCHIVE_SHA256)
+    echo "Whole-artifact Comparison"
+    echo "------------------------------------------------------"
+    echo "  Built:    $ab"
+    echo "  Official: $ao"
+    if [[ "$ab" == "$ao" ]]; then
+        ARCHIVE_MATCH=true;  echo "  ✓ Archives are byte-identical"
+    else
+        ARCHIVE_MATCH=false; echo "  ⚠ Archives differ"
+    fi
+    echo ""
+fi
+
 if [[ "$CRITICAL_MATCH" == "true" ]] && [[ "$MODULES_MATCH" == "true" ]] && [[ "$FILE_COUNT_MATCH" == "true" ]] && [[ "$FILE_HASH_MATCH" == "true" ]] && [[ "$META_OK" == "true" ]] && [[ "$EXTRA_OK" == "true" ]]; then
     STATUS="reproducible"
     VERDICT="✅ REPRODUCIBLE"
@@ -656,17 +672,18 @@ script_version: ${SCRIPT_VERSION}
 verdict: ${STATUS}
 notes: |
   Built from source at tag ${SPARROW_VERSION} in Ubuntu 22.04 with Eclipse Temurin
-  JDK 25.0.2+10, via ./gradlew jpackage; the tarball type additionally runs
-  ./gradlew packageTarDistribution so the compared artifact is the tarball upstream
-  ships, not the pre-packaging jpackage tree. Verdict is a file-by-file comparison of extracted
-  contents, not of the outer archive. Built-only lib/runtime/legal/ modules are removed
-  before comparison. Phase 5 additionally compares install-time package metadata (deb:
-  control, preinst, postinst, prerm, postrm, debian-binary; rpm: PREIN/POSTIN/PREUN/
-  POSTUN scriptlets and interpreters). Symlinks are compared as links (target text),
-  not dereferenced. Built and official file sets are compared both ways. Not compared:
-  archive structure, file modes, ownership, timestamps. Payload outside the selected
-  application subtree is compared separately in Phase 6.
-  critical_binaries=${CRITICAL_MATCH} modules=${MODULES_MATCH} file_count=${FILE_COUNT_MATCH} file_hashes=${FILE_HASH_MATCH} package_metadata=${META_MATCH} out_of_subtree=${EXTRA_MATCH}
+  JDK 25.0.2+10 via ./gradlew jpackage; the tarball type also runs ./gradlew
+  packageTarDistribution, so the compared artifact is the tarball upstream ships, not
+  the pre-packaging jpackage tree. The verdict is computed from the file-by-file
+  comparison of extracted contents. Where both outer archives exist (tarball) they are
+  also hashed and compared, reported as archive_identical below and recorded rather
+  than gated on. Built-only lib/runtime/legal/ modules are removed before comparison.
+  Phase 5 also compares install-time package metadata (deb: control, preinst, postinst,
+  prerm, postrm, debian-binary; rpm: PREIN/POSTIN/PREUN/POSTUN scriptlets and
+  interpreters). Symlinks are compared as links (target text), not dereferenced. Built
+  and official file sets are compared both ways. Not compared: file modes, ownership,
+  timestamps, directory entries. Payload outside the application subtree is Phase 6.
+  critical_binaries=${CRITICAL_MATCH} modules=${MODULES_MATCH} file_count=${FILE_COUNT_MATCH} file_hashes=${FILE_HASH_MATCH} package_metadata=${META_MATCH} out_of_subtree=${EXTRA_MATCH} archive_identical=${ARCHIVE_MATCH}
 YAML_END
 
 echo "========================================================"
@@ -775,6 +792,7 @@ RUN mkdir -p /built && \
         cd build/jpackage && \
         (set -- *.tar.gz; [ $# -eq 1 ] || { echo "ERROR: $# tarballs"; exit 1; }; \
             echo "Built artifact SHA256:" && sha256sum "$1" && \
+            sha256sum "$1" | cut -d' ' -f1 > /built/ARCHIVE_SHA256 && \
             tar -xzf "$1" -C /built); \
     fi
 
@@ -830,6 +848,8 @@ RUN if [ "${BUILD_TYPE}" = "deb" ]; then \
         else \
             wget -q https://github.com/sparrowwallet/sparrow/releases/download/${SPARROW_VERSION}/sparrowwallet-${SPARROW_VERSION}-x86_64.tar.gz; \
         fi && \
+        sha256sum sparrowwallet-${SPARROW_VERSION}-x86_64.tar.gz \
+            | cut -d' ' -f1 > /official/ARCHIVE_SHA256 && \
         tar -xzf sparrowwallet-${SPARROW_VERSION}-x86_64.tar.gz; \
     fi
 
