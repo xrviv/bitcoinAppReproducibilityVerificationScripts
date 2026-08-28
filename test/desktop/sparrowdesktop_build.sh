@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # sparrowdesktop_build.sh - Sparrow Desktop Reproducible Build Verifier
-# Version: v0.18.7
+# Version: v0.19.1
 #
 # Linux (tarball/deb/rpm) builds run containerized via Docker/Podman;
 # Windows (msi/zip) builds run via GitHub Actions.
@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.19.0"
+SCRIPT_VERSION="v0.19.1"
 
 GH_REPO="xrviv/WalletScrutinyCom"
 GH_WORKFLOW="sparrow-build.yml"
