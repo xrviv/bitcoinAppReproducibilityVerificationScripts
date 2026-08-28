@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.18.7"
+SCRIPT_VERSION="v0.19.0"
 
 GH_REPO="xrviv/WalletScrutinyCom"
 GH_WORKFLOW="sparrow-build.yml"
@@ -655,8 +655,10 @@ cat > /output/COMPARISON_RESULTS.yaml << YAML_END
 script_version: ${SCRIPT_VERSION}
 verdict: ${STATUS}
 notes: |
-  Built from source at tag ${SPARROW_VERSION} via ./gradlew jpackage in Ubuntu 22.04
-  with Eclipse Temurin JDK 25.0.2+10. Verdict is a file-by-file comparison of extracted
+  Built from source at tag ${SPARROW_VERSION} in Ubuntu 22.04 with Eclipse Temurin
+  JDK 25.0.2+10, via ./gradlew jpackage; the tarball type additionally runs
+  ./gradlew packageTarDistribution so the compared artifact is the tarball upstream
+  ships, not the pre-packaging jpackage tree. Verdict is a file-by-file comparison of extracted
   contents, not of the outer archive. Built-only lib/runtime/legal/ modules are removed
   before comparison. Phase 5 additionally compares install-time package metadata (deb:
   control, preinst, postinst, prerm, postrm, debian-binary; rpm: PREIN/POSTIN/PREUN/
@@ -769,7 +771,11 @@ RUN mkdir -p /built && \
                 > "/built/meta/scriptlets/$tag"; \
         done; \
     else \
-        cp -r build/jpackage/Sparrow /built/; \
+        ./gradlew packageTarDistribution && \
+        cd build/jpackage && \
+        (set -- *.tar.gz; [ $# -eq 1 ] || { echo "ERROR: $# tarballs"; exit 1; }; \
+            echo "Built artifact SHA256:" && sha256sum "$1" && \
+            tar -xzf "$1" -C /built); \
     fi
 
 WORKDIR /official
