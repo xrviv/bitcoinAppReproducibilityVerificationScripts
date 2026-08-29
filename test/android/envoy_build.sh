@@ -1,6 +1,6 @@
 #!/bin/bash
 # envoy_build.sh — Envoy (com.foundationdevices.envoy) Android reproducible build verification
-# Version:       v0.2.6
+# Version:       v0.3.0
 # Organization:  WalletScrutiny.com
 # Project:       https://github.com/Foundation-Devices/envoy
 #
@@ -33,7 +33,7 @@ set -euo pipefail
 
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.2.6"
+readonly SCRIPT_VERSION="v0.3.0"
 readonly SCRIPT_NAME="envoy_build.sh"
 readonly LAST_MODIFIED_BY="Daniel Garcia"
 readonly LAST_MODIFIED_ON="2026-08-29"
@@ -70,6 +70,7 @@ OFFICIAL_DIR=""
 VERDICT="not_reproducible"
 VERSION_NAME=""; VERSION_CODE=""; SIGNER="unknown"; APP_HASH=""; COMMIT_HASH="unknown"
 TAG=""; TAG_TYPE="unknown"; SDK=""; SDK_SRC=""; SPEC=""
+SOURCE_REF=""; TAG_COMMIT=""; TAG_PUBSPEC=""
 RAW_TOTAL=0; UNACC_TOTAL=0; MISSING_TOTAL=0
 ACC_SIGN=0; ACC_STAMP=0; ACC_MANI=0; ACC_ARSC=0
 RESULT_DONE=false
@@ -100,7 +101,8 @@ rm -f "${EXEC_DIR}/COMPARISON_RESULTS.yaml"
 
 usage() {
     cat <<USAGE
-Usage: ${SCRIPT_NAME} --binary <dir-of-split-apks|base.apk> [--version <v>] [--arch <a>] [--type <t>]
+Usage: ${SCRIPT_NAME} --binary <dir-of-split-apks|base.apk> [--version <v>] [--arch <a>]
+                      [--type <t>] [--commit <sha>]
 
   --binary   REQUIRED. Directory holding the device-pulled Play splits (base.apk
              plus split_config.*.apk), or the path to base.apk itself, in which
@@ -109,6 +111,13 @@ Usage: ${SCRIPT_NAME} --binary <dir-of-split-apks|base.apk> [--version <v>] [--a
              from base.apk.
   --arch     Optional. Logged. The ABI comes from the official split set.
   --type     Optional. Logged, unused.
+  --commit   Optional. Build this revision instead of the release tag. For releases
+             whose tag does not describe the shipped artifact (e.g. the build number
+             was bumped after the release build was cut). The pubspec cross-check
+             still runs and is still fatal, so this cannot be used to build an
+             unrelated revision -- only one that genuinely yields the shipped
+             versionCode. Provenance is weaker than a tag build and the results
+             block says so.
 
 Environment:
   WS_DEVICE_SDK  Optional override for the device spec's sdkVersion. When unset the
@@ -166,7 +175,7 @@ run_diff() {
 # ------------------------------------------------------------------------------
 # Arguments
 # ------------------------------------------------------------------------------
-binary_arg=""; version_arg=""; arch_arg=""; type_arg=""
+binary_arg=""; version_arg=""; arch_arg=""; type_arg=""; commit_arg=""
 need_arg() { [[ -n "${2:-}" && "${2:0:2}" != "--" ]] || die_invalid "Option $1 requires a value."; }
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -174,6 +183,7 @@ while [[ $# -gt 0 ]]; do
         --version)      need_arg "$1" "${2:-}"; version_arg="$2"; shift 2 ;;
         --arch)         need_arg "$1" "${2:-}"; arch_arg="$2"; shift 2 ;;
         --type)         need_arg "$1" "${2:-}"; type_arg="$2"; shift 2 ;;
+        --commit)       need_arg "$1" "${2:-}"; commit_arg="$2"; shift 2 ;;
         --script-version) echo "${SCRIPT_NAME} ${SCRIPT_VERSION}"; echo "Exit code: ${EXIT_SUCCESS}"; exit "${EXIT_SUCCESS}" ;;
         -h|--help)      usage; echo "Exit code: ${EXIT_SUCCESS}"; exit "${EXIT_SUCCESS}" ;;
         # Unknown parameters must never be fatal (luis-changes-2026-03-11).
@@ -327,13 +337,32 @@ log "Cloning ${REPO_URL}"
 "${GIT[@]}" clone "$REPO_URL" "$SRC_DIR" >/dev/null 2>&1 || fail "ftbfs" "git clone failed for ${REPO_URL}."
 ( cd "$SRC_DIR" && "${GIT[@]}" rev-parse --verify "refs/tags/${TAG}" >/dev/null 2>&1 ) \
     || fail "ftbfs" "Upstream has no tag ${TAG} for the shipped version ${VERSION_NAME}; the artifact cannot be tied to published source."
-( cd "$SRC_DIR" && "${GIT[@]}" checkout -q "$TAG" ) || fail "ftbfs" "Could not check out ${TAG}."
+
+# What the TAG says, recorded whether or not we build it. When --commit is used because the tag
+# does not describe the artifact, the divergence is itself a finding and must reach the report.
+TAG_COMMIT="$( cd "$SRC_DIR" && "${GIT[@]}" rev-parse "${TAG}^{commit}" )"
+TAG_PUBSPEC="$( cd "$SRC_DIR" && "${GIT[@]}" show "${TAG}:pubspec.yaml" 2>/dev/null | sed -n 's/^version:[[:space:]]*//p' | head -1 )"
+
+if [[ -n "$commit_arg" ]]; then
+    ( cd "$SRC_DIR" && "${GIT[@]}" rev-parse --verify "${commit_arg}^{commit}" >/dev/null 2>&1 ) \
+        || fail "ftbfs" "--commit ${commit_arg} is not a commit in ${REPO_URL}."
+    ( cd "$SRC_DIR" && "${GIT[@]}" checkout -q "$commit_arg" ) || fail "ftbfs" "Could not check out ${commit_arg}."
+    SOURCE_REF="commit ${commit_arg} (explicit --commit; NOT the release tag)"
+    log_warn "Building an explicit commit, not the release tag ${TAG}."
+    log_warn "  ${TAG} points at ${TAG_COMMIT} with pubspec ${TAG_PUBSPEC:-unknown}."
+    log_warn "  Provenance is weaker than a tag build: the shipped artifact is being tied to an"
+    log_warn "  untagged revision. The cross-check below still decides whether that revision"
+    log_warn "  actually describes the artifact, and is still fatal."
+else
+    ( cd "$SRC_DIR" && "${GIT[@]}" checkout -q "$TAG" ) || fail "ftbfs" "Could not check out ${TAG}."
+    SOURCE_REF="tag ${TAG}"
+fi
 COMMIT_HASH="$( cd "$SRC_DIR" && "${GIT[@]}" rev-parse HEAD )"
 # --porcelain, not diff-index: diff-index ignores untracked files, which are build inputs too.
 [[ -z "$( cd "$SRC_DIR" && "${GIT[@]}" status --porcelain )" ]] \
     || fail "ftbfs" "Working tree is not clean immediately after checkout; refusing to build."
 TAG_TYPE="$( cd "$SRC_DIR" && "${GIT[@]}" cat-file -t "$TAG" 2>/dev/null || echo unknown )"
-log_ok "Building ${TAG} at ${COMMIT_HASH}"
+log_ok "Building ${SOURCE_REF} at ${COMMIT_HASH}"
 [[ "$TAG_TYPE" == "commit" ]] && log "Tag ${TAG} is lightweight and carries no signature of its own."
 
 # Source cross-check. A mismatch means the tag does not describe the shipped artifact, so the
@@ -344,7 +373,7 @@ pv="$(sed -n 's/^version:[[:space:]]*//p' "${SRC_DIR}/pubspec.yaml" | head -1)"
 expect_code=$(( BASH_REMATCH[1]*1000000 + BASH_REMATCH[2]*10000 + BASH_REMATCH[3]*100 + BASH_REMATCH[4] ))
 pvn="${pv%%+*}"
 [[ "$pvn" == "$VERSION_NAME" && "$expect_code" == "$VERSION_CODE" ]] \
-    || fail "ftbfs" "Source/artifact mismatch: ${TAG}'s pubspec ${pv} yields versionName ${pvn} / versionCode ${expect_code}, but base.apk reports ${VERSION_NAME} / ${VERSION_CODE}. The tag does not describe the shipped artifact."
+    || fail "ftbfs" "Source/artifact mismatch: ${SOURCE_REF}'s pubspec ${pv} yields versionName ${pvn} / versionCode ${expect_code}, but base.apk reports ${VERSION_NAME} / ${VERSION_CODE}. That revision does not describe the shipped artifact.$( [[ -z "$commit_arg" ]] && printf ' If the build number was bumped after the release build was cut, find the commit whose pubspec yields %s and pass it with --commit.' "$VERSION_CODE" )"
 log_ok "Source cross-check: pubspec ${pv} yields versionCode ${expect_code}, matching the artifact"
 
 [[ -f "${SRC_DIR}/pubspec.lock" && -f "${SRC_DIR}/Cargo.lock" ]] \
@@ -714,6 +743,8 @@ fi
 echo ""
 echo "Revision, tag (and its signature):"
 echo "Tag: ${TAG} ($([[ "$TAG_TYPE" == "commit" ]] && echo 'lightweight, no signature possible' || echo "$TAG_TYPE"))"
+echo "Built from: ${SOURCE_REF}"
+[[ -n "$commit_arg" ]] && echo "NOTE: built from an UNTAGGED commit because ${TAG} (${TAG_COMMIT}, pubspec ${TAG_PUBSPEC:-unknown}) does not describe the shipped artifact."
 echo ""
 echo "===== Also ====="
 echo "channel:        google-play (split set)"
