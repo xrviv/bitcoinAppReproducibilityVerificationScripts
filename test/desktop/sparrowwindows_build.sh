@@ -1,9 +1,9 @@
 #!/bin/bash
 #
 # sparrowwindows_build.sh - Sparrow Wallet Windows (MSI/ZIP) Reproducible Build Verifier
-# Version: v0.1.2
+# Version: v0.1.3
 # Last modified by: Daniel Garcia
-# Last modified on: 2026-08-29 (v0.1.2)
+# Last modified on: 2026-08-29 (v0.1.3)
 #
 # Builds Sparrow for Windows via GitHub Actions, downloads the built installer and
 # compares it against the official release artifact.
@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.2"
+SCRIPT_VERSION="v0.1.3"
 APP_ID="sparrow"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256=""
@@ -815,6 +815,7 @@ emit_verification_summary() {
     print_hash_legend
 
     # appHash is the official artifact EXACTLY AS DISTRIBUTED (verification-result-summary-format.md).
+    # Only canonical fields inside the markers; anything extra lives outside them.
     echo ""
     echo "===== Begin Results ====="
     echo "appId:          ${APP_ID}"
@@ -823,24 +824,24 @@ emit_verification_summary() {
     echo "apkVersionCode: N/A"
     echo "verdict:        ${summary_verdict}"
     echo "appHash:        ${official_sha}"
-    echo "officialFile:   Sparrow-${APP_VERSION}.${APP_TYPE}"
-    echo "builtHash:      ${built_sha}"
     echo "commit:         ${RESOLVED_COMMIT}"
     echo "scriptVersion:  ${SCRIPT_VERSION}"
     echo "scriptHash:     ${SCRIPT_SHA256:-N/A}"
     echo ""
-    echo "Diff:"
-    if [[ "$official_sha" == "$built_sha" ]]; then
-        echo "(none: rebuilt ${APP_TYPE^^} is byte-for-byte identical to the official ${APP_TYPE^^})"
-    else
-        echo "Official ${APP_TYPE^^}: ${official_sha}"
-        echo "Built    ${APP_TYPE^^}: ${built_sha}"
-        if [[ "$APP_TYPE" == "msi" ]]; then
-            echo "MSI database comparison (normalized allowlist): ${WORK_DIR}/logs/msi-compare.txt"
-        else
-            echo "Per-file comparison above; ZIP verdict requires whole-file equality."
-        fi
+
+    # Desktop/binary workflow: Luis's machine-readable summary (format doc section 3).
+    local match_flag=0 match_word="DOESN'T MATCH" matches=0 mismatches=1
+    if [[ "$official_sha" == "$built_sha" && "$official_sha" != "N/A" ]]; then
+        match_flag=1; match_word="MATCHES"; matches=1; mismatches=0
     fi
+    echo "Diff:"
+    echo "BUILDS MATCH BINARIES"
+    echo "Sparrow-${APP_VERSION}.${APP_TYPE} - ${APP_ARCH} - ${built_sha} - ${match_flag} (${match_word})"
+    echo ""
+    echo "SUMMARY"
+    echo "total: 1"
+    echo "matches: ${matches}"
+    echo "mismatches: ${mismatches}"
     echo ""
     echo "Revision, tag (and its signature):"
     echo "tag:            ${APP_VERSION}"
@@ -849,8 +850,35 @@ emit_verification_summary() {
     echo "Signature Summary:"
     echo "Not checked by this script. Verify the official artifact against Sparrow's signed"
     echo "release manifest (Craig Raw's key) BEFORE passing it via --binary."
+
+    # Canonical "Also" section for non-standard notes (format doc section 5).
+    if [[ "$APP_TYPE" == "msi" && "$match_flag" -eq 0 ]]; then
+        echo ""
+        echo "===== Also ===="
+        echo "MSI database comparison (normalized allowlist), full output:"
+        echo "${WORK_DIR}/logs/msi-compare.txt"
+        echo "Named-stream and table equivalence is necessary but not sufficient;"
+        echo "the OLE container itself was not examined."
+    fi
     echo ""
     echo "===== End Results ====="
+
+    # Diff investigation commands, after the end marker (format doc section 7).
+    local ex_official ex_built
+    if [[ "$APP_TYPE" == "msi" ]]; then
+        ex_official="${WORK_DIR}/ex-official"; ex_built="${WORK_DIR}/ex-built"
+    else
+        ex_official="${WORK_DIR}/official-zip-extracted"; ex_built="${WORK_DIR}/built-zip-extracted"
+    fi
+    echo ""
+    echo "Run a full"
+    if [[ -d "$ex_official" && -d "$ex_built" ]]; then
+        echo "diff --recursive $ex_official $ex_built"
+        echo "meld $ex_official $ex_built"
+        echo "or"
+    fi
+    echo "diffoscope \"$official_artifact\" \"${built_artifact:-missing}\""
+    echo "for more details."
 }
 
 display_results() {
