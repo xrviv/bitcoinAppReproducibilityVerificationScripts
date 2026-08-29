@@ -1,6 +1,6 @@
 #!/bin/bash
 # envoy_build.sh — Envoy (com.foundationdevices.envoy) Android reproducible build verification
-# Version:       v0.3.1
+# Version:       v0.3.2
 # Organization:  WalletScrutiny.com
 # Project:       https://github.com/Foundation-Devices/envoy
 #
@@ -33,7 +33,7 @@ set -euo pipefail
 
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.3.1"
+readonly SCRIPT_VERSION="v0.3.2"
 readonly SCRIPT_NAME="envoy_build.sh"
 readonly LAST_MODIFIED_BY="Daniel Garcia"
 readonly LAST_MODIFIED_ON="2026-08-29"
@@ -464,9 +464,10 @@ nixrun unzip -q -o "${WORK_DIR}/built.apks" 'splits/*.apk' -d "${WORK_DIR}/bt" \
 cp "${WORK_DIR}"/bt/splits/*.apk "${WORK_DIR}/built/" || fail "ftbfs" "No split APKs produced by bundletool."
 log "built splits:"
 for f in "${WORK_DIR}"/built/*.apk; do printf '  %s  %s\n' "$(sha256_of "$f")" "$(basename "$f")"; done
-log "NOTE: the AAB is unsigned, but bundletool signs the APKs it generates with a debug key"
-log "      (kept inside this workspace). Play signing differences are excluded only under the"
-log "      exact root-META-INF filename rule below, never because 'our build is unsigned'."
+log "NOTE: the AAB is unsigned, and no keystore is passed to bundletool, so the APKs it"
+log "      generates are unsigned too. Measured signing state is reported in the results"
+log "      block. Play signing differences are excluded only under the exact root-META-INF"
+log "      filename rule below, never because 'our build is unsigned'."
 
 # ------------------------------------------------------------------------------
 # Comparison
