@@ -1,7 +1,9 @@
 #!/bin/bash
 #
 # sparrowwindows_build.sh - Sparrow Wallet Windows (MSI/ZIP) Reproducible Build Verifier
-# Version: v0.1.1
+# Version: v0.1.2
+# Last modified by: Daniel Garcia
+# Last modified on: 2026-08-29 (v0.1.2)
 #
 # Builds Sparrow for Windows via GitHub Actions, downloads the built installer and
 # compares it against the official release artifact.
@@ -29,11 +31,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.1"
-# Provenance fields for the results block (script-version-and-hash.md, settled 2026-08-27:
-# version in header AND results block; hash and Last-modified fields in the results block only).
-SCRIPT_LAST_MODIFIED_BY="Daniel Garcia"
-SCRIPT_LAST_MODIFIED_ON="2026-08-29"
+SCRIPT_VERSION="v0.1.2"
 APP_ID="sparrow"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256=""
@@ -766,16 +764,21 @@ build_and_verify_windows() {
 
     display_results "$execution_dir"
 }
-# Best-effort resolution of the source commit behind the release tag, via the helper
-# container (host has no gh and only docker/podman is allowed as a dependency).
+# Best-effort resolution of the source commit behind the release tag. The fine-grained
+# GITHUB_TOKEN is scoped to xrviv/WalletScrutinyCom and GitHub answers 404 for
+# sparrowwallet/sparrow with it, so ask the public API WITHOUT the token, and validate
+# strictly: anything that is not a 40-hex sha (404 body, rate-limit JSON, empty)
+# leaves RESOLVED_COMMIT at "unknown" rather than leaking garbage into the results block.
 resolve_commit() {
     local sha peeled
-    sha=$(gh_c api "repos/sparrowwallet/sparrow/git/refs/tags/${APP_VERSION}" \
-        --jq '.object.sha' 2>/dev/null || true)
-    [[ -n "$sha" ]] || return 0
-    peeled=$(gh_c api "repos/sparrowwallet/sparrow/git/tags/${sha}" \
-        --jq '.object.sha' 2>/dev/null || true)
-    RESOLVED_COMMIT="${peeled:-$sha}"
+    sha=$("$DOCKER_CMD" run --rm -e APP_VERSION="${APP_VERSION}" "${GH_HELPER_IMAGE}" \
+        bash -c 'curl -fsSL "https://api.github.com/repos/sparrowwallet/sparrow/git/refs/tags/${APP_VERSION}" | jq -r ".object.sha // empty"' \
+        2>/dev/null || true)
+    [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 0
+    peeled=$("$DOCKER_CMD" run --rm "${GH_HELPER_IMAGE}" \
+        bash -c "curl -fsSL 'https://api.github.com/repos/sparrowwallet/sparrow/git/tags/${sha}' | jq -r '.object.sha // empty'" \
+        2>/dev/null || true)
+    if [[ "$peeled" =~ ^[0-9a-f]{40}$ ]]; then RESOLVED_COMMIT="$peeled"; else RESOLVED_COMMIT="$sha"; fi
 }
 
 # Plain-language legend for the meaningful hashes, kept OUTSIDE the Begin/End markers so
@@ -825,8 +828,6 @@ emit_verification_summary() {
     echo "commit:         ${RESOLVED_COMMIT}"
     echo "scriptVersion:  ${SCRIPT_VERSION}"
     echo "scriptHash:     ${SCRIPT_SHA256:-N/A}"
-    echo "Last modified by: ${SCRIPT_LAST_MODIFIED_BY}"
-    echo "Last modified on: ${SCRIPT_LAST_MODIFIED_ON}"
     echo ""
     echo "Diff:"
     if [[ "$official_sha" == "$built_sha" ]]; then
