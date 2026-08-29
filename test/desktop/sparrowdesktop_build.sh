@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # sparrowdesktop_build.sh - Sparrow Desktop Reproducible Build Verifier
-# Version: v0.19.2
+# Version: v0.20.0
 #
 # Linux (tarball/deb/rpm) builds run containerized via Docker/Podman;
 # Windows (msi/zip) builds run via GitHub Actions.
@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.19.2"
+SCRIPT_VERSION="v0.20.0"
 
 GH_REPO="xrviv/WalletScrutinyCom"
 GH_WORKFLOW="sparrow-build.yml"
@@ -25,7 +25,6 @@ EXIT_BUILD_FAILED=1
 EXIT_INVALID_PARAMS=2
 
 DEFAULT_JDK_VERSION="25.0.2+10"
-DEFAULT_BASE_IMAGE="ubuntu:22.04"
 DOCKER_CMD="${DOCKER_CMD:-}"
 
 APP_VERSION=""
@@ -254,8 +253,8 @@ build_and_verify() {
     mkdir -p "$WORK_DIR"
     cd "$WORK_DIR"
 
-    # Always create sparrow_official_binary so the Dockerfile COPY always succeeds.
-    # If --binary provided, populate it; otherwise leave it empty (wget path runs).
+    # Always create sparrow_official_binary so the Dockerfile COPY succeeds; empty
+    # unless --binary was given, in which case the container's wget path is skipped.
     if [[ -n "$BINARY_PATH" ]]; then
         cp "$BINARY_PATH" "${WORK_DIR}/sparrow_official_binary"
         BINARY_PROVIDED_FLAG="1"
@@ -375,8 +374,7 @@ echo "VERIFICATION PHASE"
 echo "========================================================"
 echo ""
 
-# Hash-compare every path listed in $1 between built root $2 and official root $3.
-# Prints the standard four-line block per path. Sets CMP_TOTAL and CMP_DIFF.
+# Hash-compare paths in $1 between built $2 and official $3; sets CMP_TOTAL, CMP_DIFF.
 cmp_tree() {
     local listing="$1" broot="$2" oroot="$3"
     local rel bf of bh oh st idx=0
@@ -589,8 +587,7 @@ if [[ "$diff_files" -gt 0 ]]; then
     FILE_HASH_MATCH=false
 fi
 
-# Compare two parallel trees: /built/$1 against /official/$1. Prints a numbered
-# block per path. Sets AREA_MATCH to true/false, or leaves it n/a if absent.
+# Compare /built/$1 against /official/$1; sets AREA_MATCH true/false, or n/a if absent.
 compare_area() {
     AREA_MATCH="n/a"
     [[ -d "/official/$1" && -d "/built/$1" ]] || return 0
@@ -671,18 +668,16 @@ cat > /output/COMPARISON_RESULTS.yaml << YAML_END
 script_version: ${SCRIPT_VERSION}
 verdict: ${STATUS}
 notes: |
-  Built from source at tag ${SPARROW_VERSION} in Ubuntu 22.04 with Eclipse Temurin
-  JDK 25.0.2+10 via ./gradlew jpackage; the tarball type also runs ./gradlew
-  packageTarDistribution, so the compared artifact is the tarball upstream ships, not
-  the pre-packaging jpackage tree. The verdict is computed from the file-by-file
-  comparison of extracted contents. Where both outer archives exist (tarball) they are
-  also hashed and compared, reported as archive_identical below and recorded rather
-  than gated on. Built-only lib/runtime/legal/ modules are removed before comparison.
-  Phase 5 also compares install-time package metadata (deb: control, preinst, postinst,
-  prerm, postrm, debian-binary; rpm: PREIN/POSTIN/PREUN/POSTUN scriptlets and
-  interpreters). Symlinks are compared as links (target text), not dereferenced. Built
-  and official file sets are compared both ways. Not compared: file modes, ownership,
-  timestamps, directory entries. Payload outside the application subtree is Phase 6.
+  Built from source at tag ${SPARROW_VERSION} on Ubuntu 22.04 with Eclipse Temurin
+  JDK 25.0.2+10 via ./gradlew jpackage; tarball also runs ./gradlew
+  packageTarDistribution, so the compared artifact is the archive upstream ships, not
+  the pre-packaging jpackage tree. Verdict comes from the file-by-file comparison of
+  extracted contents; outer archives (tarball) are hashed and reported as
+  archive_identical, not gated on. Built-only lib/runtime/legal/ modules are removed
+  first. Phase 5 compares package metadata (deb: control, preinst, postinst, prerm,
+  postrm, debian-binary; rpm: PREIN/POSTIN/PREUN/POSTUN scriptlets and interpreters).
+  Symlinks compare as links. File sets compared both ways. Not compared: modes,
+  ownership, timestamps, directory entries. Phase 6 covers payload outside the subtree.
   critical_binaries=${CRITICAL_MATCH} modules=${MODULES_MATCH} file_count=${FILE_COUNT_MATCH} file_hashes=${FILE_HASH_MATCH} package_metadata=${META_MATCH} out_of_subtree=${EXTRA_MATCH} archive_identical=${ARCHIVE_MATCH}
 YAML_END
 
@@ -884,8 +879,7 @@ CMD ["cat", "/output/COMPARISON_RESULTS.yaml"]
 DOCKERFILE_END
 }
 
-# Hash-compare every path listed in $1 between official root $2 and built root $3.
-# Prints the standard four-line block per path. Sets CMP_TOTAL, CMP_OK, CMP_BAD.
+# Hash-compare paths in $1 between official $2 and built $3; sets CMP_TOTAL/OK/BAD.
 compare_extracted() {
     local listing="$1" oroot="$2" broot="$3"
     local rel oh bh st idx=0
@@ -1047,8 +1041,7 @@ build_and_verify_windows() {
     fi
 
     echo ""
-    local zip_match=0
-    local msi_match=0
+    local zip_match=0 msi_match=0 whole_match=0
 
     if [[ "$APP_TYPE" == "zip" ]]; then
         echo "[INFO] === ZIP Comparison ==="
@@ -1058,8 +1051,12 @@ build_and_verify_windows() {
             ftbfs_die "Built ZIP file not found in downloaded artifact"
         fi
 
-        echo "[INFO] ZIP official SHA256: $(sha256sum "$official_zip" | cut -d' ' -f1)"
-        echo "[INFO] ZIP built    SHA256: $(sha256sum "$built_zip_file" | cut -d' ' -f1)"
+        local ozs bzs
+        ozs=$(sha256sum "$official_zip" | cut -d' ' -f1)
+        bzs=$(sha256sum "$built_zip_file" | cut -d' ' -f1)
+        echo "[INFO] ZIP official SHA256: $ozs"
+        echo "[INFO] ZIP built    SHA256: $bzs"
+        [[ "$ozs" == "$bzs" ]] && whole_match=1
 
         local official_zip_extract="${WORK_DIR}/official-zip-extracted"
         local built_zip_extract="${WORK_DIR}/built-zip-extracted"
@@ -1105,7 +1102,7 @@ build_and_verify_windows() {
         built_msi_sha=$(sha256sum "$built_msi_file" | awk '{print $1}')
 
         if [[ "$official_msi_sha" == "$built_msi_sha" ]]; then
-            msi_match=1
+            msi_match=1; whole_match=1
             echo "[INFO] MSI: SHA256 MATCH"
             echo "[INFO]   ${official_msi_sha}"
         else
@@ -1143,20 +1140,20 @@ build_and_verify_windows() {
             diff -q "$msi_file_list" "$msi_built_list" >/dev/null || ds=$?
             [[ "$ds" -le 1 ]] || die "diff status $ds" $EXIT_BUILD_FAILED
             if [[ "$ds" -eq 1 ]]; then
-                echo "[INFO] MSI: stream sets differ (official vs built):"
+                echo "[INFO] MSI: payload file sets differ (official vs built):"
                 diff "$msi_file_list" "$msi_built_list" | sed 's/^/    /' || [ $? -eq 1 ]
             fi
             sort -u "$msi_file_list" "$msi_built_list" > "$msi_union"
             local msi_total msi_ok msi_bad
             msi_total=$(wc -l < "$msi_union" | tr -d ' ')
-            echo "[INFO] ${msi_total} streams to verify (union of both extractions)"
+            echo "[INFO] ${msi_total} extracted payload files to verify (union)"
             echo ""
             compare_extracted "$msi_union" "$official_msi_extract" "$built_msi_extract"
             msi_total=$CMP_TOTAL; msi_ok=$CMP_OK; msi_bad=$CMP_BAD
             echo "[INFO] MSI: ${msi_ok}/${msi_total} files verified"
             if [[ "$msi_bad" -eq 0 ]]; then
                 msi_match=1
-                echo "[INFO] MSI: PAYLOAD STREAM MATCH (MSI bytes differ; all ${msi_ok} streams identical)"
+                echo "[INFO] MSI: PAYLOAD MATCH ONLY — all ${msi_ok} extracted payload files identical; MSI database NOT compared"
             else
                 echo "[INFO] MSI: CONTENT MISMATCH — ${msi_bad} file(s) differ"
             fi
@@ -1164,23 +1161,20 @@ build_and_verify_windows() {
     fi
 
     echo ""
-    local verdict notes=""
-    if [[ "$APP_TYPE" == "zip" && "$zip_match" -eq 1 ]]; then
-        verdict="reproducible"
-    elif [[ "$APP_TYPE" == "msi" && "$msi_match" -eq 1 ]]; then
+    local verdict payload=false artifact=false
+    [[ "$zip_match" -eq 1 || "$msi_match" -eq 1 ]] && payload=true
+    [[ "$whole_match" -eq 1 ]] && artifact=true
+    if [[ "$artifact" == true ]]; then
         verdict="reproducible"
     else
         verdict="not_reproducible"
-        notes="${APP_TYPE^^} content differs"
+        echo "[INFO] Payload equality is not artifact reproducibility; installer database not compared."
     fi
 
-    if [[ -n "$notes" ]]; then
-        printf 'script_version: %s\nverdict: %s\nnotes: "%s"\n' \
-            "$SCRIPT_VERSION" "$verdict" "$notes" > "$results_file"
-    else
-        printf 'script_version: %s\nverdict: %s\n' \
-            "$SCRIPT_VERSION" "$verdict" > "$results_file"
-    fi
+    printf 'script_version: %s\nverdict: %s\nnotes: |\n  %s\n  payload_files_identical=%s artifact_identical=%s\n' \
+        "$SCRIPT_VERSION" "$verdict" \
+        "Windows builds via GitHub Actions and compares files extracted from the ${APP_TYPE^^}. It does NOT decode the MSI database (Component, File, Registry, RemoveFile, CustomAction, Binary, sequence tables), so payload equality is not artifact reproducibility." \
+        "$payload" "$artifact" > "$results_file"
     cp "$results_file" "$execution_dir/" 2>/dev/null || true
 
     display_results "$execution_dir"
