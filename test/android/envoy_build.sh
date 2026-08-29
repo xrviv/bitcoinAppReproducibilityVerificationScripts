@@ -1,6 +1,6 @@
 #!/bin/bash
 # envoy_build.sh — Envoy (com.foundationdevices.envoy) Android reproducible build verification
-# Version:       v0.2.5
+# Version:       v0.2.6
 # Organization:  WalletScrutiny.com
 # Project:       https://github.com/Foundation-Devices/envoy
 #
@@ -33,7 +33,7 @@ set -euo pipefail
 
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.2.5"
+readonly SCRIPT_VERSION="v0.2.6"
 readonly SCRIPT_NAME="envoy_build.sh"
 readonly LAST_MODIFIED_BY="Daniel Garcia"
 readonly LAST_MODIFIED_ON="2026-08-29"
@@ -580,14 +580,22 @@ arsc_ok() {
 # unsigned and bundletool says so on stderr. v0.2.4 and earlier printed a hardcoded claim that
 # they had been debug-signed, which was false and contradicted the run's own comparison evidence
 # (root META-INF signing material was official-only). Measure it from the built artifact instead.
+# Root META-INF entries detect ONLY v1/JAR signing. APK Signature Schemes v2 and v3 live in the
+# APK Signing Block, not in ZIP entries, so a v2/v3-only APK has no signing files under META-INF
+# and counting them would call a properly signed APK "unsigned". That matters here: v1 signatures
+# are only required below API 24, so a modern signer may legitimately emit none. apksigner is the
+# authority on signing state across all schemes; the v1 entry count is reported alongside it as a
+# separate fact, never as the answer. (v0.2.5 got this wrong; fixed v0.2.6.)
 signing_state() {
-    local b="${BLT[base]:-}" n
-    [[ -n "$b" && -f "$b" ]] && n="$(nixrun unzip -l "$b" 2>/dev/null | awk '{print $NF}' \
-        | grep -cE "^META-INF/${SIGN_NAME}$" || true)" || { echo "AAB unsigned; built APK signing state NOT MEASURED (no built base APK)"; return 0; }
-    if [[ "${n:-0}" -gt 0 ]]; then
-        echo "AAB unsigned; generated APKs carry ${n} root META-INF signing entry(ies)"
+    local b="${BLT[base]:-}" out schemes n rc=0
+    [[ -n "$b" && -f "$b" ]] || { echo "AAB unsigned; built APK signing state NOT MEASURED (no built base APK)"; return 0; }
+    n="$(nixrun unzip -l "$b" 2>/dev/null | awk '{print $NF}' | grep -cE "^META-INF/${SIGN_NAME}$" || true)"
+    out="$(nixrun "$APKSIGNER" verify --verbose "$b" 2>&1)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        echo "AAB unsigned; generated APKs unsigned (apksigner reports no valid signature; ${n} root META-INF v1 entry(ies))"
     else
-        echo "AAB unsigned; generated APKs also unsigned (no keystore passed to bundletool; no root META-INF signing entries)"
+        schemes="$(printf '%s\n' "$out" | sed -n 's/^Verified using \(v[0-9]*\) scheme.*: true$/\1/p' | paste -sd, -)"
+        echo "AAB unsigned; generated APKs SIGNED, apksigner verified via ${schemes:-scheme not reported} (${n} root META-INF v1 entry(ies))"
     fi
 }
 
