@@ -1,18 +1,18 @@
 #!/bin/bash
 #
 # sparrowwindows_build.sh - Sparrow Wallet Windows (MSI/ZIP) Reproducible Build Verifier
-# Version: v0.1.0
+# Version: v0.1.1
 #
 # Builds Sparrow for Windows via GitHub Actions, downloads the built installer and
 # compares it against the official release artifact.
 #
 # For MSI the comparison covers every named OLE stream and every decoded MSI database
-# table. Four classes are normalized away, and each one is printed by name: the
+# table. Five classes are normalized away, and each one is printed by name: the
 # Authenticode signature, the PackageCode, build timestamps (the two documented summary
-# FILETIME properties and the cabinet's per-file date/time fields), and the storage
-# order of rows within a table. The cabinet is compared byte-for-byte after zeroing
-# exactly those date/time fields, so compressed payload, checksums and folder records
-# are all covered. Any other difference fails the run.
+# FILETIME properties and the cabinet's per-file date/time fields), the storage
+# order of rows within a table, and string-pool storage order. The cabinet is compared
+# byte-for-byte after zeroing exactly those date/time fields, so compressed payload,
+# checksums and folder records are all covered. Any other difference fails the run.
 #
 # OUT OF SCOPE, and not claimed: the OLE container itself - its header, FAT/DIFAT,
 # directory entries, sector padding and bytes past the final sector. Extraction exposes
@@ -29,7 +29,15 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.0"
+SCRIPT_VERSION="v0.1.1"
+# Provenance fields for the results block (script-version-and-hash.md, settled 2026-08-27:
+# version in header AND results block; hash and Last-modified fields in the results block only).
+SCRIPT_LAST_MODIFIED_BY="Daniel Garcia"
+SCRIPT_LAST_MODIFIED_ON="2026-08-29"
+APP_ID="sparrow"
+SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_SHA256=""
+RESOLVED_COMMIT="unknown"
 
 GH_REPO="xrviv/WalletScrutinyCom"
 GH_WORKFLOW="sparrow-build.yml"
@@ -52,6 +60,12 @@ CUSTOM_WORK_DIR=""
 KEEP_CONTAINER=false
 QUIET=false
 BINARY_PATH=""
+
+# Never fatal: a hashing problem is not a build outcome.
+sha256_of() {
+    [[ -f "$1" ]] || { echo "N/A"; return 0; }
+    sha256sum "$1" | awk '{print $1}'
+}
 
 die() {
     echo "ERROR: $1" >&2
@@ -456,6 +470,36 @@ if __name__ == '__main__':
 MSICMP_END
 }
 
+# True when the container engine runs rootless, where container UID 0 already maps to
+# the invoking user. Test how the engine actually runs, never its executable name.
+is_rootless() {
+    local r=""
+    case "$DOCKER_CMD" in
+        *podman) r="$("$DOCKER_CMD" info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)" ;;
+        *docker) if "$DOCKER_CMD" info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless
+                 then r="true"; else r="false"; fi ;;
+    esac
+    [[ "$r" == "true" ]]
+}
+
+# Hand the workspace back so the invoking user can delete it without sudo
+# (non-sudo-directories-guideline.md). The helper containers bind-mount WORK_DIR and
+# write as container root; under a rootful engine those files land root-owned on the
+# host and the build-server account cannot remove them. Under a rootless engine the
+# caller IS container UID 0, so chown to 0:0 there and to the numeric uid otherwise.
+# Runs on failure too via the EXIT trap in build_and_verify_windows. Never fatal:
+# a verdict already reached must not be lost to a cleanup problem.
+restore_host_owner() {
+    [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" && -n "${DOCKER_CMD}" ]] || return 0
+    "$DOCKER_CMD" image inspect "${GH_HELPER_IMAGE}" >/dev/null 2>&1 || return 0
+    local uid gid
+    uid="$(id -u)"; gid="$(id -g)"
+    if is_rootless; then uid=0; gid=0; fi
+    "$DOCKER_CMD" run --rm -v "${WORK_DIR}:/w" --entrypoint chown "${GH_HELPER_IMAGE}" \
+        -R "${uid}:${gid}" /w >/dev/null 2>&1 \
+        || warn "Could not restore ownership of ${WORK_DIR}; deleting it may need 'podman unshare rm -rf'"
+}
+
 ftbfs_die() {
     printf 'script_version: %s\nverdict: ftbfs\nnotes: "%s"\n' "$SCRIPT_VERSION" "$1" > "$results_file"
     cp "$results_file" "$execution_dir/" 2>/dev/null || true
@@ -480,6 +524,8 @@ build_and_verify_windows() {
 
     mkdir -p "$WORK_DIR" "$log_dir" "$official_dir" "$built_dir"
     cd "$WORK_DIR"
+    # Ownership must be restored on every exit path, crashes included.
+    trap restore_host_owner EXIT
 
     echo "======================================================"
     echo "Sparrow Desktop v${APP_VERSION} — Windows ${APP_TYPE^^} Verification"
@@ -663,9 +709,17 @@ build_and_verify_windows() {
             local cmp_rc=0
             set +e
             "$DOCKER_CMD" run --rm -v "${WORK_DIR}:/work" "${GH_HELPER_IMAGE}" \
-                python3 /work/msicmp.py /work/ex-official /work/ex-built 2>&1 | tee "${log_dir}/msi-compare.txt"
-            cmp_rc=${PIPESTATUS[0]}
+                python3 /work/msicmp.py /work/ex-official /work/ex-built \
+                > "${log_dir}/msi-compare.txt" 2>&1
+            cmp_rc=$?
             set -e
+            # Diff output rule: at most 5 difference lines on the terminal; the
+            # full comparator output stays in logs/msi-compare.txt.
+            awk -v logfile="${log_dir}/msi-compare.txt" '
+                /^  ! / { d++; if (d > 5) next }
+                { print }
+                END { if (d > 5) printf "    ... and %d more difference line(s); full output: %s\n", d - 5, logfile }
+            ' "${log_dir}/msi-compare.txt"
             echo ""
             if [[ "$cmp_rc" -eq 0 ]]; then
                 msi_match=1
@@ -712,6 +766,92 @@ build_and_verify_windows() {
 
     display_results "$execution_dir"
 }
+# Best-effort resolution of the source commit behind the release tag, via the helper
+# container (host has no gh and only docker/podman is allowed as a dependency).
+resolve_commit() {
+    local sha peeled
+    sha=$(gh_c api "repos/sparrowwallet/sparrow/git/refs/tags/${APP_VERSION}" \
+        --jq '.object.sha' 2>/dev/null || true)
+    [[ -n "$sha" ]] || return 0
+    peeled=$(gh_c api "repos/sparrowwallet/sparrow/git/tags/${sha}" \
+        --jq '.object.sha' 2>/dev/null || true)
+    RESOLVED_COMMIT="${peeled:-$sha}"
+}
+
+# Plain-language legend for the meaningful hashes, kept OUTSIDE the Begin/End markers so
+# that block stays a clean key: value list (dannys-amendments.md, "Ambiguous Artifact Hashes").
+print_hash_legend() {
+    echo ""
+    echo "HASH LEGEND"
+    echo "  appHash      sha256 of the official ${APP_TYPE^^} exactly as distributed. THIS is the"
+    echo "               hash to publish — a user reproduces it with sha256sum on the file they"
+    echo "               downloaded."
+    echo "  builtHash    sha256 of our rebuilt ${APP_TYPE^^}. Reported to localize a failure;"
+    echo "               NOT what the verdict is based on by itself. Do not publish alone."
+    echo "  scriptHash   sha256 of this script, identifying which tooling produced these results."
+}
+
+# Standardized WalletScrutiny verification summary (verification-result-summary-format.md).
+# The machine verdict lives in COMPARISON_RESULTS.yaml; this block is the human/recording view.
+emit_verification_summary() {
+    local yaml_verdict summary_verdict
+    yaml_verdict=$(grep "^verdict:" COMPARISON_RESULTS.yaml | cut -d' ' -f2)
+    case "$yaml_verdict" in
+        reproducible)     summary_verdict="reproducible" ;;
+        not_reproducible) summary_verdict="differences found" ;;
+        *)                summary_verdict="$yaml_verdict" ;;
+    esac
+    [[ "$RESOLVED_COMMIT" == "unknown" ]] && resolve_commit
+
+    local official_artifact built_artifact official_sha built_sha
+    official_artifact="${WORK_DIR}/official/Sparrow-${APP_VERSION}.${APP_TYPE}"
+    built_artifact=$(find "${WORK_DIR}/built/${APP_TYPE}" -name "*.${APP_TYPE}" 2>/dev/null | head -1)
+    official_sha=$(sha256_of "$official_artifact")
+    built_sha=$(sha256_of "${built_artifact:-/nonexistent}")
+
+    print_hash_legend
+
+    # appHash is the official artifact EXACTLY AS DISTRIBUTED (verification-result-summary-format.md).
+    echo ""
+    echo "===== Begin Results ====="
+    echo "appId:          ${APP_ID}"
+    echo "signer:         N/A"
+    echo "apkVersionName: ${APP_VERSION}"
+    echo "apkVersionCode: N/A"
+    echo "verdict:        ${summary_verdict}"
+    echo "appHash:        ${official_sha}"
+    echo "officialFile:   Sparrow-${APP_VERSION}.${APP_TYPE}"
+    echo "builtHash:      ${built_sha}"
+    echo "commit:         ${RESOLVED_COMMIT}"
+    echo "scriptVersion:  ${SCRIPT_VERSION}"
+    echo "scriptHash:     ${SCRIPT_SHA256:-N/A}"
+    echo "Last modified by: ${SCRIPT_LAST_MODIFIED_BY}"
+    echo "Last modified on: ${SCRIPT_LAST_MODIFIED_ON}"
+    echo ""
+    echo "Diff:"
+    if [[ "$official_sha" == "$built_sha" ]]; then
+        echo "(none: rebuilt ${APP_TYPE^^} is byte-for-byte identical to the official ${APP_TYPE^^})"
+    else
+        echo "Official ${APP_TYPE^^}: ${official_sha}"
+        echo "Built    ${APP_TYPE^^}: ${built_sha}"
+        if [[ "$APP_TYPE" == "msi" ]]; then
+            echo "MSI database comparison (normalized allowlist): ${WORK_DIR}/logs/msi-compare.txt"
+        else
+            echo "Per-file comparison above; ZIP verdict requires whole-file equality."
+        fi
+    fi
+    echo ""
+    echo "Revision, tag (and its signature):"
+    echo "tag:            ${APP_VERSION}"
+    echo "commit:         ${RESOLVED_COMMIT}"
+    echo ""
+    echo "Signature Summary:"
+    echo "Not checked by this script. Verify the official artifact against Sparrow's signed"
+    echo "release manifest (Craig Raw's key) BEFORE passing it via --binary."
+    echo ""
+    echo "===== End Results ====="
+}
+
 display_results() {
     local exec_dir="$1"
 
@@ -725,6 +865,8 @@ display_results() {
     if [[ "$exec_dir" != "$WORK_DIR" ]]; then
         echo "Build server location: $exec_dir/COMPARISON_RESULTS.yaml"
     fi
+
+    emit_verification_summary
     echo ""
 
     local verdict
@@ -786,6 +928,24 @@ parse_arguments() {
 }
 
 main() {
+    # Runs as a normal user only; root runs break the ownership guarantees below.
+    if [[ "${EUID}" -eq 0 ]]; then
+        echo "ERROR: Do not run this script as root; run it as a normal user." >&2
+        exit $EXIT_INVALID_PARAMS
+    fi
+
+    echo ""
+    echo "======================================================"
+    echo "Sparrow Windows (MSI/ZIP) Reproducible Build Verifier ${SCRIPT_VERSION}"
+    echo "======================================================"
+    echo ""
+
+    # Self-identify before doing anything else, so a recording of this run always shows
+    # which bytes of tooling produced the result (script-version-and-hash.md, 2026-08-17).
+    SCRIPT_SHA256="$(sha256_of "$SCRIPT_PATH")"
+    echo "[INFO] Script:  $(basename "$SCRIPT_PATH") ${SCRIPT_VERSION}"
+    echo "[INFO]         sha256: ${SCRIPT_SHA256}"
+
     parse_arguments "$@"
     if [[ -z "${GITHUB_TOKEN}" ]]; then
         echo "[INFO] GITHUB_TOKEN/GH_TOKEN not set; Windows verification needs it to dispatch the build."
