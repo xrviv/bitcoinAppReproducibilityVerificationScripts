@@ -1,6 +1,6 @@
 #!/bin/bash
 # envoy_build.sh — Envoy (com.foundationdevices.envoy) Android reproducible build verification
-# Version:       v0.3.0
+# Version:       v0.3.1
 # Organization:  WalletScrutiny.com
 # Project:       https://github.com/Foundation-Devices/envoy
 #
@@ -33,7 +33,7 @@ set -euo pipefail
 
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.3.0"
+readonly SCRIPT_VERSION="v0.3.1"
 readonly SCRIPT_NAME="envoy_build.sh"
 readonly LAST_MODIFIED_BY="Daniel Garcia"
 readonly LAST_MODIFIED_ON="2026-08-29"
@@ -749,7 +749,7 @@ echo ""
 echo "===== Also ====="
 echo "channel:        google-play (split set)"
 echo "appHashMeaning: base.apk exactly as supplied; not an aggregate of the split set"
-echo "buildEnv:       nix develop at ${TAG} (Flutter 3.44.2, Rust 1.91.0, pinned Android SDK/NDK)"
+echo "buildEnv:       nix develop at ${SOURCE_REF} (Flutter 3.44.2, Rust 1.91.0, pinned Android SDK/NDK)"
 echo "buildCmd:       ORG_GRADLE_PROJECT_nosign=true flutter build aab --release --target-platform android-arm64"
 echo "bundletool:     ${BT_VER} (declared by AGP 8.12.0's POM; not proven to match Play's generator), sha256 ${BT_SHA}"
 echo "deviceSpec:     $(cat "$SPEC")"
