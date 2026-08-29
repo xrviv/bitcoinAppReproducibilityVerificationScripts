@@ -1,6 +1,6 @@
 #!/bin/bash
 # envoy_build.sh — Envoy (com.foundationdevices.envoy) Android reproducible build verification
-# Version:       v0.2.4
+# Version:       v0.2.5
 # Organization:  WalletScrutiny.com
 # Project:       https://github.com/Foundation-Devices/envoy
 #
@@ -33,10 +33,10 @@ set -euo pipefail
 
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.2.4"
+readonly SCRIPT_VERSION="v0.2.5"
 readonly SCRIPT_NAME="envoy_build.sh"
 readonly LAST_MODIFIED_BY="Daniel Garcia"
-readonly LAST_MODIFIED_ON="2026-08-27"
+readonly LAST_MODIFIED_ON="2026-08-29"
 SCRIPT_PATH="$(readlink -f "$0")"
 readonly SCRIPT_PATH
 SCRIPT_SHA256=""
@@ -575,6 +575,22 @@ arsc_ok() {
     echo "      arsc: decoded res/ tree IDENTICAL"
 }
 
+# Report the signing state we MEASURED, never a fixed assumption. bundletool signs the APKs it
+# generates only when a keystore is passed with --ks; this script passes none, so they come out
+# unsigned and bundletool says so on stderr. v0.2.4 and earlier printed a hardcoded claim that
+# they had been debug-signed, which was false and contradicted the run's own comparison evidence
+# (root META-INF signing material was official-only). Measure it from the built artifact instead.
+signing_state() {
+    local b="${BLT[base]:-}" n
+    [[ -n "$b" && -f "$b" ]] && n="$(nixrun unzip -l "$b" 2>/dev/null | awk '{print $NF}' \
+        | grep -cE "^META-INF/${SIGN_NAME}$" || true)" || { echo "AAB unsigned; built APK signing state NOT MEASURED (no built base APK)"; return 0; }
+    if [[ "${n:-0}" -gt 0 ]]; then
+        echo "AAB unsigned; generated APKs carry ${n} root META-INF signing entry(ies)"
+    else
+        echo "AAB unsigned; generated APKs also unsigned (no keystore passed to bundletool; no root META-INF signing entries)"
+    fi
+}
+
 SUMMARY="${WORK_DIR}/comparison/summary.txt"; : > "$SUMMARY"
 
 for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
@@ -699,7 +715,7 @@ echo "buildCmd:       ORG_GRADLE_PROJECT_nosign=true flutter build aab --release
 echo "bundletool:     ${BT_VER} (declared by AGP 8.12.0's POM; not proven to match Play's generator), sha256 ${BT_SHA}"
 echo "deviceSpec:     $(cat "$SPEC")"
 echo "sdkVersionSrc:  ${SDK_SRC}"
-echo "signingState:   AAB unsigned; bundletool debug-signed the generated APKs (keystore kept in the workspace)"
+echo "signingState:   $(signing_state)"
 echo "rawDiffs:       ${RAW_TOTAL}"
 echo "acceptedDiffs:  ${ACC_TOTAL} (signing ${ACC_SIGN}, sourcestamp ${ACC_STAMP}, manifest ${ACC_MANI}, arsc ${ACC_ARSC})"
 echo "unaccounted:    ${UNACC_TOTAL}"
