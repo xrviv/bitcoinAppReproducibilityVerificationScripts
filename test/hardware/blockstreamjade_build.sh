@@ -2,7 +2,7 @@
 # ==============================================================================
 # blockstreamjade_build.sh - Blockstream Jade (classic) Reproducible Build Verifier
 # ==============================================================================
-# Version: v0.3.1
+# Version: v0.3.2
 # Organization: WalletScrutiny.com
 # Last modified by: Daniel Garcia
 # Last modified on: 2026-08-31
@@ -54,7 +54,7 @@
 
 set -eEuo pipefail
 
-SCRIPT_VERSION="v0.3.1"
+SCRIPT_VERSION="v0.3.2"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256=""
 APP_ID="blockstreamjade"
@@ -177,7 +177,13 @@ parse_args() {
 
 normalize_type() {
   case "${1,,}" in
-    ""|all) echo "" ;;
+    # `jade` is what the build server passes: _hardware/blockstreamjade.md
+    # declares `types: jade`, and ABS forwards that value verbatim
+    # (docs/script_verifications.md). It means "the whole product", i.e. all
+    # four classic artifacts - matching the one-verification-per-product
+    # publication model. Before v0.3.2 the bare page type fell through to
+    # INVALID and every ABS run exited 2 before fetching anything.
+    ""|all|jade|jade_classic|blockstreamjade) echo "" ;;
     jade-ble|jade1.0-ble|jade_ble) echo "jade-ble" ;;
     jade-noradio|jade1.0-noradio|jade_noradio) echo "jade-noradio" ;;
     jade1.1-ble|jade1_1-ble|jade11-ble) echo "jade1.1-ble" ;;
@@ -209,7 +215,7 @@ validate_inputs() {
 
   TYPE="$(normalize_type "${TYPE}")"
   if [[ "${TYPE}" == "INVALID" ]]; then
-    log_fail "Unsupported --type. Use one of: jade-ble, jade-noradio, jade1.1-ble, jade1.1-noradio, or omit for all four."
+    log_fail "Unsupported --type. Use one of: jade-ble, jade-noradio, jade1.1-ble, jade1.1-noradio, or jade/all/omit for all four."
     exit "${EXIT_INVALID}"
   fi
 
