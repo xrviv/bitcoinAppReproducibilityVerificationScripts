@@ -2,10 +2,10 @@
 # ==============================================================================
 # blockstreamjade_build.sh - Blockstream Jade (classic) Reproducible Build Verifier
 # ==============================================================================
-# Version: v0.3.0
+# Version: v0.3.1
 # Organization: WalletScrutiny.com
 # Last modified by: Daniel Garcia
-# Date last modified: 2026-08-05
+# Last modified on: 2026-08-31
 # Project: https://github.com/Blockstream/Jade
 # ==============================================================================
 #
@@ -54,7 +54,9 @@
 
 set -eEuo pipefail
 
-SCRIPT_VERSION="v0.3.0"
+SCRIPT_VERSION="v0.3.1"
+SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_SHA256=""
 APP_ID="blockstreamjade"
 REPO_URL="https://github.com/Blockstream/Jade"
 MOUNT_PATH="/builds/blockstream/jade"
@@ -88,6 +90,14 @@ NC='\033[0m'
 log_info() { echo "[INFO] $*"; }
 log_warn() { echo -e "${YELLOW}[WARN] $*${NC}" >&2; }
 log_fail() { echo -e "${RED}[FAIL] $*${NC}" >&2; }
+
+# Hashes a host-side file, returning N/A rather than failing, so a hashing
+# problem can never abort a run under `set -eEuo pipefail`. Distinct from
+# sha256_local() below, which is only ever handed files known to exist.
+sha256_of() {
+  [[ -f "$1" ]] || { echo "N/A"; return 0; }
+  sha256sum "$1" | awk '{print $1}'
+}
 
 declare -A V_RESULT V_NOTE V_CMPHASH V_FWHASH V_PAYLOAD V_BUILT V_SIGSTATE V_SIGKEY
 
@@ -671,6 +681,15 @@ print_disclaimer() {
 }
 
 main() {
+  # FIRST action, before parse_args: the asciinema recording is the only
+  # artifact attached to a published verification, so it must establish on its
+  # own which script bytes produced the result - and an invalid-argument run
+  # exits at parse time, so a later banner would not record which script failed.
+  # See ws-notes/script-notes/script-version-and-hash.md.
+  SCRIPT_SHA256="$(sha256_of "${SCRIPT_PATH}")"
+  log_info "Script:  $(basename "${SCRIPT_PATH}") ${SCRIPT_VERSION}"
+  log_info "         sha256: ${SCRIPT_SHA256}"
+
   parse_args "$@"
   validate_inputs
   detect_container_cmd
@@ -679,10 +698,6 @@ main() {
   mkdir -p "${WORK_DIR}"
 
   print_disclaimer
-  # Printed to the terminal, not just written to the YAML: the asciinema
-  # recording is the only artifact attached to a published verification, so it
-  # must be able to establish on its own which script version produced the result.
-  echo "blockstreamjade_build.sh ${SCRIPT_VERSION}"
   echo "Verifying Blockstream Jade firmware v${VERSION} (${TYPE:-all classic variants})"
   echo "Work dir: ${WORK_DIR}"
   echo
@@ -735,9 +750,10 @@ main() {
   echo
   echo "===== Begin Results ====="
   echo "appId:   ${APP_ID}"
-  echo "script_version: ${SCRIPT_VERSION}"
   echo "version: ${VERSION}"
   echo "commit:  ${SRC_COMMIT}"
+  echo "scriptVersion:  ${SCRIPT_VERSION}"
+  echo "scriptHash:     ${SCRIPT_SHA256}"
   echo "sdkconfig method: ${SDK_METHOD}"
   # Jade publishes a compressed artifact whose decompressed form carries the
   # signature block, so "the hash of the official firmware" is two values, not
