@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # unstoppablewallet_build.sh - Unstoppable Wallet Reproducible Build Verification
-# Version:       v0.4.4
+# Version:       v0.5.0
 # Organization:  WalletScrutiny.com
+# Last modified by: Danny Garcia
+# Last modified on: 2026-09-01
 # Project:       https://github.com/horizontalsystems/unstoppable-wallet-android
 # Host deps:     docker or podman only
 # Notes:         Play Store-only, split-only. --binary must be a DIRECTORY of device-pulled
@@ -9,13 +11,20 @@
 #                Single-APK releases (<= v0.47.x) are NOT supported by v0.3.0 (use an older script).
 #                v0.49.0: zcash de-forked → external cash.z.ecc.android (not built); zano-kit-android
 #                built from source, but its ~290 MB prebuilt .a (Zano/Boost/OpenSSL) are trusted blobs.
+#                v0.50.1: compileSdk 37; thorchain-kit-android is built and published locally.
 
-SCRIPT_VERSION="v0.4.4"
-echo "Starting unstoppablewallet_build.sh ${SCRIPT_VERSION}"
+SCRIPT_VERSION="v0.5.0"
+SCRIPT_NAME="unstoppablewallet_build.sh"
+SCRIPT_PATH="$(readlink -f "$0")"
+if [[ -f "$SCRIPT_PATH" ]]; then
+    SCRIPT_SHA256="$(sha256sum "$SCRIPT_PATH" | awk '{print $1}')"
+else
+    SCRIPT_SHA256="N/A"
+fi
+printf '%s %s sha256:%s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION" "$SCRIPT_SHA256"
 
 set -uo pipefail   # no -e: diff/cmp return 1 on differences
 
-SCRIPT_NAME="unstoppablewallet_build.sh"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_ID="io.horizontalsystems.bankwallet"
 HOST_UID="$(id -u)"
@@ -75,6 +84,7 @@ version_arg=""
 apk_file=""
 arch_arg=""
 type_arg=""
+device_sdk_arg=""
 
 require_arg() {
     local flag="$1" val="${2:-}"
@@ -93,13 +103,22 @@ while [[ $# -gt 0 ]]; do
         --apk)      require_arg --apk     "${2:-}"; apk_file="$2";     shift 2 ;;
         --arch)     require_arg --arch    "${2:-}"; arch_arg="$2";     shift 2 ;;
         --type)     require_arg --type    "${2:-}"; type_arg="$2";     shift 2 ;;
-        -h|--help)  echo "Usage: $SCRIPT_NAME --binary <official.apk | dir-of-split-apks> [--version v] [--arch a] [--type t]"; echo "Exit code: 0"; exit 0 ;;
+        --device-sdk) require_arg --device-sdk "${2:-}"; device_sdk_arg="$2"; shift 2 ;;
+        -h|--help)  echo "Usage: $SCRIPT_NAME --binary <dir-of-split-apks> [--version v] [--arch a] [--type t] [--device-sdk N]"; echo "Exit code: 0"; exit 0 ;;
         *)
             log_warn "Unknown parameter ignored: $1"
             shift
             ;;
     esac
 done
+
+DEVICE_SDK="${device_sdk_arg:-${WS_DEVICE_SDK:-36}}"
+if [[ ! "$DEVICE_SDK" =~ ^[0-9]+$ || "$DEVICE_SDK" -lt 21 || "$DEVICE_SDK" -gt 99 ]]; then
+    log_error "--device-sdk/WS_DEVICE_SDK must be an Android API level (21-99); got: ${DEVICE_SDK}"
+    write_warning_yaml "Invalid Android device SDK/API level: ${DEVICE_SDK}"
+    echo ""; echo "Exit code: 2"
+    exit 2
+fi
 
 if [[ -z "$apk_file" ]]; then
     log_error "--binary is required. Unstoppable Wallet is Play Store-only."
@@ -134,6 +153,7 @@ for f in "${OFFICIAL_SPLITS[@]}"; do
 done
 apk_file="$OFFICIAL_DIR/base.apk"   # base.apk drives Phase 0 metadata
 log_info "${#OFFICIAL_SPLITS[@]} official split(s) in ${OFFICIAL_DIR}"
+log_info "Device SDK/API for bundletool: ${DEVICE_SDK}"
 [[ -n "$arch_arg" ]]  && log_info "--arch ${arch_arg} accepted but not used (configs derived from official splits)"
 [[ -n "$type_arg" ]]  && log_info "--type ${type_arg} accepted but not used"
 [[ -n "$version_arg" ]] && log_info "--version ${version_arg} accepted; actual version derived from APK metadata"
@@ -229,6 +249,7 @@ banner "UNSTOPPABLE WALLET REPRODUCIBLE BUILD VERIFICATION"
 echo "  Script:    ${SCRIPT_NAME} ${SCRIPT_VERSION}"
 echo "  App ID:    ${APP_ID}"
 echo "  APK:       ${apk_file}"
+echo "  Device SDK:${DEVICE_SDK}"
 echo "  Runtime:   ${CRUN} ($($CRUN --version 2>&1 | head -1))"
 echo "  Workspace: ${workspace}"
 echo "  Date:      $(date)"
@@ -261,7 +282,7 @@ RUN mkdir -p ${ANDROID_HOME}/cmdline-tools && \
 RUN yes | sdkmanager --licenses && \
     sdkmanager \
         "platforms;android-33" "platforms;android-34" \
-        "platforms;android-35" "platforms;android-36" \
+        "platforms;android-35" "platforms;android-36" "platforms;android-37.0" \
         "build-tools;30.0.3" "build-tools;34.0.0" \
         "build-tools;35.0.0" "build-tools;36.0.0" \
         "ndk;23.1.7779620" "ndk;25.1.8937393" "ndk;29.0.14033849" \
@@ -299,8 +320,15 @@ APKSIGNER="${ANDROID_HOME}/build-tools/36.0.0/apksigner"
 apk_info=$("${AAPT2}" dump badging /input/official.apk 2>/dev/null || true)
 version_name=$(echo "$apk_info" | grep -oP "versionName='[^']+'" | sed "s/versionName='//;s/'$//" || true)
 version_code=$(echo "$apk_info" | grep -oP "versionCode='[^']+'" | sed "s/versionCode='//;s/'$//" || true)
-signer_hash=$("${APKSIGNER}" verify --print-certs /input/official.apk 2>/dev/null \
-    | grep "Signer #1 certificate SHA-256" | awk '{print $6}' || true)
+signer_output=$("${APKSIGNER}" verify --verbose --print-certs /input/official.apk 2>&1) || {
+    echo "ERROR: official base.apk signature verification failed"
+    printf '%s\n' "$signer_output"
+    exit 1
+}
+# Supports both legacy "Signer #1" and rotated SDK-range signer labels while excluding SourceStamp.
+signer_hash=$(printf '%s\n' "$signer_output" \
+    | sed -nE '/^Signer( #[0-9]+| \(minSdkVersion=[^)]*\)) certificate SHA-256 digest:/ {s/.*digest: //;p;}' \
+    | sort -u | paste -sd, -)
 
 pkg_name=$(echo "$apk_info" | grep -oP "^package: name='[^']+'" | sed "s/^package: name='//;s/'$//" || true)
 
@@ -347,6 +375,10 @@ log_success "APK app ID verified: ${pkg_id}"
 log_success "APK metadata: v${wallet_version} (code ${version_code})"
 log_info    "Signer SHA-256: ${signer}"
 log_info    "Official APK SHA-256: ${app_hash}"
+log_info    "Official split APK SHA-256 values:"
+for official_split in "${OFFICIAL_SPLITS[@]}"; do
+    printf '  %s  %s\n' "$(sha256of "$official_split")" "$(basename "$official_split")"
+done
 
 banner "PHASE 1: BUILD DEPS FROM SOURCE + BUILD WALLET"
 echo "  Building horizontalsystems deps from source (zano: Kotlin/JNI wrapper only — links prebuilt .a blobs)."
@@ -441,6 +473,18 @@ echo ""; echo "=== Step 1: Clone all repos === $(date)"
 
 git clone --depth 1 --branch __WALLET_VERSION__ "$GH/unstoppable-wallet-android.git" /build/wallet
 
+compile_sdk=$(sed -nE 's/^[[:space:]]*compileSdk[[:space:]]*=[[:space:]]*"([0-9]+)".*/\1/p' \
+    /build/wallet/gradle/libs.versions.toml | head -1)
+require_nonempty "compileSdk" "$compile_sdk"
+platform_dir=$(find "$ANDROID_HOME/platforms" -maxdepth 1 -type d \
+    \( -name "android-${compile_sdk}" -o -name "android-${compile_sdk}.0" \) -print -quit)
+if [[ -z "$platform_dir" ]]; then
+    echo "ERROR: compileSdk ${compile_sdk} is not installed under $ANDROID_HOME/platforms"
+    echo "       Refusing to build dependencies before this environment defect is fixed."
+    exit 1
+fi
+echo "Compile SDK ${compile_sdk} present: ${platform_dir}"
+
 if [[ -f "/build/wallet/app/build.gradle.kts" ]]; then
     wallet_gradle="/build/wallet/app/build.gradle.kts"
 elif [[ -f "/build/wallet/app/build.gradle" ]]; then
@@ -460,6 +504,8 @@ MARKET_VER=$(extract_wallet_hs_version "market-kit-android" "$wallet_gradle")
 SOLANA_VER=$(extract_wallet_hs_version "solana-kit-android" "$wallet_gradle")
 TRON_VER=$(extract_wallet_hs_version "tron-kit-android" "$wallet_gradle")
 ZANO_VER=$(extract_wallet_hs_version "zano-kit-android" "$wallet_gradle")
+HD_WALLET_VER=$(extract_wallet_hs_version "hd-wallet-kit-android" "$wallet_gradle" || true)
+THORCHAIN_VER=$(extract_wallet_hs_version "thorchain-kit-android" "$wallet_gradle" || true)
 
 require_nonempty "monero-kit-android version" "$MONERO_VER"
 require_nonempty "stellar-kit-android version" "$STELLAR_VER"
@@ -483,6 +529,8 @@ echo "  market-kit-android:               $MARKET_VER"
 echo "  solana-kit-android:               $SOLANA_VER"
 echo "  tron-kit-android:                 $TRON_VER"
 echo "  zano-kit-android:                 $ZANO_VER"
+[[ -n "$HD_WALLET_VER" ]] && echo "  hd-wallet-kit-android:            $HD_WALLET_VER"
+[[ -n "$THORCHAIN_VER" ]] && echo "  thorchain-kit-android:             $THORCHAIN_VER"
 
 clone_at_commit "$GH/ton-kit-android.git"                     "$TON_VER"      /build/deps/ton-kit-android
 clone_at_commit "$GH/stellar-kit-android.git"                 "$STELLAR_VER"  /build/deps/stellar-kit-android
@@ -495,10 +543,15 @@ clone_at_commit "$GH/bitcoin-kit-android.git"                 "$BITCOIN_VER"  /h
 clone_at_commit "$GH/ethereum-kit-android.git"                "$ETHEREUM_VER" /build/deps/ethereum-kit-android
 clone_at_commit "$GH/tron-kit-android.git"                    "$TRON_VER"     /build/deps/tron-kit-android
 clone_at_commit "$GH/monero-kit-android.git"                  "$MONERO_VER"   /build/deps/monero-kit-android
+if [[ -n "$THORCHAIN_VER" ]]; then
+    clone_at_commit "$GH/thorchain-kit-android.git"            "$THORCHAIN_VER" /build/deps/thorchain-kit-android
+fi
 
-HD_WALLET_VER=$(grep -Eo "com\\.github\\.horizontalsystems:hd-wallet-kit-android:[^\"']+" \
-    /home/jitpack/build/bitcoincore/build.gradle 2>/dev/null \
-    | head -1 | sed -E 's/.*:hd-wallet-kit-android://')
+if [[ -z "$HD_WALLET_VER" ]]; then
+    HD_WALLET_VER=$(grep -Eo "com\\.github\\.horizontalsystems:hd-wallet-kit-android:[^\"']+" \
+        /home/jitpack/build/bitcoincore/build.gradle 2>/dev/null \
+        | head -1 | sed -E 's/.*:hd-wallet-kit-android://')
+fi
 if [[ -z "$HD_WALLET_VER" ]]; then
     HD_WALLET_VER=$(grep -Eo "com\\.github\\.horizontalsystems:hd-wallet-kit-android:[^\"']+" \
         /build/deps/tron-kit-android/tronkit/build.gradle 2>/dev/null \
@@ -508,7 +561,7 @@ if [[ -z "$HD_WALLET_VER" ]]; then
     echo "ERROR: Could not derive hd-wallet-kit-android version from dependent repos"
     exit 1
 fi
-echo "  hd-wallet-kit-android (derived from dependency graph): $HD_WALLET_VER"
+echo "  hd-wallet-kit-android (resolved direct or dependency pin): $HD_WALLET_VER"
 clone_at_commit "$GH/hd-wallet-kit-android.git" "$HD_WALLET_VER" /build/deps/hd-wallet-kit-android
 
 echo "All repos cloned."
@@ -532,7 +585,22 @@ cd /build/deps/ton-kit-android
 sed -i "s/from components.release/from components.release\\n                groupId = \\\"com.github.horizontalsystems\\\"\\n                artifactId = \\\"ton-kit-android\\\"\\n                version = \\\"$TON_VER\\\"/" tonkit/build.gradle
 ./gradlew :tonkit:publishToMavenLocal --no-daemon
 
-echo ""; echo "=== Step 4b: stellar-kit-android === $(date)"
+if [[ -n "$THORCHAIN_VER" ]]; then
+    echo ""; echo "=== Step 4b: thorchain-kit-android === $(date)"
+    cd /build/deps/thorchain-kit-android
+    sed -i '/maven.*jitpack/i\        mavenLocal()' settings.gradle
+    sed -i -E "s/(com\\.github\\.horizontalsystems:hd-wallet-kit-android:)[^\"']+/\\1$HD_WALLET_VER/g" thorchainkit/build.gradle
+    if grep -qF "artifactId = 'thorchain-kit-android'" thorchainkit/build.gradle; then
+        sed -i "/artifactId = 'thorchain-kit-android'/{n;s/version = '[^']*'/version = '$THORCHAIN_VER'/;}" thorchainkit/build.gradle
+    else
+        sed -i "/from components.release/a\\                groupId = 'com.github.horizontalsystems'\\n                artifactId = 'thorchain-kit-android'\\n                version = '$THORCHAIN_VER'" thorchainkit/build.gradle
+    fi
+    grep -qF "version = '$THORCHAIN_VER'" thorchainkit/build.gradle || {
+        echo "ERROR: thorchain-kit publication version not set to $THORCHAIN_VER"; exit 1; }
+    ./gradlew :thorchainkit:publishToMavenLocal --no-daemon
+fi
+
+echo ""; echo "=== Step 4c: stellar-kit-android === $(date)"
 cd /build/deps/stellar-kit-android
 grep -qF "maven-publish" stellarkit/build.gradle || sed -i "/plugins {/a\\    id 'maven-publish'" stellarkit/build.gradle
 if grep -qF "release(MavenPublication)" stellarkit/build.gradle; then
@@ -557,26 +625,26 @@ fi
 grep -qF "version = '$STELLAR_VER'" stellarkit/build.gradle || { echo "ERROR: stellar-kit publication version not set to $STELLAR_VER"; exit 1; }
 ./gradlew :stellarkit:publishToMavenLocal --no-daemon
 
-echo ""; echo "=== Step 4c: market-kit-android === $(date)"
+echo ""; echo "=== Step 4d: market-kit-android === $(date)"
 cd /build/deps/market-kit-android
 sed -i "s/version = '1.0.0'/version = '$MARKET_VER'/" marketkit/build.gradle
 ./gradlew :marketkit:publishToMavenLocal --no-daemon
 
-echo ""; echo "=== Step 4d: blockchain-fee-rate-kit-android === $(date)"
+echo ""; echo "=== Step 4e: blockchain-fee-rate-kit-android === $(date)"
 cd /build/deps/blockchain-fee-rate-kit-android
 sed -i "s/artifactId = 'feeratekit'/artifactId = 'blockchain-fee-rate-kit-android'/" feeratekit/build.gradle
 sed -i "s/version = '1.0.0'/version = '$FEERATE_VER'/" feeratekit/build.gradle
 ./gradlew :feeratekit:publishToMavenLocal --no-daemon
 
-echo ""; echo "=== Step 4e: solana-kit-android === $(date)"
+echo ""; echo "=== Step 4f: solana-kit-android === $(date)"
 cd /build/deps/solana-kit-android
 sed -i "s/version = '1.0.0'/version = '$SOLANA_VER'/" solanakit/build.gradle
 ./gradlew :solanakit:publishToMavenLocal --no-daemon
 
-# Step 4f: zano-kit-android (new in v0.49.0; native C++/JNI). Build Kotlin SDK + libzanokit.so
+# Step 4g: zano-kit-android (new in v0.49.0; native C++/JNI). Build Kotlin SDK + libzanokit.so
 # from source + publish. CAVEAT: links ~290 MB prebuilt .a (Zano engine/Boost/OpenSSL) NOT rebuilt
 # (upstream builds them macOS-only) — trusted vendor blobs, flag in report. Needs NDK 27.0.12077973.
-echo ""; echo "=== Step 4f: zano-kit-android === $(date)"
+echo ""; echo "=== Step 4g: zano-kit-android === $(date)"
 echo "  [BLOB CAVEAT] zano links prebuilt .a (Zano engine/Boost/OpenSSL) — not rebuilt from source"
 cd /build/deps/zano-kit-android
 grep -qF "maven-publish" zanokit/build.gradle || sed -i "/plugins {/a\\    id 'maven-publish'" zanokit/build.gradle
@@ -753,6 +821,7 @@ set +e
 $CRUN run \
     --name "$CTR_P3" \
     "${MEM_ARGS[@]}" \
+    -e "WS_DEVICE_SDK=${DEVICE_SDK}" \
     -v "${OFFICIAL_DIR}:/official:ro" \
     -v "$P3_DIR:/output" \
     -v "$p3_ctx/build.sh:/build/build.sh:ro" \
@@ -939,6 +1008,8 @@ echo "apkVersionCode: ${version_code}"
 echo "verdict:        ${P5_VERDICT}"
 echo "appHash:        ${app_hash}"
 echo "commit:         ${commit}"
+echo "scriptVersion:  ${SCRIPT_VERSION}"
+echo "scriptHash:     ${SCRIPT_SHA256}"
 echo "comparisonDiffs: ${diff_count}"
 echo "acceptableDiffs: ${accepted_count} (WS #574)"
 echo "materialDiffs:  ${material_count}"
