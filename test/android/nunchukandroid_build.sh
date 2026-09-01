@@ -1,12 +1,12 @@
 #!/bin/bash
 # nunchukandroid_build.sh — Nunchuk Android Reproducible Build Verification
-# Version: v0.5.0
+# Version: v0.5.1
 # Organization: WalletScrutiny.com
 # License: MIT
 set -euo pipefail
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.5.0"
+readonly SCRIPT_VERSION="v0.5.1"
 readonly SCRIPT_NAME="nunchukandroid_build.sh"
 readonly APP_ID="io.nunchuk.android"
 readonly REPO_URL="https://github.com/nunchuk-io/nunchuk-android.git"
@@ -15,8 +15,7 @@ readonly NUNCHUK_IMAGE_BASE="nunchuk_build_env"
 readonly EXIT_SUCCESS=0
 readonly EXIT_FAILED=1
 readonly EXIT_INVALID=2
-# Self-identification (script-notes/script-version-and-hash.md, 2026-08-17): hash THIS file
-# before anything else, so a recording ties a verdict to exact bytes.
+# Self-identification, first action, ties a verdict to exact bytes: script-version-and-hash.md
 SCRIPT_PATH="$(readlink -f "$0")"
 if [[ -f "${SCRIPT_PATH}" ]]; then
     SCRIPT_SHA256="$(sha256sum "${SCRIPT_PATH}" | awk '{print $1}')"
@@ -56,12 +55,6 @@ log_pass()  { echo "[PASS] $*"; }
 log_fail()  { echo "[FAIL] $*"; }
 log_warn()  { echo "[WARNING] $*"; }
 die_invalid() { log_fail "$*"; echo "Exit code: ${EXIT_INVALID}"; exit "${EXIT_INVALID}"; }
-safe_grep_count() {
-    local grep_output
-    grep_output="$("$@" 2>/dev/null || true)"
-    grep_output="${grep_output//$'\n'/}"
-    [[ -n "${grep_output}" ]] && printf '%s\n' "${grep_output}" || printf '0\n'
-}
 write_yaml_outputs() {
     local content="$1"
     printf '%s\n' "$content" > "${EXEC_DIR}/COMPARISON_RESULTS.yaml"
@@ -95,10 +88,23 @@ on_error() {
     echo "Exit code: ${EXIT_FAILED}"
     exit "${EXIT_FAILED}"
 }
+# Nested containers write files the caller cannot remove and the build account has no sudo,
+# so hand the workspace back before ANY cleanup, on failure too, then verify.
+# non-sudo-directories-guideline.md (2026-08-11)
+reclaim_workspace() {
+    [[ -n "${WORK_DIR:-}" && -d "${WORK_DIR}" && -n "${CONTAINER_CMD:-}" ]] || return 0
+    ${CONTAINER_CMD} run --rm --user 0:0 -v "${WORK_DIR}:/w${VOLUME_RW}" \
+        "${WS_CONTAINER}" chown -R "$(id -u):$(id -g)" /w >/dev/null 2>&1 || true
+    local stray
+    stray="$(find "${WORK_DIR}" ! -uid "$(id -u)" -print -quit 2>/dev/null || true)"
+    [[ -n "${stray}" ]] && log_warn "Still not caller-owned: ${stray}"
+    return 0
+}
 cleanup_on_error() {
     local exit_code=$?
     if [[ "${exit_code}" -ne 0 && "${RESULT_DONE}" != "true" && -n "${WORK_DIR:-}" ]]; then
         log_warn "Script failed with exit code: ${exit_code}"
+        reclaim_workspace
         log_warn "Work directory preserved: ${WORK_DIR}"
         generate_error_yaml "ftbfs" || true
     fi
@@ -550,11 +556,9 @@ compare_split_apks() {
     fi
 }
 DIFF_LINE_MATCH='^Only in |^Files |^Binary files |^diff '
-# Exclude root META-INF SIGNING files by NAME, never the directory by path: META-INF also holds
-# services/ bindings, version-control-info.textproto, app-metadata.properties and androidx.*.version
-# markers - payload/provenance, counted. meta-inf-filter-scope.md (2026-08-27). Root only, so a
-# META-INF inside a bundled jar/aar stays counted. DIRECTION: our build is unsigned, so an "Only in"
-# signing file is expected on the OFFICIAL side alone; one only in BUILT means something signed it.
+# Root META-INF SIGNING files by NAME only, never the directory by path; nested META-INF stays
+# counted. DIRECTION: "Only in" is official-side only - a signing name in BUILT means something
+# signed our unsigned output. Rationale: meta-inf-filter-scope.md (2026-08-27).
 SIGN_NAME='[^/]*(\.(SF|RSA|DSA|EC)|MANIFEST\.MF)'
 META_INF_ROOT_EXCLUDE="^Only in comparison/official_[^/:]+/META-INF: ${SIGN_NAME}\$|^(Files|Binary files) comparison/(official|built)_[^/]+/META-INF/${SIGN_NAME} and |^diff (-r )?comparison/(official|built)_[^/]+/META-INF/${SIGN_NAME} "
 ensure_manifest_norm_awk() {
@@ -821,6 +825,7 @@ print_results_block() {
 }
 prepare() {
     log_info "=== PREPARE PHASE ==="
+    reclaim_workspace
     rm -rf "${WORK_DIR}"
     mkdir -p "${WORK_DIR}"
     mkdir -p "${WORK_DIR}/official-split-apks"
@@ -1051,16 +1056,14 @@ $(echo "${SEMANTIC_NOTES}" | sed '/^$/d; s/^/    - /')"
     else
         verdict="not_reproducible"
     fi
-    local notes
+    local notes ntail="
+  Build: ./gradlew bundleProductionRelease with disorderfs (reproducible directory ordering).
+  Non-META-INF diffs: ${TOTAL_DIFFS}.${semantic_summary}"
     if [[ "${BUILD_MODE}" == "split" ]]; then
         if [[ "${APK_INPUT_IS_DIR}" == "true" ]]; then
-            notes="Split-set mode: all supplied official splits vs matching built splits from ${GIT_TAG}.
-  Build: ./gradlew bundleProductionRelease with disorderfs (reproducible directory ordering).
-  Non-META-INF diffs: ${TOTAL_DIFFS}.${semantic_summary}"
+            notes="Split-set mode: all supplied official splits vs matching built splits from ${GIT_TAG}.${ntail}"
         else
-            notes="Split mode: official $(basename "${OFFICIAL_APK}") vs built split from ${GIT_TAG}.
-  Build: ./gradlew bundleProductionRelease with disorderfs (reproducible directory ordering).
-  Non-META-INF diffs: ${TOTAL_DIFFS}.${semantic_summary}"
+            notes="Split mode: official $(basename "${OFFICIAL_APK}") vs built split from ${GIT_TAG}.${ntail}"
         fi
     else
         notes="GitHub mode: official APK from GitHub releases vs built assembleProductionRelease.
@@ -1070,6 +1073,7 @@ $(echo "${SEMANTIC_NOTES}" | sed '/^$/d; s/^/    - /')"
     generate_comparison_yaml "${verdict}" "${notes}"
     print_results_block "${verdict}"
     RESULT_DONE=true
+    reclaim_workspace
     if [[ "${should_cleanup}" == "true" ]]; then
         log_info "Cleaning up ${WORK_DIR}..."
         rm -rf "${WORK_DIR}"
