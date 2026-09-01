@@ -2,9 +2,9 @@
 # ==============================================================================
 # greenandroid_build.sh - Blockstream Green Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.3.5
+# Version:       v0.4.0
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-06-05
+# Last Modified: 2026-09-01
 # Project:       https://github.com/Blockstream/green_android
 # ==============================================================================
 # LICENSE: MIT License
@@ -13,15 +13,11 @@
 # ~/work/ws-notes/script-notes/android/com.greenaddress.greenbits_android_wallet/changelog.md
 # ==============================================================================
 #
-# TECHNICAL DISCLAIMER:
-# This script is provided for technical analysis and reproducible build
-# verification purposes only. No warranty is provided regarding the security,
-# functionality, or fitness for any particular purpose. Users assume all risks.
-#
-# LEGAL DISCLAIMER:
-# This script is designed for legitimate security research and reproducible
-# build verification. Users are responsible for ensuring compliance with all
-# applicable laws. The developers assume no liability for any misuse.
+# TECHNICAL AND LEGAL DISCLAIMER:
+# Provided for reproducible build verification and legitimate security research only, as-is and
+# without warranty as to security, functionality or fitness for any purpose. Users assume all
+# risks, are responsible for compliance with applicable laws, and should examine this script
+# before running it. The developers assume no liability for any misuse.
 #
 # SCRIPT SUMMARY:
 # Phase 1 — GDK from source:
@@ -47,7 +43,7 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 # Constants
 # ------------------------------------------------------------------------------
-SCRIPT_VERSION="v0.3.5"
+SCRIPT_VERSION="v0.4.0"
 APP_ID="com.greenaddress.greenbits_android_wallet"
 REPO_URL="https://github.com/Blockstream/green_android.git"
 GDK_REPO_URL="https://github.com/Blockstream/gdk.git"
@@ -59,6 +55,16 @@ EXIT_INVALID=2
 
 execution_dir="$(pwd)"
 script_name="$(basename "$0")"
+
+# --- Self-identification (script-notes/script-version-and-hash.md, 2026-08-17) ---
+# Hash THIS file before doing anything else, so a reader can tie a verdict to exact bytes.
+script_path="$(readlink -f "$0")"
+if [[ -f "${script_path}" ]]; then
+  script_sha256="$(sha256sum "${script_path}" | awk '{print $1}')"
+else
+  script_sha256="unknown"
+fi
+printf '%s %s sha256:%s\n' "${script_name}" "${SCRIPT_VERSION}" "${script_sha256}"
 
 should_cleanup=false
 downloaded_apk=""
@@ -984,8 +990,19 @@ diff_brief="$($CONTAINER_CMD run --rm \
   "$WS_CONTAINER" \
   sh -c "diff -qr '$(basename "${from_play_unzipped}")' '$(basename "${from_build_unzipped}")' || true")"
 
-# Filter META-INF differences (Leo's regex)
-filtered_diff="$(echo "${diff_brief}" | grep -vE '^Only in [^/:]+: META-INF$|^Only in [^/:]+/META-INF:|^Files [^/]+/META-INF/' || true)"
+# Filter root META-INF SIGNING files by NAME, never the META-INF/ directory by path: it also
+# carries services/ bindings, version-control-info.textproto, app-metadata.properties and the
+# androidx.*.version markers, which are payload/provenance and must be counted.
+# See ws-notes/script-notes/meta-inf-filter-scope.md (2026-08-27). Matches only files DIRECTLY
+# under root META-INF/, so a META-INF inside a bundled jar/aar stays counted.
+# DIRECTION MATTERS: the local build is unsigned, so an "Only in" signing file is expected on the
+# OFFICIAL side alone. One appearing only in OUR build means something signed it - material, never
+# filtered. Hence the "Only in" exclusion is anchored to the official directory by name.
+SIGN_NAME='[^/]*(\.(SF|RSA|DSA|EC)|MANIFEST\.MF)'
+official_dir_re="$(basename "${from_play_unzipped}" | sed 's/[][\.^$*+?(){}|\/]/\\&/g')"
+filtered_diff="$(echo "${diff_brief}" \
+  | grep -vE "^Only in ${official_dir_re}/META-INF: ${SIGN_NAME}$" \
+  | grep -vE "^Files [^/ ]+/META-INF/${SIGN_NAME} and " || true)"
 filtered_diff_compact="$(echo "${filtered_diff}" | tr -d '\n\r')"
 if [[ -z "${diff_brief}" || -z "${filtered_diff_compact}" ]]; then
   diff_count=0
@@ -1143,6 +1160,8 @@ echo "apkFlavor:         ${build_flavor}"
 echo "apkVerdict:        ${apk_verdict}"
 echo "appHash:           ${app_hash}"
 echo "commit:            ${commit_hash}"
+echo "scriptVersion:     ${SCRIPT_VERSION}"
+echo "scriptHash:        ${script_sha256}"
 echo ""
 echo "Diff:"
 echo "${diff_display}"
