@@ -2,9 +2,10 @@
 # ==============================================================================
 # greenfdroid_build.sh - Blockstream Green F-Droid Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.5
+# Version:       v0.2.6
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-07-07
+# Last modified by: Danny Garcia
+# Last modified on: 2026-09-01
 # Project:       https://github.com/Blockstream/green_android
 # F-Droid:       https://f-droid.org/packages/com.greenaddress.greenbits_android_wallet/
 # License:       MIT
@@ -31,7 +32,7 @@ set -euo pipefail
 # ----------------------------------------
 # Constants
 # ----------------------------------------
-SCRIPT_VERSION="v0.2.5"
+SCRIPT_VERSION="v0.2.6"
 APP_ID="com.greenaddress.greenbits_android_wallet"
 REPO_URL="https://github.com/Blockstream/green_android.git"
 GDK_REPO_URL="https://github.com/Blockstream/gdk.git"
@@ -40,7 +41,7 @@ FDROID_RECIPE_URL="https://gitlab.com/fdroid/fdroiddata/-/raw/master/metadata/co
 # sha256 of the recipe build block minus blank + versionName/versionCode/commit
 # lines; recompute with the guard pipeline below after re-auditing a change.
 EXPECTED_RECIPE_SHA256="bd2b5c1324b1cebfb17591b7bf79ff247f9ad14eff58dd1eb2a6ab7356cd4baf"
-ENV_VALIDATED_THROUGH_CODE="22000525"  # newest env-validated versionCode
+ENV_VALIDATED_THROUGH_CODE="22000527"  # newest env-validated versionCode
 APP_COMMIT=""                          # resolved at runtime from the F-Droid recipe
 
 EXIT_SUCCESS=0
@@ -49,6 +50,8 @@ EXIT_INVALID=2
 
 execution_dir="$(pwd)"
 script_name="$(basename "$0")"
+SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_SHA256=""
 
 should_cleanup=false
 downloaded_apk=""
@@ -73,6 +76,15 @@ _staging_tag=""
 log_info()  { echo "[INFO] $*"; }
 log_warn()  { echo "[WARN] $*"; }
 log_error() { echo "[ERROR] $*"; }
+
+sha256_of() {
+  [[ -f "$1" ]] || { echo "N/A"; return 0; }
+  sha256sum "$1" | awk '{print $1}'
+}
+
+SCRIPT_SHA256="$(sha256_of "${SCRIPT_PATH}")"
+log_info "Script:  $(basename "${SCRIPT_PATH}") ${SCRIPT_VERSION}"
+log_info "         sha256: ${SCRIPT_SHA256}"
 
 append_additional_info() {
   local line="$1"
@@ -224,7 +236,7 @@ generate_comparison_yaml() {
     echo "  App: ${APP_ID}"
     echo "  Version: ${version_name} (versionCode ${version_code})"
     echo "  Build flavor: productionFDroid (F-Droid distribution)"
-    echo "  Build environment: Debian Trixie, username vagrant, cmake 3.31.6+, NDK r26b (26.1.10909125)"
+    echo "  Build environment: Debian Trixie, username vagrant, Android platforms 36/37.0, cmake 3.31.6+, NDK r26b (26.1.10909125)"
     echo "  Checkout path: /home/vagrant/build/com.greenaddress.greenbits_android_wallet/ (matches fdroidserver)"
     echo "  SOURCE_DATE_EPOCH: derived from app git commit timestamp"
     echo "  Comparison method: apksigcopier compare --unsigned"
@@ -296,6 +308,7 @@ RUN sdkmanager \
         "ndk;${ANDROID_NDK_VERSION}" \
         "platform-tools" \
         "platforms;android-36" \
+        "platforms;android-37.0" \
     && test -x "${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
 
 RUN groupadd --gid "${GROUP_ID}" vagrant \
@@ -462,6 +475,22 @@ git checkout "${APP_COMMIT}"
 echo "[BUILD] Confirming commit..."
 git log -1 --format="%H %s"
 git log -1 --format="%H" > /tmp/commit-hash.txt
+
+echo "[BUILD] Verifying the source compile SDK is installed before the slow GDK build..."
+compile_sdk=$(sed -n -E 's/^androidCompileSdk[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+  gradle/libs.versions.toml | head -1)
+[[ -z "${compile_sdk}" ]] && { echo "[BUILD] ERROR: androidCompileSdk not found in gradle/libs.versions.toml"; exit 1; }
+sdk_platform=""
+for candidate in \
+  "${ANDROID_HOME}/platforms/android-${compile_sdk}" \
+  "${ANDROID_HOME}/platforms/android-${compile_sdk}.0"; do
+  if [[ -d "${candidate}" ]]; then
+    sdk_platform="${candidate}"
+    break
+  fi
+done
+[[ -z "${sdk_platform}" ]] && { echo "[BUILD] ERROR: compileSdk ${compile_sdk} is not installed in ${ANDROID_HOME}; update the build image before retrying"; exit 1; }
+echo "[BUILD] Compile SDK ${compile_sdk} present: ${sdk_platform}"
 
 echo "[BUILD] Setting SOURCE_DATE_EPOCH from commit timestamp..."
 export SOURCE_DATE_EPOCH
@@ -1013,6 +1042,8 @@ echo "apkVersionCode: ${version_code}"
 echo "verdict:        ${verdict}"
 echo "appHash:        ${official_sha256}"
 echo "commit:         ${commit_hash}"
+echo "scriptVersion:  ${SCRIPT_VERSION}"
+echo "scriptHash:     ${SCRIPT_SHA256}"
 echo ""
 if [[ -n "${diff_output}" ]]; then
   echo "Diff (${diff_line_count} line(s); full diff in artifacts/apk-diff.txt):"
