@@ -1,12 +1,12 @@
 #!/bin/bash
 # nunchukandroid_build.sh — Nunchuk Android Reproducible Build Verification
-# Version: v0.4.11
+# Version: v0.5.0
 # Organization: WalletScrutiny.com
 # License: MIT
 set -euo pipefail
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.4.11"
+readonly SCRIPT_VERSION="v0.5.0"
 readonly SCRIPT_NAME="nunchukandroid_build.sh"
 readonly APP_ID="io.nunchuk.android"
 readonly REPO_URL="https://github.com/nunchuk-io/nunchuk-android.git"
@@ -15,6 +15,16 @@ readonly NUNCHUK_IMAGE_BASE="nunchuk_build_env"
 readonly EXIT_SUCCESS=0
 readonly EXIT_FAILED=1
 readonly EXIT_INVALID=2
+# Self-identification (script-notes/script-version-and-hash.md, 2026-08-17): hash THIS file
+# before anything else, so a recording ties a verdict to exact bytes.
+SCRIPT_PATH="$(readlink -f "$0")"
+if [[ -f "${SCRIPT_PATH}" ]]; then
+    SCRIPT_SHA256="$(sha256sum "${SCRIPT_PATH}" | awk '{print $1}')"
+else
+    SCRIPT_SHA256="unknown"
+fi
+readonly SCRIPT_SHA256
+printf '%s %s sha256:%s\n' "${SCRIPT_NAME}" "${SCRIPT_VERSION}" "${SCRIPT_SHA256}"
 VERSION=""
 ARCH=""
 TYPE=""
@@ -540,7 +550,13 @@ compare_split_apks() {
     fi
 }
 DIFF_LINE_MATCH='^Only in |^Files |^Binary files |^diff '
-META_INF_ROOT_EXCLUDE='^Only in comparison/(official|built)_[^/:]+: META-INF$|^Only in comparison/(official|built)_[^/:]+/META-INF(/[^:]*)?: |^(Files|Binary files) comparison/(official|built)_[^/]+/META-INF/|^diff (-r )?comparison/(official|built)_[^/]+/META-INF/'
+# Exclude root META-INF SIGNING files by NAME, never the directory by path: META-INF also holds
+# services/ bindings, version-control-info.textproto, app-metadata.properties and androidx.*.version
+# markers - payload/provenance, counted. meta-inf-filter-scope.md (2026-08-27). Root only, so a
+# META-INF inside a bundled jar/aar stays counted. DIRECTION: our build is unsigned, so an "Only in"
+# signing file is expected on the OFFICIAL side alone; one only in BUILT means something signed it.
+SIGN_NAME='[^/]*(\.(SF|RSA|DSA|EC)|MANIFEST\.MF)'
+META_INF_ROOT_EXCLUDE="^Only in comparison/official_[^/:]+/META-INF: ${SIGN_NAME}\$|^(Files|Binary files) comparison/(official|built)_[^/]+/META-INF/${SIGN_NAME} and |^diff (-r )?comparison/(official|built)_[^/]+/META-INF/${SIGN_NAME} "
 ensure_manifest_norm_awk() {
     local awk_path="${WORK_DIR}/manifest_norm.awk"
     cat > "${awk_path}" <<'AWK_EOF'
@@ -747,6 +763,7 @@ print_results_block() {
     echo ""
     echo "===== Begin Results ====="
     echo "scriptVersion:  ${SCRIPT_VERSION}"
+    echo "scriptHash:     ${SCRIPT_SHA256}"
     echo "appId:          ${APP_ID}"
     echo "signer:         ${signer:-unknown}"
     echo "apkVersionName: ${version_name:-unknown}"
