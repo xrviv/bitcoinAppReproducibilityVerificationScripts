@@ -1,27 +1,29 @@
 #!/bin/bash
 #
 # sparrowwindows_build.sh - Sparrow Wallet Windows (MSI/ZIP) Reproducible Build Verifier
-# Version: v0.1.3
+# Version: v0.2.0
 # Last modified by: Daniel Garcia
-# Last modified on: 2026-08-29 (v0.1.3)
+# Last modified on: 2026-09-02 (v0.2.0)
 #
 # Builds Sparrow for Windows via GitHub Actions, downloads the built installer and
 # compares it against the official release artifact.
 #
-# For MSI the comparison covers every named OLE stream and every decoded MSI database
-# table. Five classes are normalized away, and each one is printed by name: the
-# Authenticode signature, the PackageCode, build timestamps (the two documented summary
-# FILETIME properties and the cabinet's per-file date/time fields), the storage
-# order of rows within a table, and string-pool storage order. The cabinet is compared
-# byte-for-byte after zeroing exactly those date/time fields, so compressed payload,
-# checksums and folder records are all covered. Any other difference fails the run.
+# MSI: every named OLE stream and decoded database table is compared. Five classes are
+# normalized away, each printed by name: Authenticode signature, PackageCode, build
+# timestamps (two summary FILETIME properties plus the cabinet's per-file date/time
+# fields), table row order, string-pool order. The cabinet is compared byte-for-byte
+# after zeroing exactly those fields, so payload, checksums and folder records are
+# covered. Any other difference fails the run.
 #
-# OUT OF SCOPE, and not claimed: the OLE container itself - its header, FAT/DIFAT,
-# directory entries, sector padding and bytes past the final sector. Extraction exposes
-# named streams only.
+# OUT OF SCOPE, not claimed: the OLE container itself - header, FAT/DIFAT, directory
+# entries, sector padding, bytes past the final sector. Extraction exposes streams only.
 #
-# Comparator exit codes are distinguished: 0 equivalent, 1 real differences,
-# 2 or more a comparator/tool error, which is reported as ftbfs and never as a verdict.
+# Comparator exit codes: 0 equivalent, 1 real differences, 2+ a tool error reported as
+# ftbfs, never as a verdict.
+#
+# The official artifact is downloaded when --binary is omitted, and always checked first:
+# manifest signature verified under a PINNED fingerprint, then sha256 matched to the
+# manifest entry. Failure exits without a verdict.
 #
 # Linux artifacts (tarball/deb/rpm) are handled by sparrowdesktop_build.sh.
 #
@@ -31,7 +33,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.3"
+SCRIPT_VERSION="v0.2.0"
 APP_ID="sparrow"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256=""
@@ -47,6 +49,11 @@ EXIT_SUCCESS=0
 EXIT_BUILD_FAILED=1
 EXIT_INVALID_PARAMS=2
 
+# Trust anchor: the fingerprint is the pin, the vendored key only a convenience.
+SPARROW_KEY_FPR="D4D0D3202FC06849A257B38DE94618334C674B40"
+SPARROW_KEY_URL="https://keybase.io/craigraw/pgp_keys.asc"
+SPARROW_RELEASE_BASE="https://github.com/sparrowwallet/sparrow/releases/download"
+
 DEFAULT_JDK_VERSION="25.0.2+10"
 DOCKER_CMD="${DOCKER_CMD:-}"
 
@@ -58,6 +65,9 @@ CUSTOM_WORK_DIR=""
 KEEP_CONTAINER=false
 QUIET=false
 BINARY_PATH=""
+SKIP_SIG_VERIFY=false
+BINARY_SOURCE="operator-supplied"
+SIG_STATUS="not checked"
 
 # Never fatal: a hashing problem is not a build outcome.
 sha256_of() {
@@ -131,6 +141,67 @@ gh_c() {
         -w /work \
         "${GH_HELPER_IMAGE}" \
         gh "$@"
+}
+# Helper writes land under /work (= WORK_DIR); restore_host_owner hands them back.
+helper_c() {
+    "$DOCKER_CMD" run --rm -v "${WORK_DIR}:/work" -w /work \
+        --entrypoint "$1" "${GH_HELPER_IMAGE}" "${@:2}"
+}
+fetch_url() { helper_c curl -fsSL -o "/work/official/$2" "$1" 2>/dev/null; }
+
+# The key is FETCHED, never trusted: VALIDSIG carries the primary fingerprint of whoever
+# actually signed, asserted against SPARROW_KEY_FPR, so the download path need not be
+# trusted. Keyring is ephemeral in WORK_DIR; ~/.gnupg would pass unreproducibly.
+verify_official_signature() {
+    local art="$1"
+    if [[ "$SKIP_SIG_VERIFY" == true ]]; then
+        SIG_STATUS="SKIPPED (--no-verify-signature)"
+        warn "Signature verification skipped."
+        return 0
+    fi
+
+    local man="sparrow-${APP_VERSION}-manifest.txt" od="${WORK_DIR}/official"
+    echo "[INFO] Verifying ${art} against the signed manifest..."
+
+    local f
+    for f in "$man" "${man}.asc"; do
+        [[ -f "${od}/${f}" ]] || fetch_release_asset "$f" \
+            || die "Could not download ${f}" $EXIT_INVALID_PARAMS
+    done
+    fetch_url "$SPARROW_KEY_URL" "signing-key.asc" \
+        || die "Could not download the signing key" $EXIT_INVALID_PARAMS
+
+    helper_c bash -c "
+        export GNUPGHOME=/work/gnupg
+        mkdir -p \"\$GNUPGHOME\" && chmod 700 \"\$GNUPGHOME\"
+        gpg --batch --no-tty -q --import /work/official/signing-key.asc
+        gpg --batch --no-tty --status-fd 1 --verify \
+            '/work/official/${man}.asc' '/work/official/${man}'
+    " > "${WORK_DIR}/logs/gpg-verify.txt" 2>&1 || true
+
+    if ! grep -q "VALIDSIG ${SPARROW_KEY_FPR}" "${WORK_DIR}/logs/gpg-verify.txt"; then
+        SIG_STATUS="FAILED (manifest not signed by pinned key)"
+        sed -n '1,20p' "${WORK_DIR}/logs/gpg-verify.txt" >&2
+        die "Manifest signature check FAILED for ${man}" $EXIT_INVALID_PARAMS
+    fi
+    echo "[INFO]   manifest signed by pin ${SPARROW_KEY_FPR}"
+
+    local want got
+    want=$(awk -v n="*${art}" '$2 == n {print $1; exit}' "${od}/${man}")
+    [[ -n "$want" ]] || { SIG_STATUS="FAILED (${art} absent from manifest)"
+        die "${art} has no entry in ${man}" $EXIT_INVALID_PARAMS; }
+    got=$(sha256_of "${od}/${art}")
+    if [[ "$want" != "$got" ]]; then
+        SIG_STATUS="FAILED (sha256 vs signed manifest)"
+        die "${art} sha256 ${got} != manifest ${want}" $EXIT_INVALID_PARAMS
+    fi
+    SIG_STATUS="VERIFIED (pinned key; sha256 matches)"
+    echo "[INFO]   sha256 matches manifest entry"
+}
+
+# One release asset into official/. Never fatal; callers decide.
+fetch_release_asset() {
+    fetch_url "${SPARROW_RELEASE_BASE}/${APP_VERSION}/$1" "$1"
 }
 compare_extracted() {
     local listing="$1" oroot="$2" broot="$3"
@@ -480,13 +551,12 @@ is_rootless() {
     [[ "$r" == "true" ]]
 }
 
-# Hand the workspace back so the invoking user can delete it without sudo
-# (non-sudo-directories-guideline.md). The helper containers bind-mount WORK_DIR and
-# write as container root; under a rootful engine those files land root-owned on the
-# host and the build-server account cannot remove them. Under a rootless engine the
-# caller IS container UID 0, so chown to 0:0 there and to the numeric uid otherwise.
-# Runs on failure too via the EXIT trap in build_and_verify_windows. Never fatal:
-# a verdict already reached must not be lost to a cleanup problem.
+# Hand the workspace back so the caller can delete it without sudo
+# (non-sudo-directories-guideline.md). Helpers bind-mount WORK_DIR and write as container
+# root; under a rootful engine those land root-owned and the build-server account cannot
+# remove them. Rootless, the caller IS container UID 0, so chown 0:0 there, numeric uid
+# otherwise. Runs on failure too via the EXIT trap. Never fatal: a verdict already
+# reached must not be lost to a cleanup problem.
 restore_host_owner() {
     [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" && -n "${DOCKER_CMD}" ]] || return 0
     "$DOCKER_CMD" image inspect "${GH_HELPER_IMAGE}" >/dev/null 2>&1 || return 0
@@ -538,13 +608,21 @@ build_and_verify_windows() {
     local official_msi="${official_dir}/Sparrow-${APP_VERSION}.msi"
     local official_zip="${official_dir}/Sparrow-${APP_VERSION}.zip"
 
-    if [[ "$APP_TYPE" == "msi" ]]; then
-        echo "[INFO] Using provided MSI: $(basename "$BINARY_PATH")"
-        cp "$BINARY_PATH" "$official_msi"
+    local oname="Sparrow-${APP_VERSION}.${APP_TYPE}" otgt="${official_dir}/Sparrow-${APP_VERSION}.${APP_TYPE}"
+
+    if [[ -n "$BINARY_PATH" ]]; then
+        echo "[INFO] Using provided ${APP_TYPE^^}: $(basename "$BINARY_PATH")"
+        cp "$BINARY_PATH" "$otgt"
     else
-        echo "[INFO] Using provided ZIP: $(basename "$BINARY_PATH")"
-        cp "$BINARY_PATH" "$official_zip"
+        echo "[INFO] Downloading ${oname}..."
+        fetch_release_asset "$oname" \
+            || die "Could not download ${oname}" $EXIT_INVALID_PARAMS
+        BINARY_SOURCE="downloaded from sparrowwallet/sparrow releases"
+        echo "[INFO] Downloaded $(sha256_of "$otgt")"
     fi
+
+    # Input-integrity problem, not a build outcome: no verdict.
+    verify_official_signature "$oname"
 
     local trigger_time
     trigger_time="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -764,11 +842,10 @@ build_and_verify_windows() {
 
     display_results "$execution_dir"
 }
-# Best-effort resolution of the source commit behind the release tag. The fine-grained
-# GITHUB_TOKEN is scoped to xrviv/WalletScrutinyCom and GitHub answers 404 for
-# sparrowwallet/sparrow with it, so ask the public API WITHOUT the token, and validate
-# strictly: anything that is not a 40-hex sha (404 body, rate-limit JSON, empty)
-# leaves RESOLVED_COMMIT at "unknown" rather than leaking garbage into the results block.
+# Best-effort source commit behind the release tag. The fine-grained GITHUB_TOKEN is
+# scoped to xrviv/WalletScrutinyCom and GitHub answers 404 for sparrowwallet/sparrow with
+# it, so ask the public API WITHOUT the token and validate strictly: anything not a
+# 40-hex sha leaves RESOLVED_COMMIT "unknown" rather than leaking garbage into results.
 resolve_commit() {
     local sha peeled
     sha=$("$DOCKER_CMD" run --rm -e APP_VERSION="${APP_VERSION}" "${GH_HELPER_IMAGE}" \
@@ -781,21 +858,20 @@ resolve_commit() {
     if [[ "$peeled" =~ ^[0-9a-f]{40}$ ]]; then RESOLVED_COMMIT="$peeled"; else RESOLVED_COMMIT="$sha"; fi
 }
 
-# Plain-language legend for the meaningful hashes, kept OUTSIDE the Begin/End markers so
-# that block stays a clean key: value list (dannys-amendments.md, "Ambiguous Artifact Hashes").
+# Hash legend, kept OUTSIDE the Begin/End markers so that block stays a clean
+# key: value list (dannys-amendments.md, "Ambiguous Artifact Hashes").
 print_hash_legend() {
     echo ""
     echo "HASH LEGEND"
-    echo "  appHash      sha256 of the official ${APP_TYPE^^} exactly as distributed. THIS is the"
-    echo "               hash to publish — a user reproduces it with sha256sum on the file they"
-    echo "               downloaded."
-    echo "  builtHash    sha256 of our rebuilt ${APP_TYPE^^}. Reported to localize a failure;"
-    echo "               NOT what the verdict is based on by itself. Do not publish alone."
-    echo "  scriptHash   sha256 of this script, identifying which tooling produced these results."
+    echo "  appHash      sha256 of the official ${APP_TYPE^^} exactly as distributed. THIS is"
+    echo "               the hash to publish — reproduced with sha256sum on the download."
+    echo "  builtHash    sha256 of our rebuild. Localizes a failure; NOT the verdict on"
+    echo "               its own. Do not publish alone."
+    echo "  scriptHash   sha256 of this script: which tooling produced these results."
 }
 
-# Standardized WalletScrutiny verification summary (verification-result-summary-format.md).
-# The machine verdict lives in COMPARISON_RESULTS.yaml; this block is the human/recording view.
+# Standardized summary (verification-result-summary-format.md). The machine verdict
+# lives in COMPARISON_RESULTS.yaml; this block is the human/recording view.
 emit_verification_summary() {
     local yaml_verdict summary_verdict
     yaml_verdict=$(grep "^verdict:" COMPARISON_RESULTS.yaml | cut -d' ' -f2)
@@ -814,8 +890,8 @@ emit_verification_summary() {
 
     print_hash_legend
 
-    # appHash is the official artifact EXACTLY AS DISTRIBUTED (verification-result-summary-format.md).
-    # Only canonical fields inside the markers; anything extra lives outside them.
+    # appHash is the official artifact EXACTLY AS DISTRIBUTED. Only canonical fields
+    # inside the markers; anything extra lives outside them.
     echo ""
     echo "===== Begin Results ====="
     echo "appId:          ${APP_ID}"
@@ -848,8 +924,9 @@ emit_verification_summary() {
     echo "commit:         ${RESOLVED_COMMIT}"
     echo ""
     echo "Signature Summary:"
-    echo "Not checked by this script. Verify the official artifact against Sparrow's signed"
-    echo "release manifest (Craig Raw's key) BEFORE passing it via --binary."
+    echo "official artifact: ${BINARY_SOURCE}"
+    echo "manifest signature: ${SIG_STATUS}"
+    echo "pinned key: ${SPARROW_KEY_FPR} (Craig Raw)"
 
     # Canonical "Also" section for non-standard notes (format doc section 5).
     if [[ "$APP_TYPE" == "msi" && "$match_flag" -eq 0 ]]; then
@@ -913,9 +990,11 @@ display_results() {
 }
 parse_arguments() {
     if [[ $# -eq 0 ]]; then
-        echo "Usage: $0 --version VERSION --arch x86_64-windows --type msi|zip --binary FILE"
-        echo "  --binary FILE   the official installer to compare against (required)"
-        echo "  Optional: --work-dir DIR --keep-container --quiet"
+        echo "Usage: $0 --version VERSION --arch x86_64-windows --type msi|zip [--binary FILE]"
+        echo "  --binary FILE   official installer; if omitted it is downloaded and"
+        echo "                  --type is required. Always checked against the signed"
+        echo "                  release manifest first."
+        echo "  Optional: --work-dir DIR --keep-container --quiet --no-verify-signature"
         exit $EXIT_INVALID_PARAMS
     fi
     while [[ $# -gt 0 ]]; do
@@ -927,6 +1006,7 @@ parse_arguments() {
             --work-dir) require_value "$1" "${2:-}"; CUSTOM_WORK_DIR="$2"; shift 2 ;;
             --apk)
                 if [[ $# -ge 2 && "${2:-}" != --* ]]; then shift 2; else shift; fi ;;
+            --no-verify-signature) SKIP_SIG_VERIFY=true; shift ;;
             --keep-container) KEEP_CONTAINER=true; shift ;;
             --quiet) QUIET=true; shift ;;
             --no-cache) shift ;;
@@ -937,7 +1017,16 @@ parse_arguments() {
     [[ -n "$APP_VERSION" ]] || die "Missing required parameter: --version" $EXIT_INVALID_PARAMS
     [[ -n "$APP_ARCH" ]] || die "Missing required parameter: --arch" $EXIT_INVALID_PARAMS
     is_windows_arch "$APP_ARCH" || die "--arch '$APP_ARCH' is not a Windows arch; Linux types are handled by sparrowdesktop_build.sh" $EXIT_INVALID_PARAMS
-    [[ -n "$BINARY_PATH" ]] || die "Missing required parameter: --binary (the official installer)" $EXIT_INVALID_PARAMS
+    # --binary optional since v0.2.0; with no file name --type must be explicit.
+    if [[ -z "$BINARY_PATH" ]]; then
+        case "$APP_TYPE" in
+            msi|zip) ;;
+            "") die "--type msi|zip is required when --binary is not given" $EXIT_INVALID_PARAMS ;;
+            *) die "Invalid --type '$APP_TYPE' (must be msi or zip)" $EXIT_INVALID_PARAMS ;;
+        esac
+        return 0
+    fi
+
     [[ -e "$BINARY_PATH" ]] || die "--binary path does not exist: $BINARY_PATH" $EXIT_INVALID_PARAMS
 
     local bname; bname=$(basename "$BINARY_PATH")
