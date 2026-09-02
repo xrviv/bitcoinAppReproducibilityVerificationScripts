@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # unstoppablefdroid_build.sh - Unstoppable Wallet (F-Droid variant) Reproducible Build Verification
-# Version:       v0.1.1
+# Version:       v0.1.2
 # Organization:  WalletScrutiny.com
 # Last modified by: Danny Garcia
 # Last modified on: 2026-09-02
@@ -32,7 +32,7 @@
 #                F-Droid's own build does NOT do this (it consumes JitPack artifacts), so a
 #                match here is a strictly stronger claim than F-Droid's.
 
-SCRIPT_VERSION="v0.1.1"
+SCRIPT_VERSION="v0.1.2"
 SCRIPT_NAME="unstoppablefdroid_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 if [[ -f "$SCRIPT_PATH" ]]; then
@@ -989,8 +989,19 @@ set -uo pipefail
 APKTOOL="java -jar /opt/apktool.jar"
 
 rm -rf /tmp/o /tmp/b; mkdir -p /tmp/o /tmp/b
-unzip -q -o /input/official.apk -d /tmp/o
-unzip -q -o /input/built.apk    -d /tmp/b
+# A silent unzip failure would leave an empty tree, which diff would then report as
+# "no differences" — a false reproducible verdict. Both unpacks are fatal.
+if ! unzip -q -o /input/official.apk -d /tmp/o; then
+    echo "ERROR: failed to unpack the official APK"; exit 3
+fi
+if ! unzip -q -o /input/built.apk -d /tmp/b; then
+    echo "ERROR: failed to unpack the built APK"; exit 3
+fi
+for d in /tmp/o /tmp/b; do
+    if [[ "$(find "$d" -type f | head -1)" == "" ]]; then
+        echo "ERROR: ${d} is empty after unpacking; refusing to compare"; exit 3
+    fi
+done
 
 # Signing material is never comparable: F-Droid signs with its own key, our build is
 # unsigned. Remove the whole root META-INF signing set on both sides before diffing.
@@ -1003,8 +1014,28 @@ BLT_N=$(find /tmp/b -type f | wc -l)
 echo "  files compared: ${OFF_N} official, ${BLT_N} built"
 
 diff -rq /tmp/o /tmp/b > /tmp/rawdiff.txt 2>&1
+diff_rc=$?
+# diff exits 0 (same) or 1 (differences). Anything else is a tool error, and treating it
+# as "no differences" would be a false reproducible verdict.
+if [[ "$diff_rc" -ne 0 && "$diff_rc" -ne 1 ]]; then
+    echo "ERROR: diff -rq failed with exit ${diff_rc}; refusing to emit a verdict"
+    sed 's/^/    /' /tmp/rawdiff.txt | head -20
+    exit 3
+fi
 cnt=$(grep -E '^(Files|Only in)' /tmp/rawdiff.txt || true)
+# Every line diff produced must be one we understand. An unparsed line (a permission
+# error, a symlink warning) must not be silently dropped from the count.
+unparsed=$(grep -vE '^(Files|Only in)' /tmp/rawdiff.txt | grep -v '^$' || true)
+if [[ -n "$unparsed" ]]; then
+    echo "ERROR: unrecognised diff output; refusing to emit a verdict"
+    printf '%s\n' "$unparsed" | sed 's/^/    /' | head -20
+    exit 3
+fi
 raw_total=$(printf '%s\n' "$cnt" | grep -c . || true); raw_total=${raw_total:-0}
+if [[ "$diff_rc" -eq 1 && "$raw_total" -eq 0 ]]; then
+    echo "ERROR: diff reported differences but none were parsed; refusing to emit a verdict"
+    exit 3
+fi
 echo "  raw differences: ${raw_total}"
 printf '%s\n' "$cnt" | head -5 | sed 's/^/    /'
 [[ "$raw_total" -gt 5 ]] && echo "    ... full list: diff_full.txt"
