@@ -2,9 +2,10 @@
 # ==============================================================================
 # bitcoinknotsdesktop_build.sh - Bitcoin Knots Reproducible Build Verification
 # ==============================================================================
-# Version:       v1.1.11
+# Version:       v1.1.12
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-08-12
+# Last modified by: Daniel Andrei R. Garcia
+# Last modified on: 2026-09-04
 # Project:       https://github.com/bitcoinknots/bitcoin
 # ==============================================================================
 # LICENSE: MIT License
@@ -53,8 +54,18 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v1.1.11"
+SCRIPT_VERSION="v1.1.12"
 SCRIPT_NAME="bitcoinknotsdesktop_build.sh"
+
+# Script self-identification. Resolved via readlink -f so a relative invocation or a
+# symlink still yields a path that hashes; sha256_of never fails the run.
+SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_SHA256=""
+
+sha256_of() {
+    [[ -f "$1" ]] || { echo "N/A"; return 0; }
+    sha256sum "$1" | awk '{print $1}'
+}
 APP_ID="bitcoinknots"
 APP_NAME="Bitcoin Knots"
 REPO_URL="https://github.com/bitcoinknots/bitcoin"
@@ -998,6 +1009,8 @@ verify_checksums() {
         echo "appHash:        N/A (no official release)"
     fi
     echo "commit:         ${version}"
+    echo "scriptVersion:  ${SCRIPT_VERSION}"
+    echo "scriptHash:     ${SCRIPT_SHA256}"
     echo ""
     echo "Diff:"
     if [[ "$verdict" == "reproducible" ]]; then
@@ -1047,8 +1060,11 @@ verify_checksums() {
 
 # Main execution function
 main() {
-    # Display script version first
-    log_info "Script version: ${SCRIPT_VERSION}"
+    # Self-identification is the first action, before argument parsing, so that even a
+    # run that dies on a bad argument records which script bytes failed.
+    SCRIPT_SHA256="$(sha256_of "$SCRIPT_PATH")"
+    log_info "Script:  $(basename "$SCRIPT_PATH") ${SCRIPT_VERSION}"
+    log_info "         sha256: ${SCRIPT_SHA256}"
     echo ""
     
     local version=""
