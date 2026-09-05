@@ -1,8 +1,8 @@
 #!/bin/bash
-# bitbox2nova_build.sh v3.2.0 - WalletScrutiny verification script for BitBox02 Nova
+# bitbox2nova_build.sh v3.4.0 - WalletScrutiny verification script for BitBox02 Nova
 # Organization: WalletScrutiny.com
 # Last modified by: Daniel Garcia
-# Date last modified: 2026-08-18 (v3.2.0)
+# Last modified on: 2026-09-05 (v3.4.0)
 # Usage: bitbox2nova_build.sh --version VERSION [--type TYPE] [--binary PATH] [--arch ARCH]
 #
 # Verifies BitBox02 Nova firmware reproducibility: builds from source via the upstream
@@ -13,7 +13,7 @@
 set -eE
 
 # ---- Globals ----------------------------------------------------------------
-SCRIPT_VERSION="v3.2.0"
+SCRIPT_VERSION="v3.4.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # readlink -f, not $0: a relative or symlinked invocation would otherwise hash nothing.
 SCRIPT_PATH="$(readlink -f "$0")"
@@ -253,6 +253,7 @@ while [[ $retry_count -lt $MAX_RETRIES ]]; do
     alpine \
     sh -c "
       set -e
+      trap '${INNER_CHOWN} /work 2>/dev/null || true' EXIT
       rm -rf /work/src
       apk add --no-cache git >/dev/null 2>&1
       RESOLVED_TAG='firmware/v${version}'
@@ -267,13 +268,13 @@ while [[ $retry_count -lt $MAX_RETRIES ]]; do
       cd /work/src
       git fetch --tags
       git rev-parse HEAD > /work/commit.txt
-      ${INNER_CHOWN} /work
     "; then
     break
   fi
   retry_count=$(( retry_count + 1 ))
   if [[ $retry_count -eq $MAX_RETRIES ]]; then
     echo -e "${RED}Failed to clone repository after $MAX_RETRIES attempts.${NC}"
+    repair_ownership "$workDir"
     write_results "ftbfs" "BitBox02 Nova v${version} (${firmwareType}): failed to clone repository."
     exit "$EXIT_FAIL"
   fi
@@ -349,15 +350,16 @@ else
       alpine \
       sh -c "
         set -e
+        trap '${INNER_CHOWN} /out 2>/dev/null || true' EXIT
         apk add --no-cache wget >/dev/null 2>&1
         wget -O '/out/${SIGNED_FILENAME}' '${DOWNLOAD_URL}'
-        ${INNER_CHOWN} '/out/${SIGNED_FILENAME}'
       "; then
       break
     fi
     retry_count=$(( retry_count + 1 ))
     if [[ $retry_count -eq $MAX_RETRIES ]]; then
       echo -e "${RED}Failed to download firmware after $MAX_RETRIES attempts.${NC}"
+      repair_ownership "$workDir/official"
       $CONTAINER_CMD rmi "$IMAGE_TAG" --force 2>/dev/null || true
       write_results "ftbfs" "BitBox02 Nova v${version} (${firmwareType}): failed to download official firmware."
       exit "$EXIT_FAIL"
@@ -389,6 +391,11 @@ if ! $CONTAINER_CMD run --rm \
   "$IMAGE_TAG" \
   bash -c "
     set -eo pipefail
+    # Runs on every exit from this shell, success or failure -- make writes build
+    # artifacts into /bb02 (host \$workDir/src) as root, and a failed build (dirty
+    # tree, compile error, edition mismatch) must not skip cleanup: that is exactly
+    # when leftovers matter, per non-sudo-directories-guideline.md.
+    trap '${INNER_CHOWN} /bb02 /out 2>/dev/null || true' EXIT
     git config --global --add safe.directory /bb02
     cd /bb02
 
@@ -486,13 +493,18 @@ print('monotonic version: ' + str(monotonic))
 print('device hash scheme: ' + scheme)
 \" \"\$SIGNED\" '${EXPECTED_PRODUCT_ID}'
 
-    ${INNER_CHOWN} /out
   "; then
+  # The container's own EXIT trap already ran chown/no-op as appropriate; podman's
+  # rootless case still needs the host-side unshare repair, and needs it on this
+  # failure path too -- a crashed build is exactly when leftovers matter most.
+  repair_ownership "$workDir/src"
+  repair_ownership "$workDir/out"
   echo -e "${RED}Build or comparison failed!${NC}"
   $CONTAINER_CMD rmi "$IMAGE_TAG" --force 2>/dev/null || true
   write_results "ftbfs" "BitBox02 Nova v${version} (${firmwareType}): firmware build or in-container comparison failed."
   exit "$EXIT_FAIL"
 fi
+repair_ownership "$workDir/src"
 repair_ownership "$workDir/out"
 
 echo -e "${GREEN}Firmware build and comparison completed!${NC}"
