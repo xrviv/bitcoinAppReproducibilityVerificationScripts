@@ -2,7 +2,7 @@
 #
 # passportprime_build.sh - Foundation Passport Prime (KeyOS) Reproducible Build Verifier
 #
-# Version: v0.6.0
+# Version: v0.6.1
 #
 # Last modified by: Danny Garcia
 # Last modified on: 2026-09-08
@@ -28,7 +28,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.6.0"
+SCRIPT_VERSION="v0.6.1"
 APP_ID="passportprime"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -538,7 +538,7 @@ rm -f "${COSIGN_PROBE}"
 nix develop .#build --command bash -c '
     set -euo pipefail
     scripts/generate-cosign2-dev-key.sh
-    # --keyos-version: required in newer xtask; probe, don't hardcode.
+    # --keyos-version: required in newer xtask; probe instead of hardcoding.
     KEYOS_VERSION_ARG=()
     if cargo xtask build-all --help 2>&1 | grep -q -- "--keyos-version"; then
         KEYOS_VERSION_ARG=(--keyos-version "$KEYOS_VERSION")

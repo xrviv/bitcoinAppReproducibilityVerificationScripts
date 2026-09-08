@@ -163,6 +163,21 @@ grep -q -- '--keyos-version' "${TMP}/gen/inner_build.sh" &&
 check "xtask build-all passes --keyos-version only when the flag is supported" "${rc}"
 
 rc=1
+# Regression (2026-09-08): a stray apostrophe in a comment inside the
+# `nix develop .#build --command bash -c '...'` block silently closes that
+# single-quoted string early, leaking the rest (including the cargo
+# invocation) OUTSIDE the nix devshell -- undetectable by `bash -n`, since
+# the result is still syntactically valid, just wrong ("cargo: command not
+# found" only surfaces at actual runtime, inside a real build). Checked by
+# following bash's own quoting rule: take everything between the opening
+# quote and the FIRST quote character anywhere after it, and confirm the
+# final build command is still inside that span.
+inner="$(awk '/nix develop \.#build --command bash -c .$/{grab=1} grab{print}' "${TMP}/gen/inner_build.sh" \
+    | awk -v RS="'" 'NR==2{print; exit}')"
+printf '%s' "${inner}" | grep -q 'cargo xtask build-all --production-bootloader' && rc=0
+check "nix-devshell bash -c block has no early-closing quote" "${rc}"
+
+rc=1
 grep -q 'verify_official_signature' "${TMP}/gen/inner_build.sh" &&
     grep -q 'two distinct keys trusted by KeyOS source' "${TMP}/gen/inner_build.sh" &&
     grep -q 'vendor devshell does not provide cosign2' "${TMP}/gen/inner_build.sh" && rc=0
