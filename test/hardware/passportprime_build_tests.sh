@@ -155,6 +155,14 @@ grep -q 'tar -xf "${RELEASE_DIR}/${fname}" -C "${RELEASE_TREE}"' "${TMP}/gen/inn
 check "release assets extract and resolve under their nested <version>/ dir" "${rc}"
 
 rc=1
+# v1.4.0's xtask added a required --keyos-version flag to --production-firmware,
+# absent at v1.3.2 -- probed via --help rather than a hardcoded version cutoff.
+grep -q -- '--keyos-version' "${TMP}/gen/inner_build.sh" &&
+    grep -q 'xtask build-all --help' "${TMP}/gen/inner_build.sh" &&
+    grep -q 'KEYOS_VERSION_ARG\[@\]' "${TMP}/gen/inner_build.sh" && rc=0
+check "xtask build-all passes --keyos-version only when the flag is supported" "${rc}"
+
+rc=1
 grep -q 'verify_official_signature' "${TMP}/gen/inner_build.sh" &&
     grep -q 'two distinct keys trusted by KeyOS source' "${TMP}/gen/inner_build.sh" &&
     grep -q 'vendor devshell does not provide cosign2' "${TMP}/gen/inner_build.sh" && rc=0

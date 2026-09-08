@@ -2,7 +2,7 @@
 #
 # passportprime_build.sh - Foundation Passport Prime (KeyOS) Reproducible Build Verifier
 #
-# Version: v0.5.3
+# Version: v0.6.0
 #
 # Last modified by: Danny Garcia
 # Last modified on: 2026-09-08
@@ -12,7 +12,7 @@
 # Signed compiled files are authenticated first, then hashed after their
 # non-deterministic 2048-byte cosign2 header; source-derived assets hash whole.
 # Scope excludes the raw Factory image, packaged OTA/composite artifacts, and
-# like-for-like bootloader comparison (no public plaintext production boot.bin).
+# bootloader comparison (no public plaintext production boot.bin to match).
 # A matching x86_64 build is valid; rerun mismatches on vendor-preferred aarch64.
 # Exit: 0 reproducible, 1 difference/failure/blocked verification, 2 bad input.
 #
@@ -28,7 +28,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.5.3"
+SCRIPT_VERSION="v0.6.0"
 APP_ID="passportprime"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -36,8 +36,8 @@ EXIT_SUCCESS=0
 EXIT_BUILD_FAILED=1
 EXIT_INVALID_PARAMS=2
 
-# Upstream URLs are set where used: Dockerfile heredoc (clone), inner_build.sh
-# (download + extraction). Pinned Nix base image; digest-pinned, tag is mutable.
+# Upstream URLs set where used: Dockerfile (clone), inner_build.sh (download).
+# Pinned Nix base image; digest-pinned, tag is mutable.
 NIX_IMAGE="docker.io/nixos/nix:2.31.5@sha256:4ae3542b89e38bf739a98d9e1ffd082c3c7b8a6455ec0c2331560b9440aec442"
 SUPPORTED_ARCH="armv7a"
 SUPPORTED_TYPE="firmware"
@@ -491,10 +491,9 @@ block_verification() { # state detail
     echo "[BUILD] BLOCKED ($1): $2"; exit 3
 }
 
-# Official binaries: two GitHub Release assets on the KeyOS repo, used when no
-# matching KeyOS-Releases branch exists (see changelog for which versions).
-# Tar paths carry the "<version>/" layout release_path_for already expects.
-# Pin of record: the two asset sha256 hashes, each checked against its sidecar.
+# Official binaries: two GitHub Release assets, used when no KeyOS-Releases
+# branch exists. Tar paths carry the "<version>/" layout release_path_for
+# expects. Pin: the two asset sha256 hashes, per sidecar.
 RELEASE_DIR="$(mktemp -d /tmp/keyos-release.XXXXXX)"
 RELEASE_TREE="${RELEASE_DIR}/tree"
 mkdir -p "${RELEASE_TREE}"
@@ -503,10 +502,10 @@ RELEASE_ASSET_BASE="https://github.com/Foundation-Devices/KeyOS/releases/downloa
 for bundle in Recovery.bin CoreSystemRecovery.bin; do
     fname="KeyOS-v${KEYOS_VERSION}-${bundle}"
     if ! curl -fsSL "${AUTH_ARGS[@]}" -o "${RELEASE_DIR}/${fname}" "${RELEASE_ASSET_BASE}/${fname}"; then
-        block_verification VERIFICATION_ERROR "could not download release asset ${fname}"
+        block_verification VERIFICATION_ERROR "could not download ${fname}"
     fi
     if ! curl -fsSL "${AUTH_ARGS[@]}" -o "${RELEASE_DIR}/${fname}.sha256" "${RELEASE_ASSET_BASE}/${fname}.sha256"; then
-        block_verification VERIFICATION_ERROR "could not download checksum for ${fname}"
+        block_verification VERIFICATION_ERROR "could not download ${fname}.sha256"
     fi
     published_hash="$(cut -d' ' -f1 "${RELEASE_DIR}/${fname}.sha256")"
     actual_hash="$(sha256sum "${RELEASE_DIR}/${fname}" | cut -d' ' -f1)"
@@ -515,16 +514,16 @@ for bundle in Recovery.bin CoreSystemRecovery.bin; do
     fi
     printf '%s %s\n' "${fname}" "${actual_hash}" >> "${OUT}/release-asset-hashes.txt"
     tar -xf "${RELEASE_DIR}/${fname}" -C "${RELEASE_TREE}"
-    # Bundles' manifest.json differ; rename so extraction can't clobber one.
+    # Bundles' manifests differ; rename so extraction can't clobber one.
     manifest_path="${RELEASE_TREE}/${KEYOS_VERSION}/manifest.json"
     [ -f "${manifest_path}" ] && mv "${manifest_path}" "${manifest_path}.${bundle%.bin}"
 done
-[ -s "${OUT}/release-asset-hashes.txt" ] || block_verification VERIFICATION_ERROR "no release assets recorded"
+[ -s "${OUT}/release-asset-hashes.txt" ] || block_verification VERIFICATION_ERROR "no assets recorded"
 : > "${OUT}/official-inventory.txt"
 while IFS= read -r -d '' f; do
     printf '%s\n' "${f#"${RELEASE_TREE}"/}" >> "${OUT}/official-inventory.txt"
 done < <(find "${RELEASE_TREE}" -type f -print0)
-[ -s "${OUT}/official-inventory.txt" ] || block_verification VERIFICATION_ERROR "empty official inventory"
+[ -s "${OUT}/official-inventory.txt" ] || block_verification VERIFICATION_ERROR "empty inventory"
 RELEASE_PIN="$(paste -sd';' "${OUT}/release-asset-hashes.txt")"
 echo "[BUILD] Comparands: KeyOS release assets v${KEYOS_VERSION} (${RELEASE_PIN})"
 
@@ -539,18 +538,23 @@ rm -f "${COSIGN_PROBE}"
 nix develop .#build --command bash -c '
     set -euo pipefail
     scripts/generate-cosign2-dev-key.sh
-    cargo xtask build-all --production-bootloader --production-firmware
+    # --keyos-version: required in newer xtask; probe, don't hardcode.
+    KEYOS_VERSION_ARG=()
+    if cargo xtask build-all --help 2>&1 | grep -q -- "--keyos-version"; then
+        KEYOS_VERSION_ARG=(--keyos-version "$KEYOS_VERSION")
+    fi
+    cargo xtask build-all --production-bootloader --production-firmware "${KEYOS_VERSION_ARG[@]}"
     cargo xtask print-hashes
 ' | tee "${OUT}/build-log.txt" | tail -50
-# Full vendor hash listing for the record (independent of our own hashing below).
+# Full vendor hash listing for the record (independent of our hashing below).
 nix develop .#build --command cargo xtask print-hashes > "${OUT}/print-hashes.txt"
 
 # --- [2/4] locate the built firmware image (contains every release member) ---
 # 'cargo xtask build-all' assembles boot.img from the freshly built components
 # + assets. We verify the boot image's non-bootloader FILE MEMBERS by
 # extracting them from THIS image and comparing each with its loose
-# counterpart in the release branch. Composite/OTA/companion artifacts are a
-# disclosed boundary, not covered. Sanity check the loose compiled outputs first.
+# counterpart in the release assets. Composite/OTA artifacts are a disclosed
+# boundary, not covered. Sanity check the compiled outputs first.
 for img in app.bin recovery.bin; do
     [ -f "${TARGET_DIR}/images/${img}" ] || { echo "[BUILD] FAIL: missing built ${img}"; exit 1; }
 done
@@ -645,7 +649,7 @@ while IFS= read -r -d '' f; do
     relp="$(release_path_for "${part}" "${rel}")"
     if [ -z "${relp}" ]; then
         echo "EXCLUDED bootloader ${part}/${rel} (no like-for-like public plaintext production artifact)" >> "${OUT}/comparison-hashes.txt"
-        # Reported for owner-side comparison against the device screen; never compared here.
+        # For owner-side comparison against the device screen; never compared here.
         printf '%s %s %s\n' "${rel}" "$(stat -c%s "${f}")" "$(sha256sum "${f}" | cut -d' ' -f1)" >> "${OUT}/bootloader-hashes.txt"
         excluded=$((excluded+1)); continue
     fi
@@ -662,7 +666,7 @@ while IFS= read -r -d '' f; do
         provided_used=$((provided_used+1))
         echo "${prov}" >> "${OUT}/provided-used.txt"
     else
-        # Already extracted above (tar keeps its "<version>/" dir).
+        # Already extracted (tar keeps its "<version>/" dir).
         src_path="${RELEASE_TREE}/${KEYOS_VERSION}/${relp}"
         if [ ! -f "${src_path}" ] || ! cp "${src_path}" "${OUT}/official/${safe}"; then
             echo "MISSING_OFFICIAL ${cls} ${relp} (${src_path})" >> "${OUT}/comparison-hashes.txt"
