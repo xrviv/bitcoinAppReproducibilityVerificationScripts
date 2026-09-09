@@ -2,7 +2,7 @@
 # ==============================================================================
 # apollo_build.sh - Muun Wallet Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.1
+# Version:       v0.2.2
 # Organization:  WalletScrutiny.com
 # Last Modified: 2026-09-09
 # Project:       https://github.com/muun/apollo
@@ -54,6 +54,16 @@
 # than swapping the base image - keeps the exact pinned digest Muun's own CI
 # references instead of introducing an unverified base-OS substitution.
 #
+# UPDATE (v0.2.2, 2026-09-09): bypassing the date check surfaced a second,
+# deeper EOL problem - specific bullseye-security package files (curl, git)
+# now 404 even though still listed in the Packages index; the suite is having
+# old files pruned, not just going unsigned. The apt-get install line is now
+# also patched with -t bullseye, redirecting the whole package set to the
+# frozen (never-pruned) main archive. Verified live in a container off this
+# exact pinned digest: clean install, no dependency conflicts, and TLS still
+# works against github.com/proxy.golang.org/static.rust-lang.org despite the
+# older ca-certificates bundle that comes with it.
+#
 # NOTE ON WORKSPACE REUSE (added v0.2.1, 2026-09-09):
 # A pre-existing workdir_<app>_<version>_<arch> from a prior run is now
 # removed automatically before a new run starts, rather than the run dying
@@ -87,7 +97,7 @@ fi
 # ==============================================================================
 # Script Metadata
 # ==============================================================================
-SCRIPT_VERSION="v0.2.1"
+SCRIPT_VERSION="v0.2.2"
 APP_ID="io.muun.apollo"
 REPO_URL="https://github.com/muun/apollo"
 WS_CONTAINER="docker.io/walletscrutiny/android:5"
@@ -527,16 +537,34 @@ sed -i \
   's|TARGETS="$TARGETS"|TARGETS="aarch64-unknown-linux-musl x86_64-unknown-linux-musl aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android"|' \
   "${src_dir}/android/Dockerfile"
 
-# Patch 3 (always, added v0.2.0): Bypass expired bullseye-security Valid-Until.
-# The pinned openjdk:17-jdk-slim@sha256:... base is Debian 11 "bullseye", now
-# oldoldstable; bullseye-security's InRelease Valid-Until has passed permanently
-# (confirmed against security.debian.org, not a transient mirror lag), so a bare
-# apt-get update fails with exit 100 on every run. Muun's own pinned digest is
-# unchanged through v55.11, so this bypasses the date check rather than
-# substituting an unverified base image — same pinned digest, same package set.
-log_info "Patching android/Dockerfile (bypassing expired bullseye-security Valid-Until)..."
+# Patch 3 (always, added v0.2.0, extended v0.2.2): bullseye-security is EOL in
+# two distinct ways, both hit live on 2026-09-09 and both fixed here.
+#
+# (a) The pinned openjdk:17-jdk-slim@sha256:... base is Debian 11 "bullseye",
+#     now oldoldstable; bullseye-security's InRelease Valid-Until has passed
+#     permanently (confirmed against security.debian.org, not a transient
+#     mirror lag), so a bare apt-get update fails with exit 100 on every run.
+#     Fixed in v0.2.0 by bypassing the date check.
+# (b) Bypassing (a) exposed a second, deeper problem: specific package files
+#     (curl_7.74.0-1.3+deb11u16, git_2.30.2-1+deb11u5) return 404 from
+#     security.debian.org even though the Packages index still lists them —
+#     bullseye-security is having old superseded files pruned now that it's
+#     fully EOL, not just going unsigned. Confirmed live in a container off
+#     this exact pinned digest: `-t bullseye` (the frozen, non-pruned main
+#     archive) resolves and installs the whole package set cleanly, including
+#     git and curl, with no dependency conflicts. Verified TLS still works
+#     against github.com, proxy.golang.org and static.rust-lang.org — the
+#     downstream endpoints this build actually needs — even with the older
+#     (2021 vs. 2025) ca-certificates bundle that comes along with `-t
+#     bullseye`; the roots this build needs were issued well before 2021.
+#
+# Muun's own pinned digest is unchanged through v55.11 (their own CI hits the
+# same base image), so both patches bypass/redirect rather than substitute an
+# unverified base image — same pinned digest, same effective package set.
+log_info "Patching android/Dockerfile (bullseye-security is EOL: bypassing expired Valid-Until, redirecting to non-pruned main archive)..."
 sed -i \
-  's|RUN apt-get update \\|RUN apt-get update -o Acquire::Check-Valid-Until=false \\|' \
+  -e 's|RUN apt-get update \\|RUN apt-get update -o Acquire::Check-Valid-Until=false \\|' \
+  -e 's|apt-get install --yes --no-install-recommends \\|apt-get install --yes --no-install-recommends -t bullseye \\|' \
   "${src_dir}/android/Dockerfile"
 
 log_info "Building Muun Wallet from source using android/Dockerfile..."
