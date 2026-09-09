@@ -2,7 +2,7 @@
 # ==============================================================================
 # apollo_build.sh - Muun Wallet Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.0
+# Version:       v0.2.1
 # Organization:  WalletScrutiny.com
 # Last Modified: 2026-09-09
 # Project:       https://github.com/muun/apollo
@@ -54,6 +54,16 @@
 # than swapping the base image - keeps the exact pinned digest Muun's own CI
 # references instead of introducing an unverified base-OS substitution.
 #
+# NOTE ON WORKSPACE REUSE (added v0.2.1, 2026-09-09):
+# A pre-existing workdir_<app>_<version>_<arch> from a prior run is now
+# removed automatically before a new run starts, rather than the run dying
+# with "Workspace already exists" and requiring --cleanup or a manual rm.
+# --cleanup still controls only whether the workspace is removed AFTER a run
+# completes; it never gated the stale-workspace-before-a-run case, and
+# nothing about the workspace is ever privileged (host user owns everything
+# under it), so there was no reason to require an extra flag or manual step
+# to re-run the same version/arch twice.
+#
 # NOTE ON BUILD TIME:
 # First run downloads Android SDK, Go 1.24.7, and Rust toolchains (~several GB).
 # Expect 30-90 minutes on first run. Docker layer cache speeds up subsequent runs.
@@ -77,7 +87,7 @@ fi
 # ==============================================================================
 # Script Metadata
 # ==============================================================================
-SCRIPT_VERSION="v0.2.0"
+SCRIPT_VERSION="v0.2.1"
 APP_ID="io.muun.apollo"
 REPO_URL="https://github.com/muun/apollo"
 WS_CONTAINER="docker.io/walletscrutiny/android:5"
@@ -429,13 +439,15 @@ fi
 # ==============================================================================
 work_dir="${execution_dir}/workdir_${APP_ID}_${version_name}_${build_arch}"
 
+# A leftover workspace from a prior run of this exact app/version/arch is
+# always safe to discard automatically: it is a script-owned scratch
+# directory scoped to this one combination, never anything the operator
+# needs preserved across invocations. --cleanup controls only whether the
+# workspace is removed AFTER this run completes (see below); it does not
+# gate whether a stale one is removed BEFORE a run starts.
 if [[ -d "${work_dir}" ]]; then
-  if [[ "${should_cleanup}" == true ]]; then
-    log_info "Removing existing workspace: ${work_dir}"
-    rm -rf "${work_dir}"
-  else
-    die_invalid "Workspace already exists: ${work_dir}. Remove it manually or re-run with --cleanup."
-  fi
+  log_info "Removing stale workspace from a prior run: ${work_dir}"
+  rm -rf "${work_dir}"
 fi
 
 mkdir -p "${work_dir}"
