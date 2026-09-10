@@ -2,17 +2,17 @@
 #
 # passportprime_build.sh - Foundation Passport Prime (KeyOS) Reproducible Build Verifier
 #
-# Version: v0.4.1
+# Version: v0.6.2
 #
-# Last modified by: Danny Garcia
-# Last modified on: 2026-08-11
+# Last modified by: Danny Garcia, Bob
+# Last modified on: 2026-09-09
 #
 # Builds KeyOS with the vendor's pinned Nix recipe, extracts boot.img members,
-# and compares them bidirectionally with one immutable KeyOS-Releases commit.
+# and compares them bidirectionally with the official KeyOS Release assets.
 # Signed compiled files are authenticated first, then hashed after their
 # non-deterministic 2048-byte cosign2 header; source-derived assets hash whole.
 # Scope excludes the raw Factory image, packaged OTA/composite artifacts, and
-# like-for-like bootloader comparison (no public plaintext production boot.bin).
+# bootloader comparison (no public plaintext production boot.bin to match).
 # A matching x86_64 build is valid; rerun mismatches on vendor-preferred aarch64.
 # Exit: 0 reproducible, 1 difference/failure/blocked verification, 2 bad input.
 #
@@ -28,7 +28,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.4.1"
+SCRIPT_VERSION="v0.6.2"
 APP_ID="passportprime"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -36,9 +36,8 @@ EXIT_SUCCESS=0
 EXIT_BUILD_FAILED=1
 EXIT_INVALID_PARAMS=2
 
-# Upstream URLs (KeyOS repo, KeyOS-Releases raw base) are set where they are
-# used: the Dockerfile heredoc (clone) and inner_build.sh (RAW_BASE, tree API).
-# Pinned Nix base image (single-user Nix). Digest-pinned: a tag is mutable.
+# Upstream URLs set where used: Dockerfile (clone), inner_build.sh (download).
+# Pinned Nix base image; digest-pinned, tag is mutable.
 NIX_IMAGE="docker.io/nixos/nix:2.31.5@sha256:4ae3542b89e38bf739a98d9e1ffd082c3c7b8a6455ec0c2331560b9440aec442"
 SUPPORTED_ARCH="armv7a"
 SUPPORTED_TYPE="firmware"
@@ -48,16 +47,14 @@ APP_ARCH="${SUPPORTED_ARCH}"
 APP_TYPE="${SUPPORTED_TYPE}"
 BINARY_PATH=""
 NO_CACHE=false
-# Cap cargo parallelism to bound peak RAM. KeyOS GUI apps build with
-# codegen-units=1 (one large rustc each); the default of one job per core can
-# exhaust memory on smaller hosts and trigger a (silent) OOM kill. Job count
-# does NOT affect output bytes, so this is reproducibility-neutral. Override
-# with CARGO_JOBS (e.g. CARGO_JOBS=2 on a very small machine, or =nproc on a
-# large build server).
+# Cap cargo jobs to bound peak RAM (codegen-units=1 GUI apps can OOM-kill a
+# small host silently). Job count never changes output bytes. Override with
+# CARGO_JOBS (=2 on a tiny box, =nproc on a build server).
 CARGO_JOBS="${CARGO_JOBS:-4}"
 DOCKER_CMD="${DOCKER_CMD:-}"
 WORK_DIR=""
 IMAGE_TAG=""
+SCRIPT_SHA256=""
 GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
 NORMALIZE_OWNERSHIP=false
 
@@ -180,12 +177,12 @@ Usage:
 
 Parameters:
   --version VERSION   Firmware version without 'v' prefix (e.g. 1.2.1).
-                      Source ref used: tag vVERSION. Official binaries:
-                      KeyOS-Releases branch VERSION, pinned once to a commit.
+                      Source ref: tag vVERSION. Official binaries: KeyOS
+                      Release assets vVERSION, each sha256-pinned.
                       Required (firmware blobs carry no extractable version).
   --binary PATH       Optional official artifact(s) used as the comparand for
                       their matching members (components not provided are
-                      downloaded from KeyOS-Releases). A directory may contain
+                      downloaded from the KeyOS Release). A directory may contain
                       any of: app.bin, recovery.bin, gui-app-*.elf (or
                       gui-app-*/app.elf). A single file must be named app.bin,
                       recovery.bin or gui-app-*.elf; unrecognized names are
@@ -336,7 +333,7 @@ release_path_for() {   # $1=partition $2=relpath -> release path ('' = excluded)
 
 is_signed() {          # only these carry the 2048-byte cosign2 header
     case "$1" in
-        recovery.bin|keyos/app.bin|keyos/apps/*/app.elf) return 0 ;;
+        recovery.bin|keyos/app.bin|keyos/apps/*/app.elf|keyos/apps/*/manifest.json) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -394,6 +391,7 @@ closure_class_for() {  # $1 -> compare|bootloader|out_of_scope|unknown
         KeyOS-v*-Recovery.bin|KeyOS-v*-CoreSystemRecovery.bin) echo out_of_scope ;;
         KeyOS-v*Update.tar|envoy-server/*)                echo out_of_scope ;;
         v[0-9]*-v[0-9]*.zip)                              echo out_of_scope ;;  # versioned update bundle (e.g. v1.2.2-v1.3.0.zip, LFS; classified 2026-07-29)
+        manifest.json.*)                                  echo out_of_scope ;;  # per-bundle PRM1 manifest, renamed on extraction
         *)                                                 echo unknown ;;
     esac
 }
@@ -418,7 +416,7 @@ ARG KEYOS_REF
 RUN mkdir -p /etc/nix && \
     printf 'experimental-features = nix-command flakes\nsandbox = false\n' >> /etc/nix/nix.conf
 
-# The nixos/nix base image already provides git, curl and coreutils on the
+# The nixos/nix base image already provides git, curl, tar and coreutils on the
 # runtime PATH (/root/.nix-profile/bin), and openssl is provided inside the
 # 'nix develop .#build' dev shell (used by generate-cosign2-dev-key.sh). We do
 # NOT run 'nix-env -iA' here: installing into the root profile rewrites its
@@ -490,23 +488,41 @@ block_verification() { # state detail
     echo "[BUILD] BLOCKED ($1): $2"; exit 3
 }
 
-# A filtered, no-checkout clone avoids GitHub API quotas and obtains both the
-# immutable commit and complete tree inventory before the long firmware build.
-RELEASE_REPO="$(mktemp -d /tmp/keyos-releases.XXXXXX)"
-if ! git clone --quiet --filter=blob:none --no-checkout --depth 1 \
-        --branch "${KEYOS_VERSION}" --single-branch \
-        https://github.com/Foundation-Devices/KeyOS-Releases.git "${RELEASE_REPO}"; then
-    block_verification VERIFICATION_ERROR "could not resolve KeyOS-Releases branch ${KEYOS_VERSION}"
-fi
-RELEASE_COMMIT="$(git -C "${RELEASE_REPO}" rev-parse HEAD 2>/dev/null || true)"
-is_sha40 "${RELEASE_COMMIT}" || block_verification VERIFICATION_ERROR "invalid KeyOS-Releases commit"
-if ! git -C "${RELEASE_REPO}" ls-tree -r --name-only HEAD > "${OUT}/official-inventory.txt"; then
-    block_verification VERIFICATION_ERROR "could not read KeyOS-Releases inventory"
-fi
-[ -s "${OUT}/official-inventory.txt" ] || block_verification VERIFICATION_ERROR "empty KeyOS-Releases inventory"
-echo "${RELEASE_COMMIT}" > "${OUT}/keyos-releases-commit.txt"
-RAW_BASE="https://raw.githubusercontent.com/Foundation-Devices/KeyOS-Releases/${RELEASE_COMMIT}/${KEYOS_VERSION}"
-echo "[BUILD] Comparands: KeyOS-Releases ${KEYOS_VERSION} = ${RELEASE_COMMIT}"
+# Official binaries: two GitHub Release assets, used when no KeyOS-Releases
+# branch exists. Tar paths carry the "<version>/" layout release_path_for
+# expects. Pin: the two asset sha256 hashes, per sidecar.
+RELEASE_DIR="$(mktemp -d /tmp/keyos-release.XXXXXX)"
+RELEASE_TREE="${RELEASE_DIR}/tree"
+mkdir -p "${RELEASE_TREE}"
+RELEASE_ASSET_BASE="https://github.com/Foundation-Devices/KeyOS/releases/download/v${KEYOS_VERSION}"
+: > "${OUT}/release-asset-hashes.txt"
+for bundle in Recovery.bin CoreSystemRecovery.bin; do
+    fname="KeyOS-v${KEYOS_VERSION}-${bundle}"
+    if ! curl -fsSL "${AUTH_ARGS[@]}" -o "${RELEASE_DIR}/${fname}" "${RELEASE_ASSET_BASE}/${fname}"; then
+        block_verification VERIFICATION_ERROR "could not download ${fname}"
+    fi
+    if ! curl -fsSL "${AUTH_ARGS[@]}" -o "${RELEASE_DIR}/${fname}.sha256" "${RELEASE_ASSET_BASE}/${fname}.sha256"; then
+        block_verification VERIFICATION_ERROR "could not download ${fname}.sha256"
+    fi
+    published_hash="$(cut -d' ' -f1 "${RELEASE_DIR}/${fname}.sha256")"
+    actual_hash="$(sha256sum "${RELEASE_DIR}/${fname}" | cut -d' ' -f1)"
+    if [ "${published_hash}" != "${actual_hash}" ]; then
+        block_verification VERIFICATION_ERROR "${fname} sha256 mismatch: got ${actual_hash}, expected ${published_hash}"
+    fi
+    printf '%s %s\n' "${fname}" "${actual_hash}" >> "${OUT}/release-asset-hashes.txt"
+    tar -xf "${RELEASE_DIR}/${fname}" -C "${RELEASE_TREE}"
+    # Bundles' manifests differ; rename so extraction can't clobber one.
+    manifest_path="${RELEASE_TREE}/${KEYOS_VERSION}/manifest.json"
+    [ -f "${manifest_path}" ] && mv "${manifest_path}" "${manifest_path}.${bundle%.bin}"
+done
+[ -s "${OUT}/release-asset-hashes.txt" ] || block_verification VERIFICATION_ERROR "no assets recorded"
+: > "${OUT}/official-inventory.txt"
+while IFS= read -r -d '' f; do
+    printf '%s\n' "${f#"${RELEASE_TREE}"/}" >> "${OUT}/official-inventory.txt"
+done < <(find "${RELEASE_TREE}" -type f -print0)
+[ -s "${OUT}/official-inventory.txt" ] || block_verification VERIFICATION_ERROR "empty inventory"
+RELEASE_PIN="$(paste -sd';' "${OUT}/release-asset-hashes.txt")"
+echo "[BUILD] Comparands: KeyOS release assets v${KEYOS_VERSION} (${RELEASE_PIN})"
 
 COSIGN_PROBE="${OUT}/cosign2-probe.bin"; printf x > "${COSIGN_PROBE}"
 if ! nix develop .#build --command cosign2 dump --input "${COSIGN_PROBE}" >/dev/null 2>&1; then
@@ -519,18 +535,23 @@ rm -f "${COSIGN_PROBE}"
 nix develop .#build --command bash -c '
     set -euo pipefail
     scripts/generate-cosign2-dev-key.sh
-    cargo xtask build-all --production-bootloader --production-firmware
+    # --keyos-version: required in newer xtask; probe instead of hardcoding.
+    KEYOS_VERSION_ARG=()
+    if cargo xtask build-all --help 2>&1 | grep -q -- "--keyos-version"; then
+        KEYOS_VERSION_ARG=(--keyos-version "$KEYOS_VERSION")
+    fi
+    cargo xtask build-all --production-bootloader --production-firmware "${KEYOS_VERSION_ARG[@]}"
     cargo xtask print-hashes
 ' | tee "${OUT}/build-log.txt" | tail -50
-# Full vendor hash listing for the record (independent of our own hashing below).
+# Full vendor hash listing for the record (independent of our hashing below).
 nix develop .#build --command cargo xtask print-hashes > "${OUT}/print-hashes.txt"
 
 # --- [2/4] locate the built firmware image (contains every release member) ---
 # 'cargo xtask build-all' assembles boot.img from the freshly built components
 # + assets. We verify the boot image's non-bootloader FILE MEMBERS by
 # extracting them from THIS image and comparing each with its loose
-# counterpart in the release branch. Composite/OTA/companion artifacts are a
-# disclosed boundary, not covered. Sanity check the loose compiled outputs first.
+# counterpart in the release assets. Composite/OTA artifacts are a disclosed
+# boundary, not covered. Sanity check the compiled outputs first.
 for img in app.bin recovery.bin; do
     [ -f "${TARGET_DIR}/images/${img}" ] || { echo "[BUILD] FAIL: missing built ${img}"; exit 1; }
 done
@@ -569,18 +590,18 @@ echo "[BUILD] Extracted members: $(find "${EX}" -type f | wc -l) (mtools from ${
 # --- [4/4] compare every member to the official release (bidirectional) ---
 # Forward: every extracted built member is hashed and compared against the
 # corresponding official file (user-provided via --binary when available,
-# otherwise downloaded). Reverse: the pinned release commit's git inventory
+# otherwise downloaded). Reverse: the extracted release inventory
 # is checked afterwards, so an official member ABSENT from
 # the built image is caught too — enumeration of built files alone cannot see
 # those.
-# Map an extracted member to its path under the KeyOS-Releases <version>/ dir.
+# Map an extracted member to its path under the release-asset <version>/ tree.
 # The bootloader is excluded by vendor design (disclosed, not a mismatch):
 # boot.bin carries a secret EXTRA_ENTROPY, boot.cip is its encrypted form.
 # (release_path_for / is_signed / member_hash / provided_name_for /
 # closure_class_for are defined in comparison_lib.sh, sourced above.)
 
-# Each member is tagged COMPILED (the signed firmware: app.bin, recovery.bin,
-# app ELFs) or ASSET (manifests + static assets). Both are compared; the full
+# Each member is tagged COMPILED (cosign2-signed: app.bin, recovery.bin, app
+# ELFs and, since KeyOS 1.4.0, app manifests) or ASSET. Both are compared; the full
 # table is written to comparison-hashes.txt. The terminal prints the COMPILED
 # table in full and summarises the ASSET set, to avoid swamping build logs.
 mkdir -p "${OUT}/official"
@@ -625,7 +646,7 @@ while IFS= read -r -d '' f; do
     relp="$(release_path_for "${part}" "${rel}")"
     if [ -z "${relp}" ]; then
         echo "EXCLUDED bootloader ${part}/${rel} (no like-for-like public plaintext production artifact)" >> "${OUT}/comparison-hashes.txt"
-        # Reported for owner-side comparison against the device screen; never compared here.
+        # For owner-side comparison against the device screen; never compared here.
         printf '%s %s %s\n' "${rel}" "$(stat -c%s "${f}")" "$(sha256sum "${f}" | cut -d' ' -f1)" >> "${OUT}/bootloader-hashes.txt"
         excluded=$((excluded+1)); continue
     fi
@@ -642,9 +663,10 @@ while IFS= read -r -d '' f; do
         provided_used=$((provided_used+1))
         echo "${prov}" >> "${OUT}/provided-used.txt"
     else
-        url="${RAW_BASE}/${relp}"
-        if ! curl -fsSL "${AUTH_ARGS[@]}" -o "${OUT}/official/${safe}" "${url}"; then
-            echo "MISSING_OFFICIAL ${cls} ${relp} (${url})" >> "${OUT}/comparison-hashes.txt"
+        # Already extracted (tar keeps its "<version>/" dir).
+        src_path="${RELEASE_TREE}/${KEYOS_VERSION}/${relp}"
+        if [ ! -f "${src_path}" ] || ! cp "${src_path}" "${OUT}/official/${safe}"; then
+            echo "MISSING_OFFICIAL ${cls} ${relp} (${src_path})" >> "${OUT}/comparison-hashes.txt"
             if [ "${cls}" = COMPILED ]; then c_total=$((c_total+1)); c_miss=$((c_miss+1)); else a_total=$((a_total+1)); a_miss=$((a_miss+1)); fi
             continue
         fi
@@ -694,7 +716,12 @@ oos_official=0
 unknown_official=0
 closure=ok
 while IFS= read -r opath || [ -n "${opath}" ]; do
-    case "${opath}" in "${KEYOS_VERSION}/"*) orel="${opath#"${KEYOS_VERSION}/"}" ;; *) continue ;; esac
+    case "${opath}" in
+        "${KEYOS_VERSION}/"*) orel="${opath#"${KEYOS_VERSION}/"}" ;;
+        *)  # Surfaced, not dropped -- an unexpected shape must not go unnoticed.
+            echo "UNKNOWN_OFFICIAL ${opath} (outside ${KEYOS_VERSION}/ prefix)" >> "${OUT}/comparison-hashes.txt"
+            unknown_official=$((unknown_official+1)); continue ;;
+    esac
     case "$(closure_class_for "${orel}")" in
         bootloader) continue ;;
         out_of_scope)
@@ -724,7 +751,7 @@ fi
 
 {
     echo "COMMIT=${actual_commit}"
-    echo "RELEASE_COMMIT=${RELEASE_COMMIT}"
+    echo "RELEASE_PIN=\"${RELEASE_PIN}\""
     echo "C_TOTAL=${c_total}";  echo "C_MATCHED=${c_match}"; echo "C_MISMATCHED=${c_mis}"; echo "C_MISSING=${c_miss}"
     echo "A_TOTAL=${a_total}";  echo "A_MATCHED=${a_match}"; echo "A_MISMATCHED=${a_mis}"; echo "A_MISSING=${a_miss}"
     echo "EXCLUDED=${excluded}"
@@ -753,6 +780,12 @@ INNER_EOF
 # ----------------------------------------------------------------------------
 
 main() {
+    # First action, before parse_args: joins app version -> script bytes.
+    log_info "Script: ${SCRIPT_VERSION} $(basename "${BASH_SOURCE[0]}")"
+    SCRIPT_SHA256="N/A"
+    command -v sha256sum >/dev/null 2>&1 && SCRIPT_SHA256="$(sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1)"
+    log_info "         sha256: ${SCRIPT_SHA256}"
+
     parse_arguments "$@"
     # A failed/current run must never leave an earlier run's result in place.
     rm -f "${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
@@ -763,12 +796,6 @@ main() {
     # Keep evidence inside the invocation directory so ABS owns its lifecycle.
     WORK_DIR="$(mktemp -d "${PWD}/passportprime_${safe_ver}_${APP_ARCH}_XXXXXX")"
     mkdir -p "${WORK_DIR}/out"
-    log_info "Script version: ${SCRIPT_VERSION}"
-    if command -v sha256sum >/dev/null 2>&1; then
-        log_info "Script sha256: $(sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1)"
-    else
-        log_warn "sha256sum unavailable on host; self-hash omitted (build runs in the pinned container)"
-    fi
     log_info "App: ${APP_ID} ${APP_VERSION} (${APP_ARCH}, ${APP_TYPE})"
     log_info "Work dir: ${WORK_DIR}"
 
@@ -834,7 +861,7 @@ main() {
     echo ""
     echo "===== Begin Results ====="
     echo "appId:          ${APP_ID}"
-    echo "comparands:     KeyOS-Releases ${APP_VERSION}"
+    echo "comparands:     KeyOS GitHub Release assets v${APP_VERSION}"
     echo "versionName:    ${APP_VERSION}"
     echo "arch:           ${APP_ARCH}"
     echo "type:           ${APP_TYPE}"
@@ -845,7 +872,9 @@ main() {
         echo "review_state:   ${VERIFICATION_STATE}"
     fi
     echo "commit:         ${COMMIT}"
-    echo "release commit: ${RELEASE_COMMIT}"
+    echo "scriptVersion:  ${SCRIPT_VERSION}"
+    echo "scriptHash:     ${SCRIPT_SHA256}"
+    echo "release assets: ${RELEASE_PIN}"
     echo "signature policy: KeyOS 9056b480 utils/fw-utils/src/hash.rs:14-36 (source consistency; not independent identity)"
     echo "source-trusted signatures: ${SIGNATURE_VERIFIED:-0}/${C_TOTAL}; authentication failed: ${AUTHENTICATION_FAILED:-0}"
     echo "compiled:       ${C_MATCHED}/${C_TOTAL} matched (${C_MISMATCHED} mismatched, ${C_MISSING} missing)"
@@ -894,8 +923,8 @@ main() {
             closure_note="Reverse closure UNVERIFIED (tree listing unavailable): this run establishes the forward comparison only — an official member absent from the build would not have been detected." ;;
     esac
 
-    local notes="Vendor Nix recipe (REPRODUCIBILITY.md) run in a pinned ${NIX_IMAGE} container. Source commit: ${COMMIT}. KeyOS-Releases branch ${APP_VERSION} was resolved once to commit ${RELEASE_COMMIT}; all downloads and inventory used that commit. All non-bootloader file members of the locally assembled boot.img were compared against its corresponding loose files. ${closure_note}
-Compiled firmware: ${C_MATCHED}/${C_TOTAL} matched (app.bin, recovery.bin, app ELFs; ${SIGNATURE_VERIFIED:-0} comparands signed by two distinct keys from KeyOS commit 9056b480, utils/fw-utils/src/hash.rs:14-36, then hashed after the 2048-byte cosign2 header). This checks source-to-release consistency, not signer identity through an independent trust channel.
+    local notes="Vendor Nix recipe (REPRODUCIBILITY.md) run in a pinned ${NIX_IMAGE} container. Source commit: ${COMMIT}. Official binaries: KeyOS GitHub Release assets v${APP_VERSION} (${RELEASE_PIN}), sha256-verified before extraction. All non-bootloader file members of the locally assembled boot.img were compared against its corresponding loose file inside those assets. ${closure_note}
+Compiled firmware: ${C_MATCHED}/${C_TOTAL} matched (app.bin, recovery.bin, app ELFs, app manifests since KeyOS 1.4.0; ${SIGNATURE_VERIFIED:-0} comparands signed by two distinct keys from KeyOS commit 9056b480, utils/fw-utils/src/hash.rs:14-36, then hashed after the 2048-byte cosign2 header). This checks source-to-release consistency, not signer identity through an independent trust channel.
 Source-derived manifests & assets: ${A_MATCHED}/${A_TOTAL} matched. Provided (--binary) artifacts used as comparand: ${PROVIDED_USED:-0}.
 Not covered by this verdict: raw Factory image bytes, the distributed OTA package, packaged composites, and like-for-like bootloader comparison. No public plaintext production boot.bin is available; boot.cip is encrypted and the device exposes a normalized hash.
 Full per-member table: comparison-hashes.txt. On mismatch, vendor recommends an aarch64 rebuild before drawing conclusions."
