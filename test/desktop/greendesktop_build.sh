@@ -2,7 +2,7 @@
 #
 # greendesktop_build.sh - Blockstream Green Desktop (green_qt) Reproducible Build Verifier
 #
-# Version: v0.3.1
+# Version: v0.3.4
 #
 # Description:
 #   Reproducible build verification for Blockstream Green Desktop Linux AppImage.
@@ -12,15 +12,22 @@
 #   packages via upstream's own tools/appimage.sh, and compares the extracted
 #   squashfs payload against the official release AppImage file-by-file.
 #
-#   Qt 6.11.0 is fetched as the official prebuilt via aqtinstall (token-free;
+#   Qt is fetched as the official prebuilt via aqtinstall (token-free;
 #   binary-equivalence to the official online-installer Qt was confirmed by
-#   hash comparison during the 3.4.0 investigation). NOTE: upstream bumped Qt
-#   to 6.11.1 for Windows/macOS CI in the 3.4.1 release and has kept the Linux
-#   x86_64 Dockerfile (ci/linux-x86_64/Dockerfile) at 6.11.0 through 3.5.0 —
-#   verified by diffing release_3.4.0..3.4.1 and release_3.4.1..3.5.0. The
-#   6.11.1 PATH in ci/linux-x86_64.yml points at a directory that does not
-#   exist in the image and is silently skipped. Do not bump this without
-#   re-checking that specific Dockerfile at the target release tag.
+#   hash comparison during the 3.4.0 investigation). Since v0.3.3 the Qt
+#   version and module list are read from upstream's ci/linux-x86_64/Dockerfile
+#   at the release tag (the qt.qt6.NNNN.* / extensions.*.NNNN.* installer ids)
+#   instead of being hard-coded: Linux Qt was 6.11.0 through 3.5.2, 6.11.1 at
+#   3.5.3 and 6.11.2 at 3.5.4. v0.3.2 and earlier pinned 6.11.0, so their 3.5.3
+#   and 3.5.4 verdicts diffed every bundled libQt6*.so by construction. The
+#   version actually used is printed in the results and recorded in
+#   qt-version.txt in the out dir. The build runs with the versioned Qt path
+#   (/qt/<version>/gcc_64/bin) first on PATH, exactly as upstream's ENV PATH
+#   does: v0.3.3 built through a /qt/current symlink, which made the
+#   pre-packaging RUNPATH 6 bytes shorter and left a different patchelf filler
+#   (27 vs 33 'X') plus a different Build ID in usr/bin/blockstream at 3.5.4.
+#   The image also records its full dpkg package list (build-image-packages.txt)
+#   so bundled Ubuntu system libraries can be attributed to package revisions.
 #
 #   From 3.5.0 the build mirrors upstream CI more closely: it drives
 #   tools/ci/build.sh (qt-cmake --preset ci, --parallel 4) and packages with
@@ -55,7 +62,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.3.1"
+SCRIPT_VERSION="v0.3.4"
 APP_ID="blockstreamgreen"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -72,9 +79,17 @@ SUPPORTED_TYPE="appimage"
 # ci/linux-x86_64/download-appimage-binaries.sh, run in the final image stage
 # and taken from the pinned checkout. This script carries no pins of its own.
 # NOTE: upstream fetches those tools from the rolling 'continuous' release tag
-# and verifies recorded hashes. If the continuous assets are rebuilt upstream,
-# that hash check fails and the image build FTBFSes — which is the correct,
-# loud failure. Hashes recorded at release_3.5.0 were confirmed live 2026-08-19.
+# and verifies recorded hashes. Those assets get rebuilt upstream (plugin-qt was
+# rebuilt 2026-08-22, which broke the release_3.5.2 pins and FTBFSed v0.3.1).
+# Upstream CI itself never re-runs that check: it builds from a prebuilt image
+# (LINUX_IMAGE sha256 pin in ci/linux-x86_64.yml) created while the pins were
+# fresh. Since v0.3.2 this script therefore tries upstream's pinned check first
+# and, only if it fails, falls back to the CURRENT continuous assets; the
+# sha256 of every tool actually used is always recorded in
+# appimage-tools-used.txt in the out dir, and a stale-pin fallback is called
+# out in the results and notes. The fallback can only introduce spurious
+# packaging diffs (false not_reproducible), never a false reproducible: the
+# payload comparison itself never runs through these tools.
 
 APP_VERSION=""
 APP_ARCH="${SUPPORTED_ARCH}"
@@ -272,15 +287,30 @@ ENV CMAKE_INSTALL_PREFIX=$PREFIX
 
 FROM base0 AS base
 # WS modification: aqtinstall fetches the same prebuilt Qt packages token-free.
-# qtshadertools is listed explicitly because aqtinstall does not resolve transitive
-# module dependencies, while upstream's online installer appears to pull it in on its
-# own: libQt6ShaderTools.so.6 was present in the official 3.4.0/3.4.1/3.5.0 AppImages
-# and absent from our rebuilds until v0.3.1.
-RUN python3 -m venv /aqt-venv && \
+# The Qt version and module list come from upstream's own Dockerfile at the pinned
+# ref, so a Qt bump upstream is followed automatically (6.11.0 -> 6.11.1 at 3.5.3,
+# 6.11.2 at 3.5.4). qtshadertools is appended because aqtinstall does not resolve
+# transitive module dependencies, while upstream's online installer pulls it in on
+# its own: libQt6ShaderTools.so.6 was present in the official AppImages and absent
+# from our rebuilds until v0.3.1.
+COPY --from=src /green_qt/ci/linux-x86_64/Dockerfile /upstream-linux-x86_64.Dockerfile
+RUN set -e; \
+    id="$(grep -oE 'qt\.qt6\.[0-9]+\.linux_gcc_64' /upstream-linux-x86_64.Dockerfile | head -n1 | cut -d. -f3)"; \
+    if [ -z "$id" ]; then echo "[WS] no qt.qt6.NNNN.linux_gcc_64 id in upstream ci/linux-x86_64/Dockerfile" >&2; exit 1; fi; \
+    major="${id%"${id#?}"}"; patch="${id#"${id%?}"}"; minor="${id#?}"; minor="${minor%?}"; \
+    QT_VERSION="${major}.${minor}.${patch}"; \
+    modules="$( { grep -oE "qt\.qt6\.${id}\.addons\.[a-z0-9]+" /upstream-linux-x86_64.Dockerfile | sed 's/.*\.addons\.//'; \
+                 grep -oE "extensions\.[a-z0-9]+\.${id}\.linux_gcc_64" /upstream-linux-x86_64.Dockerfile | cut -d. -f2; \
+                 echo qtshadertools; } | awk '!seen[$0]++' | tr '\n' ' ')"; \
+    if ! grep -q "/qt/${QT_VERSION}/gcc_64/bin" /upstream-linux-x86_64.Dockerfile; then \
+        echo "[WS] WARNING: upstream Dockerfile PATH does not mention /qt/${QT_VERSION}/gcc_64; installer ids say ${QT_VERSION}, using that" >&2; fi; \
+    echo "[WS] Qt ${QT_VERSION} (from upstream ci/linux-x86_64/Dockerfile), modules: ${modules}"; \
+    echo "${QT_VERSION}" > /qt-version.txt; echo "${modules}" > /qt-modules.txt; \
+    python3 -m venv /aqt-venv && \
     /aqt-venv/bin/pip install --no-cache-dir aqtinstall==3.3.0 && \
-    /aqt-venv/bin/aqt install-qt linux desktop 6.11.0 linux_gcc_64 --outputdir /qt \
-      -m qtwebengine qt5compat qtconnectivity qtmultimedia qtserialport qtpositioning qtwebview qtwebchannel qtshadertools
-ENV PATH="/qt/6.11.0/gcc_64/bin/:$PATH"
+    /aqt-venv/bin/aqt install-qt linux desktop "${QT_VERSION}" linux_gcc_64 --outputdir /qt -m ${modules} && \
+    ln -s "/qt/${QT_VERSION}/gcc_64" /qt/current
+ENV PATH="/qt/current/bin/:$PATH"
 
 FROM base AS hidapi
 COPY --from=src /green_qt/tools/buildlibusb.sh /green_qt/tools/buildhidapi.sh tools/
@@ -348,8 +378,22 @@ COPY --from=src /green_qt /green_qt
 COPY --from=src /green_qt_commit.txt /green_qt_commit.txt
 # Upstream's own pinned + SHA256-checked AppImage tools; tools/appimage.sh
 # expects them at image root (it does `cp /linuxdeploy-x86_64.AppImage .`).
+# The pins point at rolling 'continuous' assets that upstream rebuilds; when a
+# rebuild makes the pins stale (hit at 3.5.2: plugin-qt rebuilt 2026-08-22),
+# fall back to the current assets and leave /appimage-tools-pins-stale as a
+# marker. The hashes of the tools actually used are always recorded.
 COPY --from=src /green_qt/ci/linux-x86_64/download-appimage-binaries.sh .
-RUN ./download-appimage-binaries.sh
+RUN ./download-appimage-binaries.sh || ( \
+      echo "[WS] WARNING: upstream AppImage tool pins are stale (continuous assets rebuilt upstream)" && \
+      echo "[WS] Falling back to current continuous assets; hashes recorded in appimage-tools-used.txt" && \
+      rm -f linuxdeploy-x86_64.AppImage linuxdeploy-plugin-qt-x86_64.AppImage appimagetool-x86_64.AppImage && \
+      curl -fsSL -o linuxdeploy-x86_64.AppImage https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage && \
+      curl -fsSL -o linuxdeploy-plugin-qt-x86_64.AppImage https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage && \
+      curl -fsSL -o appimagetool-x86_64.AppImage https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage && \
+      chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-qt-x86_64.AppImage appimagetool-x86_64.AppImage && \
+      touch /appimage-tools-pins-stale \
+    ) && \
+    sha256sum linuxdeploy-x86_64.AppImage linuxdeploy-plugin-qt-x86_64.AppImage appimagetool-x86_64.AppImage | tee /appimage-tools-used.txt
 COPY inner_build.sh /usr/local/bin/inner_build.sh
 RUN chmod +x /usr/local/bin/inner_build.sh
 DOCKERFILE_EOF
@@ -377,6 +421,9 @@ export APPIMAGE_EXTRACT_AND_RUN=1
 AUTH_ARGS=()
 [ -n "${GITHUB_TOKEN:-}" ] && AUTH_ARGS=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
 
+# Use the versioned Qt prefix, not the /qt/current symlink: the pre-packaging
+# RUNPATH embeds this path and its length survives packaging as patchelf filler.
+export PATH="/qt/$(cat /qt-version.txt)/gcc_64/bin:${PATH}"
 echo "[BUILD] qt-cmake: $(command -v qt-cmake)"
 
 # --- [1/6] official AppImage ---
@@ -499,12 +546,20 @@ diff -r official-extracted built-extracted > diff-appimage-payload.txt 2>&1 || t
 diff meta-official.txt meta-built.txt > diff-appimage-metadata.txt 2>&1 || true
 
 # --- [6/6] machine-readable result ---
+cp /appimage-tools-used.txt "${OUT}/appimage-tools-used.txt"
+cp /qt-version.txt "${OUT}/qt-version.txt"
+dpkg-query -W -f '${binary:Package} ${Version}\n' | sort > "${OUT}/build-image-packages.txt"
+TOOLS_PINS="upstream"
+[ -f /appimage-tools-pins-stale ] && TOOLS_PINS="stale-fallback"
 {
     echo "OFFICIAL_SHA256=$(sha256sum "official-${APPIMAGE_NAME}" | cut -d' ' -f1)"
     echo "BUILT_SHA256=$(sha256sum "built-${APPIMAGE_NAME}" | cut -d' ' -f1)"
     echo "PAYLOAD_DIFF_LINES=$(wc -l < diff-appimage-payload.txt)"
     echo "METADATA_DIFF_LINES=$(wc -l < diff-appimage-metadata.txt)"
     echo "COMMIT=$(cat commit.txt)"
+    echo "TOOLS_PINS=${TOOLS_PINS}"
+    echo "QT_VERSION=$(cat /qt-version.txt)"
+    echo "QT_MODULES=\"$(cat /qt-modules.txt)\""
 } > RESULT.env
 echo "[BUILD] inner build complete"
 INNER_EOF
@@ -529,6 +584,7 @@ main() {
     WORK_DIR="$(mktemp -d "${execution_dir}/greendesktop_${safe_ver}_${APP_ARCH}_XXXXXX")"
     mkdir -p "${WORK_DIR}/out"
     log_info "Script version: ${SCRIPT_VERSION}"
+    log_info "Script sha256: $(sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1)"
     log_info "App: ${APP_ID} ${APP_VERSION} (${APP_ARCH}, ${APP_TYPE})"
     log_info "Work dir: ${WORK_DIR}"
 
@@ -577,6 +633,7 @@ main() {
     echo "appHash:        ${OFFICIAL_SHA256}"
     echo "builtHash:      ${BUILT_SHA256}"
     echo "commit:         ${COMMIT}"
+    echo "qt:             ${QT_VERSION:-unknown} (from upstream ci/linux-x86_64/Dockerfile at release_${APP_VERSION})"
     echo ""
     echo "Payload diff: ${PAYLOAD_DIFF_LINES} line(s) (full: ${out}/diff-appimage-payload.txt)"
     if [[ "${PAYLOAD_DIFF_LINES}" -gt 0 ]]; then
@@ -584,6 +641,12 @@ main() {
         head -5 "${out}/diff-appimage-payload.txt"
     fi
     echo "Metadata diff (modes/types/symlinks): ${METADATA_DIFF_LINES} line(s) (full: ${out}/diff-appimage-metadata.txt)"
+    echo "AppImage tools: ${TOOLS_PINS:-upstream} (hashes used: ${out}/appimage-tools-used.txt)"
+    if [[ "${TOOLS_PINS:-upstream}" == "stale-fallback" ]]; then
+        echo "WARNING: upstream's AppImage tool pins were stale (continuous assets rebuilt);"
+        echo "         packaging used the current continuous assets. A payload diff limited to"
+        echo "         bundled Qt/library selection may stem from that tool drift."
+    fi
     echo "===== End Results ====="
     echo ""
 
@@ -594,7 +657,18 @@ checkout, with SOURCE_DATE_EPOCH mtime normalisation as upstream CI does it.
 Known upstream nondeterminism: liblwk (Blockstream/lwk#165). libglsdk reproduces
 byte-for-byte, verified at 3.4.1 and 3.5.0. As of 3.5.0 upstream resolved all three
 items raised in Blockstream/green_qt#187: QML mtimes, the OpenSSL build timestamp
-(both via SOURCE_DATE_EPOCH) and the unpinned AppImage packaging tools."
+(both via SOURCE_DATE_EPOCH) and the unpinned AppImage packaging tools.
+Qt ${QT_VERSION:-unknown} prebuilt via aqtinstall, version and modules taken from upstream's
+ci/linux-x86_64/Dockerfile at release_${APP_VERSION} (modules: ${QT_MODULES:-unknown}).
+AppImage packaging tools: ${TOOLS_PINS:-upstream} (sha256 of the tools actually
+used: appimage-tools-used.txt in ${out})."
+    if [[ "${TOOLS_PINS:-upstream}" == "stale-fallback" ]]; then
+        notes="${notes}
+WARNING: upstream's pinned hashes for the rolling 'continuous' AppImage tools were
+stale at run time (assets rebuilt upstream), so packaging used the current continuous
+assets instead. Upstream CI does not hit this because it builds from a prebuilt image
+created while its pins were fresh."
+    fi
     write_yaml "${verdict}" "${notes}"
     cleanup_image
 
