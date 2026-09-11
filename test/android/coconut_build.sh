@@ -1,8 +1,8 @@
 #!/bin/bash
-# coconut_build.sh v0.1.15 — Coconut Wallet (onl.coconut.wallet) Android reproducible build
+# coconut_build.sh v0.1.16 — Coconut Wallet (onl.coconut.wallet) Android reproducible build
 # verification
 # Organization: WalletScrutiny.com
-# Last modified by: Bob (WalletScrutiny agent), for Daniel Garcia
+# Last modified by: Daniel Garcia
 # Last modified on: 2026-09-11
 # Project: https://github.com/noncelab/coconut_wallet
 #
@@ -16,74 +16,23 @@
 # Users are responsible for ensuring compliance with all applicable laws and regulations. The
 # developers assume no liability for any misuse or legal consequences arising from use.
 #
-# SCOPE: mainnet flavor only (onl.coconut.wallet). regtest (onl.coconut.wallet.regtest) is a
-# separate Play listing and out of scope. Google Play App Bundle delivery: builds the AAB from
-# source, materialises a device-specific split-APK set with bundletool, compares split-by-split
-# against the official Play splits supplied via --binary/--apk. There is NO Android CI workflow
-# in the repo (.github/workflows/ has only a chat-notification hook) — this build recipe is
-# reverse-engineered from android/fastlane/Fastfile (release_android_mainnet lane), Makefile and
-# android/scripts/build_android_release.sh. See build-notes/android/coconut_wallet/*-findings.md
-# for the full forensics trail.
+# SCOPE: mainnet flavor only (onl.coconut.wallet); regtest is a separate Play listing, out of
+# scope. Builds the AAB from source and compares a bundletool split set, split by split, against
+# the official Play splits supplied via --binary/--apk. No upstream Android CI exists; the recipe
+# is reconstructed from android/fastlane/Fastfile, Makefile and the release helper script.
 #
-# STEPS: parse args -> stage official splits -> decode base.apk for metadata (apktool) -> derive
-# release tag from versionName -> build one podman image with the full toolchain (Flutter 3.29.1,
-# Go 1.26, Rust stable + cargo-ndk, JDK 17, Android SDK/NDK, bundletool, apktool) -> inside a
-# container: clone the tag, clone the BitBox02 bridge fork the README requires, extract the three
-# required .env assets FROM THE OFFICIAL APK (they are gitignored source-side but bundled verbatim
-# into every built APK as Flutter assets — see NOTE A below), build both native bridges from
-# source, generate a throwaway release keystore, `flutter build appbundle`, bundletool
-# build-apks with a device spec derived from the official splits -> unzip and diff each split ->
-# resources.arsc decode-compare (the one sanctioned automated diff-interpretation, per
-# review-notes/resources.arsc.md) -> mechanical verdict -> COMPARISON_RESULTS.yaml.
-#
-# NOTE A (--env extraction, needs review): mainnet.env/regtest.env/testnet.env carry API_HOST,
-# NETWORK_TYPE and the Firebase Android/iOS keys (lib/app/bootstrap/app_bootstrap.dart,
-# lib/firebase_options.dart). They are unconditional pubspec.yaml assets (not flavor-scoped), the
-# repo has no .env.example, and upstream's README says to obtain them by emailing
-# hello@noncelab.com. This script instead reads them out of the user-supplied official APK
-# (assets/flutter_assets/*.env) — bytes the vendor already ships to every installer, not a
-# fabricated secret — and copies them into the cloned source tree before building. Flagged in
-# ~/work/ws-notes/build-notes/android/coconut_wallet/0.17.0-findings.md as a design decision that
-# should be reviewed before this script is trusted, since no other WS Android script does this.
-#
-# NOTE B (google-services.json, UNRESOLVED): the official mainnet release lane sets
-# REQUIRE_GOOGLE_SERVICES=true, which applies the native com.google.gms.google-services Gradle
-# plugin. That file is Firebase-project credentials, is gitignored, is consumed only by the
-# Gradle plugin (not bundled into the APK as a raw asset, so it cannot be recovered the way NOTE A
-# recovers the .env files), and this script does NOT attempt to reconstruct it. This build
-# therefore runs WITHOUT REQUIRE_GOOGLE_SERVICES=true — a known, disclosed divergence from the
-# official build path. Any Firebase/google-services-shaped diff should be attributed to this, not
-# treated as an unexplained non-reproducibility. See findings NOTE 4b for the full reasoning.
-#
-# NOTE C (BitBox02 bridge fork, reproducibility risk): go/go.mod replaces
-# github.com/BitBoxSwiss/bitbox02-api-go with a sibling checkout of a NON-UPSTREAM fork
-# (https://github.com/4xvgal/bitbox02-api-go, branch fix/nil-guard-psbt — a mutable ref, not a
-# tag or pinned commit). This script clones and logs the exact commit it resolved, but the fork
-# itself remains outside WalletScrutiny's control.
-#
-# NOTE D (upstream Makefile does not parse — modification disclosed): at tag v0.17.0, Makefile
-# line 23 (the ios-mainnet-appstore recipe) is indented with 4 spaces instead of a TAB. GNU make
-# reads the entire file before running any target, so this breaks EVERY target — including the
-# gomobile-android and trezor-android targets upstream's own README instructs you to run. Verified
-# present at the tag and introduced 2025-10-08 in commit 5579122b, i.e. broken for ~11 months.
-# It goes unnoticed because android/app/libs/bitboxbridge.aar is committed prebuilt, so nobody
-# normally invokes that target; this script rebuilds it from source, so it hits the bug. Before
-# Phase 4 the script repairs make SYNTAX ONLY (leading spaces -> TAB on recipe lines), never a
-# recipe's command text, prints the full before/after diff, saves it to makefile-repair.diff, and
-# aborts if make still fails to parse. The single affected line is an iOS App Store target with no
-# bearing on this Android build. The repair is reported in the results block (makefileRepair:) and
-# is skipped automatically if upstream fixes it.
-#
-# Per ~/work/ws-notes/general-notes/first-party-prebuilt-native-blob-policy.md, the vendored
-# android/app/libs/bitboxbridge.aar and the (gitignored, always-rebuilt) Trezor .so/Kotlin bridge
-# are both first-party native blobs and are rebuilt from source here rather than trusted.
+# NOTE A: the three .env assets are recovered from the official APK (gitignored upstream).
+# NOTE B: google-services.json is not reconstructed; REQUIRE_GOOGLE_SERVICES stays unset.
+# NOTE C: the BitBox02 bridge is built from the non-upstream fork upstream's README requires.
+# NOTE D: upstream's Makefile does not parse at v0.17.0; a whitespace-only repair is applied.
+# The full design notes (SCOPE, STEPS, NOTE A-D) are kept in this script's changelog.
 #
 # Exit codes: 0 = reproducible, 1 = not_reproducible or ftbfs, 2 = invalid parameters.
 set -euo pipefail
 
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.1.15"
+readonly SCRIPT_VERSION="v0.1.16"
 readonly SCRIPT_NAME="coconut_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 readonly SCRIPT_PATH
