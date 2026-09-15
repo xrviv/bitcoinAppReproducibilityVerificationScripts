@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # mixinandroid_build.sh - Mixin Messenger (one.mixin.messenger) Android Verification
-# Version: v0.1.6
+# Version: v0.1.4
 # Organization: WalletScrutiny.com
 # Last modified by: Bob (WalletScrutiny agent), for Daniel Garcia
 # Date last modified: 2026-09-14
@@ -44,7 +44,7 @@
 #  5. Bugsnag mapping-upload tasks are chained onto every release bundle task and
 #     need an account; they are excluded (-x), which does not change the AAB.
 
-SCRIPT_VERSION="v0.1.6"
+SCRIPT_VERSION="v0.1.9"
 SCRIPT_NAME="mixinandroid_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 if [[ -f "$SCRIPT_PATH" ]]; then
@@ -355,11 +355,15 @@ set -uo pipefail
 tag="__TAG__"; want="__VERSION__"; vcode="__VCODE__"
 export GRADLE_USER_HOME=/gradle-home GRADLE_OPTS="-Dorg.gradle.daemon=false"
 echo "[BUILD] java: $(java -version 2>&1 | head -1)"
+# /project is a host directory; under a rootful runtime its owner is not the container user and
+# git refuses every command after the clone ("dubious ownership"), silently blanking the commit.
+git config --global --add safe.directory /project
 if [[ ! -f /project/app/build.gradle.kts ]]; then
     git -c advice.detachedHead=false clone -q --depth 1 --branch "$tag" "__REPO__" /project || { echo "[BUILD] ERROR: tag ${tag} not found at __REPO__"; exit 7; }
 fi
 cd /project || exit 7
-tag_commit=$(git rev-parse HEAD)
+tag_commit=$(git rev-parse HEAD 2>/dev/null)
+[[ -n "$tag_commit" ]] || { echo "[BUILD] ERROR: git cannot read HEAD in /project"; git rev-parse HEAD; exit 9; }
 echo "[BUILD] ${tag} = ${tag_commit} ($(git cat-file -t "refs/tags/${tag}" 2>/dev/null || echo lightweight) tag object)"
 # The artifact may name the exact commit it was built from. When that commit is public it is the
 # honest thing to build; the tag is the fallback. Either way both commits are reported.
@@ -367,9 +371,9 @@ offrev="__OFFREV__"; source_note="tag ${tag} (artifact names no revision)"
 if [[ -n "$offrev" && "$offrev" != "$tag_commit" ]]; then
     if git fetch -q --depth 1 origin "$offrev" 2>/dev/null && git -c advice.detachedHead=false checkout -q "$offrev"; then
         changed=$(git diff --name-only "$offrev" "$tag_commit" | paste -sd, -)
-        source_note="artifact-named revision ${offrev:0:12} built instead of ${tag} (${tag_commit:0:12}); files differing between the two: ${changed:-none}"
+        source_note="artifact-named revision ${offrev:0:12} built instead of ${tag} (${tag_commit:0:12}), files differing between the two: ${changed:-none}"
     else
-        source_note="WARNING: artifact names revision ${offrev:0:12}, not fetchable from the public repository; built ${tag} (${tag_commit:0:12}) instead"
+        source_note="WARNING: artifact names revision ${offrev:0:12}, not fetchable from the public repository, built ${tag} (${tag_commit:0:12}) instead"
     fi
 elif [[ -n "$offrev" ]]; then source_note="artifact names ${tag}'s commit ${tag_commit:0:12}"; fi
 printf '%s\n' "$source_note" > /out/source_note.txt; echo "[BUILD] ${source_note}"
@@ -413,12 +417,13 @@ build_rc=$?
 case "$build_rc" in
     0) ;;
     7) die 2 "Clone of ${tag} failed (see output above)" "Tag ${tag} could not be cloned from ${REPO_URL}" ;;
+    9) die 1 "git cannot read the checkout in /project (ownership or permissions, see output above)" "git could not read the source checkout" ;;
     8) die 1 "Source at ${tag} does not declare version ${wallet_version}" "Source version at ${tag} does not match the artifact version ${wallet_version}" ;;
     *) die 1 "Gradle build failed (see built/gradle.log)" "Gradle :app:bundle${FLAVOR_CAP}Release failed" ;;
 esac
 [[ -f "$BUILD_DIR/app.aab" ]] || die 1 "Build finished without an AAB" "Gradle :app:bundle${FLAVOR_CAP}Release produced no AAB"
 commit=$(cat "$BUILD_DIR/commit.txt"); version_build_note=$(cat "$BUILD_DIR/version_build_note.txt")
-source_note=$(paste -sd';' "$BUILD_DIR/source_note.txt" | sed 's/;/; /g')
+source_note=$(paste -sd'|' "$BUILD_DIR/source_note.txt" | sed 's/|/; /g')
 [[ "$version_build_note" == *patched* ]] && log_warn "$version_build_note"
 [[ "$source_note" == *WARNING* || "$source_note" == *patched* ]] && log_warn "$source_note"
 log_success "Checked out ${tag} = ${commit}; AAB built: $(sha256of "$BUILD_DIR/app.aab")"
@@ -514,7 +519,11 @@ while IFS='|' read -r off rel; do
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         if [[ "$line" =~ ^Files\ /tmp/o-[^/]+/(.*)\ and\ /tmp/b-.*\ differ$ ]]; then f="${BASH_REMATCH[1]}"
-        else echo "${off}: ${line#Only in }" >> /out/material.txt; mat=$((mat+1)); continue; fi
+        else   # "Only in /tmp/o-<tag>/dir: file" -> "only in official: dir/file"
+            rest="${line#Only in }"; odir="${rest%%: *}"; ofile="${rest#*: }"
+            case "$odir" in /tmp/o-*) side="only in official" ;; *) side="only in built" ;; esac
+            odir="${odir#/tmp/[ob]-"${tag}"}"; odir="${odir#/}"
+            echo "${off}: ${side}: ${odir:+$odir/}${ofile}" >> /out/material.txt; mat=$((mat+1)); continue; fi
         case "$f" in
             resources.arsc)
                 decode_both
@@ -572,8 +581,9 @@ while IFS='|' read -r off rel; do
     rm -rf "$o" "$b" /tmp/do /tmp/db
 done < /pairs.txt
 echo ""; echo "  totals: raw=${total_raw} acceptable=${total_acc} material=${total_mat}"
-[[ -s /out/material.txt ]] && { echo "  material entries: $(wc -l < /out/material.txt) (comparison/material.txt)"; head -5 /out/material.txt | sed 's/^/    /'; }
-[[ -s /out/acceptable.txt ]] && echo "  acceptable entries listed individually in comparison/acceptable.txt"
+# Every verdict-bearing entry is printed so the recording alone carries the full list (WS rule).
+[[ -s /out/material.txt ]] && { echo "  material entries, complete list ($(wc -l < /out/material.txt), also comparison/material.txt):"; head -200 /out/material.txt | sed 's/^/    /'; [[ $(wc -l < /out/material.txt) -gt 200 ]] && echo "    ... truncated at 200, see the file"; }
+[[ -s /out/acceptable.txt ]] && { echo "  acceptable entries, complete list ($(wc -l < /out/acceptable.txt), also comparison/acceptable.txt):"; sed 's/^/    /' /out/acceptable.txt; }
 printf 'raw_total=%s\nacceptable=%s\nmaterial=%s\n' "$total_raw" "$total_acc" "$total_mat" > /out/summary.txt
 CMP
 printf '%s\n' "${PAIRS[@]}" > "$ctx/pairs.txt"
