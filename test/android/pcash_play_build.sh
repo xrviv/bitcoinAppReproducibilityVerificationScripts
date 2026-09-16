@@ -429,15 +429,8 @@ fi
 echo "  Revision: ${build_rev:-<resolved in container>}   source: ${rev_source}"
 echo "  Branch to recreate: ${GIT_BRANCH_NAME}   Gradle flag: none (-Pfdroid is f-droid only)"
 
-# The vendor's BuildConfig.GIT_HASH tells whether their `git` worked at build time (AGP
-# records the revision without it). No literal for the recorded revision => it read
-# "unknown" => make ours fail the same way, or classes.dex differs by that string alone.
-git_shim=0
-if [[ -n "$vcs_revision" && -z "$git_hash" ]]; then
-  git_shim=1
-  log_warn "No GIT_HASH literal for ${vcs_revision:0:10} in the official dex: the vendor's git was"
-  log_warn "unavailable at build time (BuildConfig.GIT_HASH=unknown). Building with git shadowed to match."
-fi
+[[ -n "$vcs_revision" && -z "$git_hash" ]] && \
+  log_warn "No GIT_HASH literal for ${vcs_revision:0:10} in the official dex; expect classes.dex to differ by that string."
 case "$git_hash" in
   *-dirty)  log_warn "GIT_HASH ends in -dirty: the vendor built from uncommitted changes." ;;
   *-fdroid) log_warn "GIT_HASH ends in -fdroid: built from branch f-droid, contradicting the Play lineage." ;;
@@ -522,12 +515,6 @@ if ! git diff-index --quiet HEAD --; then
   exit 2
 fi
 
-if [[ "${WS_GIT_SHIM:-0}" == "1" ]]; then
-  mkdir -p /tmp/nogit && printf '#!/bin/sh\nexit 128\n' > /tmp/nogit/git && chmod +x /tmp/nogit/git
-  export PATH="/tmp/nogit:$PATH"
-  echo "=== git shadowed for the build (BuildConfig.GIT_HASH -> unknown, as in the official artifact) ==="
-fi
-
 echo "=== Toolchain ==="; java -version 2>&1; ./gradlew --version 2>&1 | sed -n '1,12p'
 echo "=== Gradle build === $(date)"
 ./gradlew --no-daemon --max-workers=2 clean :app:bundleRelease \
@@ -607,7 +594,6 @@ section "Source build (30-90 min cold) - $(date)"
 crun \
   -e "WS_DEVICE_SDK=${WS_DEVICE_SDK:-}" \
   -e "WS_GIT_REVISION=${build_rev}" \
-  -e "WS_GIT_SHIM=${git_shim}" \
   --volume "$OFFICIAL_DIR:/official:ro" \
   --volume "${BUILD_DIR}:/output" \
   --volume "${img_ctx}/build.sh:/build/build.sh:ro" \
@@ -952,7 +938,7 @@ lineage:         ${LINEAGE} (signals: $google_signals)
 sourceRef:       ${built_ref:-unknown} (branch ${GIT_BRANCH_NAME})
 revisionSource:  ${rev_source}
 candidateCommits: ${candidate_count:-1}
-gitHashInBinary: ${git_hash:-none} (git shadowed during build: ${git_shim})
+gitHashInBinary: ${git_hash:-none}
 agpVersion:      official ${official_agp:-?}, built revision ${built_agp:-?}
 rawDiffs:        ${raw_total}
 acceptedDiffs:   ${t_acc} (signing ${t_sign}, sourcestamp ${t_stamp}, manifest ${t_mani}, arsc ${t_arsc})
@@ -964,7 +950,7 @@ depProvenance:   JitPack deps consumed as published binaries, not rebuilt from s
  comparison log. signer is Play App Signing's key, not the developer key.
 EOF
 
-generate_yaml "${VERDICT}" "Google Play split set, master lineage DETECTED from artifact contents ($google_signals). Revision ${built_ref:-unknown} from ${rev_source}$([[ "$git_shim" == 1 ]] && echo "; git shadowed during the build because the official BuildConfig.GIT_HASH is unknown"). Built :app:bundleRelease, split with bundletool 1.18.3 (matches AGP 9.0.1). ${raw_total} raw difference(s); ${t_acc} EARNED exclusions - signing ${t_sign} (Play re-signs, local build unsigned), SourceStamp ${t_stamp} (1 root entry, off-only, 32 bytes, apksigner SourceStamp OK), AndroidManifest ${t_mani} (only Play's off-only distribution meta-data entries), resources.arsc ${t_arsc} (decoded res/ compared; where the sole delta was the three positional Crashlytics build_ids arrays, triples were zipped by index, Counter-compared with multiplicity preserved, canonicalised, and the ENTIRE decoded res/ tree then compared identical). ${t_unacc} UNACCOUNTED difference(s) - the verdict is judged on this alone. ${t_missing} split(s) unmatched. Official base.apk SHA-256 ${app_hash}. JitPack deps (com.github.piratecash forks) were consumed as published binaries, NOT rebuilt from source, so a byte-match does not attest their provenance."
+generate_yaml "${VERDICT}" "Google Play split set, master lineage DETECTED from artifact contents ($google_signals). Revision ${built_ref:-unknown} from ${rev_source}. Built :app:bundleRelease, split with bundletool 1.18.3 (matches AGP 9.0.1). ${raw_total} raw difference(s); ${t_acc} EARNED exclusions - signing ${t_sign} (Play re-signs, local build unsigned), SourceStamp ${t_stamp} (1 root entry, off-only, 32 bytes, apksigner SourceStamp OK), AndroidManifest ${t_mani} (only Play's off-only distribution meta-data entries), resources.arsc ${t_arsc} (decoded res/ compared; where the sole delta was the three positional Crashlytics build_ids arrays, triples were zipped by index, Counter-compared with multiplicity preserved, canonicalised, and the ENTIRE decoded res/ tree then compared identical). ${t_unacc} UNACCOUNTED difference(s) - the verdict is judged on this alone. ${t_missing} split(s) unmatched. Official base.apk SHA-256 ${app_hash}. JitPack deps (com.github.piratecash forks) were consumed as published binaries, NOT rebuilt from source, so a byte-match does not attest their provenance."
 
 echo ""
 echo "Exit code: ${EXIT_CODE}"
