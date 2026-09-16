@@ -144,11 +144,11 @@ if [[ -z "${CONTAINER_CMD:-}" ]]; then
   fi
 fi
 
-# Container user = host user, so no root-owned leftovers. HOME=/tmp: npm/gradle/apktool cache there.
+# Container user = host user, so no root-owned leftovers. HOME=/home/runner as on CI.
 if [[ "$CONTAINER_CMD" == "podman" ]]; then
-  CONTAINER_RUN_USER_ARGS=(--userns=keep-id -e HOME=/tmp)
+  CONTAINER_RUN_USER_ARGS=(--userns=keep-id -e HOME=/home/runner)
 else
-  CONTAINER_RUN_USER_ARGS=(--user "${HOST_UID}:${HOST_GID}" -e HOME=/tmp)
+  CONTAINER_RUN_USER_ARGS=(--user "${HOST_UID}:${HOST_GID}" -e HOME=/home/runner)
 fi
 
 MEM_LIMIT="${MEM_LIMIT:-24g}"
@@ -211,6 +211,8 @@ img_ctx="$(mktemp -d)"
 # node 24.18.0 (setup-node "24"), Temurin 17.0.19+10, SDK 36 / build-tools 36.0.0 /
 # NDK 28.2.13676358; AGP auto-installed NDK 27.0.12077973 (realm) and CMake 3.22.1
 # there, so they are pre-installed here (the SDK is read-only for the build user).
+# Paths match the runner exactly: the NDK/prefab include paths end up in the GNU
+# build-id of every locally compiled .so, and one lands in libappmodules .rodata.
 # /home/runner chmod: the mapped user must be able to clone into the CI path.
 cat > "${img_ctx}/Dockerfile" <<'DOCKERFILE_END'
 FROM ubuntu:24.04@sha256:a08e551cb33850e4740772b38217fc1796a66da2506d312abe51acda354ff061
@@ -224,18 +226,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN cd /tmp && \
   wget -q https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz && \
   echo "55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742  node-v24.18.0-linux-x64.tar.xz" | sha256sum -c - && \
-  mkdir -p /opt/node && tar -xJf node-v24.18.0-linux-x64.tar.xz -C /opt/node --strip-components=1 && \
+  mkdir -p /opt/hostedtoolcache/node/24.18.0/x64 && tar -xJf node-v24.18.0-linux-x64.tar.xz -C /opt/hostedtoolcache/node/24.18.0/x64 --strip-components=1 && \
   rm node-v24.18.0-linux-x64.tar.xz
 
 RUN cd /tmp && \
   wget -q -O jdk.tar.gz "https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.19%2B10/OpenJDK17U-jdk_x64_linux_hotspot_17.0.19_10.tar.gz" && \
   echo "d8afc263758141a66e0e3aafc321e783f7016696f4eaea067d340a269037d331  jdk.tar.gz" | sha256sum -c - && \
-  mkdir -p /opt/jdk && tar -xzf jdk.tar.gz -C /opt/jdk --strip-components=1 && rm jdk.tar.gz
+  mkdir -p /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/17.0.19-10/x64 && \
+  tar -xzf jdk.tar.gz -C /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/17.0.19-10/x64 --strip-components=1 && rm jdk.tar.gz
 
-ENV JAVA_HOME=/opt/jdk
-ENV ANDROID_HOME=/opt/android-sdk
-ENV ANDROID_SDK_ROOT=/opt/android-sdk
-ENV PATH="/opt/node/bin:${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${JAVA_HOME}/bin:${PATH}"
+ENV JAVA_HOME=/opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/17.0.19-10/x64
+ENV ANDROID_HOME=/usr/local/lib/android/sdk
+ENV ANDROID_SDK_ROOT=/usr/local/lib/android/sdk
+ENV PATH="/opt/hostedtoolcache/node/24.18.0/x64/bin:${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${JAVA_HOME}/bin:${PATH}"
 
 RUN mkdir -p ${ANDROID_HOME}/cmdline-tools && cd ${ANDROID_HOME}/cmdline-tools && \
   wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O ct.zip && \
@@ -290,6 +293,10 @@ agp="$(unzip -p $A META-INF/com/android/build/gradle/app-metadata.properties 2>/
 uuid="$(grep -A1 'android:name([^)]*)="com.bugsnag.android.BUILD_UUID"' /output/manifest-official.txt \
   | sed -n 's/.*android:value([^)]*)="\([^"]*\)".*/\1/p' | head -1)"
 bp=0; unzip -l $A 2>/dev/null | grep -q 'assets/dexopt/baseline.prof' && bp=1
+# The react-native gradle plugin writes the BUILD HOST's LAN IP into this release
+# resource (AgpConfiguratorUtils.configureDevServerLocation); -PreactNativeDevServerIp overrides it.
+devip="$("$BT/aapt2" dump resources $A 2>/dev/null | grep -A1 'string/react_native_dev_server_ip' \
+  | sed -n 's/.*"\([0-9.]*\)".*/\1/p' | head -1)"
 
 # versionCode = $(date +%s) of the CI step that built it; only trust timestamp-shaped values.
 ts=""
@@ -297,7 +304,7 @@ ts=""
 
 for kv in "pkg_name:${pkg:-unknown}" "version_name:${vname:-unknown}" "version_code:${vcode:-unknown}" \
   "signer:${signer:-unknown}" "split_name:${split_name}" "vcs:${vcs}" "agp:${agp}" "abis:${abis}" \
-  "build_uuid:${uuid}" "stamp:${stamp}" "has_baseline_profile:${bp}" "build_time:${ts}"; do
+  "build_uuid:${uuid}" "stamp:${stamp}" "has_baseline_profile:${bp}" "build_time:${ts}" "dev_ip:${devip}"; do
   printf '%s\n' "${kv#*:}" > "/output/${kv%%:*}.txt"
 done
 
@@ -311,6 +318,7 @@ cat <<META
 [META] AGP version:         ${agp:-<none>} (META-INF/.../app-metadata.properties)
 [META] VCS info:            ${vcs:-<none>} (META-INF/version-control-info.textproto)
 [META] Bugsnag BUILD_UUID:  ${uuid:-<none>} (manifest meta-data, random per build)
+[META] dev_server_ip res:   ${devip:-<none>} (build host LAN IP written by the RN gradle plugin)
 [META] split name:          ${split_name:-<none>} (empty = not a split)
 [META] baseline.prof:       ${bp}
 META
@@ -333,6 +341,7 @@ version_code="$(meta version_code unknown)"
 signer="$(meta signer unknown)"
 official_agp="$(meta agp)"
 official_uuid="$(meta build_uuid)"
+dev_ip="$(meta dev_ip)"
 build_time="$(meta build_time)"
 split_name="$(meta split_name)"
 app_hash="$(sha256of "$apk_file")"
@@ -365,6 +374,11 @@ echo "  Revision: ${build_rev:-<resolved in container>}"
 echo "  Source:   ${rev_source}"
 [[ -z "$official_uuid" ]] && \
   log_warn "No Bugsnag BUILD_UUID in the official manifest; the built manifest will carry one unless upstream removed the plugin."
+if [[ -n "$dev_ip" ]]; then
+  log_info "react_native_dev_server_ip=${dev_ip} in the official resources: passed as -PreactNativeDevServerIp (build input, like versionCode)"
+else
+  log_warn "No react_native_dev_server_ip resource in the official APK; the built one will carry this container's IP"
+fi
 
 phase "PHASE 1: BUILD FROM SOURCE"
 echo "  npm ci --omit=dev  ->  ./gradlew assembleRelease --no-daemon --stacktrace --console=plain"
@@ -389,8 +403,10 @@ CI_PATH="__CI_PATH__"
 WANT_VNAME="__WANT_VNAME__"
 WANT_VCODE="__WANT_VCODE__"
 BUILD_TS="__BUILD_TS__"
+DEV_IP="__DEV_IP__"
 
-export GRADLE_USER_HOME=/tmp/gradle-home
+# CI's ~/.gradle: the prefab include path under it is baked into libappmodules.so.
+export GRADLE_USER_HOME=/home/runner/.gradle
 mkdir -p "$GRADLE_USER_HOME"
 git config --global --add safe.directory '*'
 
@@ -473,7 +489,7 @@ git diff --stat; git diff | grep -E '^[-+] ' | head -4
 echo "=== Gradle assembleRelease === $(date)"
 cd android
 ./gradlew assembleRelease --no-daemon --stacktrace --console=plain -I /no-upload.gradle \
-  > /output/gradle-build.log 2>&1
+  ${DEV_IP:+-PreactNativeDevServerIp=$DEV_IP} > /output/gradle-build.log 2>&1
 rc=$?
 grep -E '^> Task :app:(createBundle|externalNativeBuild|package|processBugsnag)|BUILD (SUCCESSFUL|FAILED)|FAILURE|What went wrong' /output/gradle-build.log | head -12
 if [[ $rc -ne 0 ]]; then
@@ -495,6 +511,7 @@ sed -i \
   -e "s|__WANT_VNAME__|$wallet_version|g" \
   -e "s|__WANT_VCODE__|$version_code|g" \
   -e "s|__BUILD_TS__|$([[ -n "$build_time" ]] && echo "$version_code")|g" \
+  -e "s|__DEV_IP__|$dev_ip|g" \
   "${img_ctx}/build.sh"
 chmod +x "${img_ctx}/build.sh"
 
