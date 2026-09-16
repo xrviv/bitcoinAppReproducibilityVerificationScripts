@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # bluewallet_build.sh - BlueWallet (Google Play) reproducible build verification
-# Version:          v0.1.0
+# Version:          v0.1.1
 # Organization:     WalletScrutiny.com
 # Last Modified:    2026-09-16
 # App ID:           io.bluewallet.bluewallet
@@ -15,7 +15,7 @@
 # no warranty of any kind. Review before running.
 # Exit codes: 0 = identical, 1 = difference or build failure, 2 = bad parameters.
 
-SCRIPT_VERSION="v0.1.0"
+SCRIPT_VERSION="v0.1.1"
 
 SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
 SCRIPT_HASH="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
@@ -717,15 +717,21 @@ notes="${APP_ID} ${wallet_version} (versionCode ${version_code}${build_time:+ = 
 generate_yaml "$verdict" "$notes"
 
 echo ""
-echo "===== SUMMARY ====="
-echo "appId:          ${APP_ID}"
-echo "versionName:    ${wallet_version}"
-echo "versionCode:    ${version_code}"
-echo "commit:         ${built_ref}"
-echo "verdict:        ${verdict}"
-echo "scriptVersion:  ${SCRIPT_VERSION}"
-echo "scriptHash:     ${SCRIPT_HASH}"
-echo "==================="
+cat <<EOF
+===== Begin Results =====
+appId:           ${APP_ID}
+signer:          ${signer}
+apkVersionName:  ${wallet_version}
+apkVersionCode:  ${version_code}
+verdict:         ${verdict}
+appHash:         ${app_hash}
+commit:          $(cat "${BUILD_DIR}/commit.txt" 2>/dev/null || echo unknown)
+scriptVersion:   ${SCRIPT_VERSION}
+scriptHash:      ${SCRIPT_HASH:-unknown}
+===== End Results =====
+
+sourceRef:       ${built_ref:-unknown} (branch master, ${rev_source})
+EOF
 echo ""
 echo "Exit code: ${rc}"
 exit "$rc"
