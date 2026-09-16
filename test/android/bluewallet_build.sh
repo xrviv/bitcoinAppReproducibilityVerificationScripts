@@ -209,8 +209,9 @@ img_ctx="$(mktemp -d)"
 
 # Pins are what BuildReleaseApk run 11977 (the run that produced 8.0.1) used:
 # node 24.18.0 (setup-node "24"), Temurin 17.0.19+10, SDK 36 / build-tools 36.0.0 /
-# NDK 28.2.13676358, CMake 3.22.1 (AGP default). /home/runner chmod: the mapped
-# user must be able to clone into the CI path.
+# NDK 28.2.13676358; AGP auto-installed NDK 27.0.12077973 (realm) and CMake 3.22.1
+# there, so they are pre-installed here (the SDK is read-only for the build user).
+# /home/runner chmod: the mapped user must be able to clone into the CI path.
 cat > "${img_ctx}/Dockerfile" <<'DOCKERFILE_END'
 FROM ubuntu:24.04@sha256:a08e551cb33850e4740772b38217fc1796a66da2506d312abe51acda354ff061
 ARG DEBIAN_FRONTEND=noninteractive
@@ -243,7 +244,7 @@ RUN mkdir -p ${ANDROID_HOME}/cmdline-tools && cd ${ANDROID_HOME}/cmdline-tools &
 
 RUN yes | sdkmanager --licenses >/dev/null && \
   sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools" \
-    "ndk;28.2.13676358" "cmake;3.22.1" >/dev/null && chmod -R a+rX ${ANDROID_HOME}
+    "ndk;28.2.13676358" "ndk;27.0.12077973" "cmake;3.22.1" >/dev/null && chmod -R a+rX ${ANDROID_HOME}
 
 ADD https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar /opt/apktool.jar
 RUN chmod 0644 /opt/apktool.jar
