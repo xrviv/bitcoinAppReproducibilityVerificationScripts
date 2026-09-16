@@ -1,42 +1,28 @@
 #!/usr/bin/env bash
-# ==============================================================================
 # pcash_play_build.sh - P.CASH Terminal (Google Play) reproducible build verification
-# ==============================================================================
-# Version:          v0.6.4
+# Version:          v0.7.0
 # Organization:     WalletScrutiny.com
 # Last Modified:    2026-09-16
-# Last Modified by: WalletScrutiny.com
 # App ID:           cash.p.terminal
 # Project:          https://github.com/piratecash/pcash-wallet
 # Play Store:       https://play.google.com/store/apps/details?id=cash.p.terminal
-# ==============================================================================
 #
-# CHANNEL: GOOGLE PLAY (split APK set). For the single GPG-signed p.cash.apk on
-# GitHub/F-Droid use pcash_fdroid_build.sh.
+# CHANNEL: GOOGLE PLAY (split APK set). The single GPG-signed p.cash.apk on
+# GitHub/F-Droid is built from branch f-droid: use pcash_fdroid_build.sh.
+# Design notes, history and rationale: ws-notes script-notes/android/cash.p.terminal/changelog.md
 #
-# P.CASH ships TWO builds from two branches with IDENTICAL versionName and
-# versionCode, so version metadata cannot tell them apart. master (Firebase/GMS
-# present) goes to Play; f-droid (those groups excluded) goes to GitHub/F-Droid.
-# Lineage is DETECTED from artifact contents in PHASE 0, never assumed. master
-# carries no tag: its revision is pinned by versionName AND versionCode.
-#
-# DISCLAIMER: provided for technical analysis and reproducible build verification
-# only, with no warranty of security, functionality or fitness for any purpose.
-# It performs automated builds and APK comparisons - review before running. Users
-# are responsible for compliance with applicable laws.
-#
+# Provided for technical analysis and reproducible build verification only, with
+# no warranty of any kind. Review before running.
 # Exit codes: 0 = identical, 1 = difference or build failure, 2 = bad parameters.
-# ==============================================================================
 
-SCRIPT_VERSION="v0.6.4"
+SCRIPT_VERSION="v0.7.0"
 
-# Ties a verdict to the exact script bytes.
 SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
 SCRIPT_HASH="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
 echo "pcash_play_build.sh $SCRIPT_VERSION sha256:${SCRIPT_HASH:-unknown}"
 echo "Starting pcash_play_build.sh $SCRIPT_VERSION (Google Play lineage)"
 
-# Deliberately no -e: diff and cmp return 1 on legitimate differences.
+# No -e: diff and cmp return 1 on legitimate differences.
 set -uo pipefail
 
 SCRIPT_NAME="pcash_play_build.sh"
@@ -52,19 +38,12 @@ log_info()    { echo -e "${BLUE}[INFO]${NC} $*"; }
 log_success() { echo -e "${GREEN}[OK]${NC} $*"; }
 log_warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
-
 banner() { printf '\n== %s ==\n' "$*"; }
-
 section() { printf -- '\n-- %s --\n' "$*"; }
-
 phase() { banner "$*"; echo "  $(date)"; }
-
 sha256of() { sha256sum "$1" | awk '{print $1}'; }
 
-# LANDMINE: script_verifications.md rule 4 - the YAML MUST land in the SCRIPT's
-# directory; that is where ABS looks. A $PWD-only copy is invisible to ABS when
-# cwd != script dir. The $PWD copy below is convenience only.
-# LANDMINE: do not "fix" this to $PWD alone; that silently breaks ABS pickup.
+# The YAML must land in the SCRIPT's directory (ABS reads it there); $PWD copy is convenience.
 execution_dir="$SCRIPT_DIR"
 invocation_dir="$(pwd -P)"
 
@@ -77,8 +56,6 @@ verdict: ${verdict}
 notes: |
  ${notes}
 EOF
-  # Convenience copy where the operator actually ran, so a local run does not
-  # require digging in the scripts directory. ABS reads the one above.
   if [[ "$invocation_dir" != "$execution_dir" ]]; then
     cp -f "${execution_dir}/COMPARISON_RESULTS.yaml" \
        "${invocation_dir}/COMPARISON_RESULTS.yaml" 2>/dev/null || true
@@ -86,7 +63,6 @@ EOF
   log_info "COMPARISON_RESULTS.yaml written with verdict: ${verdict}"
 }
 
-# Exit code is the CALLER's: 2 = bad params, 1 = build/compare failure.
 fail() {
   local code="$1" note="$2"
   generate_yaml "ftbfs" "$note"
@@ -96,13 +72,9 @@ fail() {
 
 die_invalid() { log_error "$1"; fail 2 "Invalid invocation: $1"; }
 
-# Root would leave root-owned artifacts, defeating the user mapping.
 [[ "$EUID" -eq 0 ]] && die_invalid "Do not run this script as root."
 
-# --version is OPTIONAL (ABS omits it); version comes from base.apk.
-# Unknown parameters warn and continue, never fatal.
-
-version_arg=""; binary_arg=""; arch_arg=""; type_arg=""
+version_arg=""; binary_arg=""; arch_arg=""; type_arg=""; rev_arg="${WS_GIT_REVISION:-}"
 
 require_arg() {
   local flag="$1" val="${2:-}"
@@ -112,13 +84,16 @@ require_arg() {
 
 usage() {
   cat <<USAGE
-Usage: ${SCRIPT_NAME} --binary <dir-of-split-apks> [--version <v>] [--arch <a>] [--type <t>]
+Usage: ${SCRIPT_NAME} --binary <dir-of-split-apks> [--git-revision <sha>] [--version <v>] [--arch <a>] [--type <t>]
 
- --binary   REQUIRED. DIRECTORY of device-pulled splits: base.apk +
-      split_config.*.apk. A single p.cash.apk is the other channel:
-      use $COUNTERPART.
+ --binary        REQUIRED. DIRECTORY of device-pulled splits: base.apk +
+                 split_config.*.apk. A single p.cash.apk is the other channel:
+                 use $COUNTERPART.
+ --git-revision  Commit to build (7-40 hex). Default: the revision base.apk names
+                 in META-INF/version-control-info.textproto; else the oldest
+                 master commit declaring the artifact's versionName+versionCode.
  --version/--arch/--type  Optional; logged. Version comes from base.apk.
- WS_DEVICE_SDK  env: device API level for the device-spec.
+ WS_DEVICE_SDK   env: device API level for the device-spec (default 36).
 
 Exit codes: 0 = identical, 1 = any difference, 2 = invalid parameters.
 USAGE
@@ -126,33 +101,30 @@ USAGE
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --version) require_arg --version "${2:-}"; version_arg="$2"; shift 2 ;;
-    --binary)  require_arg --binary  "${2:-}"; binary_arg="$2";  shift 2 ;;
-    --apk)     require_arg --apk     "${2:-}"; binary_arg="$2";  shift 2 ;;  # Android alias
-    --arch)    require_arg --arch    "${2:-}"; arch_arg="$2";    shift 2 ;;
-    --type)    require_arg --type    "${2:-}"; type_arg="$2";    shift 2 ;;
-    -h|--help) usage; echo "Exit code: 0"; exit 0 ;;
-    *)         log_warn "Unknown argument: $1 (ignored)"; shift; continue ;;
+    --version)      require_arg --version "${2:-}"; version_arg="$2"; shift 2 ;;
+    --binary)       require_arg --binary  "${2:-}"; binary_arg="$2";  shift 2 ;;
+    --apk)          require_arg --apk     "${2:-}"; binary_arg="$2";  shift 2 ;;
+    --arch)         require_arg --arch    "${2:-}"; arch_arg="$2";    shift 2 ;;
+    --type)         require_arg --type    "${2:-}"; type_arg="$2";    shift 2 ;;
+    --git-revision) require_arg --git-revision "${2:-}"; rev_arg="$2"; shift 2 ;;
+    -h|--help)      usage; echo "Exit code: 0"; exit 0 ;;
+    *)              log_warn "Unknown argument: $1 (ignored)"; shift; continue ;;
   esac
 done
 
-# --- --binary must be a DIRECTORY of splits: Play publishes nothing downloadable.
-
 if [[ -z "$binary_arg" ]]; then
-  log_error "--binary is required: the Play lineage cannot be downloaded."
-  log_error "Pull the split set off a device (base.apk + split_config.*.apk) and pass its directory."
-  log_error "If you have a single official p.cash.apk from GitHub Releases or F-Droid,"
-  log_error "that is the other lineage - use $COUNTERPART instead."
+  log_error "--binary is required: pass the DIRECTORY of device-pulled Play splits (base.apk + split_config.*.apk)."
+  log_error "A single official p.cash.apk (GitHub Releases / F-Droid) is the other lineage: use $COUNTERPART."
   fail 2 "--binary not provided. The Google Play lineage requires a directory of device-pulled split APKs; it cannot be downloaded. For a single p.cash.apk use $COUNTERPART."
 fi
 [[ -e "$binary_arg" ]] || die_invalid "--binary path does not exist: ${binary_arg}"
 if [[ ! -d "$binary_arg" ]]; then
-  log_error "--binary must be a DIRECTORY of split APKs, but a single file was given:"
-  log_error "  ${binary_arg}"
-  log_error "A single p.cash.apk is the F-Droid/GitHub-release lineage, built from branch"
-  log_error "f-droid with Firebase stripped. Verify it with $COUNTERPART instead."
+  log_error "--binary must be a DIRECTORY of split APKs, not a single file: ${binary_arg}"
+  log_error "A single p.cash.apk is the F-Droid/GitHub lineage (branch f-droid). Use $COUNTERPART."
   fail 2 "--binary was a single file, but the Google Play lineage is distributed as split APKs. A single p.cash.apk belongs to the F-Droid/GitHub lineage; use $COUNTERPART."
 fi
+[[ -z "$rev_arg" || "$rev_arg" =~ ^[0-9a-fA-F]{7,40}$ ]] || \
+  die_invalid "--git-revision must be 7-40 hex characters (got: '${rev_arg}')"
 
 OFFICIAL_DIR="$(realpath "$binary_arg")"
 [[ -f "${OFFICIAL_DIR}/base.apk" ]] || \
@@ -161,7 +133,6 @@ OFFICIAL_DIR="$(realpath "$binary_arg")"
 declare -a OFFICIAL_SPLITS=()
 while IFS= read -r f; do OFFICIAL_SPLITS+=("$f"); done \
   < <(find "$OFFICIAL_DIR" -maxdepth 1 -name '*.apk' | sort)
-# Reject stray APKs: none may silently join the official set.
 for f in "${OFFICIAL_SPLITS[@]}"; do
   bn="$(basename "$f")"
   [[ "$bn" == "base.apk" || "$bn" == split_config*.apk ]] || \
@@ -173,9 +144,7 @@ log_info "${#OFFICIAL_SPLITS[@]} official split(s) found in ${OFFICIAL_DIR}"
 [[ -n "$arch_arg" ]]    && log_info "--arch ${arch_arg} accepted; ABIs are derived from the official split set"
 [[ -n "$type_arg" ]]    && log_info "--type ${type_arg} accepted but not used"
 [[ -n "$version_arg" ]] && log_info "--version ${version_arg} accepted; the authoritative version comes from base.apk"
-
-# Write-path runs map container user -> host user (else root-owned leftovers
-# need sudo). HOME=/tmp: apktool caches under $HOME.
+[[ -n "$rev_arg" ]]     && log_info "--git-revision ${rev_arg}: overrides every revision heuristic"
 
 if [[ -z "${CONTAINER_CMD:-}" ]]; then
   if command -v docker &>/dev/null; then
@@ -187,6 +156,7 @@ if [[ -z "${CONTAINER_CMD:-}" ]]; then
   fi
 fi
 
+# Container user = host user, so no root-owned leftovers. HOME=/tmp: apktool caches there.
 if [[ "$CONTAINER_CMD" == "podman" ]]; then
   CONTAINER_RUN_USER_ARGS=(--userns=keep-id -e HOME=/tmp)
 else
@@ -197,7 +167,6 @@ MEM_LIMIT="${MEM_LIMIT:-16g}"
 MEM_ARGS=()
 [[ -n "$MEM_LIMIT" ]] && MEM_ARGS=(--memory="$MEM_LIMIT")
 
-# Single entry point so the user mapping cannot be forgotten.
 crun() {
   $CONTAINER_CMD run --rm "${CONTAINER_RUN_USER_ARGS[@]}" "${MEM_ARGS[@]}" "$@"
 }
@@ -206,7 +175,6 @@ section "PRE-FLIGHT: HOST TOOL CHECK"
 printf "  %-10s OK  (%s)\n" "$CONTAINER_CMD" "$(command -v "$CONTAINER_CMD")"
 echo "  No host JDK, Gradle, Android SDK, bundletool or apktool is required or used."
 
-# Keeps parallel arch/type runs from colliding on image/workspace names.
 RUN_ID="pcash-play-$(date +%s)-$$"
 IMG="ws-pcash-play-${RUN_ID}"
 workspace="${execution_dir}/pcash_play_verification_${RUN_ID}"
@@ -217,9 +185,7 @@ img_ctx=""
 
 mkdir -p "$META_DIR" "$BUILD_DIR" "$CMP_DIR"
 
-# Reclaims ownership on EVERY exit path so cleanup never needs sudo.
-# LANDMINE: deliberately does NOT use crun() - it must run as ROOT inside the
-# container to chown. Adding the user mapping here would break cleanup.
+# Runs as root in the container on purpose: it must be able to chown.
 ensure_user_ownership() {
   local path="$1"
   [[ -e "$path" ]] || return 0
@@ -249,13 +215,12 @@ cat <<EOF
  Date:      $(date)
 EOF
 
-# One pinned image for metadata, build and comparison. JDK 21 (app
-# targets Java 17). No NDK: nothing native is compiled.
-
 phase "SETUP: BUILD CONTAINER IMAGE"
 
 img_ctx="$(mktemp -d)"
 
+# bundletool must match the one AGP embeds (AGP 9.0.1 -> 1.18.3); /build chmod:
+# WORKDIR alone is root-owned and the mapped-user clone fails.
 cat > "${img_ctx}/Dockerfile" <<'DOCKERFILE_END'
 FROM ubuntu:24.04@sha256:a08e551cb33850e4740772b38217fc1796a66da2506d312abe51acda354ff061
 ARG DEBIAN_FRONTEND=noninteractive
@@ -278,15 +243,10 @@ RUN mkdir -p ${ANDROID_HOME}/cmdline-tools && \
 RUN yes | sdkmanager --licenses >/dev/null && \
   sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools" >/dev/null
 
-# LANDMINE: must match the bundletool AGP embeds (AGP 9.0.1 -> 1.18.3), which
-# sparse-encodes SDK 32+ and injects the variant min into split manifests; older
-# versions do neither and fake diffs. Re-pin whenever AGP moves.
 ADD https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar /opt/bundletool.jar
 ADD https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar /opt/apktool.jar
 RUN chmod 0644 /opt/bundletool.jar /opt/apktool.jar
 
-# LANDMINE: WORKDIR alone creates /build root-owned and the mapped-user git clone
-# then fails with "could not create work tree dir". Keep /build in this chmod.
 RUN mkdir -p /tmp/afw /build && chmod 0777 /tmp /tmp/afw /build
 WORKDIR /build
 DOCKERFILE_END
@@ -298,8 +258,6 @@ if ! $CONTAINER_CMD build -t "$IMG" -f "${img_ctx}/Dockerfile" "$img_ctx"; then
 fi
 log_success "Image built: ${IMG}"
 
-# --- PHASE 0: metadata from base.apk + the lineage detector over the whole set.
-
 phase "PHASE 0: OFFICIAL BINARY METADATA"
 
 cat > "${img_ctx}/meta.sh" <<'META_END'
@@ -308,65 +266,40 @@ set -uo pipefail
 BT="${ANDROID_HOME}/build-tools/36.0.0"
 AAPT2="$BT/aapt2"
 APKSIGNER="$BT/apksigner"
+A=/input/official.apk
 
-info="$("$AAPT2" dump badging /input/official.apk 2>/dev/null)"
-
-# LANDMINE: anchor on '^package:' and stop at the first quote. A greedy '.*name='
-# matches versionName= and silently returns the wrong value.
+info="$("$AAPT2" dump badging $A 2>/dev/null)"
+# Anchor on '^package:' and stop at the first quote (a greedy match returns versionName).
 pkg="$(printf '%s\n' "$info" | grep '^package:' | sed "s/^package: name='\([^']*\)'.*/\1/")"
 vname="$(printf '%s\n' "$info" | grep '^package:' | sed "s/.*versionName='\([^']*\)'.*/\1/")"
 vcode="$(printf '%s\n' "$info" | grep '^package:' | sed "s/.*versionCode='\([^']*\)'.*/\1/")"
-
-signer="$("$APKSIGNER" verify --print-certs /input/official.apk 2>/dev/null \
+signer="$("$APKSIGNER" verify --print-certs $A 2>/dev/null \
   | awk '/Signer #1 certificate SHA-256/ {print $NF; exit}')"
-
 # A true base APK declares no split name; config splits do.
 split_name="$(printf '%s\n' "$info" | sed -n "s/.*split='\([^']*\)'.*/\1/p" | head -1)"
-printf '%s\n' "${split_name}" > /output/base_split_name.txt
 
-printf '%s\n' "${pkg:-unknown}"    > /output/pkg_name.txt
-printf '%s\n' "${vname:-unknown}"  > /output/version_name.txt
-printf '%s\n' "${vcode:-unknown}"  > /output/version_code.txt
-printf '%s\n' "${signer:-unknown}" > /output/signer.txt
+# AGP records the built commit (from .git/HEAD, no git binary needed) and its own version.
+rev="$(unzip -p $A META-INF/version-control-info.textproto 2>/dev/null \
+  | sed -n 's/.*revision: *"\([0-9a-f]\{40\}\)".*/\1/p' | head -1)"
+agp="$(unzip -p $A META-INF/com/android/build/gradle/app-metadata.properties 2>/dev/null \
+  | sed -n 's/^androidGradlePluginVersion=//p' | head -1)"
 
 rm -rf /tmp/dex && mkdir -p /tmp/dex
-unzip -q -o /input/official.apk 'classes*.dex' -d /tmp/dex 2>/dev/null
-: > /output/gh.txt
-: > /output/git_branch.txt
-: > /output/ghc.txt
+unzip -q -o $A 'classes*.dex' -d /tmp/dex 2>/dev/null
+# BuildConfig.GIT_HASH is "<10hex>[-dirty][-fdroid]" or "unknown". Only the literal
+# for the recorded revision is probative; bare 10-hex and "unknown" collide with junk.
+gh=""; gitbr=""
 if compgen -G "/tmp/dex/classes*.dex" > /dev/null; then
-  # LANDMINE: this app's GIT_HASH is ALWAYS "<10hex>-fdroid" or the literal
-  # "unknown" - a BARE 10-hex string is an unrelated dex literal. Do not loosen
-  # this pattern or drop the all-same-char filter: it then picks "0000000000".
-  strings -a /tmp/dex/classes*.dex 2>/dev/null \
-    | grep -xE '[0-9a-f]{10}(-dirty)?(-fdroid)?|unknown' \
-    | awk '{ h=$0; sub(/-.*$/,"",h);
-        if (h=="unknown") { print; next }
-        c=substr(h,1,1); u=0;
-        for(i=2;i<=length(h);i++) if(substr(h,i,1)!=c) { u=1; break }
-        if (u) print }' \
-    | sort -u > /output/ghc.txt
-  # Preference order matches what the branch can actually emit.
-  grep -m1 -xE '[0-9a-f]{10}(-dirty)?-fdroid' /output/ghc.txt \
-    > /output/gh.txt 2>/dev/null || \
-  grep -m1 -x 'unknown' /output/ghc.txt \
-    > /output/gh.txt 2>/dev/null || \
-  head -1 /output/ghc.txt > /output/gh.txt 2>/dev/null || true
-  # LANDMINE: report EVERY match, never `head -1`. "f-droid" sorts before
-  # "master", so head -1 always claims "f-droid" when both literals appear
-  # anywhere in the dex - making it non-probative. See changelog 2026-08-20.
-  strings -a /tmp/dex/classes*.dex 2>/dev/null \
-    | grep -xE 'f-droid|master' | sort -u | paste -sd, - > /output/git_branch.txt || true
+  [[ -n "$rev" ]] && gh="$(strings -a /tmp/dex/classes*.dex 2>/dev/null \
+    | grep -m1 -xE "${rev:0:10}(-dirty)?(-fdroid)?")"
+  # Report EVERY branch literal: head -1 would always claim "f-droid" (sorts first).
+  gitbr="$(strings -a /tmp/dex/classes*.dex 2>/dev/null | grep -xE 'f-droid|master' | sort -u | paste -sd, -)"
 fi
 
-# LANDMINE: scan the WHOLE split set and look PAST zip entry names.
-# libcrashlytics*.so live in split_config.<abi>.apk; Google Sign-In resources are
-# compiled INSIDE resources.arsc. Four signals; ANY hit = present; the firing
-# signal is reported. bp (baseline.prof) NEVER infers lineage.
+# Lineage: scan the WHOLE split set, past entry names (crashlytics .so live in the ABI
+# split; Sign-In resources sit inside resources.arsc). ANY hit = present.
 GPAT='firebase|crashlytics|com/google/android/gms|com\.google\.android\.gms'
 fb=0; bp=0; sigs=""
-
-# (a) zip entry names and (b) native lib names, in EVERY split - one listing each
 for f in /official/*.apk; do
   L="$(unzip -l "$f" 2>/dev/null)"; n="$(basename "$f")"
   printf '%s' "$L" | grep -qiE "$GPAT" && { fb=1; sigs="${sigs}zipnames:${n} "; }
@@ -374,14 +307,12 @@ for f in /official/*.apk; do
     && { fb=1; sigs="${sigs}nativelib:${n} "; }
   printf '%s' "$L" | grep -q 'assets/dexopt/baseline.prof' && bp=1
 done
-# (c) dex string pool of base.apk (class names, not entry names)
 if compgen -G "/tmp/dex/classes*.dex" > /dev/null; then
   if strings -a /tmp/dex/classes*.dex 2>/dev/null \
     | grep -qE 'com\.google\.firebase|com\.google\.android\.gms'; then
     fb=1; sigs="${sigs}dexstrings:base.apk "
   fi
 fi
-# (d) DECODED resources.arsc of base.apk - compiled-in resources, invisible to grep.
 rm -rf /tmp/dres
 if java -jar /opt/apktool.jar d -f --no-src --no-debug-info \
     --frame-path /tmp/afw -o /tmp/dres /official/base.apk >/dev/null 2>&1; then
@@ -392,19 +323,22 @@ else
   sigs="${sigs}resources.arsc:DECODE-FAILED "
 fi
 
-printf '%s\n' "$fb" > /output/has_firebase.txt
-printf '%s\n' "$bp" > /output/has_baseline_profile.txt
-printf '%s\n' "${sigs:-none}" > /output/google_signals.txt
+for kv in "pkg_name:${pkg:-unknown}" "version_name:${vname:-unknown}" "version_code:${vcode:-unknown}" \
+  "signer:${signer:-unknown}" "base_split_name:${split_name}" "vcs_revision:${rev}" "agp:${agp}" \
+  "gh:${gh}" "git_branch:${gitbr}" "has_firebase:${fb}" "has_baseline_profile:${bp}" "google_signals:${sigs:-none}"; do
+  printf '%s\n' "${kv#*:}" > "/output/${kv%%:*}.txt"
+done
 
 cat <<META
 [META] package:             ${pkg:-unknown}
 [META] versionName:         ${vname:-unknown}
 [META] versionCode:         ${vcode:-unknown}
 [META] signer SHA-256:      ${signer:-unknown}
-[META] GIT_HASH (dex):      $(cat /output/gh.txt 2>/dev/null)
-[META] GIT_HASH candidates: $(wc -l < /output/ghc.txt 2>/dev/null) (>1 means the choice is ambiguous)
-[META] GIT_BRANCH literals: $(cat /output/git_branch.txt 2>/dev/null) (all matches; not proof of source branch)
-[META] base split name:     $(cat /output/base_split_name.txt 2>/dev/null) (empty = true base APK)
+[META] vcs revision:        ${rev:-<none>} (META-INF/version-control-info.textproto)
+[META] AGP version:         ${agp:-<none>} (META-INF/.../app-metadata.properties)
+[META] GIT_HASH literal:    ${gh:-<not in dex>} (BuildConfig.GIT_HASH for that revision)
+[META] GIT_BRANCH literals: ${gitbr:-<none>} (all matches; not proof of source branch)
+[META] base split name:     ${split_name:-<none>} (empty = true base APK)
 [META] google/firebase:     ${fb}   signals: ${sigs:-none}
 [META] baseline.prof:       ${bp}
 META
@@ -421,36 +355,35 @@ if ! crun \
   fail 1 "Could not read metadata from base.apk."
 fi
 
-pkg_id="$(cat "${META_DIR}/pkg_name.txt" 2>/dev/null || echo unknown)"
-wallet_version="$(cat "${META_DIR}/version_name.txt" 2>/dev/null || echo unknown)"
-version_code="$(cat "${META_DIR}/version_code.txt" 2>/dev/null || echo unknown)"
-signer="$(cat "${META_DIR}/signer.txt" 2>/dev/null || echo unknown)"
-git_hash="$(cat "${META_DIR}/git_hash.txt" 2>/dev/null || echo '')"
-git_branch="$(cat "${META_DIR}/git_branch.txt" 2>/dev/null || echo '')"
-has_firebase="$(cat "${META_DIR}/has_firebase.txt" 2>/dev/null || echo 0)"
-has_baseline="$(cat "${META_DIR}/has_baseline_profile.txt" 2>/dev/null || echo 0)"
-google_signals="$(cat "${META_DIR}/google_signals.txt" 2>/dev/null || echo none)"
+meta() { cat "${META_DIR}/$1.txt" 2>/dev/null || echo "${2:-}"; }
+pkg_id="$(meta pkg_name unknown)"
+wallet_version="$(meta version_name unknown)"
+version_code="$(meta version_code unknown)"
+signer="$(meta signer unknown)"
+vcs_revision="$(meta vcs_revision)"
+official_agp="$(meta agp)"
+git_hash="$(meta gh)"
+git_branch="$(meta git_branch)"
+has_firebase="$(meta has_firebase 0)"
+has_baseline="$(meta has_baseline_profile 0)"
+google_signals="$(meta google_signals none)"
+base_split="$(meta base_split_name)"
 app_hash="$(sha256of "$apk_file")"
 
-# Mandatory package-name check, before anything is built.
 [[ "$pkg_id" == "$APP_ID" ]] || \
   die_invalid "APK package name mismatch: expected ${APP_ID}, got ${pkg_id}"
 log_success "Package name verified: ${pkg_id}"
 log_success "Version: $wallet_version (versionCode $version_code)"
 log_info    "Signer SHA-256:   ${signer}"
 log_info    "base.apk SHA-256: ${app_hash}"
-log_info    "GIT_HASH in dex:  ${git_hash:-<not recovered>}"
 
 [[ -n "$wallet_version" && "$wallet_version" != "unknown" ]] || \
   die_invalid "Could not read versionName from base.apk"
 [[ -n "$version_arg" && "$version_arg" != "$wallet_version" ]] && \
   log_warn "--version was '${version_arg}' but base.apk reports '$wallet_version'; using the binary's value"
 
-# --- Packaging guard: Play ships a split set, the other channel one APK. This
-# checks SHAPE only; lineage comes from the detector above.
-
+# Packaging guard checks SHAPE only; lineage comes from the detector.
 section "Packaging check"
-base_split="$(cat "${META_DIR}/base_split_name.txt" 2>/dev/null || echo '')"
 config_splits=0
 for f in "${OFFICIAL_SPLITS[@]}"; do
   [[ "$(basename "$f")" == split_config*.apk ]] && config_splits=$((config_splits + 1))
@@ -461,51 +394,54 @@ cat <<EOF
  Google/Firebase present:  ${has_firebase}  <- SELECTS THE SOURCE BRANCH
  detector signals:         $google_signals
  baseline.prof present:    ${has_baseline}  (reported only; never infers lineage)
- GIT_HASH literal:         ${git_hash:-<not recovered>}  (informational)
+ GIT_HASH literal:         ${git_hash:-<not in dex>}  (informational)
  GIT_BRANCH literals:      ${git_branch:-<none>}  (informational)
 EOF
 
 if [[ -n "$base_split" ]]; then
-  log_error "base.apk declares split name '${base_split}', so it is not a base APK."
-  log_error "Supply the directory exactly as pulled from the device."
+  log_error "base.apk declares split name '${base_split}', so it is not a base APK. Supply the directory exactly as pulled."
   fail 2 "base.apk declares split name '${base_split}'; a Play base APK declares none. Not a valid Play split set."
 fi
 if [[ "$config_splits" -eq 0 ]]; then
-  log_error "No split_config.*.apk found - this is a single-APK artifact, not a Play split set."
-  log_error "Google Play delivers this app as an App Bundle split set; a lone p.cash.apk"
-  log_error "is the GitHub/F-Droid packaging of the SAME source."
-  log_error "Verify it with $COUNTERPART instead."
+  log_error "No split_config.*.apk found: a single APK is the GitHub/F-Droid packaging. Use $COUNTERPART."
   fail 2 "No split_config APKs present: the artifact is a single APK, which is the GitHub/F-Droid packaging built from a DIFFERENT branch (f-droid). Use $COUNTERPART."
 fi
 log_success "Play packaging confirmed: base APK + ${config_splits} config split(s)"
 
-# Revision follows DETECTED lineage: Firebase/GMS => master (no tag; pinned by
-# versionName+versionCode). Absent => f-droid.
-
+# Firebase/GMS present => master (no tag). Absent => f-droid: refuse, never compare across lineages.
 section "Resolving source revision"
 if [[ "$has_firebase" != "1" ]]; then
-  log_error "No Google/Firebase signal in this split set, so it is not the master"
-  log_error "build that Play ships. Refusing: building the f-droid branch and"
-  log_error "comparing across lineages is exactly how v0.3.x produced 1,314 bogus"
-  log_error "diffs. Check the artifact's provenance, or use $COUNTERPART."
+  log_error "No Google/Firebase signal in this split set, so it is not the master build Play ships."
+  log_error "Refusing to build f-droid and compare across lineages. Check provenance, or use $COUNTERPART."
   fail 2 "Lineage anomaly: a Play split set with no Google/Firebase signal (detector: $google_signals). Play ships the master build, which contains both. Refusing rather than comparing across lineages."
 fi
 LINEAGE="master"
 GIT_BRANCH_NAME="master"
 log_info "Google/Firebase present -> MASTER lineage. Signals: $google_signals"
-echo "  Revision: pinned in-container by versionName $wallet_version + versionCode $version_code"
+
+if [[ -n "$rev_arg" ]]; then
+  build_rev="$rev_arg"; rev_source="--git-revision"
+elif [[ -n "$vcs_revision" ]]; then
+  build_rev="$vcs_revision"; rev_source="META-INF/version-control-info.textproto in base.apk"
+else
+  build_rev=""; rev_source="oldest master commit declaring versionName $wallet_version + versionCode $version_code"
+fi
+echo "  Revision: ${build_rev:-<resolved in container>}   source: ${rev_source}"
 echo "  Branch to recreate: ${GIT_BRANCH_NAME}   Gradle flag: none (-Pfdroid is f-droid only)"
 
-# LANDMINE: GIT_HASH cannot be recovered reliably from a dex string pool - only
-# the "<10hex>-fdroid" form is distinctive; bare 10-hex and "unknown" collide with
-# unrelated literals. Informational cross-check ONLY, never a gate.
+# The vendor's BuildConfig.GIT_HASH tells whether their `git` worked at build time (AGP
+# records the revision without it). No literal for the recorded revision => it read
+# "unknown" => make ours fail the same way, or classes.dex differs by that string alone.
+git_shim=0
+if [[ -n "$vcs_revision" && -z "$git_hash" ]]; then
+  git_shim=1
+  log_warn "No GIT_HASH literal for ${vcs_revision:0:10} in the official dex: the vendor's git was"
+  log_warn "unavailable at build time (BuildConfig.GIT_HASH=unknown). Building with git shadowed to match."
+fi
 case "$git_hash" in
-  *-dirty) log_warn "GIT_HASH ends in -dirty: built from uncommitted changes." ;;
-  *)       log_info "GIT_HASH in binary: ${git_hash:-<none>} (not authoritative)" ;;
+  *-dirty)  log_warn "GIT_HASH ends in -dirty: the vendor built from uncommitted changes." ;;
+  *-fdroid) log_warn "GIT_HASH ends in -fdroid: built from branch f-droid, contradicting the Play lineage." ;;
 esac
-
-# --- PHASE 1: build. Needs a real git checkout - app/build.gradle shells out to
-# `git rev-parse`. No secrets to inject.
 
 phase "PHASE 1: BUILD FROM SOURCE"
 echo "  Gradle:  ./gradlew clean :app:bundleRelease"
@@ -519,8 +455,7 @@ GIT_BRANCH_NAME="__GIT_BRANCH_NAME__"
 WANT_VNAME="__WANT_VNAME__"
 WANT_VCODE="__WANT_VCODE__"
 
-# app/build.gradle THROWS if some but not all four FIREBASE_DEV_* are set;
-# BUILD_NUMBER overrides versionCode.
+# app/build.gradle throws if some but not all FIREBASE_DEV_* are set; BUILD_NUMBER overrides versionCode.
 unset FIREBASE_DEV_KEYSTORE_PATH FIREBASE_DEV_STORE_PASSWORD \
    FIREBASE_DEV_KEY_ALIAS FIREBASE_DEV_KEY_PASSWORD BUILD_NUMBER
 
@@ -528,57 +463,69 @@ export GRADLE_USER_HOME=/tmp/gradle-home
 mkdir -p "$GRADLE_USER_HOME"
 
 echo "=== Clone ${REPO_URL} === $(date)"
-# Full clone: the recovered abbreviated commit is not fetchable by a shallow one.
 git clone "$REPO_URL" /build/src || { echo "FATAL: clone failed"; exit 1; }
 cd /build/src
 git config --global --add safe.directory /build/src
 
-# Pin by walking master's first-parent line for commits declaring BOTH
-# versionName and versionCode; the code disambiguates a shared name.
-echo "=== Pinning master revision for ${WANT_VNAME} / versionCode ${WANT_VCODE} ==="
-: > /output/mc.txt
-for c in $(git rev-list --first-parent origin/master); do
-  g=$(git show "$c:app/build.gradle" 2>/dev/null)
-  vn=$(printf '%s' "$g" | grep -m1 'versionName' | sed 's/.*versionName *"\([^"]*\)".*/\1/')
-  vc=$(printf '%s' "$g" | grep -m1 'versionCode' | sed 's/.*versionCode *\([0-9]*\).*/\1/')
-  if [[ "$vn" == "$WANT_VNAME" && "$vc" == "$WANT_VCODE" ]]; then
-    echo "$c" >> /output/mc.txt
-  elif [[ -s /output/mc.txt ]]; then
-    break   # walked past the version window; stop
+gradle_ver() { git show "$1:app/build.gradle" 2>/dev/null | grep -m1 "$2" | sed "s/.*$2 *\"\{0,1\}\([^\" ]*\).*/\1/"; }
+
+GIT_REF="${WS_GIT_REVISION:-}"; n=1
+if [[ -n "$GIT_REF" ]]; then
+  git rev-parse -q --verify "${GIT_REF}^{commit}" >/dev/null || git fetch -q origin "$GIT_REF" 2>/dev/null
+  if ! GIT_REF="$(git rev-parse -q --verify "${GIT_REF}^{commit}")"; then
+    echo "FATAL: revision ${WS_GIT_REVISION} is not in the public repository ${REPO_URL}."
+    exit 4
   fi
-done
-n=$(wc -l < /output/mc.txt)
-echo "Candidate commits: ${n}"
-while read -r c; do echo "  ${c:0:10}  $(git log -1 --format=%s "$c" | cut -c1-60)"; done < /output/mc.txt
-if [[ "$n" -eq 0 ]]; then
-  echo "FATAL: no master commit declares versionName ${WANT_VNAME} with versionCode ${WANT_VCODE}."
-  echo "The published artifact cannot be matched to any public master revision."
-  exit 4
+  echo "=== Pinned revision ${GIT_REF} ==="
+  git merge-base --is-ancestor "$GIT_REF" origin/master && echo "  reachable from origin/master" \
+    || echo "  WARNING: not reachable from origin/master"
+  vn="$(gradle_ver "$GIT_REF" versionName)"; vc="$(gradle_ver "$GIT_REF" versionCode)"
+  [[ "$vn" == "$WANT_VNAME" && "$vc" == "$WANT_VCODE" ]] \
+    || echo "  WARNING: it declares versionName ${vn:-?} / versionCode ${vc:-?}, the artifact is ${WANT_VNAME}/${WANT_VCODE}"
+else
+  # Walk master's first-parent line for commits declaring BOTH versionName and versionCode.
+  echo "=== Pinning master revision for ${WANT_VNAME} / versionCode ${WANT_VCODE} ==="
+  : > /output/mc.txt
+  for c in $(git rev-list --first-parent origin/master); do
+    if [[ "$(gradle_ver "$c" versionName)" == "$WANT_VNAME" && "$(gradle_ver "$c" versionCode)" == "$WANT_VCODE" ]]; then
+      echo "$c" >> /output/mc.txt
+    elif [[ -s /output/mc.txt ]]; then
+      break
+    fi
+  done
+  n=$(wc -l < /output/mc.txt)
+  echo "Candidate commits: ${n}"
+  while read -r c; do echo "  ${c:0:10}  $(git log -1 --format=%s "$c" | cut -c1-60)"; done < /output/mc.txt
+  if [[ "$n" -eq 0 ]]; then
+    echo "FATAL: no master commit declares versionName ${WANT_VNAME} with versionCode ${WANT_VCODE}."
+    exit 4
+  fi
+  GIT_REF="$(tail -1 /output/mc.txt)"
+  [[ "$n" -gt 1 ]] && echo "AMBIGUOUS: ${n} commits share this versionName+versionCode; building the oldest."
 fi
-# Oldest candidate = the commit that bumped versionCode. Overridable ok.
-GIT_REF="${WS_MASTER_COMMIT:-$(tail -1 /output/mc.txt)}"
 printf '%s\n' "$n" > /output/candidate-count.txt
 echo "Building: ${GIT_REF}"
-[[ "$n" -gt 1 ]] && echo "AMBIGUOUS: ${n} commits share this versionName+versionCode."
 
 # Named branch, not detached HEAD: the branch name feeds getGitVersionSuffix().
-if ! git checkout -B "$GIT_BRANCH_NAME" "$GIT_REF"; then
-  echo "FATAL: could not check out tag '${GIT_REF}'"
-  echo "Tags near this version:"
-  git tag | grep -F "${GIT_REF%-fdroid}" || true
-  exit 2
-fi
-
+git checkout -B "$GIT_BRANCH_NAME" "$GIT_REF" || { echo "FATAL: could not check out ${GIT_REF}"; exit 2; }
 echo "=== Revision under build ==="
 git log -1 --pretty=format:'%H %ci %s' ; echo
 git rev-parse HEAD > /output/commit.txt
 git rev-parse --short=10 HEAD > /output/expected_git_hash.txt
+agp="$(sed -n 's/^gradle = "\([^"]*\)".*/\1/p' gradle/libs.versions.toml 2>/dev/null | head -1)"
+printf '%s\n' "$agp" > /output/agp.txt
+echo "AGP at this revision: ${agp:-?}"
 
-# A dirty tree makes app/build.gradle append "-dirty" to BuildConfig.GIT_HASH.
 if ! git diff-index --quiet HEAD --; then
   echo "FATAL: working tree is dirty immediately after checkout; refusing to build"
   git status --porcelain | head -20
   exit 2
+fi
+
+if [[ "${WS_GIT_SHIM:-0}" == "1" ]]; then
+  mkdir -p /tmp/nogit && printf '#!/bin/sh\nexit 128\n' > /tmp/nogit/git && chmod +x /tmp/nogit/git
+  export PATH="/tmp/nogit:$PATH"
+  echo "=== git shadowed for the build (BuildConfig.GIT_HASH -> unknown, as in the official artifact) ==="
 fi
 
 echo "=== Toolchain ==="; java -version 2>&1; ./gradlew --version 2>&1 | sed -n '1,12p'
@@ -602,8 +549,7 @@ fi
 cp "$aab" /output/app-release.aab
 AAPT2="$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort | tail -1)"
 
-# Device-spec from OFFICIAL split names; a wrong spec surfaces as UNMATCHED,
-# never a false pass. No language splits exist.
+# Device-spec from OFFICIAL split names; a wrong spec surfaces as UNMATCHED, never a false pass.
 ABIS=(); DEN=""
 for f in /official/*.apk; do
   c="$(basename "$f")"; c="${c#*config.}"; c="${c%.apk}"
@@ -613,15 +559,13 @@ for f in /official/*.apk; do
     xhdpi) DEN=320 ;; xxhdpi) DEN=480 ;; xxxhdpi) DEN=640 ;;
   esac
 done
-# app/build.gradle restricts abiFilters to armeabi-v7a and arm64-v8a.
 [[ ${#ABIS[@]} -eq 0 ]] && ABIS=("arm64-v8a")
 [[ -z "$DEN" ]] && DEN=480
-# Device API level: a property of the PHONE, not readable from the APKs. Selects
-# the AAB variant. Pass WS_DEVICE_SDK=$(adb shell getprop ro.build.version.sdk).
+# Device API level is a property of the PHONE, not readable from the APKs.
 if [[ -n "${WS_DEVICE_SDK:-}" ]]; then
   SDK="$WS_DEVICE_SDK"; SDK_SRC="supplied via WS_DEVICE_SDK"
 else
-  SDK=36; SDK_SRC="DEFAULT GUESS -- pass WS_DEVICE_SDK to set the real value"
+  SDK=36; SDK_SRC="DEFAULT GUESS -- pass WS_DEVICE_SDK=\$(adb shell getprop ro.build.version.sdk)"
 fi
 echo "=== device sdkVersion: ${SDK} (${SDK_SRC}) ==="
 ABIJSON="$(printf '"%s",' "${ABIS[@]}")"; ABIJSON="[${ABIJSON%,}]"
@@ -640,8 +584,7 @@ sha256sum /output/built/*.apk
 
 echo ""
 echo "=== Dependency provenance (JitPack / piratecash forks) ==="
-# PUBLISHED BINARIES, not rebuilt: a byte-match proves both sides fetched the same
-# AAR, NOT that the AAR matches its source. Recorded so a re-run spots a moved tag.
+# Published binaries, not rebuilt: a byte-match proves both sides fetched the same AAR only.
 grep -Eo 'https://jitpack\.io/[^ ]+\.(aar|jar|pom)' /output/gradle-build.log 2>/dev/null \
   | sort -u > /output/jitpack-artifacts.txt || true
 find "$GRADLE_USER_HOME/caches/modules-2/files-2.1" -path '*com.github.piratecash*' \
@@ -663,6 +606,8 @@ chmod +x "${img_ctx}/build.sh"
 section "Source build (30-90 min cold) - $(date)"
 crun \
   -e "WS_DEVICE_SDK=${WS_DEVICE_SDK:-}" \
+  -e "WS_GIT_REVISION=${build_rev}" \
+  -e "WS_GIT_SHIM=${git_shim}" \
   --volume "$OFFICIAL_DIR:/official:ro" \
   --volume "${BUILD_DIR}:/output" \
   --volume "${img_ctx}/build.sh:/build/build.sh:ro" \
@@ -670,12 +615,10 @@ crun \
 BUILD_RC=${PIPESTATUS[0]}
 
 if [[ $BUILD_RC -ne 0 ]]; then
-  # Container exit codes: 1 clone, 2 checkout/dirty tree, 3 gradle/bundletool,
-  # 4 = no master commit matches this versionName+versionCode.
+  # Container exit codes: 1 clone, 2 checkout/dirty tree, 3 gradle/bundletool, 4 revision not found.
   if [[ $BUILD_RC -eq 4 ]]; then
-    log_error "Cannot pin a revision: no master commit declares versionName $wallet_version"
-    log_error "with versionCode $version_code. This is a FINDING, not a script fault."
-    fail 1 "Google Play (master lineage): no public master commit declares versionName $wallet_version with versionCode $version_code, so the shipped artifact cannot be matched to published source. No build attempted. Official base.apk SHA-256: ${app_hash}."
+    log_error "Cannot pin a revision (${rev_source}). This is a FINDING, not a script fault."
+    fail 1 "Google Play (master lineage): the source revision could not be pinned (${rev_source}${build_rev:+: $build_rev}); the shipped artifact cannot be matched to published source. No build attempted. Official base.apk SHA-256: ${app_hash}."
   fi
   log_error "Source build failed (container exit ${BUILD_RC}: 1=clone, 2=checkout, 3=gradle/bundletool)"
   log_info  "Full Gradle log: ${BUILD_DIR}/gradle-build.log"
@@ -685,9 +628,17 @@ log_success "Source build finished"
 
 candidate_count="$(cat "${BUILD_DIR}/candidate-count.txt" 2>/dev/null || echo 1)"
 built_ref="$(cat "${BUILD_DIR}/commit.txt" 2>/dev/null | cut -c1-10)"
+built_agp="$(cat "${BUILD_DIR}/agp.txt" 2>/dev/null || echo '')"
 if [[ "${candidate_count:-1}" -gt 1 ]]; then
   log_warn "AMBIGUOUS: ${candidate_count} master commits declare $wallet_version/$version_code."
-  log_warn "Built the oldest (${built_ref}). List: ${BUILD_DIR}/master-candidates.txt"
+  log_warn "Built the oldest (${built_ref}). List: ${BUILD_DIR}/mc.txt"
+fi
+if [[ -n "$official_agp" && -n "$built_agp" ]]; then
+  if [[ "$official_agp" == "$built_agp" ]]; then
+    log_success "AGP cross-check: official artifact and built revision both use AGP ${built_agp}"
+  else
+    log_warn "AGP cross-check MISMATCH: official artifact built with AGP ${official_agp}, revision declares ${built_agp}"
+  fi
 fi
 built_hash_expect="$(cat "${BUILD_DIR}/expected_git_hash.txt" 2>/dev/null || echo '')"
 if [[ -n "$git_hash" && -n "$built_hash_expect" ]]; then
@@ -698,9 +649,7 @@ if [[ -n "$git_hash" && -n "$built_hash_expect" ]]; then
   fi
 fi
 
-# --- PHASE 2: compare. NO general acceptable-diffs filtering. resources.arsc
-# decode is the one sanctioned exception. Previews capped at 5 lines.
-
+# PHASE 2: no general acceptable-diffs filtering; every raw diff must be EARNED by a class.
 phase "PHASE 2: PER-SPLIT COMPARISON"
 
 cat > "${img_ctx}/compare.sh" <<'CMP_END'
@@ -711,10 +660,8 @@ BT="${ANDROID_HOME}/build-tools/36.0.0"
 AAPT2="$BT/aapt2"
 APKSIGNER="$BT/apksigner"
 
-# LANDMINE: the config key MUST come from the APK's own split= attribute, never
-# its filename. Device splits are split_config.arm64_v8a.apk while bundletool
-# emits base-arm64_v8a.apk for the same config, so filename matching pairs
-# nothing and every config reads UNMATCHED -> false not_reproducible.
+# Pair splits by the APK's own split= attribute, never by filename (device: split_config.X.apk,
+# bundletool: base-X.apk).
 cfg_of() {
   local s
   s="$("$AAPT2" dump badging "$1" 2>/dev/null | sed -n "s/.*split='\([^']*\)'.*/\1/p" | head -1)"
@@ -723,9 +670,7 @@ cfg_of() {
   printf '%s' "$s"
 }
 
-# LANDMINE: resource-aware (ElementTree), NEVER a line filter - <item> lines do
-# not carry their parent array name, so a grep filter can silently swallow a
-# change elsewhere. Every guard fails CLOSED.
+# Resource-aware (ElementTree) Crashlytics build_ids canonicaliser; every guard fails CLOSED.
 cat > /tmp/cn.py <<'PYEOF'
 import sys, os, re, collections
 import xml.etree.ElementTree as ET
@@ -792,8 +737,8 @@ stamp_ok() {
   echo "      stamp: 1 root entry, off-only, 32 bytes, apksigner SourceStamp OK"
 }
 
-# AndroidManifest: accepted ONLY if the sole delta is Play's three distribution
-# meta-data entries, off-only, with exactly the expected values.
+# AndroidManifest: accepted ONLY if the sole delta is Play's distribution meta-data, off-only.
+# base has 3 entries, config splits only derived.apk.id: blocks must equal allowlisted names.
 manifest_ok() {
   local o="$1" b="$2" c="$3" d left bad n
   "$AAPT2" dump xmltree --file AndroidManifest.xml "$o" > /tmp/mo.txt 2>/dev/null || return 1
@@ -802,23 +747,19 @@ manifest_ok() {
   printf '%s\n' "$d" > "/out/diff_manifest_${c}.txt"
   printf '%s\n' "$d" | grep -q '^>' && { echo "      manifest: BUILT-only lines present"; return 1; }
   left="$(printf '%s\n' "$d" | grep '^<' | sed 's/^< *//')"
-  # LANDMINE: aapt2 prints the full ns URI before :name/:value, ints as bare "=4".
   bad="$(printf '%s\n' "$left" | grep -vE '^E: meta-data|^A: [^ ]*android:name\(0x[0-9a-f]+\)="com\.android\.(stamp\.source|stamp\.type|vending\.derived\.apk\.id)"|^A: [^ ]*android:value\(0x[0-9a-f]+\)="(https://play\.google\.com/store|STAMP_TYPE_DISTRIBUTION_APK)"|^A: [^ ]*android:value\(0x[0-9a-f]+\)=4$')"
   if [[ -n "$(printf '%s' "$bad" | tr -d '[:space:]')" ]]; then
     echo "      manifest: unexpected off-only line(s):"
     printf '%s\n' "$bad" | head -3 | sed 's/^/        /'
     return 1
   fi
-  # LANDMINE: base has 3 Play entries, config splits only derived.apk.id; a fixed
-  # count of 3 falsely fails them. Blocks must equal allowlisted names.
   n=$(printf '%s\n' "$left" | grep -c '^E: meta-data')
   m=$(printf '%s\n' "$left" | grep -c 'android:name(0x[0-9a-f]*)="com\.android\.')
   [[ "$n" -ge 1 && "$n" -eq "$m" ]] || { echo "      manifest: $n block(s) vs $m Play name(s)"; return 1; }
   echo "      manifest: $n off-only Play meta-data, none built-only"
 }
 
-# resources.arsc: decode both, then the verdict table extended with the
-# cl-buildid-order-only class. Decode failure is NEVER accepted.
+# resources.arsc: decode both; accepted only when the decoded (or canonicalised) trees are identical.
 ARSC_CLASS=""
 arsc_ok() {
   local o="$1" b="$2" c="$3" rd rd2
@@ -857,7 +798,6 @@ for f in /official/*.apk; do OFF["$(cfg_of "$f")"]="$f"; done
 for f in /built/*.apk;    do BLT["$(cfg_of "$f")"]="$f"; done
 
 RAW=0; SIGN=0; STAMP=0; MANI=0; ARSC=0; UNACC=0; MISSING=0; FAILED=0
-SIGRE='\.(SF|RSA|DSA|EC)( |$)|MANIFEST\.MF( |$)'
 : > /out/summary.txt
 
 for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
@@ -878,7 +818,6 @@ for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
   unzip -q -o "$b" -d /tmp/b
   echo "  entries: $(find /tmp/o -type f | wc -l) official, $(find /tmp/b -type f | wc -l) built"
 
-  # Per-ABI native lib hashes. A .so on one side only is a hard fail.
   while IFS= read -r so; do
     rel="${so#/tmp/o/}"
     if [[ -f "/tmp/b/${rel}" ]]; then
@@ -896,7 +835,6 @@ for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
   echo "  raw diffs: ${n}   (full list: diff-unzipped-${cfg}.txt)"
   [[ "$n" -gt 0 ]] && printf '%s\n' "$raw" | head -5 | sed 's/^/    /'
 
-  # Every raw line must be claimed by an EARNED class or it stays unaccounted.
   read -r c_sign c_stamp c_mani c_arsc < <(printf '%s\n' "$raw" | awk '
     /\.(SF|RSA|DSA|EC)( |$)|MANIFEST\.MF( |$)/{a++;next}
     /stamp-cert-sha256/{b++} /AndroidManifest\.xml/{c++} /resources\.arsc/{d++}
@@ -955,7 +893,6 @@ raw_total="${raw_total:-1}"; t_sign="${t_sign:-0}"; t_stamp="${t_stamp:-0}"
 t_mani="${t_mani:-0}"; t_arsc="${t_arsc:-0}"; t_unacc="${t_unacc:-1}"; t_missing="${t_missing:-1}"
 t_acc=$((t_sign + t_stamp + t_mani + t_arsc))
 
-
 section "RESULT"
 cat <<EOF
  Official splits:      ${#OFFICIAL_SPLITS[@]}
@@ -996,8 +933,6 @@ else
   VERDICT="not_reproducible"; EXIT_CODE=1
 fi
 
-# appId..commit per script_verifications.md; scriptVersion/scriptHash after
-# commit per script-version-and-hash.md. Others below End Results.
 cat <<EOF
 
 ===== Begin Results =====
@@ -1014,9 +949,11 @@ scriptHash:      ${SCRIPT_HASH:-unknown}
 
 channel:         google-play (split set)
 lineage:         ${LINEAGE} (signals: $google_signals)
-sourceRef:       ${built_ref:-pinned-in-container} (branch ${GIT_BRANCH_NAME})
+sourceRef:       ${built_ref:-unknown} (branch ${GIT_BRANCH_NAME})
+revisionSource:  ${rev_source}
 candidateCommits: ${candidate_count:-1}
-gitHashInBinary: ${git_hash:-unknown}
+gitHashInBinary: ${git_hash:-none} (git shadowed during build: ${git_shim})
+agpVersion:      official ${official_agp:-?}, built revision ${built_agp:-?}
 rawDiffs:        ${raw_total}
 acceptedDiffs:   ${t_acc} (signing ${t_sign}, sourcestamp ${t_stamp}, manifest ${t_mani}, arsc ${t_arsc})
 unaccountedDiffs: ${t_unacc}
@@ -1027,7 +964,7 @@ depProvenance:   JitPack deps consumed as published binaries, not rebuilt from s
  comparison log. signer is Play App Signing's key, not the developer key.
 EOF
 
-generate_yaml "${VERDICT}" "Google Play split set, master lineage DETECTED from artifact contents ($google_signals). master has no tag; revision pinned by versionName $wallet_version + versionCode $version_code, ${candidate_count:-1} commit(s) matched (ref ${built_ref:-unknown}). Built :app:bundleRelease, split with bundletool 1.18.3 (matches AGP 9.0.1). ${raw_total} raw difference(s); ${t_acc} EARNED exclusions - signing ${t_sign} (Play re-signs, local build unsigned), SourceStamp ${t_stamp} (1 root entry, off-only, 32 bytes, apksigner SourceStamp OK), AndroidManifest ${t_mani} (only Play's three off-only distribution meta-data entries), resources.arsc ${t_arsc} (decoded res/ compared; where the sole delta was the three positional Crashlytics build_ids arrays, triples were zipped by index, Counter-compared with multiplicity preserved, canonicalised, and the ENTIRE decoded res/ tree then compared identical). ${t_unacc} UNACCOUNTED difference(s) - the verdict is judged on this alone. ${t_missing} split(s) unmatched. Official base.apk SHA-256 ${app_hash}. JitPack deps (com.github.piratecash forks) were consumed as published binaries, NOT rebuilt from source, so a byte-match does not attest their provenance."
+generate_yaml "${VERDICT}" "Google Play split set, master lineage DETECTED from artifact contents ($google_signals). Revision ${built_ref:-unknown} from ${rev_source}$([[ "$git_shim" == 1 ]] && echo "; git shadowed during the build because the official BuildConfig.GIT_HASH is unknown"). Built :app:bundleRelease, split with bundletool 1.18.3 (matches AGP 9.0.1). ${raw_total} raw difference(s); ${t_acc} EARNED exclusions - signing ${t_sign} (Play re-signs, local build unsigned), SourceStamp ${t_stamp} (1 root entry, off-only, 32 bytes, apksigner SourceStamp OK), AndroidManifest ${t_mani} (only Play's off-only distribution meta-data entries), resources.arsc ${t_arsc} (decoded res/ compared; where the sole delta was the three positional Crashlytics build_ids arrays, triples were zipped by index, Counter-compared with multiplicity preserved, canonicalised, and the ENTIRE decoded res/ tree then compared identical). ${t_unacc} UNACCOUNTED difference(s) - the verdict is judged on this alone. ${t_missing} split(s) unmatched. Official base.apk SHA-256 ${app_hash}. JitPack deps (com.github.piratecash forks) were consumed as published binaries, NOT rebuilt from source, so a byte-match does not attest their provenance."
 
 echo ""
 echo "Exit code: ${EXIT_CODE}"
