@@ -2,9 +2,9 @@
 # ==============================================================================
 # pcash_play_build.sh - P.CASH Terminal (Google Play) reproducible build verification
 # ==============================================================================
-# Version:          v0.6.3
+# Version:          v0.6.4
 # Organization:     WalletScrutiny.com
-# Last Modified:    2026-08-20
+# Last Modified:    2026-09-16
 # Last Modified by: WalletScrutiny.com
 # App ID:           cash.p.terminal
 # Project:          https://github.com/piratecash/pcash-wallet
@@ -28,7 +28,7 @@
 # Exit codes: 0 = identical, 1 = difference or build failure, 2 = bad parameters.
 # ==============================================================================
 
-SCRIPT_VERSION="v0.6.3"
+SCRIPT_VERSION="v0.6.4"
 
 # Ties a verdict to the exact script bytes.
 SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
@@ -555,8 +555,8 @@ if [[ "$n" -eq 0 ]]; then
   echo "The published artifact cannot be matched to any public master revision."
   exit 4
 fi
-# Newest candidate is the release tip for that versionCode. Overridable.
-GIT_REF="${WS_MASTER_COMMIT:-$(head -1 /output/mc.txt)}"
+# Oldest candidate = the commit that bumped versionCode. Overridable ok.
+GIT_REF="${WS_MASTER_COMMIT:-$(tail -1 /output/mc.txt)}"
 printf '%s\n' "$n" > /output/candidate-count.txt
 echo "Building: ${GIT_REF}"
 [[ "$n" -gt 1 ]] && echo "AMBIGUOUS: ${n} commits share this versionName+versionCode."
@@ -687,7 +687,7 @@ candidate_count="$(cat "${BUILD_DIR}/candidate-count.txt" 2>/dev/null || echo 1)
 built_ref="$(cat "${BUILD_DIR}/commit.txt" 2>/dev/null | cut -c1-10)"
 if [[ "${candidate_count:-1}" -gt 1 ]]; then
   log_warn "AMBIGUOUS: ${candidate_count} master commits declare $wallet_version/$version_code."
-  log_warn "Built the newest (${built_ref}). List: ${BUILD_DIR}/master-candidates.txt"
+  log_warn "Built the oldest (${built_ref}). List: ${BUILD_DIR}/master-candidates.txt"
 fi
 built_hash_expect="$(cat "${BUILD_DIR}/expected_git_hash.txt" 2>/dev/null || echo '')"
 if [[ -n "$git_hash" && -n "$built_hash_expect" ]]; then
