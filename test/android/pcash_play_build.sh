@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # pcash_play_build.sh - P.CASH Terminal (Google Play) reproducible build verification
-# Version:          v0.7.0
+# Version:          v0.7.1
 # Organization:     WalletScrutiny.com
-# Last Modified:    2026-09-16
+# Last Modified:    2026-09-18
 # App ID:           cash.p.terminal
 # Project:          https://github.com/piratecash/pcash-wallet
 # Play Store:       https://play.google.com/store/apps/details?id=cash.p.terminal
@@ -15,7 +15,7 @@
 # no warranty of any kind. Review before running.
 # Exit codes: 0 = identical, 1 = difference or build failure, 2 = bad parameters.
 
-SCRIPT_VERSION="v0.7.0"
+SCRIPT_VERSION="v0.7.1"
 
 SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
 SCRIPT_HASH="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
@@ -241,7 +241,7 @@ RUN mkdir -p ${ANDROID_HOME}/cmdline-tools && \
   unzip -q cmdline-tools.zip && rm cmdline-tools.zip && mv cmdline-tools latest
 
 RUN yes | sdkmanager --licenses >/dev/null && \
-  sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools" >/dev/null
+  sdkmanager "platforms;android-36" "platforms;android-37.0" "build-tools;36.0.0" "platform-tools" >/dev/null
 
 ADD https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar /opt/bundletool.jar
 ADD https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar /opt/apktool.jar
