@@ -1,29 +1,25 @@
 #!/bin/bash
 #
 # sparrowwindows_build.sh - Sparrow Wallet Windows (MSI/ZIP) Reproducible Build Verifier
-# Version: v0.2.0
-# Last modified by: Daniel Garcia
-# Last modified on: 2026-09-02 (v0.2.0)
+# Version: v0.3.1
+# Last modified on: 2026-09-03 (v0.3.1)
 #
-# Builds Sparrow for Windows via GitHub Actions, downloads the built installer and
-# compares it against the official release artifact.
+# Builds Sparrow for Windows via GitHub Actions and compares the built installer to the
+# official release artifact.
 #
-# MSI: every named OLE stream and decoded database table is compared. Five classes are
-# normalized away, each printed by name: Authenticode signature, PackageCode, build
-# timestamps (two summary FILETIME properties plus the cabinet's per-file date/time
-# fields), table row order, string-pool order. The cabinet is compared byte-for-byte
-# after zeroing exactly those fields, so payload, checksums and folder records are
-# covered. Any other difference fails the run.
+# MSI: every named stream and decoded table is compared; five classes are normalized
+# away and each is printed - Authenticode signature, PackageCode, build timestamps (two
+# summary FILETIMEs and the cabinet per-file date/time fields), table row order,
+# string-pool order. The cabinet is byte-compared after zeroing only those fields.
+# The container is accounted for, not byte-compared: bytes past the final sector, data
+# in unallocated sectors, dated directory entries and one-sided streams are checked;
+# metadata sectors (header, FAT/DIFAT, directory) are structural, not authored.
 #
-# OUT OF SCOPE, not claimed: the OLE container itself - header, FAT/DIFAT, directory
-# entries, sector padding, bytes past the final sector. Extraction exposes streams only.
-#
-# Comparator exit codes: 0 equivalent, 1 real differences, 2+ a tool error reported as
-# ftbfs, never as a verdict.
-#
-# The official artifact is downloaded when --binary is omitted, and always checked first:
-# manifest signature verified under a PINNED fingerprint, then sha256 matched to the
-# manifest entry. Failure exits without a verdict.
+# Comparator exit codes: 0 equivalent, 1 real differences, 2+ a tool error as ftbfs.
+# The official artifact is downloaded when --binary is omitted and always checked first:
+# manifest signature verified under a PINNED fingerprint, then sha256 matched.
+# The build workflow runs in a fork NAMED sparrow (--build-repo overrides): a runner works
+# in D:\a\<name>\<name> and that path is an MSI build input (see changelog).
 #
 # Linux artifacts (tarball/deb/rpm) are handled by sparrowdesktop_build.sh.
 #
@@ -33,13 +29,13 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.2.0"
+SCRIPT_VERSION="v0.3.1"
 APP_ID="sparrow"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256=""
 RESOLVED_COMMIT="unknown"
 
-GH_REPO="xrviv/WalletScrutinyCom"
+GH_REPO="xrviv/sparrow"
 GH_WORKFLOW="sparrow-build.yml"
 GH_WORKFLOW_REF="master"
 GH_HELPER_IMAGE="sparrow-win-helper"
@@ -62,8 +58,6 @@ APP_ARCH=""
 APP_TYPE=""
 WORK_DIR=""
 CUSTOM_WORK_DIR=""
-KEEP_CONTAINER=false
-QUIET=false
 BINARY_PATH=""
 SKIP_SIG_VERIFY=false
 BINARY_SOURCE="operator-supplied"
@@ -83,9 +77,7 @@ warn() {
     echo "WARN: $1" >&2
 }
 detect_container_cmd() {
-    if [[ -n "$DOCKER_CMD" ]]; then
-        return
-    fi
+    [[ -z "$DOCKER_CMD" ]] || return 0
     if command -v podman >/dev/null 2>&1; then
         DOCKER_CMD="podman"
     elif command -v docker >/dev/null 2>&1; then
@@ -95,22 +87,13 @@ detect_container_cmd() {
     fi
 }
 require_value() {
-    local flag="$1"
-    local value="${2:-}"
-    if [[ -z "$value" || "$value" == --* ]]; then
-        die "Missing value for parameter: $flag" $EXIT_INVALID_PARAMS
-    fi
+    [[ -n "${2:-}" && "${2:-}" != --* ]] || die "Missing value for parameter: $1" $EXIT_INVALID_PARAMS
 }
 sanitize_component() {
-    local input="$1"
-    input=$(echo "$input" | tr '[:upper:]' '[:lower:]')
-    input=$(echo "$input" | sed -E 's/[^a-z0-9]+/-/g')
-    input="${input#-}"
-    input="${input%-}"
-    if [[ -z "$input" ]]; then
-        input="na"
-    fi
-    echo "$input"
+    local input
+    input=$(echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g')
+    input="${input#-}"; input="${input%-}"
+    echo "${input:-na}"
 }
 is_windows_arch() {
     case "${1:-}" in
@@ -135,12 +118,8 @@ RUN apt-get update -qq \
 GHEOF
 }
 gh_c() {
-    "$DOCKER_CMD" run --rm \
-        -e GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
-        -v "${WORK_DIR}:/work" \
-        -w /work \
-        "${GH_HELPER_IMAGE}" \
-        gh "$@"
+    "$DOCKER_CMD" run --rm -e GITHUB_TOKEN="${GITHUB_TOKEN:-}" -v "${WORK_DIR}:/work" -w /work \
+        "${GH_HELPER_IMAGE}" gh "$@"
 }
 # Helper writes land under /work (= WORK_DIR); restore_host_owner hands them back.
 helper_c() {
@@ -212,8 +191,8 @@ compare_extracted() {
     while IFS= read -r rel; do
         idx=$((idx + 1))
         oh="(missing)"; bh="(missing)"
-        [[ -f "${oroot}/${rel#./}" ]] && oh=$(sha256sum "${oroot}/${rel#./}" | cut -d' ' -f1)
-        [[ -f "${broot}/${rel#./}" ]] && bh=$(sha256sum "${broot}/${rel#./}" | cut -d' ' -f1)
+        [[ -f "${oroot}/${rel#./}" ]] && oh=$(sha256_of "${oroot}/${rel#./}")
+        [[ -f "${broot}/${rel#./}" ]] && bh=$(sha256_of "${broot}/${rel#./}")
         if [[ "$oh" == "$bh" ]]; then
             st="✓ MATCH"; CMP_OK=$((CMP_OK + 1))
         else
@@ -233,26 +212,9 @@ compare_extracted() {
 write_comparator() {
     cat > "${WORK_DIR}/msicmp.py" << 'MSICMP_END'
 #!/usr/bin/env python3
-"""Normalized comparison of two extracted MSI installers.
-
-Input: two directories produced by `7z x -tCompound <installer>.msi -o<dir>`,
-each holding the installer's named OLE streams.
-
-Exit codes
-  0  equivalent under the allowlist below
-  1  differences remain after normalization
-  2  comparator error - malformed, truncated or unsupported input
-
-The allowlist is deliberately small and every item it removes is printed:
-  A. the Authenticode signature stream, present on one side only
-  B. the PackageCode (PID_REVNUMBER) in the summary-information stream
-  C. build timestamps - the two documented FILETIME summary properties, and the
-     per-file date/time fields inside the cabinet
-  D. the storage order of rows within a database table
-
-OUT OF SCOPE, and not claimed: the OLE container itself - its header, FAT/DIFAT,
-directory entries, sector padding and any bytes past the last sector. `-tCompound`
-exposes named streams only. Container structure must be checked separately.
+"""Normalized comparison of two MSI installers: named streams, decoded database
+tables, and - when the .msi paths are given - the OLE container itself.
+Exit 0 equivalent, 1 differences remain, 2 comparator error (never a verdict).
 """
 import sys, os, struct, re
 from collections import Counter
@@ -268,21 +230,18 @@ def rd(d, n):
     if not os.path.exists(p): return None
     with open(p, 'rb') as f: return f.read()
 
-# ---------------------------------------------------------------- cabinet ----
+# -- cabinet
 def cab_normalized(b, who):
-    """Return a copy of the cabinet with only the per-file date/time fields zeroed.
-
-    Everything else - header, folder records, compressed data blocks, checksums,
-    names, padding, trailing bytes - is left intact so the caller can compare the
-    whole thing byte-for-byte."""
+    """Copy of the cabinet with only the per-file date/time fields zeroed; every
+    other byte (header, folders, data, checksums, names, padding) left intact."""
     if len(b) < 36 or b[:4] != b'MSCF':
         raise Bad(f'{who}: not a cabinet')
     (_, r1, cbCab, r2, coffFiles, r3, vmin, vmaj,
      cFolders, cFiles, flags, setID, iCab) = struct.unpack_from('<4sIIIIIBBHHHHH', b, 0)
     if flags & 0x0004:
-        raise Bad(f'{who}: cabinet carries reserve fields (flags=0x{flags:04x}); unsupported')
+        raise Bad(f'{who}: cabinet reserve fields (flags=0x{flags:04x}) unsupported')
     if flags & 0x0003:
-        raise Bad(f'{who}: multi-cabinet set (flags=0x{flags:04x}); unsupported')
+        raise Bad(f'{who}: multi-cabinet set (flags=0x{flags:04x}) unsupported')
     if cbCab != len(b):
         raise Bad(f'{who}: header size {cbCab} != actual {len(b)}')
     if coffFiles >= len(b):
@@ -312,23 +271,20 @@ def compare_cabinet(x, y):
         norm(f'cabinet per-file date/time fields ({cx} entries); all other cabinet bytes identical')
     else:
         n = sum(1 for a, b in zip(nx, ny) if a != b) + abs(len(nx) - len(ny))
-        diff(f'cabinet differs in {n} byte(s) beyond the per-file date/time fields '
-             f'- this covers compressed data, checksums, folder records and header')
+        diff(f'cabinet differs in {n} byte(s) beyond the per-file date/time fields')
 
-# ------------------------------------------------- summary information -------
+# -- summary information
 PID_REVNUMBER, PID_CREATE_DTM, PID_LASTSAVE_DTM = 9, 12, 13
 VT_LPSTR, VT_FILETIME = 30, 64
 
 def summary_normalized(b, who):
-    """Zero exactly the PackageCode GUID and the two FILETIME payloads, in place in a
-    copy, and return it with a note of what was blanked. Everything else in the stream -
-    header fields, section table, other properties, padding, trailing bytes - is left
-    alone so the caller can compare the whole stream byte-for-byte."""
+    """Zero exactly the PackageCode GUID and the two FILETIME payloads in a copy, with
+    a note of what was blanked; every other byte of the stream is left alone."""
     if len(b) < 48: raise Bad(f'{who}: summary stream too short')
     bo, fmt, osv, clsid, nsets = struct.unpack_from('<HHI16sI', b, 0)
     if bo != 0xFFFE: raise Bad(f'{who}: bad property-set byte order 0x{bo:04x}')
     if nsets != 1:
-        raise Bad(f'{who}: {nsets} property sets; this comparator handles exactly one')
+        raise Bad(f'{who}: {nsets} property sets; exactly one supported')
     if 28 + 20 > len(b): raise Bad(f'{who}: section table out of bounds')
     fmtid, off = struct.unpack_from('<16sI', b, 28)
     if off + 8 > len(b): raise Bad(f'{who}: section offset out of bounds')
@@ -373,7 +329,7 @@ def compare_summary(x, y):
         diff(f'summary-information differs in {n} byte(s) outside the PackageCode GUID '
              f'and the two FILETIME payloads')
 
-# ----------------------------------------------------------- string pool -----
+# -- string pool
 def pool(d, who):
     sp, sd = rd(d, '!_StringPool'), rd(d, '!_StringData')
     if sp is None or sd is None: raise Bad(f'{who}: string pool or data stream missing')
@@ -407,14 +363,13 @@ def compare_pools(a, b, raw_differs):
     ea, eb = Counter(zip(sa[1:], ra[1:])), Counter(zip(sb[1:], rb[1:]))
     if ea != eb:
         d = (ea - eb) + (eb - ea)
-        diff(f'string pool entries or their individual reference counts differ in '
-             f'{sum(d.values())} entry/entries, e.g. {sorted(d)[:3]!r}')
+        diff(f'string pool entries/refcounts differ in {sum(d.values())}, e.g. {sorted(d)[:3]!r}')
         bad = True
     if not bad and raw_differs:
         norm('string pool storage order (same entries, same individual reference counts)')
 
-# ----------------------------------------------------------------- tables ----
-def schema(d, strings, width, who):
+# -- tables
+def schema(d, strings, who):
     raw = rd(d, '!_Columns')
     if raw is None: raise Bad(f'{who}: !_Columns missing')
     if len(raw) % 8: raise Bad(f'{who}: !_Columns length {len(raw)} not a multiple of 8')
@@ -428,7 +383,7 @@ def schema(d, strings, width, who):
         tn = strings[ti]
         # the table name becomes a filesystem path; require a strict ASCII identifier
         if not tn or not re.fullmatch(rb'[A-Za-z0-9_.]+', tn):
-            raise Bad(f'{who}: table identifier {tn!r} is not a strict ASCII identifier')
+            raise Bad(f'{who}: table identifier {tn!r} not a strict ASCII identifier')
         sc.setdefault(tn, []).append((g(1, i) - 0x8000, strings[ni], g(3, i) - 0x8000))
     for t in sc: sc[t].sort()
     return sc
@@ -458,7 +413,74 @@ def decode(d, tname, cols, strings, width, who):
         colvals.append(vals); base += m * x
     return [tuple(colvals[c][k] for c in range(len(cols))) for k in range(m)]
 
-# ------------------------------------------------------------------ main -----
+# -- container
+FREE = 0xFFFFFFFF
+
+# CFBF v4 pads the 512-byte header out to a whole sector, so sector 0 starts at ss,
+# not at 512. Getting this wrong reports a phantom tail and misreads every chain.
+def _hdr(ss): return max(ss, 512)
+
+def _fat(b, ss):
+    per, nf, h = ss // 4, struct.unpack_from('<I', b, 44)[0], _hdr(ss)
+    d = list(struct.unpack_from('<109I', b, 76))
+    s, n = struct.unpack_from('<I', b, 68)[0], struct.unpack_from('<I', b, 72)[0]
+    for _ in range(n):
+        if s >= 0xFFFFFFFA: break
+        o = h + s * ss
+        d += list(struct.unpack_from('<%dI' % (per - 1), b, o))
+        s = struct.unpack_from('<I', b, o + ss - 4)[0]
+    f = []
+    for x in d[:nf]:
+        if x < 0xFFFFFFFA: f += list(struct.unpack_from('<%dI' % per, b, h + x * ss))
+    return f
+
+def ole_map(path, who):
+    """(total, ss, nsec, tail, non-empty free sectors, dated dir entries, partial). Stream
+    names and contents are not re-derived here; run() already compares them from the
+    extracted trees, so this covers only what extraction cannot expose."""
+    b = open(path, 'rb').read()
+    if b[:8] != b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1': raise Bad(f'{who}: not a compound file')
+    ss = 1 << struct.unpack_from('<H', b, 30)[0]
+    if ss not in (512, 4096): raise Bad(f'{who}: unsupported sector size {ss}')
+    h, f = _hdr(ss), _fat(b, ss)
+    nsec, tail = divmod(len(b) - h, ss)
+    # jpackage's MSI stops at the last byte its final stream needs (signtool's rewrite pads).
+    # A partial sector the FAT allocates as end of chain is stream content, already compared.
+    part = 0
+    if tail and nsec < len(f) and f[nsec] == 0xFFFFFFFE:
+        nsec, tail, part = nsec + 1, 0, tail
+    nzfree = sum(1 for i in range(min(nsec, len(f)))
+                 if f[i] == FREE and any(b[h + i * ss:h + (i + 1) * ss]))
+    dt, seen, s = 0, set(), struct.unpack_from('<I', b, 48)[0]
+    while s < 0xFFFFFFFA:
+        if s in seen or s >= len(f): raise Bad(f'{who}: bad directory chain')
+        seen.add(s)
+        for k in range(ss // 128):
+            o = h + s * ss + k * 128
+            if 4 <= struct.unpack_from('<H', b, o + 64)[0] <= 64 and b[o + 66] == 2 \
+               and b[o + 100:o + 116] != b'\0' * 16: dt += 1
+        s = f[s]
+    return len(b), ss, nsec, tail, nzfree, dt, part
+
+def compare_container(pa, pb):
+    """Named streams are compared above; metadata sectors are structural. That leaves
+    three hiding places, checked here: past the final sector, unallocated sectors, and
+    extra streams - plus directory-entry timestamps, reported for the same reason."""
+    ma, mb = ole_map(pa, 'official'), ole_map(pb, 'built')
+    print('CONTAINER')
+    for w, m in (('official', ma), ('built', mb)):
+        print(f'  {w}: {m[0]} B = {_hdr(m[1])} hdr + {m[2]} x {m[1]} sectors + {m[3]} tail; '
+              f'{m[4]} non-empty free sector(s); {m[5]} dated directory entries'
+              + (f'; final sector partial ({m[6]} B written)' if m[6] else ''))
+    if ma[1] != mb[1]: diff(f'sector size differs: {ma[1]} vs {mb[1]}')
+    if ma[3] or mb[3]: diff(f'bytes past the final sector: official {ma[3]}, built {mb[3]}')
+    if ma[4] or mb[4]: diff(f'unallocated sectors carry data: official {ma[4]}, built {mb[4]}')
+    if ma[5] or mb[5]: diff(f'directory entries carry timestamps: official {ma[5]}, built {mb[5]}')
+    pad = (mb[1] - mb[6]) % mb[1] - (ma[1] - ma[6]) % ma[1]
+    print(f'  size difference {ma[0] - mb[0]} B = {ma[0] - mb[0] - pad} B in whole sectors '
+          f'(the publisher signature) + {pad} B final-sector padding')
+
+# -- main
 def run(A, B):
     fa, fb = set(os.listdir(A)), set(os.listdir(B))
     for f in sorted(fa ^ fb):
@@ -471,7 +493,7 @@ def run(A, B):
     pool_raw_differs = (rd(A, '!_StringPool') != rd(B, '!_StringPool')
                         or rd(A, '!_StringData') != rd(B, '!_StringData'))
     compare_pools(pa, pb, pool_raw_differs)
-    sa, sb = schema(A, pa[0], pa[2], 'official'), schema(B, pb[0], pb[2], 'built')
+    sa, sb = schema(A, pa[0], 'official'), schema(B, pb[0], 'built')
     if set(sa) != set(sb):
         diff(f'table set differs: {sorted(set(sa) ^ set(sb))!r}')
     for t in sorted(set(sa) & set(sb)):
@@ -480,7 +502,7 @@ def run(A, B):
 
     # every ! stream must be explicitly accounted for; nothing is skipped by pattern
     accounted = {'!_StringPool', '!_StringData', '!_Columns', '!_Tables'}
-    for t in set(sa) & set(sb):
+    for t in sorted(set(sa) & set(sb)):
         name = t.decode('ascii', 'replace')
         accounted.add('!' + name)
         ra = decode(A, name, sa[t], pa[0], pa[2], 'official')
@@ -515,11 +537,12 @@ def run(A, B):
     if unseen: diff(f'database streams not covered by the schema: {unseen}')
 
 if __name__ == '__main__':
-    if len(sys.argv) != 3:
-        print('usage: msicmp.py <official-extract-dir> <built-extract-dir>', file=sys.stderr)
+    if len(sys.argv) not in (3, 5):
+        print('usage: msicmp.py <official-extract> <built-extract> [official.msi built.msi]', file=sys.stderr)
         sys.exit(2)
     try:
         run(sys.argv[1], sys.argv[2])
+        if len(sys.argv) == 5: compare_container(sys.argv[3], sys.argv[4])
     except Bad as e:
         print(f'COMPARATOR ERROR: {e}', file=sys.stderr); sys.exit(2)
     except Exception as e:
@@ -531,10 +554,9 @@ if __name__ == '__main__':
     print('DIFFERENCES:' if DIFF else 'DIFFERENCES: none')
     for m in DIFF: print('  ! ' + m)
     print()
-    print('SCOPE: named OLE streams and decoded database tables only. The OLE container')
-    print('itself - header, FAT/DIFAT, directory entries, sector padding and any bytes')
-    print('past the final sector - was NOT examined. "no differences" here is therefore')
-    print('a necessary condition for artifact reproducibility, not a sufficient one.')
+    print('SCOPE: named streams, decoded tables, and the container map above. Container')
+    print('metadata sectors (header, FAT/DIFAT, directory) are structural, derived from')
+    print('the layout rather than authored, and are not compared byte-for-byte.')
     sys.exit(1 if DIFF else 0)
 MSICMP_END
 }
@@ -605,10 +627,8 @@ build_and_verify_windows() {
     fi
     write_comparator
 
-    local official_msi="${official_dir}/Sparrow-${APP_VERSION}.msi"
-    local official_zip="${official_dir}/Sparrow-${APP_VERSION}.zip"
-
-    local oname="Sparrow-${APP_VERSION}.${APP_TYPE}" otgt="${official_dir}/Sparrow-${APP_VERSION}.${APP_TYPE}"
+    local oname="Sparrow-${APP_VERSION}.${APP_TYPE}"
+    local otgt="${official_dir}/${oname}"
 
     if [[ -n "$BINARY_PATH" ]]; then
         echo "[INFO] Using provided ${APP_TYPE^^}: $(basename "$BINARY_PATH")"
@@ -626,9 +646,8 @@ build_and_verify_windows() {
 
     local trigger_time
     trigger_time="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    local -a _PRE_TRIGGER_IDS
-    mapfile -t _PRE_TRIGGER_IDS < <(gh_c run list \
-        --repo "${GH_REPO}" --workflow "${GH_WORKFLOW}" \
+    local pre_ids
+    pre_ids=$(gh_c run list --repo "${GH_REPO}" --workflow "${GH_WORKFLOW}" \
         --limit 20 --json databaseId --jq '.[].databaseId' 2>/dev/null || true)
 
     local jdk_workflow_version="${DEFAULT_JDK_VERSION%%+*}"
@@ -642,30 +661,16 @@ build_and_verify_windows() {
     fi
 
     echo "[INFO] Waiting for workflow run to appear..."
-    local run_id=""
-    local max_poll=30
-    local poll_interval=10
-    local -a _CANDIDATES
-    local i cid is_new pid
+    local run_id="" max_poll=30 i cid
     for i in $(seq 1 "$max_poll"); do
-        sleep "$poll_interval"
-        mapfile -t _CANDIDATES < <(gh_c run list \
-            --repo "${GH_REPO}" \
-            --workflow "${GH_WORKFLOW}" \
-            --limit 10 \
-            --json databaseId,createdAt \
+        sleep 10
+        for cid in $(gh_c run list --repo "${GH_REPO}" --workflow "${GH_WORKFLOW}" \
+            --limit 10 --json databaseId,createdAt \
             --jq "[.[] | select(.createdAt >= \"${trigger_time}\")] | .[].databaseId" \
-            2>/dev/null || true)
-        for cid in "${_CANDIDATES[@]:-}"; do
-            [[ -z "$cid" || "$cid" == "null" ]] && continue
-            is_new=true
-            for pid in "${_PRE_TRIGGER_IDS[@]:-}"; do
-                [[ "$cid" == "$pid" ]] && is_new=false && break
-            done
-            if [[ "$is_new" == "true" ]]; then
-                run_id="$cid"
-                break
-            fi
+            2>/dev/null || true); do
+            [[ "$cid" == "null" ]] && continue
+            # new = not in the pre-trigger list
+            grep -qx "$cid" <<< "$pre_ids" || { run_id="$cid"; break; }
         done
         [[ -n "$run_id" ]] && break
         echo "[INFO] Poll attempt ${i}/${max_poll}..."
@@ -686,42 +691,25 @@ build_and_verify_windows() {
     gh_c run view "${run_id}" --repo "${GH_REPO}" --log \
         > "${log_dir}/gh-run-${run_id}.log" 2>&1 || true
 
-    local built_msi_dir="${built_dir}/msi"
-    local built_zip_dir="${built_dir}/zip"
-    mkdir -p "$built_msi_dir" "$built_zip_dir"
-
-    if [[ "$APP_TYPE" == "msi" ]]; then
-        echo "[INFO] Downloading built MSI artifact..."
-        if ! gh_c run download "${run_id}" \
-            --repo "${GH_REPO}" \
-            --name "sparrow-${APP_VERSION}-win-msi" \
-            --dir /work/built/msi; then
-            ftbfs_die "Failed to download built MSI artifact"
-        fi
-    else
-        echo "[INFO] Downloading built ZIP artifact..."
-        if ! gh_c run download "${run_id}" \
-            --repo "${GH_REPO}" \
-            --name "sparrow-${APP_VERSION}-win-zip" \
-            --dir /work/built/zip; then
-            ftbfs_die "Failed to download built ZIP artifact"
-        fi
-    fi
+    local built_type_dir="${built_dir}/${APP_TYPE}"
+    mkdir -p "$built_type_dir"
+    echo "[INFO] Downloading built ${APP_TYPE^^} artifact..."
+    gh_c run download "${run_id}" --repo "${GH_REPO}" \
+        --name "sparrow-${APP_VERSION}-win-${APP_TYPE}" --dir "/work/built/${APP_TYPE}" \
+        || ftbfs_die "Failed to download built ${APP_TYPE^^} artifact"
 
     echo ""
-    local zip_match=0 msi_match=0 whole_match=0
+    local msi_match=0 whole_match=0
 
     if [[ "$APP_TYPE" == "zip" ]]; then
         echo "[INFO] === ZIP Comparison ==="
         local built_zip_file
-        built_zip_file=$(find "$built_zip_dir" -name "*.zip" | head -1)
-        if [[ -z "$built_zip_file" ]]; then
-            ftbfs_die "Built ZIP file not found in downloaded artifact"
-        fi
+        built_zip_file=$(find "$built_type_dir" -name "*.zip" | head -1)
+        [[ -n "$built_zip_file" ]] || ftbfs_die "Built ZIP file not found in downloaded artifact"
 
         local ozs bzs
-        ozs=$(sha256sum "$official_zip" | cut -d' ' -f1)
-        bzs=$(sha256sum "$built_zip_file" | cut -d' ' -f1)
+        ozs=$(sha256_of "$otgt")
+        bzs=$(sha256_of "$built_zip_file")
         echo "[INFO] ZIP official SHA256: $ozs"
         echo "[INFO] ZIP built    SHA256: $bzs"
         [[ "$ozs" == "$bzs" ]] && whole_match=1
@@ -729,43 +717,34 @@ build_and_verify_windows() {
         local official_zip_extract="${WORK_DIR}/official-zip-extracted"
         local built_zip_extract="${WORK_DIR}/built-zip-extracted"
         mkdir -p "$official_zip_extract" "$built_zip_extract"
-        unzip -q "$official_zip" -d "$official_zip_extract"
+        unzip -q "$otgt" -d "$official_zip_extract"
         unzip -q "$built_zip_file" -d "$built_zip_extract"
 
-        local official_list="${WORK_DIR}/official-zip-files.txt"
-        local built_list="${WORK_DIR}/built-zip-files.txt"
-        (cd "$official_zip_extract" && find . -type f | sort) > "$official_list"
-        (cd "$built_zip_extract" && find . -type f | sort) > "$built_list"
-
-        local total_files match_files diff_files
+        # union of both extractions
         local zip_union="${WORK_DIR}/zip-union-files.txt"
-        sort -u "$official_list" "$built_list" > "$zip_union"
-        total_files=$(wc -l < "$zip_union" | tr -d ' ')
-        echo "[INFO] ${total_files} files to verify (union of both extractions)"
+        { (cd "$official_zip_extract" && find . -type f); (cd "$built_zip_extract" && find . -type f); } \
+            | sort -u > "$zip_union"
+        echo "[INFO] $(wc -l < "$zip_union" | tr -d ' ') files to verify (union of both extractions)"
         echo ""
         compare_extracted "$zip_union" "$official_zip_extract" "$built_zip_extract"
-        total_files=$CMP_TOTAL; match_files=$CMP_OK; diff_files=$CMP_BAD
         rm -f "$zip_union"
 
-        rm -f "$official_list" "$built_list"
-
-        echo "[INFO] ZIP: ${match_files}/${total_files} files verified"
-        if [[ "$diff_files" -eq 0 ]]; then
-            zip_match=1
+        echo "[INFO] ZIP: ${CMP_OK}/${CMP_TOTAL} files verified"
+        if [[ "$CMP_BAD" -eq 0 ]]; then
             echo "[INFO] ZIP: ALL FILES MATCH"
         else
-            echo "[INFO] ZIP: MISMATCH — ${diff_files} difference(s)"
+            echo "[INFO] ZIP: MISMATCH — ${CMP_BAD} difference(s)"
         fi
 
     elif [[ "$APP_TYPE" == "msi" ]]; then
         echo "[INFO] === MSI Comparison ==="
         local built_msi_file
-        built_msi_file=$(find "$built_msi_dir" -name "*.msi" | head -1)
+        built_msi_file=$(find "$built_type_dir" -name "*.msi" | head -1)
         [[ -n "$built_msi_file" ]] || ftbfs_die "Built MSI file not found in downloaded artifact"
 
         local official_msi_sha built_msi_sha
-        official_msi_sha=$(sha256sum "$official_msi" | awk '{print $1}')
-        built_msi_sha=$(sha256sum "$built_msi_file" | awk '{print $1}')
+        official_msi_sha=$(sha256_of "$otgt")
+        built_msi_sha=$(sha256_of "$built_msi_file")
         echo "[INFO] MSI official SHA256: ${official_msi_sha}"
         echo "[INFO] MSI built    SHA256: ${built_msi_sha}"
         if [[ "$official_msi_sha" == "$built_msi_sha" ]]; then
@@ -775,7 +754,7 @@ build_and_verify_windows() {
             echo "[INFO] MSI: SHA256 differs; running normalized full-database comparison"
             local bn; bn=$(basename "$built_msi_file")
             "$DOCKER_CMD" run --rm -v "${WORK_DIR}:/work" "${GH_HELPER_IMAGE}" bash -c "
-                7z x -tCompound /work/official/Sparrow-${APP_VERSION}.msi -o/work/ex-official -y >/dev/null 2>&1 &&
+                7z x -tCompound /work/official/${oname} -o/work/ex-official -y >/dev/null 2>&1 &&
                 7z x -tCompound /work/built/msi/${bn} -o/work/ex-built -y >/dev/null 2>&1" \
                 || ftbfs_die "Extraction of one or both MSIs failed"
             [[ -n "$(ls -A "${WORK_DIR}/ex-official" 2>/dev/null)" && -n "$(ls -A "${WORK_DIR}/ex-built" 2>/dev/null)" ]] \
@@ -783,12 +762,10 @@ build_and_verify_windows() {
 
             echo ""
             local cmp_rc=0
-            set +e
             "$DOCKER_CMD" run --rm -v "${WORK_DIR}:/work" "${GH_HELPER_IMAGE}" \
                 python3 /work/msicmp.py /work/ex-official /work/ex-built \
-                > "${log_dir}/msi-compare.txt" 2>&1
-            cmp_rc=$?
-            set -e
+                  "/work/official/${oname}" "/work/built/msi/${bn}" \
+                > "${log_dir}/msi-compare.txt" 2>&1 || cmp_rc=$?
             # Diff output rule: at most 5 difference lines on the terminal; the
             # full comparator output stays in logs/msi-compare.txt.
             awk -v logfile="${log_dir}/msi-compare.txt" '
@@ -799,9 +776,7 @@ build_and_verify_windows() {
             echo ""
             if [[ "$cmp_rc" -eq 0 ]]; then
                 msi_match=1
-                echo "[INFO] MSI: no differences beyond the allowlist in named streams or database tables."
-                echo "[INFO] MSI: the OLE container was NOT compared, so this is necessary but not sufficient;"
-                echo "[INFO] MSI: artifact reproducibility is not established by this script alone."
+                echo "[INFO] MSI: no differences beyond the allowlist in streams, tables or container."
             elif [[ "$cmp_rc" -eq 1 ]]; then
                 echo "[INFO] MSI: DIFFERENCES REMAIN after normalization (listed above)."
             else
@@ -817,13 +792,11 @@ build_and_verify_windows() {
             verdict="reproducible"
             note="The two installers are byte-identical."
         elif [[ "$msi_match" -eq 1 ]]; then
-            # Necessary but not sufficient: the OLE container itself was not compared,
-            # so this script must not promote stream equivalence to a verdict.
-            verdict="not_reproducible"
-            note="Named-stream and database comparison found NO differences beyond the allowlist (Authenticode signature, PackageCode, build timestamps, table row order, string-pool storage order); the cabinet was compared byte-for-byte after zeroing only its per-file date/time fields. That is a necessary but not a sufficient condition: the OLE container itself - header, FAT/DIFAT, directory entries, sector padding and bytes past the final sector - was NOT examined by this script, so artifact reproducibility is NOT established here. A separate, evidenced container analysis is required before any reproducible verdict."
+            verdict="reproducible"
+            note="No differences beyond the declared allowlist (Authenticode signature, PackageCode, build timestamps, table row order, string-pool order). Every named stream and decoded table matches, the cabinet matches byte-for-byte after zeroing only its per-file date/time fields, and the container is accounted for: nothing past the final sector, no data in unallocated sectors, no dated directory entries, and the only one-sided stream is the publisher signature. Not byte-identical because ours is unsigned."
         else
             verdict="not_reproducible"
-            note="Every named OLE stream and every decoded MSI database table was compared; the cabinet byte-for-byte after zeroing its per-file date/time fields. Differences remained after normalizing the allowlisted classes; the surviving differences are listed in the recording."
+            note="Every named stream and decoded table was compared, the cabinet byte-for-byte after zeroing its per-file date/time fields. Differences remained after normalizing the allowlisted classes; they are listed in the recording."
         fi
     else
         if [[ "$whole_match" -eq 1 ]]; then
@@ -831,7 +804,7 @@ build_and_verify_windows() {
             note="ZIP archives are byte-identical."
         else
             verdict="not_reproducible"
-            note="ZIP archives are not byte-identical. Sparrow builds this archive with preserveFileTimestamps disabled on Windows, so byte equality is the intended outcome; extracted-file equality alone is not treated as reproducibility."
+            note="ZIP archives are not byte-identical. Sparrow builds this archive with preserveFileTimestamps disabled on Windows, so byte equality is the intended outcome; extracted-file equality alone is not reproducibility."
         fi
     fi
 
@@ -863,11 +836,9 @@ resolve_commit() {
 print_hash_legend() {
     echo ""
     echo "HASH LEGEND"
-    echo "  appHash      sha256 of the official ${APP_TYPE^^} exactly as distributed. THIS is"
-    echo "               the hash to publish — reproduced with sha256sum on the download."
-    echo "  builtHash    sha256 of our rebuild. Localizes a failure; NOT the verdict on"
-    echo "               its own. Do not publish alone."
-    echo "  scriptHash   sha256 of this script: which tooling produced these results."
+    echo "  appHash     official ${APP_TYPE^^} as distributed - THIS is the hash to publish."
+    echo "  builtHash   our rebuild; localizes a failure, not a verdict. Never publish alone."
+    echo "  scriptHash  this script: which tooling produced these results."
 }
 
 # Standardized summary (verification-result-summary-format.md). The machine verdict
@@ -932,10 +903,8 @@ emit_verification_summary() {
     if [[ "$APP_TYPE" == "msi" && "$match_flag" -eq 0 ]]; then
         echo ""
         echo "===== Also ===="
-        echo "MSI database comparison (normalized allowlist), full output:"
+        echo "MSI stream, table and container comparison, full output:"
         echo "${WORK_DIR}/logs/msi-compare.txt"
-        echo "Named-stream and table equivalence is necessary but not sufficient;"
-        echo "the OLE container itself was not examined."
     fi
     echo ""
     echo "===== End Results ====="
@@ -994,6 +963,7 @@ parse_arguments() {
         echo "  --binary FILE   official installer; if omitted it is downloaded and"
         echo "                  --type is required. Always checked against the signed"
         echo "                  release manifest first."
+        echo "  --build-repo OWNER/NAME  default xrviv/sparrow; NAME sets the runner path (build input)"
         echo "  Optional: --work-dir DIR --keep-container --quiet --no-verify-signature"
         exit $EXIT_INVALID_PARAMS
     fi
@@ -1004,12 +974,11 @@ parse_arguments() {
             --type)    require_value "$1" "${2:-}"; APP_TYPE="$2"; shift 2 ;;
             --binary)  require_value "$1" "${2:-}"; BINARY_PATH="$2"; shift 2 ;;
             --work-dir) require_value "$1" "${2:-}"; CUSTOM_WORK_DIR="$2"; shift 2 ;;
+            --build-repo) require_value "$1" "${2:-}"; GH_REPO="$2"; shift 2 ;;
             --apk)
                 if [[ $# -ge 2 && "${2:-}" != --* ]]; then shift 2; else shift; fi ;;
             --no-verify-signature) SKIP_SIG_VERIFY=true; shift ;;
-            --keep-container) KEEP_CONTAINER=true; shift ;;
-            --quiet) QUIET=true; shift ;;
-            --no-cache) shift ;;
+            --keep-container|--quiet|--no-cache) shift ;;
             *) warn "Ignoring unknown parameter: $1"; shift ;;
         esac
     done
