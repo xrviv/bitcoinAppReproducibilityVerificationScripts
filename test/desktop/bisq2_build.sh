@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # bisq2_build.sh - Bisq2 Desktop Reproducible Build Verification
-# Version:       v0.1.20
+# Version:       v0.1.21
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-06-04
+# Last Modified: 2026-09-18
 # Project:       https://github.com/bisq-network/bisq2
 # License:       MIT
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.20"
+SCRIPT_VERSION="v0.1.21"
 REPO_URL="https://github.com/bisq-network/bisq2"
 GH_REPO="xrviv/WalletScrutinyCom"
 GH_WORKFLOW="bisq2-windows-build.yml"
@@ -514,8 +514,6 @@ RUN apt-get update && apt-get install -y \
     apt-transport-https gnupg lsb-release \
     && rm -rf /var/lib/apt/lists/*
 
-# fakeroot passthrough: jpackage calls "fakeroot dpkg-deb -b" internally;
-# ptrace/preload breaks in rootless Podman even with --privileged.
 RUN printf '#!/bin/sh\nexec "$@"\n' > /usr/local/bin/fakeroot \
     && chmod 755 /usr/local/bin/fakeroot
 
@@ -703,7 +701,6 @@ git fetch --tags --force || fail "git fetch --tags failed"
 git checkout "$GIT_TAG" || fail "git checkout failed"
 git describe --tags --exact-match >/dev/null 2>&1 || fail "checked out commit is not exactly $GIT_TAG"
 
-# core.abbrev 10: pins short-hash to 10 chars to match the official release binary
 git config core.abbrev 10
 
 SOURCE_DATE_EPOCH=$(git log -1 --format=%ct "$GIT_TAG" 2>/dev/null || true)
@@ -747,7 +744,6 @@ echo "[INFO] Built artifact: $(basename "$BUILT_DEB") (${BUILT_SIZE} bytes)"
 [[ "$BUILT_SIZE" -lt 1048576 ]] \
     && fail "Built artifact is unexpectedly small (${BUILT_SIZE} bytes); jpackage likely failed"
 
-# Stop Gradle daemon to free memory before analysis phases
 ./gradlew --stop >/dev/null 2>&1 || true
 
 OFFICIAL_DEB="$OUTPUT/$OFFICIAL_ARTIFACT"
@@ -1193,6 +1189,12 @@ if [[ -n "$BINARY_FILE" ]]; then
     log_info "Official binary provided — skipping download, will build from source"
 fi
 
+OWNER_UID="$(id -u)"; OWNER_GID="$(id -g)"
+if { [[ "$CONTAINER_RUNTIME" == "podman" ]] && [[ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" == "true" ]]; } \
+    || { [[ "$CONTAINER_RUNTIME" == "docker" ]] && docker info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless; }; then
+    OWNER_UID=0; OWNER_GID=0
+fi
+
 log_info "Starting container..."
 set +e
 $CONTAINER_RUNTIME run \
@@ -1209,8 +1211,8 @@ $CONTAINER_RUNTIME run \
     -e SKIP_DOWNLOAD="$SKIP_DOWNLOAD" \
     -e BINARY_FILENAME="$BINARY_FILENAME" \
     -e SCRIPT_VERSION="$SCRIPT_VERSION" \
-    -e HOST_UID="$(id -u)" \
-    -e HOST_GID="$(id -g)" \
+    -e HOST_UID="$OWNER_UID" \
+    -e HOST_GID="$OWNER_GID" \
     "$IMAGE_NAME" 2>&1 | tee "$WORK_DIR/container.log"
 CONTAINER_EXIT="${PIPESTATUS[0]}"
 set -e
