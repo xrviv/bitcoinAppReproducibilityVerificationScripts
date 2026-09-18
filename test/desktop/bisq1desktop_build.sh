@@ -2,9 +2,9 @@
 # ==============================================================================
 # bisq1desktop_build.sh - Bisq 1 Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.8.1
+# Version:       v0.10.0
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-08-26
+# Last Modified: 2026-09-12
 # Project:       https://github.com/bisq-network/bisq
 # ==============================================================================
 # LICENSE: MIT License
@@ -25,49 +25,30 @@
 # Maintain changelog in separate file: ~/work/ws-notes/script-notes/desktop/bisq1/changelog.md
 # ==============================================================================
 #
-# SCRIPT SUMMARY (v0.8.0 - Bisq 1.10.0+ toolchain; deb/rpm self-build + Windows EXE via GH Actions):
-#   Drives Bisq's first-party reproducible-build framework per docs/reproducible-builds/linux.md:
-#     1. Clone the release tag TWICE on the host (clean A and B checkouts) + init submodules (required).
-#     2. Build the pinned release-builder image FROM the cloned repo's own
-#        docker/release-builder/linux/Dockerfile (azul/zulu-openjdk:21.0.6, JDK 21,
-#        SOURCE_DATE_EPOCH=0, TZ=UTC, apt-snapshot pinned). No hand-copied Dockerfile -> no drift.
-#     3. v1.10.0-1.10.3: ./gradlew clean verifyReleaseBuild verifyInstallerEvidenceBundle.
-#        v1.10.4+: upstream rewrote packaging (build-logic/packaging) and the old generateInstallers
-#        task now HARD-FAILS for DEB/RPM ("doesn't support the packaging formats DEB and RPM"),
-#        which also breaks verifyInstallerEvidenceBundle (it depends on generateInstallerManifest ->
-#        generateInstallers). The real Linux entry points are now the dedicated tasks, so we run
-#        ./gradlew clean verifyReleaseBuild :desktop:deb (or :desktop:rpm). Detected by grepping the
-#        cloned source for DebJpackageTask. Installer output also MOVED from
-#        desktop/build/packaging/jpackage/packages to desktop/build/packaging.
-#        Run BOTH worktrees (always-on A/B determinism check).
-#     4. VERDICT IS MECHANICAL on the outer-file sha256 (WS policy is mechanical; see
-#        review-notes/reproducibility-heuristics-packaged-artifacts.md). reproducible only if the
-#        rebuilt installer is byte-identical to the official AND the two rebuilds (A,B) agree.
-#     5. EVIDENCE for human classification (NOT a verdict input): extract official + rebuilt with
-#        dpkg-deb -R (control fields, maintainer scripts, payload, modes, symlinks) and split the
-#        diff into payload-vs-packaging so the report can apply reproducible_with_packaging_noise.
-#   Rebuilt installers + upstream release/installer evidence bundles are copied to ./artifacts/.
-#   Emits minimal COMPARISON_RESULTS.yaml (script_version, verdict, notes).
-#
-# SCOPE: 1.10.x toolchain only. The pre-1.10 JDK 11/17 script is retained for reference as
-#   bisq1desktop_build.sh.v0.3.5.bak (legacy multi-field YAML + missing-`v` tag bug; not ABS-current).
-#
-# WINDOWS EXE (--type exe --arch x86_64-windows): FULLY ISOLATED from deb/rpm. jpackage+WiX cannot be
-#   built on Linux, so the script AUTO-TRIGGERS bisq1-windows-build.yml on the fork (windows-2025, Zulu
-#   21.0.6, pinned WiX v3, A/B isolated worktrees), correlates the run by a unique request_id, downloads
-#   both built EXEs, and applies the mechanical outer-sha256 verdict (A==B && A==official); extraction
-#   diff is diagnostic-only. `--built <dir>` = OPTIONAL offline override (skip CI). Needs
-#   GITHUB_TOKEN/GH_TOKEN + docker for the gh helper, unless --built. Details: usage() + changelog.
+# SCRIPT SUMMARY (v0.10.0 - bob): Bisq's own recipe (docs/reproducible-builds/linux.md), toolchain per tag.
+#   deb/rpm: clone once (~1.8 GB), two local checkouts A/B + submodules; >=1.10.0 builds in the tag's own
+#   docker/release-builder image (Zulu 21.0.6, SOURCE_DATE_EPOCH=0, apt snapshot): verifyReleaseBuild +
+#   verifyInstallerEvidenceBundle (pre-1.10.4) or :desktop:<type> (1.10.4+: generateInstallers hard-fails for
+#   DEB/RPM, and deb+rpm in ONE invocation loses the first via deleteExistingInstallerArtifacts). pre-1.10:
+#   embedded Ubuntu 22.04 + Zulu 11/17 image. VERDICT is mechanical on the outer sha256: reproducible iff
+#   rebuilt == official AND A==B. EVIDENCE only: dpkg-deb -R / rpm2cpio payload split, bundled JDK vs the
+#   tag's Dockerfile pin (bisq#7930), gpg --verify vs desktop/package/*.asc. Engine: docker, or rootless
+#   podman behind a `docker` shim (--userns=keep-id added when detected).
+#   exe: jpackage+WiX cannot run on Linux; triggers bisq1-windows-build.yml on the WS fork (windows-2025,
+#   Zulu 21.0.6, WiX v3, A/B), downloads both EXEs, same verdict; --built <dir> = offline. Needs GITHUB_TOKEN.
 # ==============================================================================
 
 set -euo pipefail
+# Checkout files are packed into the Bisq jars with their on-disk mode. Upstream's release has 0644, an
+# Ubuntu host with umask 002 gives 0664 and 5 jars differ for that reason alone (found at 1.10.7). Pin it.
+umask 022
 
-SCRIPT_VERSION="v0.8.1"
+SCRIPT_VERSION="v0.10.0"
 SCRIPT_NAME="bisq1desktop_build.sh"
 APP_NAME="Bisq 1"
 APP_ID="bisq"
 REPO_URL="https://github.com/bisq-network/bisq"
-DEFAULT_VERSION="1.10.0"
+DEFAULT_VERSION="1.10.7"
 
 EXIT_SUCCESS=0
 EXIT_BUILD_FAILED=1
@@ -93,6 +74,8 @@ log_success() { echo -e "${GREEN}[OK]${NC} $*"; }
 log_warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 die() { local m="$1"; local c="${2:-$EXIT_BUILD_FAILED}"; log_error "$m"; exit "$c"; }
+YAML_OUT=""   # set by each path before use
+ftbfs_die() { write_yaml "$YAML_OUT" ftbfs "$1"; die "$1"; }   # tool failure: ftbfs YAML + exit 1
 
 VERIFY_SCRIPT=""
 cleanup_on_exit() {
@@ -166,18 +149,7 @@ emit_results_block() {  # yaml_verdict appHash commit
     echo "===== End Results ====="
 }
 
-# ============================================================================
-# WINDOWS EXE PATH (fully isolated; never enters the deb/rpm docker logic).
-# The Windows installer (jpackage+WiX) cannot be built on Linux, so the build runs on a Windows
-# GitHub Actions runner (bisq1-windows-build.yml on the fork). By DEFAULT this function TRIGGERS
-# that workflow and DOWNLOADS both built EXEs (A and B) via the gh CLI in a helper container —
-# the same end-to-end pattern as gingerwallet_build.sh / sparrowdesktop_build.sh. `--built <dir>`
-# is an OFFLINE OVERRIDE that skips CI and reuses already-downloaded artifacts. Either way this
-# function only COMPARES (mechanical A==B && A==official); it never builds on this host.
-# Needs GITHUB_TOKEN/GH_TOKEN with permission to dispatch the workflow + read its artifacts
-# (exact token type/permissions to be confirmed after the first real run) unless --built is used.
-# The token is passed only via the container env (-e); it is never logged.
-# ============================================================================
+# ---- WINDOWS EXE PATH (isolated from the deb/rpm logic; see header). Compares only, never builds here. ----
 GH_REPO="${GH_REPO:-xrviv/WalletScrutinyCom}"
 GH_WORKFLOW="bisq1-windows-build.yml"
 GH_WORKFLOW_REF="${GH_WORKFLOW_REF:-master}"
@@ -203,11 +175,8 @@ RUN apt-get update -qq \
 GHEOF
 }
 
-# Run gh inside the helper container (GH_MOUNT_DIR mounted at /work).
-# - GITHUB_TOKEN is exported and passed by NAME (`-e GITHUB_TOKEN`, no value) so it never enters argv.
-#   (It still lives in the container's env; gh authenticates from it. Not logged by this script.)
-# - Run as the host uid:gid so downloaded artifacts are user-owned (not root). HOME=/work gives gh a
-#   writable config dir inside the mount.
+# gh in the helper container: token passed by NAME (-e GITHUB_TOKEN, never in argv or logs); host uid:gid so
+# downloads are user-owned; HOME=/work gives gh a writable config dir.
 gh_c() {
     docker run --rm -e GITHUB_TOKEN -e HOME=/work \
         --user "$(id -u):$(id -g)" \
@@ -216,18 +185,18 @@ gh_c() {
 
 # Trigger bisq1-windows-build.yml, wait, download both EXE artifacts into <artdir>/A and /B.
 acquire_built_exes_via_ci() {
-    local ver="$1" artdir="$2" yaml="$3"
+    local ver="$1" artdir="$2" yaml="$3"; YAML_OUT="$yaml"
     export GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
     # Missing token / docker = infrastructure unavailable -> ftbfs + exit 1 (EXIT_BUILD_FAILED), same
     # class as the deb/rpm 'docker not found' path (exit 2 is reserved for invalid CLI parameters).
-    [[ -n "$GITHUB_TOKEN" ]] || { write_yaml "$yaml" ftbfs "GITHUB_TOKEN/GH_TOKEN required to dispatch CI + read artifacts; or pass --built <dir>."; die "GITHUB_TOKEN/GH_TOKEN (dispatch+artifact-read perms) required for --type exe (or use --built <dir>)" "$EXIT_BUILD_FAILED"; }
-    command -v docker >/dev/null 2>&1 || { write_yaml "$yaml" ftbfs "docker required for the gh helper container."; die "docker not found" "$EXIT_BUILD_FAILED"; }
-    docker info >/dev/null 2>&1 || { write_yaml "$yaml" ftbfs "docker daemon not running."; die "docker daemon not running" "$EXIT_BUILD_FAILED"; }
+    [[ -n "$GITHUB_TOKEN" ]] || ftbfs_die "GITHUB_TOKEN/GH_TOKEN required to dispatch CI + read artifacts; or pass --built <dir>."
+    command -v docker >/dev/null 2>&1 || ftbfs_die "docker required for the gh helper container."
+    docker info >/dev/null 2>&1 || ftbfs_die "docker daemon not running."
     GH_MOUNT_DIR="$artdir"; mkdir -p "$artdir"
     # gh helper image is a shared cached tooling image (debian base + apt pkgs unpinned; same shared
     # rationale as the release-builder image — rebuilt only when absent).
     if ! docker image inspect "$GH_HELPER_IMAGE" >/dev/null 2>&1; then
-        build_gh_helper || { write_yaml "$yaml" ftbfs "gh helper image build failed (see output)."; die "gh helper image build failed" "$EXIT_BUILD_FAILED"; }
+        build_gh_helper || ftbfs_die "gh helper image build failed (see output)."
     fi
 
     # Unique correlation ID echoed into the workflow run-name so we attach to OUR run exactly,
@@ -235,7 +204,7 @@ acquire_built_exes_via_ci() {
     local request_id; request_id="wsreq-${ver}-$(date -u +%Y%m%d%H%M%S)-${RANDOM}${RANDOM}"
     log_info "Triggering ${GH_WORKFLOW} on ${GH_REPO}@${GH_WORKFLOW_REF} (version=${ver}, request_id=${request_id})..."
     gh_c workflow run "$GH_WORKFLOW" --repo "$GH_REPO" --ref "$GH_WORKFLOW_REF" -f version="$ver" -f request_id="$request_id" \
-        || { write_yaml "$yaml" ftbfs "Failed to trigger ${GH_WORKFLOW}."; die "workflow trigger failed" "$EXIT_BUILD_FAILED"; }
+        || ftbfs_die "Failed to trigger ${GH_WORKFLOW}."
 
     log_info "Waiting for the run (correlating by request_id)..."
     local run_id="" i c
@@ -251,10 +220,10 @@ acquire_built_exes_via_ci() {
         [[ -n "$run_id" ]] && break
         log_info "poll ${i}/30..."
     done
-    [[ -n "$run_id" && "$run_id" != "null" ]] || { write_yaml "$yaml" ftbfs "Workflow run not found after polling."; die "workflow run not found" "$EXIT_BUILD_FAILED"; }
+    [[ -n "$run_id" && "$run_id" != "null" ]] || ftbfs_die "Workflow run not found after polling."
     log_info "Run ID ${run_id}; watching to completion (build ~20-30 min)..."
     gh_c run watch "$run_id" --repo "$GH_REPO" --exit-status \
-        || { write_yaml "$yaml" ftbfs "GitHub Actions run ${run_id} failed."; die "workflow run ${run_id} failed" "$EXIT_BUILD_FAILED"; }
+        || ftbfs_die "GitHub Actions run ${run_id} failed."
     # Stream the full GH Actions build log to the terminal (and into the cast) as verification
     # evidence, while also saving it to a file. Large, but it is the Windows build output.
     log_info "===== GitHub Actions build log (run ${run_id}) ====="
@@ -266,7 +235,7 @@ acquire_built_exes_via_ci() {
     for label in A B; do
         rm -rf "${artdir:?}/${label}"; mkdir -p "${artdir}/${label}"
         gh_c run download "$run_id" --repo "$GH_REPO" --name "bisq1-${ver}-win-exe-${label}" --dir "/work/${label}" \
-            || { write_yaml "$yaml" ftbfs "Failed to download bisq1-${ver}-win-exe-${label}."; die "artifact download failed (${label})" "$EXIT_BUILD_FAILED"; }
+            || ftbfs_die "Failed to download bisq1-${ver}-win-exe-${label}."
     done
     # Provenance artifact (workflow/runner/JDK+WiX versions, A/B hashes) — kept for the human report.
     rm -rf "${artdir:?}/provenance"; mkdir -p "${artdir}/provenance"
@@ -274,9 +243,8 @@ acquire_built_exes_via_ci() {
         || log_warn "provenance artifact not downloaded (non-fatal)"
 }
 
-# Diagnostic-only extracted diff of two installer files -> outfile. VERDICT-NEUTRAL (never changes the
-# verdict). Runs 7z extraction + diff INSIDE the gh helper container (has p7zip + diffutils) so it does
-# NOT depend on a host 7z — only docker. Used for A-vs-B and official-vs-built. Full diff retained.
+# Diagnostic-only extracted diff of two installers -> outfile (VERDICT-NEUTRAL). 7z + diff run inside the gh
+# helper container, so no host 7z is needed. Full diff retained.
 diag_extract_diff() {
     local f1="$1" f2="$2" l1="$3" l2="$4" outfile="$5" detail="$6"
     rm -f "$outfile"
@@ -326,7 +294,7 @@ diag_extract_diff() {
 
 verify_windows_exe() {
     local execution_dir; execution_dir="$(pwd)"
-    local yaml="${execution_dir}/COMPARISON_RESULTS.yaml"
+    local yaml="${execution_dir}/COMPARISON_RESULTS.yaml"; YAML_OUT="$yaml"
     local detail="${execution_dir}/comparison-detail.txt"
     local ver="${BISQ_VERSION#v}"
     local official_name="Bisq-64bit-${ver}.exe"
@@ -341,7 +309,7 @@ verify_windows_exe() {
         log_info "Downloading official ${official_name} ..."
         curl -fL --progress-bar -o "$official" \
             "${REPO_URL}/releases/download/${BISQ_VERSION}/${official_name}" \
-            || { write_yaml "$yaml" "ftbfs" "Failed to download official ${official_name}."; die "download failed"; }
+            || ftbfs_die "Failed to download official ${official_name}."
     fi
     [[ -f "$official" ]] || die "official EXE not found: $official" "$EXIT_INVALID_PARAMS"
 
@@ -407,10 +375,7 @@ Each must come from a DISTINCT artifact (bisq1-${ver}-win-exe-A and -B, version 
         notes="Windows EXE reproducible: A==B==official ($hO)."
     fi
 
-    # Diagnostics (VERDICT-NEUTRAL; never change the verdict above).
-    #   A != B            -> diff build A vs build B (characterize the build non-determinism).
-    #   A == B != official -> diff official vs build A (how the deterministic build differs from official).
-    #   reproducible       -> nothing to diff.
+    # Diagnostics (VERDICT-NEUTRAL): A != B -> diff A vs B; A == B != official -> diff official vs A.
     if [[ "$hA" != "$hB" ]]; then
         diag_extract_diff "${built[0]}" "${built[1]}" "build-A" "build-B" "${execution_dir}/diff_exe_AvsB.txt" "$detail"
     elif [[ "$hA" != "$hO" ]]; then
@@ -426,43 +391,23 @@ Each must come from a DISTINCT artifact (bisq1-${ver}-win-exe-A and -B, version 
 
 usage() {
     cat << EOF
-Bisq 1 Desktop Reproducible Build Verification Script (${SCRIPT_VERSION}, Bisq 1.10.0+ toolchain)
+Bisq 1 Desktop Reproducible Build Verification Script (${SCRIPT_VERSION})
 
-Usage:
-  $(basename "$0") --version <version> --arch <arch> --type <type> [--binary <file|dir>]
-
-Parameters:
-  --version <version>    Bisq version (e.g., 1.10.0). Default: ${DEFAULT_VERSION}
+Usage: $(basename "$0") --version <version> --arch <arch> --type <type> [--binary <file|dir>]
+  --version <version>    Bisq version, e.g. 1.10.7 (default ${DEFAULT_VERSION}; derived from a
+                         Bisq-64bit-<ver>.<type> file name given to --binary when omitted)
   --arch <arch>          x86_64-linux | x86_64-linux-gnu (deb/rpm) | x86_64-windows (exe)
   --type <type>          deb | rpm | exe
-  --binary <file|dir>    Use this local official installer (file, or dir containing it).
-  --apk <file|dir>       Alias for --binary.
-  --built <dir>          (exe only, OPTIONAL) Offline override: dir with the two pre-downloaded built
-                         EXEs (A and B). If omitted, the script triggers CI and downloads them itself.
-  --no-cache             Force fresh Docker image build (deb/rpm only).
-  --keep-container       Keep build/compare containers afterwards (deb/rpm only).
-  --help                 Show this help.
-
-ENV (exe only, unless --built): GITHUB_TOKEN or GH_TOKEN with permission to dispatch the workflow and
-  read its artifacts (exact perms TBD after first run); docker is also required for the gh helper.
-
-deb/rpm: builds the release tag TWICE on this host (A/B determinism, always-on) in the pinned
-  release-builder container. Verdict is MECHANICAL on the outer-file sha256. Full dpkg-deb -R evidence
-  (payload vs packaging split) is written for human classification.
-exe (x86_64-windows): the Windows installer (jpackage+WiX) CANNOT be built on Linux. By default the
-  script AUTO-TRIGGERS walletScrutinyCom/.github/workflows/bisq1-windows-build.yml (windows-2025, Zulu
-  21.0.6, pinned WiX v3, A/B isolated), correlates the run by a unique request_id in the run-name,
-  watches it, and downloads both built EXEs (same pattern as gingerwallet/sparrow). Verdict is mechanical
-  (A==B && A==official by sha256); extracted diff is diagnostic. --built skips CI and reuses local EXEs.
-  NOTE: installer embeds the build year (Year.now()), so verify v1.10.0 within 2026 (official=2026).
-
-Output:
-  - Exit 0: reproducible | Exit 1: differs/failed | Exit 2: invalid params
-  - COMPARISON_RESULTS.yaml (script_version, verdict, notes)
-  - artifacts/  (rebuilt installers A+B + upstream evidence bundles)
-  - comparison-detail.txt (determinism + full extracted-tree evidence)
-
-Organization: WalletScrutiny.com
+  --binary <file|dir>    Local official installer (file, or dir containing it); --apk is an alias.
+  --built <dir>          exe only: dir with the two pre-built EXEs (A and B) instead of triggering CI.
+  --no-cache             Force fresh image build (deb/rpm).   --keep-container  Keep containers.
+ENV (exe only, unless --built): GITHUB_TOKEN or GH_TOKEN (dispatch + artifact read); docker for the gh helper.
+deb/rpm: two clean builds (A/B) in the tag's own release-builder container (legacy Zulu 11/17 image pre-1.10);
+  verdict mechanical on the outer sha256; dpkg-deb -R / rpm evidence for the human report.
+exe: Windows installer built twice on a GitHub windows-2025 runner (see header); verdict mechanical, diff diagnostic.
+  NOTE: the installer embeds the build year (Year.now()), so verify a 2026 release within 2026.
+Exit 0 reproducible | 1 differs or failed | 2 invalid params. Writes COMPARISON_RESULTS.yaml, comparison-detail.txt,
+artifacts/. Organization: WalletScrutiny.com
 EOF
 }
 
@@ -485,6 +430,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# No --version: derive it from an official-style file name (Bisq-64bit-<ver>.<type>), else the default.
+if [[ -z "$BISQ_VERSION" && -n "$OFFICIAL_BINARY" ]]; then
+    BISQ_VERSION="$(basename "$OFFICIAL_BINARY" | sed -n 's/^Bisq-64bit-\([0-9][0-9.]*\)\.[a-z]*$/\1/p')"
+fi
 [[ -z "$BISQ_VERSION" ]] && BISQ_VERSION="$DEFAULT_VERSION"
 [[ -z "$BISQ_TYPE" ]] && BISQ_TYPE="deb"
 # Default arch depends on type: exe -> windows, deb/rpm -> linux.
@@ -546,7 +495,7 @@ CONTAINER_CMP="bisq1-cmp-${VC}-${TC}-${SUFFIX}"
 
 WORK_DIR="${SCRIPT_DIR}/bisq1_desktop_${VC}_${AC}_${TC}_$$"
 mkdir -p "$WORK_DIR"; cd "$WORK_DIR"; chmod 777 "$WORK_DIR" >/dev/null 2>&1 || true
-execution_dir="$(pwd)"
+execution_dir="$(pwd)"; YAML_OUT="${execution_dir}/COMPARISON_RESULTS.yaml"
 SRC_A="${WORK_DIR}/src-a"
 SRC_B="${WORK_DIR}/src-b"
 ARTIFACTS_DIR="${execution_dir}/artifacts"; mkdir -p "$ARTIFACTS_DIR"
@@ -555,15 +504,22 @@ log_info "========================================================"
 log_info "Bisq 1 Desktop Reproducible Build Verification (${SCRIPT_VERSION})"
 log_info "========================================================"
 log_info "Version: $BISQ_VERSION | Arch: $BISQ_ARCH | Type: $BISQ_TYPE"
-log_info "Toolchain: pinned release-builder (azul/zulu-openjdk:21.0.6)"
+log_info "Toolchain: auto-detected (release-builder >=1.10 / legacy Zulu 11+17 pre-1.10)"
 log_info "Mode: A/B determinism (2 clean builds) + mechanical outer-hash verdict"
 log_info "Work Dir: $WORK_DIR"
 log_info ""
 
 # ---- Docker preflight ----
-command -v docker >/dev/null 2>&1 || { write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "Docker not found on host."; die "Docker not found"; }
-docker info >/dev/null 2>&1 || { write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "Docker daemon not running."; die "Docker daemon not running"; }
+command -v docker >/dev/null 2>&1 || ftbfs_die "Docker not found on host."
+docker info >/dev/null 2>&1 || ftbfs_die "Docker daemon not running."
 log_success "Docker OK"
+# Rootless podman behind a `docker` shim needs --userns=keep-id for --user $(id -u) to keep write access to
+# the bind mounts (real docker needs nothing). Detected, never assumed.
+DOCKER_RUN_EXTRA=""
+if docker --version 2>/dev/null | grep -qi podman; then
+    DOCKER_RUN_EXTRA="--userns=keep-id"
+    log_info "Container engine is podman: adding ${DOCKER_RUN_EXTRA} to docker run"
+fi
 
 # ---- Stage official installer ----
 if [[ -n "$OFFICIAL_BINARY" ]]; then
@@ -573,41 +529,70 @@ else
     log_info "Downloading official release: ${OFFICIAL_PKG_NAME}"
     curl -fL --progress-bar -o "${execution_dir}/${OFFICIAL_PKG_NAME}" \
         "https://github.com/bisq-network/bisq/releases/download/${BISQ_VERSION}/${OFFICIAL_PKG_NAME}" \
-      || { write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "Failed to download official ${OFFICIAL_PKG_NAME}."; die "download failed"; }
+      || ftbfs_die "Failed to download official ${OFFICIAL_PKG_NAME}."
 fi
 OFFICIAL_HASH="$(sha256sum "${execution_dir}/${OFFICIAL_PKG_NAME}" | cut -d' ' -f1)"
 log_success "Official staged: ${OFFICIAL_PKG_NAME} (sha256=${OFFICIAL_HASH})"
 
-# ---- Two clean clones + submodules (REQUIRED) ----
+# Official .asc: EVIDENCE ONLY (gpg --verify in the compare container, keys from the tag). Never fatal.
+OFFICIAL_SIG="${execution_dir}/${OFFICIAL_PKG_NAME}.asc"
+if [[ -n "$OFFICIAL_BINARY" && -f "${OFFICIAL_BINARY}.asc" ]]; then
+    cp "${OFFICIAL_BINARY}.asc" "$OFFICIAL_SIG"
+elif curl -fsSL -o "$OFFICIAL_SIG" \
+        "https://github.com/bisq-network/bisq/releases/download/${BISQ_VERSION}/${OFFICIAL_PKG_NAME}.asc"; then
+    log_info "Official detached signature staged: ${OFFICIAL_PKG_NAME}.asc (evidence only)"
+else
+    rm -f "$OFFICIAL_SIG"
+    log_warn "No detached signature fetched for ${OFFICIAL_PKG_NAME} (evidence only; continuing)"
+fi
+
+# ---- One network clone, A/B = local clones of it (hardlinked objects, own .git, origin reset), submodules each ----
+SRC_BASE="${WORK_DIR}/src-base"
+log_info "cloning ${REPO_URL} once (full git output shown)..."
+git clone "$REPO_URL" "$SRC_BASE" \
+  || ftbfs_die "git clone failed (base)."
 clone_checkout() {  # dest label
     local dest="$1" label="$2"
-    log_info "[$label] cloning + checkout ${BISQ_VERSION} (full git output shown)..."
-    git clone "$REPO_URL" "$dest" \
-      || { write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "git clone failed ($label)."; die "git clone failed ($label)"; }
+    log_info "[$label] local clone + checkout ${BISQ_VERSION} (full git output shown)..."
+    git clone "$SRC_BASE" "$dest" \
+      || ftbfs_die "git clone failed ($label)."
+    git -C "$dest" remote set-url origin "$REPO_URL"
     git -C "$dest" checkout "$BISQ_VERSION" \
-      || { write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "git checkout ${BISQ_VERSION} failed ($label)."; die "git checkout failed ($label)"; }
+      || ftbfs_die "git checkout ${BISQ_VERSION} failed ($label)."
     git -C "$dest" submodule update --init --recursive \
-      || { write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "Submodule init failed ($label); upstream requires submodules."; die "submodule init failed ($label)"; }
+      || ftbfs_die "Submodule init failed ($label); upstream requires submodules."
     log_success "[$label] $(git -C "$dest" describe --tags 2>/dev/null || echo "$BISQ_VERSION") + submodules"
 }
 clone_checkout "$SRC_A" "A"
 clone_checkout "$SRC_B" "B"
+rm -rf "$SRC_BASE"
 
-# v1.10.4+ rewrote packaging: dedicated :desktop:deb / :desktop:rpm tasks replace the old
-# generateInstallers (which now hard-fails for DEB/RPM, breaking verifyInstallerEvidenceBundle),
-# and installers land in desktop/build/packaging instead of .../jpackage/packages. Detect per tag.
+# Pre-1.10 tags never shipped docker/release-builder/linux/Dockerfile; detect per tag, no hardcoded cutoff.
+UPSTREAM_DOCKERDIR="${SRC_A}/docker/release-builder/linux"
+LEGACY_TOOLCHAIN=false
+if [[ ! -f "${UPSTREAM_DOCKERDIR}/Dockerfile" ]]; then
+    LEGACY_TOOLCHAIN=true
+    IMAGE_NAME="bisq1-legacy-builder:zulu-11-17-v1"
+    log_warn "No release-builder Dockerfile at ${BISQ_VERSION} (pre-1.10) -- using legacy Zulu 11/17 toolchain."
+fi
+
+# v1.10.4+ packaging rewrite (:desktop:deb/:desktop:rpm, output in desktop/build/packaging): detect per tag.
 NEW_PACKAGING=false
-if grep -qs 'DebJpackageTask' "${SRC_A}/build-logic/packaging/src/main/kotlin/bisq/gradle/packaging/PackagingPlugin.kt"; then
+if [[ "$LEGACY_TOOLCHAIN" == "true" ]]; then
+    log_info "Packaging: pre-1.10 layout (generateInstallers, JDK17 jpackage)"
+elif grep -qs 'DebJpackageTask' "${SRC_A}/build-logic/packaging/src/main/kotlin/bisq/gradle/packaging/PackagingPlugin.kt"; then
     NEW_PACKAGING=true
     log_info "Packaging: v1.10.4+ layout (:desktop:${BISQ_TYPE} task; output desktop/build/packaging)"
 else
     log_info "Packaging: pre-1.10.4 layout (generateInstallers via verifyInstallerEvidenceBundle)"
 fi
 
-UPSTREAM_DOCKERDIR="${SRC_A}/docker/release-builder/linux"
-if [[ ! -f "${UPSTREAM_DOCKERDIR}/Dockerfile" ]]; then
-    write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "No docker/release-builder/linux/Dockerfile at ${BISQ_VERSION} (pre-1.10? use v0.3.5 script)."
-    die "release-builder Dockerfile absent at ${BISQ_VERSION}"
+# JDK the tag's own recipe pins (base image tag of docker/release-builder/linux/Dockerfile); evidence only.
+RECIPE_JDK_PIN="n/a (legacy toolchain)"
+if [[ "$LEGACY_TOOLCHAIN" != "true" ]]; then
+    RECIPE_JDK_PIN="$(sed -n 's/^FROM .*azul\/zulu-openjdk:\([^@ ]*\).*/\1/p' "${UPSTREAM_DOCKERDIR}/Dockerfile" | head -1)"
+    RECIPE_JDK_PIN="${RECIPE_JDK_PIN:-unknown}"
+    log_info "Recipe JDK pin (Dockerfile FROM): ${RECIPE_JDK_PIN}"
 fi
 
 if [[ -f "${SRC_A}/gradle/wrapper/gradle-wrapper.sha256" ]]; then
@@ -616,25 +601,59 @@ if [[ -f "${SRC_A}/gradle/wrapper/gradle-wrapper.sha256" ]]; then
         || log_warn "gradle-wrapper.sha256 check reported issues (continuing; note for report)"
 fi
 
-# ---- Build pinned image from the cloned repo's own Dockerfile (no drift) ----
-log_info "Building release-builder image from upstream Dockerfile..."
-CACHE_FLAG=""; [[ "$NO_CACHE" == "true" ]] && CACHE_FLAG="--no-cache"
-if ! docker build $CACHE_FLAG --pull=false --platform linux/amd64 \
-        -t "$IMAGE_NAME" "$UPSTREAM_DOCKERDIR" 2>&1 | tee "${execution_dir}/build-image.log"; then
-    write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "release-builder image build failed (see build-image.log)."
-    die "image build failed"
-fi
-log_success "Image built: $IMAGE_NAME"
+build_legacy_image() {  # cached tooling image for pre-1.10 tags
+    log_info "Building legacy pre-1.10 image (Ubuntu 22.04 + Zulu 11/17)..."
+    docker build $CACHE_FLAG -t "$IMAGE_NAME" - <<'LEGACYEOF'
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+      git wget ca-certificates ca-certificates-java gnupg xz-utils zstd \
+      binutils cpio fakeroot dpkg-dev rpm \
+ && wget -q https://cdn.azul.com/zulu/bin/zulu-repo_1.0.0-3_all.deb \
+ && dpkg -i zulu-repo_1.0.0-3_all.deb \
+ && apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 0xB1998361219BD9C9 \
+ && apt-get update -qq && apt-get install -y --no-install-recommends zulu11-jdk zulu17-jdk \
+ && rm -rf /var/lib/apt/lists/* zulu-repo_1.0.0-3_all.deb && update-ca-certificates \
+ && mkdir -p /usr/lib/jvm/zulu11/lib/security \
+ && touch /usr/lib/jvm/zulu11/lib/security/blacklisted.certs
+ENV GRADLE_OPTS="-Xmx4g -Dorg.gradle.daemon=false"
+LEGACYEOF
+}
 
-# ---- Run one clean build inside the image ----
-# v1.10.4+: run only :desktop:${BISQ_TYPE} (ONE type per run, so the upstream
-# deleteExistingInstallerArtifacts wipe — which deletes all .deb/.rpm before each package task —
-# can never hit us; the deb+rpm-in-one-invocation trap does not apply). verifyInstallerEvidenceBundle
-# is skipped: at v1.10.4+ it dependsOn generateInstallerManifest -> generateInstallers, which
-# hard-fails for DEB/RPM. Our own A/B + official sha256 comparison does not need it.
+# ---- Build image: upstream's own Dockerfile (>=1.10) or the cached legacy image (pre-1.10) ----
+CACHE_FLAG=""; [[ "$NO_CACHE" == "true" ]] && CACHE_FLAG="--no-cache"
+if [[ "$LEGACY_TOOLCHAIN" == "true" ]]; then
+    if [[ "$NO_CACHE" == "true" ]] || ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+        build_legacy_image || ftbfs_die "legacy image build failed."
+    fi
+else
+    log_info "Building release-builder image from upstream Dockerfile..."
+    if ! docker build $CACHE_FLAG --pull=false --platform linux/amd64 \
+            -t "$IMAGE_NAME" "$UPSTREAM_DOCKERDIR" 2>&1 | tee "${execution_dir}/build-image.log"; then
+        ftbfs_die "release-builder image build failed (see build-image.log)."
+    fi
+fi
+log_success "Image ready: $IMAGE_NAME"
+
+# ---- Run one clean build inside the image (1.10.4+: only :desktop:${BISQ_TYPE}, see header) ----
 gradle_build() {  # srcdir containername logfile label
     local src="$1" cname="$2" logf="$3" label="$4"
     local rmflag="--rm"; [[ "$KEEP_CONTAINER" == "true" ]] && rmflag=""
+    if [[ "$LEGACY_TOOLCHAIN" == "true" ]]; then
+        # Pre-1.10: two-phase build, JDK 11 compile then JDK 17 jpackage (no single-JDK recipe existed).
+        log_info "[$label] building legacy (JDK11 build + JDK17 jpackage; 20-40 min)..."
+        set +e
+        docker run $rmflag $DOCKER_RUN_EXTRA --platform linux/amd64 --user "$(id -u):$(id -g)" \
+            -v "${src}":/workspace -w /workspace --name "$cname" "$IMAGE_NAME" bash -c '
+                export JAVA_HOME=/usr/lib/jvm/zulu11 PATH="$JAVA_HOME/bin:$PATH"
+                ./gradlew --no-daemon clean build -x test || exit $?
+                export JAVA_HOME=/usr/lib/jvm/zulu17 PATH="$JAVA_HOME/bin:$PATH"
+                ./gradlew --no-daemon desktop:generateInstallers --rerun-tasks
+            ' 2>&1 | tee "$logf"
+        local rc=${PIPESTATUS[0]}
+        set -e
+        return $rc
+    fi
     local -a tasks
     if [[ "$NEW_PACKAGING" == "true" ]]; then
         tasks=(clean verifyReleaseBuild ":desktop:${BISQ_TYPE}")
@@ -643,7 +662,7 @@ gradle_build() {  # srcdir containername logfile label
     fi
     log_info "[$label] building (./gradlew ${tasks[*]}; 8-15 min)..."
     set +e
-    docker run $rmflag --platform linux/amd64 --user "$(id -u):$(id -g)" \
+    docker run $rmflag $DOCKER_RUN_EXTRA --platform linux/amd64 --user "$(id -u):$(id -g)" \
         -v "${src}":/workspace -w /workspace \
         --name "$cname" \
         "$IMAGE_NAME" \
@@ -654,13 +673,11 @@ gradle_build() {  # srcdir containername logfile label
 }
 
 if ! gradle_build "$SRC_A" "$CONTAINER_A" "${execution_dir}/build-a.log" "A"; then
-    write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "Build A failed (see build-a.log)."
-    die "build A failed"
+    ftbfs_die "Build A failed (see build-a.log)."
 fi
 log_success "Build A complete"
 if ! gradle_build "$SRC_B" "$CONTAINER_B" "${execution_dir}/build-b.log" "B"; then
-    write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "Build B failed (see build-b.log)."
-    die "build B failed"
+    ftbfs_die "Build B failed (see build-b.log)."
 fi
 log_success "Build B complete"
 
@@ -676,7 +693,7 @@ find_pkg() {  # srcdir
     fi
 }
 A_PKG="$(find_pkg "$SRC_A")"; B_PKG="$(find_pkg "$SRC_B")"
-[[ -n "$A_PKG" && -n "$B_PKG" ]] || { write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "rebuilt .${BISQ_TYPE} not found in one or both builds."; die "rebuilt installer missing"; }
+[[ -n "$A_PKG" && -n "$B_PKG" ]] || ftbfs_die "rebuilt .${BISQ_TYPE} not found in one or both builds."
 
 # Preserve artifacts + upstream evidence bundles (for inspection + the report)
 mkdir -p "$ARTIFACTS_DIR/build-a" "$ARTIFACTS_DIR/build-b"
@@ -792,18 +809,57 @@ fi
 echo "" >> "$DETAIL"
 echo "payload_diff_vs_official: $PAYLOAD_DIFF" >> "$DETAIL"
 
+# ---- Evidence: bundled JDK (jlink runtime) vs the tag's recipe pin; root cause of every 1.10.x mismatch (bisq#7930) ----
+runtime_release() {  # extracted-tree -> "JAVA_VERSION=.. JAVA_RUNTIME_VERSION=.. IMPLEMENTOR_VERSION=.."
+    local f="$1/opt/bisq/lib/runtime/release"
+    [[ -f "$f" ]] || { echo "unknown (no opt/bisq/lib/runtime/release)"; return 0; }
+    grep -E '^(JAVA_VERSION|JAVA_RUNTIME_VERSION|IMPLEMENTOR_VERSION)=' "$f" | tr -d '"' | paste -sd' '
+}
+java_version_of() { sed -n 's/.*\bJAVA_VERSION=\([^ ]*\).*/\1/p' <<< "$1"; }
+OFF_RT="$(runtime_release "$EXO")"; BLT_RT="$(runtime_release "$EXB")"
+OFF_JV="$(java_version_of "$OFF_RT")"; BLT_JV="$(java_version_of "$BLT_RT")"
+{
+  echo ""
+  echo "--- bundled JDK evidence (opt/bisq/lib/runtime/release) ---"
+  echo "bundled_runtime_official: $OFF_RT"
+  echo "bundled_runtime_built:    $BLT_RT"
+  echo "recipe_jdk_pin (Dockerfile FROM at the tag): ${RECIPE_JDK_PIN:-unknown}"
+} | tee -a "$DETAIL"
+JDK_NOTE=""
+if [[ -n "$OFF_JV" && -n "$BLT_JV" && "$OFF_JV" != "$BLT_JV" ]]; then
+    JDK_NOTE="Bundled JDK differs: official ${OFF_JV} vs rebuilt ${BLT_JV} (tag's Dockerfile pins ${RECIPE_JDK_PIN:-unknown}); same pattern as bisq#7930."
+fi
+
+# ---- Evidence: official .asc vs keys shipped in desktop/package/ of the tag (NOT a verdict input) ----
+SIG_STATUS="unchecked (no .asc staged)"
+if [[ -f "$OFFICIAL.asc" ]]; then
+    export GNUPGHOME=/tmp/gnupg; rm -rf "$GNUPGHOME"; mkdir -p -m 700 "$GNUPGHOME"
+    gpg --batch --quiet --import /keys/*.asc >/dev/null 2>&1 || true
+    if gpg --batch --verify "$OFFICIAL.asc" "$OFFICIAL" > /tmp/gpg-verify.txt 2>&1; then
+        SIG_STATUS="good ($(sed -n 's/.*using [A-Z]* key \([0-9A-F]*\).*/\1/p' /tmp/gpg-verify.txt | head -1))"
+        grep -q 'key has expired' /tmp/gpg-verify.txt && SIG_STATUS="${SIG_STATUS}, signing key EXPIRED"
+    else
+        SIG_STATUS="BAD or key not in desktop/package/*.asc (see comparison-detail.txt)"
+    fi
+    { echo ""; echo "--- official installer signature (gpg --verify, keys: desktop/package/*.asc from the tag) ---"; cat /tmp/gpg-verify.txt; } >> "$DETAIL"
+fi
+echo "official_signature: $SIG_STATUS" | tee -a "$DETAIL"
+
 # ---- MECHANICAL verdict: outer hash only (WS policy). reproducible iff A==official AND A==B. ----
 DET_NOTE="A/B determinism: $([[ "$DETERMINISTIC" == yes ]] && echo "build is deterministic (A==B)" || echo "BUILD IS NON-DETERMINISTIC (A!=B)")."
 if [[ "$BISQ_TYPE" == deb ]]; then HINT_TOOL="dpkg-deb -R"; else HINT_TOOL="rpm2cpio"; fi
 case "$PAYLOAD_DIFF" in
-  none)    CLASS_HINT="CLASSIFICATION HINT: extracted payload + modes/symlinks are IDENTICAL to official ($HINT_TOOL); the only differences are ${BISQ_TYPE} packaging/compression metadata. Candidate for human label 'reproducible_with_packaging_noise' per review-notes/reproducibility-heuristics-packaged-artifacts.md." ;;
-  present) CLASS_HINT="CLASSIFICATION HINT: real payload differences vs official exist (see comparison-detail.txt). Genuine non-reproducibility." ;;
-  *)       CLASS_HINT="CLASSIFICATION HINT: payload classification unavailable (extraction failed); see comparison-detail.txt." ;;
+  none)    CLASS_HINT="CLASSIFICATION HINT: payload + modes/symlinks IDENTICAL to official ($HINT_TOOL); only ${BISQ_TYPE} packaging metadata differs. Candidate for 'reproducible_with_packaging_noise' (see reproducibility-heuristics-packaged-artifacts.md)." ;;
+  present) CLASS_HINT="CLASSIFICATION HINT: real payload diffs vs official; genuine non-reproducibility (see comparison-detail.txt).${JDK_NOTE:+ ${JDK_NOTE}}" ;;
+  *)       CLASS_HINT="CLASSIFICATION HINT: classification unavailable (extraction failed); see comparison-detail.txt." ;;
 esac
 
-COMMON_NOTE="Bisq 1 ${BISQ_VERSION} ${BISQ_TYPE} built with the pinned upstream release-builder image (azul/zulu-openjdk:21.0.6) from the tag's own docker/release-builder/linux/Dockerfile.
+TOOLCHAIN_NOTE="the pinned release-builder image (azul/zulu-openjdk:21.0.6, its own docker/release-builder Dockerfile)"
+[[ "${LEGACY_TOOLCHAIN:-false}" == "true" ]] && TOOLCHAIN_NOTE="a legacy Ubuntu 22.04 + Zulu 11/17 image (JDK11 build, JDK17 jpackage; no release-builder Dockerfile pre-1.10)"
+COMMON_NOTE="Bisq 1 ${BISQ_VERSION} ${BISQ_TYPE} built with ${TOOLCHAIN_NOTE}.
 official_sha256=${OFF_H} build_a_sha256=${A_H} build_b_sha256=${B_H}.
-${DET_NOTE}"
+${DET_NOTE}
+Bundled JDK: official ${OFF_JV:-unknown}, rebuilt ${BLT_JV:-unknown}, recipe pin ${RECIPE_JDK_PIN:-unknown}. Official signature: ${SIG_STATUS}."
 
 if [[ "$MATCHES_OFFICIAL" == yes && "$DETERMINISTIC" == yes ]]; then
     emit_yaml reproducible "${COMMON_NOTE}
@@ -821,10 +877,12 @@ chmod +x "$VERIFY_SCRIPT"
 log_info "Comparing (A vs B determinism, A vs official + dpkg-deb -R evidence)..."
 RM_FLAG="--rm"; [[ "$KEEP_CONTAINER" == "true" ]] && RM_FLAG=""
 set +e
-docker run $RM_FLAG --platform linux/amd64 --user "$(id -u):$(id -g)" \
+docker run $RM_FLAG $DOCKER_RUN_EXTRA --platform linux/amd64 --user "$(id -u):$(id -g)" \
     -e BISQ_VERSION="$BISQ_VERSION" -e BISQ_TYPE="$BISQ_TYPE" \
     -e SCRIPT_VERSION="$SCRIPT_VERSION" -e OFFICIAL_PKG_NAME="$OFFICIAL_PKG_NAME" \
+    -e LEGACY_TOOLCHAIN="$LEGACY_TOOLCHAIN" -e RECIPE_JDK_PIN="$RECIPE_JDK_PIN" \
     -v "${execution_dir}":/output \
+    -v "${SRC_A}/desktop/package":/keys:ro \
     -v "${A_PKG}":/a:ro -v "${B_PKG}":/b:ro \
     -v "${VERIFY_SCRIPT}":/verify/verify-compare.sh:ro \
     --name "$CONTAINER_CMP" \
@@ -834,8 +892,7 @@ set -e
 
 # ---- Results ----
 if [[ ! -f "${execution_dir}/COMPARISON_RESULTS.yaml" ]]; then
-    write_yaml "${execution_dir}/COMPARISON_RESULTS.yaml" ftbfs "Comparison produced no COMPARISON_RESULTS.yaml."
-    die "no YAML produced"
+    ftbfs_die "Comparison produced no COMPARISON_RESULTS.yaml."
 fi
 log_info ""
 log_info "======================================================"
