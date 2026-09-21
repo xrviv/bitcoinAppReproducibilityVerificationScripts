@@ -2,7 +2,7 @@
 # ==============================================================================
 # trezort_build.sh - Trezor Model T (T2T1) Firmware Reproducible Build Verification
 # ==============================================================================
-# Version:           v0.1.1
+# Version:           v0.1.2
 # Organization:      WalletScrutiny.com
 # Last modified by:  dannybuntu
 # Last modified on:  2026-09-21
@@ -41,7 +41,7 @@
 set -eE
 
 # ---- Globals (RESULTS_FILE captured before any cd) --------------------------
-SCRIPT_VERSION="v0.1.1"
+SCRIPT_VERSION="v0.1.2"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256=""
 RESULTS_FILE="$(pwd)/COMPARISON_RESULTS.yaml"
@@ -234,19 +234,21 @@ case "${firmwareType,,}" in
 esac
 
 # ---- Make --binary absolute; accept a file or a directory of files ----------
-# The build server passes a directory when an asset has several files; pick the one
-# matching this --type (…-bitcoinonly.bin for bitcoin-only, the plain .bin otherwise).
+# The build server passes a directory when an asset has several files; pick the file for
+# exactly this --version and --type (trezor-t2t1-X.Y.Z-bitcoinonly.bin or trezor-t2t1-X.Y.Z.bin),
+# so a directory holding several releases can never select the wrong one.
 if [[ -n "$BINARY_PATH" ]]; then
   [[ "$BINARY_PATH" != /* ]] && BINARY_PATH="$PWD/$BINARY_PATH"
   if [[ -d "$BINARY_PATH" ]]; then
     binDir="$BINARY_PATH"
     if [[ "$firmwareType" == "bitcoin-only" ]]; then
-      BINARY_PATH=$(find "$binDir" -maxdepth 1 -type f -name "trezor-${MODEL_LC}-*-bitcoinonly.bin" | sort | head -n1)
+      wantName="trezor-${MODEL_LC}-${normalizedVersion}-bitcoinonly.bin"
     else
-      BINARY_PATH=$(find "$binDir" -maxdepth 1 -type f -name "trezor-${MODEL_LC}-*.bin" ! -name "*-bitcoinonly.bin" | sort | head -n1)
+      wantName="trezor-${MODEL_LC}-${normalizedVersion}.bin"
     fi
-    if [[ -z "$BINARY_PATH" ]]; then
-      echo -e "${RED}Error: no trezor-${MODEL_LC}-*.bin matching --type ${firmwareType} in directory: $binDir${NC}"
+    BINARY_PATH="${binDir%/}/${wantName}"
+    if [[ ! -f "$BINARY_PATH" ]]; then
+      echo -e "${RED}Error: ${wantName} (--version ${version}, --type ${firmwareType}) not found in directory: $binDir${NC}"
       exit "$EXIT_INVALID"
     fi
     echo "Selected from --binary directory: $BINARY_PATH"
@@ -373,12 +375,24 @@ build_firmware() {
   fi
   echo -e "${GREEN}Firmware built successfully${NC}"
 
-  # Fingerprint Trezor's tooling printed for this build (build/<commit>.fingerprints).
-  local fpKey fpFile
-  if [[ "$firmwareType" == "bitcoin-only" ]]; then fpKey="${MODEL_LC}_btconly"; else fpKey="${MODEL_LC}_universal"; fi
+  # Fingerprint Trezor's tooling printed for this build (build/<commit>.fingerprints). Match
+  # the edition's own artifact header ("# core-T2T1[-bitcoinonly]/firmware/...") and take the
+  # line right after it. Do not match by label: firmware-fingerprint.py labels by vendor-header
+  # text, and T2T1 uses the same "SatoshiLabs" header for both editions, so the bitcoin-only
+  # build is labelled t2t1_universal too. The value must be 64 hex characters.
+  local fpHeader fpFile
+  if [[ "$firmwareType" == "bitcoin-only" ]]; then
+    fpHeader="# core-${MODEL}-bitcoinonly/firmware/"
+  else
+    fpHeader="# core-${MODEL}/firmware/"
+  fi
   fpFile="build/${commit}.fingerprints"
-  builtFingerprint=$(grep -m1 "^${fpKey}:" "$fpFile" 2>/dev/null | cut -d: -f2- | tr -d ' ' || true)
-  [[ -n "$builtFingerprint" ]] || builtFingerprint="N/A"
+  builtFingerprint=$(awk -v h="$fpHeader" 'found { sub(/^[^:]*:/, ""); gsub(/[[:space:]]/, ""); print; exit }
+                                            index($0, h) == 1 { found = 1 }' "$fpFile" 2>/dev/null || true)
+  if [[ ! "$builtFingerprint" =~ ^[0-9a-f]{64}$ ]]; then
+    echo -e "${YELLOW}[WARN] Could not read this build's fingerprint from ${fpFile}; reporting N/A.${NC}"
+    builtFingerprint="N/A"
+  fi
 }
 
 compare_firmware() {
@@ -476,7 +490,7 @@ echo "                  official firmware as downloaded (signed) - publish this"
 echo "zeroedHash:     $officialZeroedHash"
 echo "                  official firmware with signature zeroed at offset ${seekSize}"
 echo "builtHash:      $builtHash"
-echo "                  built from source - must equal zeroedHash"
+echo "                  built from the tagged repository - must equal zeroedHash"
 echo "fingerprint:    $builtFingerprint"
 echo "                  Trezor firmware fingerprint of the build (shown on device)"
 echo "commit:         $commit"
@@ -495,7 +509,7 @@ echo "===== End Results ====="
 echo
 
 if [[ "$verdict" == "reproducible" ]]; then
-  write_results "reproducible" "${PRODUCT} v${version} (${firmwareType}) reproducible from source via build-docker.sh at core/v${normalizedVersion} (commit ${commit}); official firmware-header signature (offset ${seekSize}, 65B) zeroed before SHA-256 comparison."
+  write_results "reproducible" "${PRODUCT} v${version} (${firmwareType}) reproducible from the tagged repository via build-docker.sh at core/v${normalizedVersion} (commit ${commit}); official firmware-header signature (offset ${seekSize}, 65B) zeroed before SHA-256 comparison."
   echo
   echo "${PRODUCT} verification finished!"
   exit "$EXIT_OK"
