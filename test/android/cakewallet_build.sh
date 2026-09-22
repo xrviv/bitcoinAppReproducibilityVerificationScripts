@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # cakewallet_build.sh - Cake Wallet (Android) reproducible build verification
-# Version:          v0.1.1
+# Version:          v0.1.7
 # Organization:     WalletScrutiny.com
-# Last Modified:    2026-09-21
+# Last modified by: Daniel Garcia
+# Last modified on: 2026-09-22
 # App IDs:          com.cakewallet.cake_wallet (Cake Wallet), com.monero.app (Monero.com)
 # Project:          https://github.com/cake-tech/cake_wallet
 # Play Store:       https://play.google.com/store/apps/details?id=com.cakewallet.cake_wallet
@@ -32,7 +33,7 @@
 # of any kind. Review before running. Never run as root.
 # Exit codes: 0 = identical, 1 = difference or build failure, 2 = bad parameters.
 
-SCRIPT_VERSION="v0.1.1"
+SCRIPT_VERSION="v0.1.7"
 SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
 SCRIPT_HASH="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
 echo "cakewallet_build.sh $SCRIPT_VERSION sha256:${SCRIPT_HASH:-unknown}"
@@ -48,7 +49,7 @@ REGISTRY="ghcr.io/cake-tech/cake_wallet"
 # amd64 digest of the builder image named by Dockerfile.base at v6.4.5 (resolved 2026-09-21).
 # Other tags are pulled by name and their digest is printed; the pin only guards this one.
 PIN_TAG="debian13-flutter3.41.9-ndkr28-go1.24.1-ruststablenightly"
-PIN_DIGEST="sha256:e7d05577546aa8959e4865c13838458cfee8ce806ca961eb4307ed9479256e6e"
+PIN_DIGEST="sha256:e7d05577546aa8959e4865c13838458cfee8ce806ca961eb4307ed9479256e6e"   # amd64 manifest (index: b66e1503...)
 BUNDLETOOL_VERSION="1.18.3"
 BUNDLETOOL_SHA256="a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29"
 APKTOOL_URL="https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar"
@@ -148,9 +149,15 @@ if [[ -z "${CONTAINER_CMD:-}" ]]; then
   elif command -v docker &>/dev/null; then CONTAINER_CMD=docker
   else die_invalid "Neither podman nor docker found in PATH"; fi
 fi
-# The image expects root with HOME=/root (Flutter, SDK, rustup, Go live there). Under rootless
-# podman, container root is the invoking user, so bind-mounted files come out user-owned; under
-# docker they come out root-owned and are chowned in cleanup().
+# The image expects root with HOME=/root (Flutter, SDK, rustup, Go live there). Under a rootless
+# engine container root already is the invoking user, so cleanup() chowns to 0:0 (a chown to the
+# host uid would land in the subuid range and leave the tree unremovable); rootful engines get
+# the real host ids.
+OWNER_UID="$HOST_UID"; OWNER_GID="$HOST_GID"
+if { [[ "$CONTAINER_CMD" == podman ]] && [[ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" == true ]]; } \
+   || { [[ "$CONTAINER_CMD" == docker ]] && docker info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless; }; then
+  OWNER_UID=0; OWNER_GID=0
+fi
 MEM_LIMIT="${MEM_LIMIT-24g}"; MEM_ARGS=(); [[ -n "$MEM_LIMIT" ]] && MEM_ARGS=(--memory="$MEM_LIMIT")
 CACHE_ARGS=()
 if [[ -n "${CW_CACHE_DIR:-}" ]]; then
@@ -172,7 +179,8 @@ img_ctx="$(mktemp -d)"
 BUILD_IMAGE=""
 cleanup() {
   if [[ -n "$BUILD_IMAGE" ]] && $CONTAINER_CMD image inspect "$BUILD_IMAGE" >/dev/null 2>&1; then
-    $CONTAINER_CMD run --rm -v "${workspace}:/target" "$BUILD_IMAGE" sh -c "chown -R ${HOST_UID}:${HOST_GID} /target" >/dev/null 2>&1 \
+    $CONTAINER_CMD run --rm -v "${workspace}:/target" "${CACHE_ARGS[@]}" "$BUILD_IMAGE" \
+      sh -c "chown -R ${OWNER_UID}:${OWNER_GID} /target ${CW_CACHE_DIR:+/root/.gradle /root/.pub-cache}" >/dev/null 2>&1 \
       || log_warn "Could not normalise ownership for ${workspace}"
   fi
   rm -rf "$img_ctx" 2>/dev/null
@@ -198,12 +206,13 @@ if ! $CONTAINER_CMD pull --platform linux/amd64 "${REGISTRY}:${PIN_TAG}" >/dev/n
   fail 1 "Could not pull the upstream builder image ${REGISTRY}:${PIN_TAG}."
 fi
 BUILD_IMAGE="${REGISTRY}:${PIN_TAG}"
-digest_of() { $CONTAINER_CMD image inspect --format '{{index .RepoDigests 0}}' "$1" 2>/dev/null | sed 's/.*@//'; }
-img_digest="$(digest_of "$BUILD_IMAGE")"
-echo "  image digest: ${img_digest:-unknown}"
-if [[ -n "$img_digest" && "$img_digest" != "$PIN_DIGEST" ]]; then
-  # podman/docker may report the index digest instead of the platform manifest; record, do not stop.
-  log_warn "Digest differs from the pinned amd64 manifest ${PIN_DIGEST} (index digests differ from platform digests; the value above is recorded)"
+digest_of() { $CONTAINER_CMD image inspect --format '{{range .RepoDigests}}{{.}} {{end}}' "$1" 2>/dev/null | sed 's/[^ ]*@//g; s/ *$//'; }
+# RepoDigests lists the OCI index and the platform manifest; the pin is the amd64 manifest.
+img_digests="$(digest_of "$BUILD_IMAGE")"
+img_digest="$(tr ' ' '\n' <<<"$img_digests" | grep -x "$PIN_DIGEST" || tr ' ' '\n' <<<"$img_digests" | grep . | head -1)"
+echo "  image digest: ${img_digest:-unknown}  (RepoDigests: ${img_digests:-none})"
+if [[ -n "$img_digests" && "$img_digest" != "$PIN_DIGEST" ]]; then
+  log_warn "Pinned amd64 manifest ${PIN_DIGEST} is not among the image's RepoDigests; the value above is recorded"
 fi
 
 cat > "${img_ctx}/meta.sh" <<'META_END'
@@ -240,6 +249,8 @@ if ! crun "${OFF_MOUNT[@]}" -v "${META_DIR}:/output" -v "${img_ctx}/meta.sh:/met
 fi
 main_line="$(grep "^$(basename "$apk_main")|" "${META_DIR}/apks.txt" | head -1)"
 IFS='|' read -r _ pkg_id wallet_version version_code main_split main_abis min_sdk signer _ _ official_agp _ official_engine <<<"$main_line"
+# A Play base.apk carries no libflutter.so; take the engine hash from whichever split has one.
+[[ -z "$official_engine" ]] && official_engine="$(awk -F'|' '$13 != "" {print $13; exit}' "${META_DIR}/apks.txt")"
 app_hash="$(sha256of "$apk_main")"
 case "$pkg_id" in
   com.cakewallet.cake_wallet) APP_TYPE="cakewallet"; APP_LABEL="Cake Wallet";;
@@ -353,8 +364,20 @@ cat > "${img_ctx}/build.sh" <<'BUILD_END'
 set -o pipefail
 APP_TYPE="$1"; BUILD_KIND="$2"; DEPS_MODE="$3"; BUILD_ABI="$4"
 L=/output/build.log
-run() { echo "=== $* === $(date)"; "$@" >> "$L" 2>&1 || { echo "FATAL: '$*' failed - tail of $L:"; tail -30 "$L"; exit 3; }; }
+# A step is retried (3x, 60 s apart) only when its log tail shows a network failure: the pub
+# tree pulls ~40 git-hosted packages straight from GitHub (pubspec_overrides.yaml), which 504s.
+# Working-tree changes are attributed to the upstream step that made them (first 20 per step).
+TREE_PREV=""
+tree_note() { local now; now="$(git -C /w status --porcelain 2>/dev/null | sort)"
+  comm -13 <(printf '%s\n' "$TREE_PREV") <(printf '%s\n' "$now") | grep . | head -20 | while IFS= read -r l; do printf '  tree: %s  (by %s)\n' "$l" "$1"; done
+  comm -23 <(printf '%s\n' "$TREE_PREV") <(printf '%s\n' "$now") | grep . | head -20 | while IFS= read -r l; do printf '  tree: %s  (back to HEAD by %s)\n' "$l" "$1"; done; TREE_PREV="$now"; }
+run() { local n=1; echo "=== $* === $(date)"
+  until "$@" >> "$L" 2>&1; do
+    if (( n < 3 )) && tail -40 "$L" | grep -qE 'RPC failed|HTTP/?[0-9.]* 5[0-9][0-9]|Could not resolve host|Connection (timed out|reset|refused)|Failed to update packages|Could not (GET|HEAD|resolve)|TLS handshake'; then
+      echo "  attempt $n failed on a network error - retrying in 60 s"; n=$((n+1)); sleep 60; continue; fi
+    echo "FATAL: '$*' failed - tail of $L:"; tail -30 "$L"; exit 3; done; tree_note "$(printf '%s ' "${@:1:3}")"; }
 cd /w || exit 2
+tree_note "checkout + native-deps extraction"
 export MAKE_JOB_COUNT="${MAKE_JOB_COUNT:-$(nproc)}"
 echo "=== Toolchain ==="
 flutter --version 2>/dev/null | head -2 | sed 's/^/  /'
@@ -393,13 +416,19 @@ for kv in salt:32 keychainSalt:24 key:32 walletSalt:8 shortKey:24 backupSalt:16 
   sed -i -E "s/\"${kv%%:*}\": \"[0-9a-f]+\"/\"${kv%%:*}\": \"${z}\"/" tool/.secrets-config.json
 done
 run dart run tool/import_secrets_config.dart
+# import_secrets_config.dart reads tool/.bitcoin-secrets-config.json but never writes
+# cw_bitcoin/lib/.secrets.g.dart (also on dev); CI writes that const by hand, so do we.
+echo "const breezApiKey = '';" > cw_bitcoin/lib/.secrets.g.dart
 echo "  secrets: placeholder salts (all-zero hex of the upstream lengths), API keys empty -> lib/.secrets.g.dart $(wc -l < lib/.secrets.g.dart) consts"
+for p in $(grep -rhoE "package:cw_[a-z_]+/\.secrets\.g\.dart" --include='*.dart' lib cw_* | sed -E 's|package:(cw_[a-z_]+)/.*|\1|' | sort -u); do
+  [[ -f "$p/lib/.secrets.g.dart" ]] || { echo "FATAL: $p/lib/.secrets.g.dart is imported but was not generated"; exit 3; }
+done
 # CI compiles res/pictures/*.svg into assets/new-ui/*.svg.vec (632 in the 6.4.5 APK); the
 # ANDROID.md recipe omits this step.
 run ./compile_graphics.sh
 echo "  svg.vec compiled: $(find assets/new-ui -name '*.svg.vec' | wc -l)"
 echo "=== Working tree vs HEAD before flutter build (generated files expected) ==="
-git status --porcelain > /output/tree-status.txt; wc -l < /output/tree-status.txt | sed 's/^/  changed+untracked paths: /' ; echo "  (list: built/tree-status.txt)"
+git status --porcelain > /output/tree-status.txt; wc -l < /output/tree-status.txt | sed 's/^/  changed+untracked paths: /' ; echo "  (attributed above per step; list: built/tree-status.txt)"
 case "$BUILD_KIND" in
   split-per-abi) run flutter build apk --release --split-per-abi; out="build/app/outputs/flutter-apk/app-${BUILD_ABI}-release.apk";;
   fat)           run flutter build apk --release; out="build/app/outputs/flutter-apk/app-release.apk";;
@@ -427,12 +456,13 @@ if [[ "$mode" == "splits" ]]; then
   section "Rendering the app bundle with bundletool ${BUNDLETOOL_VERSION}"
   ABIS=(); DEN=""; LOCS=()
   for f in "${OFFICIAL[@]}"; do
-    c="$(basename "$f")"; c="${c#split_config.}"; c="${c%.apk}"
+    c="$(basename "$f" .apk)"; c="${c#split_config.}"
     case "$c" in
-      base.apk) ;;
-      arm64_v8a|armeabi_v7a|x86_64|x86) ABIS+=("${c//_/-}") ;;
+      base) ;;
+      arm64_v8a) ABIS+=(arm64-v8a) ;; armeabi_v7a) ABIS+=(armeabi-v7a) ;; x86_64|x86|armeabi) ABIS+=("$c") ;;
       ldpi) DEN=120;; mdpi) DEN=160;; tvdpi) DEN=213;; hdpi) DEN=240;; xhdpi) DEN=320;; xxhdpi) DEN=480;; xxxhdpi) DEN=640;;
-      *) LOCS+=("$c") ;;
+      [a-z][a-z]|[a-z][a-z][a-z]) LOCS+=("$c") ;;
+      *) log_warn "Unknown config split '${c}' ($(basename "$f")); it will stay unmatched" ;;
     esac
   done
   [[ ${#ABIS[@]} -eq 0 ]] && ABIS=("arm64-v8a"); [[ -z "$DEN" ]] && DEN=480; [[ ${#LOCS[@]} -eq 0 ]] && LOCS=("en")
@@ -466,6 +496,8 @@ if [[ "$mode" == "splits" ]]; then
     for o in /official/*.apk; do co=$(cfg "$o"); m=""
       for b in /out/rendered/splits/*.apk; do [[ "$(cfg "$b")" == "$co" ]] && { m="$b"; break; }; done
       echo "$(basename "$o")|${co:-base}|${m:+rendered/splits/$(basename "$m")}"; done' > "${OUT_DIR}/pairs.txt" 2>/dev/null
+  prc=$?; [[ $prc -eq 0 && "$(grep -c . "${OUT_DIR}/pairs.txt")" -eq ${#OFFICIAL[@]} ]] \
+    || fail 1 "Pairing official and rendered splits failed (exit ${prc}). Official artifact SHA-256: ${app_hash}."
   while IFS='|' read -r o c b; do
     if [[ -n "$b" ]]; then PAIRS+=("${OFFICIAL_DIR}/${o}|${OUT_DIR}/${b}"); echo "  ${o} (split '${c}') <-> ${b}"
     else log_warn "No rendered counterpart for ${o} (split '${c}') -> counted as a difference"; PAIRS+=("${OFFICIAL_DIR}/${o}|"); fi
@@ -476,6 +508,8 @@ else
   PAIRS+=("${apk_main}|${built_apk}")
 fi
 
+# Every official APK must enter the comparison; an empty or short pair list must never read as "reproducible".
+[[ ${#PAIRS[@]} -eq ${#OFFICIAL[@]} && ${#PAIRS[@]} -gt 0 ]] || fail 1 "Only ${#PAIRS[@]} of ${#OFFICIAL[@]} official APK(s) paired. Official artifact SHA-256: ${app_hash}."
 phase "PHASE 3: COMPARISON"
 # Every raw diff must be EARNED by a class with printed evidence: signing entries, Play
 # SourceStamp, Play manifest meta-data, or an apktool-decoded-identical resources.arsc.
@@ -491,10 +525,21 @@ if [[ ! -f apktool.jar ]]; then
 fi
 echo "${APKTOOL_SHA256}  apktool.jar" | sha256sum -c - >/dev/null 2>&1 && APKTOOL="java -jar /tools/apktool.jar" || APKTOOL=""
 rm -rf /tmp/o /tmp/b; mkdir -p /tmp/o /tmp/b /tmp/afw
-unzip -q -o "$o" -d /tmp/o; unzip -q -o "$b" -d /tmp/b
+# A failed unzip, diff or decode must never read as "no differences" (exit before the summary -> host fails).
+unzip -q -o "$o" -d /tmp/o; r1=$?; unzip -q -o "$b" -d /tmp/b; r2=$?
+(( r1 < 2 && r2 < 2 )) && [[ -n $(find /tmp/o -type f -print -quit) && -n $(find /tmp/b -type f -print -quit) ]] || { echo "FATAL: unzip failed ($tag: $r1/$r2)"; exit 3; }
 echo "  official: $(sha256sum "$o" | cut -c1-64)  ($(find /tmp/o -type f | wc -l) entries)"
 echo "  built:    $(sha256sum "$b" | cut -c1-64)  ($(find /tmp/b -type f | wc -l) entries)"
-raw="$(diff -rq /tmp/o /tmp/b 2>/dev/null)"; printf '%s\n' "$raw" > "$out/diff_${tag}.txt"
+# diff -rq reports a one-sided directory as one line and a one-sided file as "Only in <dir>: <name>";
+# normalise every one-sided entry to "Only in /tmp/o|b: <path from the APK root>" so files are judged by name.
+expand_dirs() { while IFS= read -r l; do
+  if [[ "$l" =~ ^Only\ in\ (/tmp/[ob])(/[^:]*)?:\ (.*)$ ]]; then
+    r="${BASH_REMATCH[1]}"; d="${BASH_REMATCH[2]#/}"; p="${d:+$d/}${BASH_REMATCH[3]}"
+    if [[ -d "$r/$p" ]]; then (cd "$r" && find "$p" -type f | sort | sed "s|^|Only in $r: |"); else printf 'Only in %s: %s\n' "$r" "$p"; fi
+    continue; fi
+  printf '%s\n' "$l"; done; }
+raw="$(diff -rq /tmp/o /tmp/b)"; rc=$?; (( rc < 2 )) || { echo "FATAL: diff failed ($tag: rc $rc)"; exit 3; }
+raw="$(expand_dirs <<<"$raw")" || { echo "FATAL: expand_dirs failed ($tag)"; exit 3; }; printf '%s\n' "$raw" > "$out/diff_${tag}.txt"
 n=$(printf '%s\n' "$raw" | grep -vc '^$')
 # Native library evidence: compiler stamp and Go version per differing .so (both sides).
 : > "$out/native_${tag}.txt"
@@ -507,24 +552,35 @@ while IFS= read -r so; do
     gv="$(strings "$f" | grep -oE '^go1\.[0-9]+(\.[0-9]+)?' | head -1)"
     gp="$(strings "$f" | grep -oE '^/(opt/homebrew|Users|home|root|w|__w|build|tmp)/[^ ]*' | head -1 | cut -c1-60)"
     echo "$rel [$side] $(stat -c%s "$f") B; ${cc:-no .comment}; ${gv:-no Go}; ${gp:-no build path}" >> "$out/native_${tag}.txt"; done
+  if [[ -f "/tmp/b/$rel" && "$(stat -c%s "$so")" == "$(stat -c%s "/tmp/b/$rel")" ]]; then
+    echo "$rel same size, differing bytes: $(cmp -l "$so" "/tmp/b/$rel" 2>/dev/null | wc -l) of $(stat -c%s "$so")" >> "$out/native_${tag}.txt"; fi
 done < <(find /tmp/o -name '*.so' -type f | sort)
 dx="$(cd /tmp/o && ls classes*.dex 2>/dev/null | while read -r f; do cmp -s "$f" "/tmp/b/$f" || printf '%s ' "$f"; done)"
 la="$(f=$(find /tmp/o -name libapp.so | head -1); [[ -n "$f" ]] && { cmp -s "$f" "/tmp/b/${f#/tmp/o/}" && echo IDENTICAL || echo DIFFERS; })"
 fa="$(diff -rq /tmp/o/assets/flutter_assets /tmp/b/assets/flutter_assets 2>/dev/null | grep -vc '^$')"
 echo "  native libs ${nsm}/${nso} identical; dex differing: ${dx:-none}; libapp.so (Dart AOT): ${la:-absent}; flutter_assets diffs: ${fa:-0}"
+nz=assets/flutter_assets/NOTICES.Z   # zlib-compressed licence text of the resolved pub packages
+if [[ -f /tmp/o/$nz && -f /tmp/b/$nz ]] && ! cmp -s /tmp/o/$nz /tmp/b/$nz; then
+  unz() { python3 -c 'import sys,zlib;sys.stdout.buffer.write(zlib.decompress(open(sys.argv[1],"rb").read()))' "$1" 2>/dev/null || { printf '\x1f\x8b\x08\0\0\0\0\0' | cat - "$1" | gzip -dc 2>/dev/null; }; }
+  diff <(unz /tmp/o/$nz) <(unz /tmp/b/$nz) > "$out/diff_notices_${tag}.txt"
+  echo "  NOTICES.Z (resolved packages' licences) differs: $(grep -c '^[<>]' "$out/diff_notices_${tag}.txt") lines, first: $(grep -m1 '^[<>]' "$out/diff_notices_${tag}.txt" | cut -c1-70)"
+fi
 [[ -s "$out/native_${tag}.txt" ]] && { echo "  native evidence (first lines; full: native_${tag}.txt):"; head -4 "$out/native_${tag}.txt" | sed 's/^/    /'; }
 # Earned classes
-c_sign=$(printf '%s\n' "$raw" | grep -cE 'META-INF/[^/ ]+\.(SF|RSA|DSA|EC)( |$)|META-INF/MANIFEST\.MF( |$)')
-c_stamp=$(printf '%s\n' "$raw" | grep -c 'stamp-cert-sha256'); c_mani=$(printf '%s\n' "$raw" | grep -c 'AndroidManifest\.xml'); c_arsc=$(printf '%s\n' "$raw" | grep -c 'resources\.arsc')
+# Root-level signature files only: anchored to the APK root ("Only in /tmp/x: META-INF/..." or "/tmp/x/META-INF/...").
+c_sign=$(printf '%s\n' "$raw" | grep -cE '(: |/tmp/[ob]/)META-INF/[^/ ]+\.(SF|RSA|DSA|EC)( |$)|(: |/tmp/[ob]/)META-INF/MANIFEST\.MF( |$)')
+# Root files only: a nested stamp/manifest/arsc stays material.
+c_stamp=$(grep -cx 'Only in /tmp/o: stamp-cert-sha256' <<<"$raw"); c_mani=$(grep -c '^Files /tmp/o/AndroidManifest\.xml ' <<<"$raw"); c_arsc=$(grep -c '^Files /tmp/o/resources\.arsc ' <<<"$raw")
 a_sign=$c_sign; a_stamp=0; a_mani=0; a_arsc=0
 [[ $c_sign -gt 0 ]] && echo "      signing: ${c_sign} META-INF signature entr(ies) - vendor key vs our throwaway key"
 if [[ $c_stamp -gt 0 ]]; then
-  if [[ ! -e /tmp/b/stamp-cert-sha256 && "$(stat -c%s /tmp/o/stamp-cert-sha256 2>/dev/null)" == "32" ]] && "$BT/apksigner" verify --verbose "$o" 2>/dev/null | grep -q 'Verified for SourceStamp: true'; then
+  if [[ ! -e /tmp/b/stamp-cert-sha256 && "$(stat -c%s /tmp/o/stamp-cert-sha256 2>/dev/null)" == "32" ]] && grep -q 'Verified for SourceStamp: true' <<<"$("$BT/apksigner" verify --verbose "$o" 2>/dev/null)"; then
     a_stamp=$c_stamp; echo "      stamp: official-only 32-byte stamp-cert-sha256, apksigner SourceStamp OK (Play injects it)"
   else echo "      stamp: NOT EARNED -> material"; fi
 fi
 if [[ $c_mani -gt 0 ]]; then
-  "$AAPT2" dump xmltree --file AndroidManifest.xml "$o" > /tmp/mo.txt 2>/dev/null; "$AAPT2" dump xmltree --file AndroidManifest.xml "$b" > /tmp/mb.txt 2>/dev/null
+  "$AAPT2" dump xmltree --file AndroidManifest.xml "$o" > /tmp/mo.txt 2>/dev/null && "$AAPT2" dump xmltree --file AndroidManifest.xml "$b" > /tmp/mb.txt 2>/dev/null \
+    && [[ -s /tmp/mo.txt && -s /tmp/mb.txt ]] || { echo "      manifest: NOT EARNED (aapt2 dump failed) -> material"; : > /tmp/mo.txt; echo x > /tmp/mb.txt; }
   d="$(diff /tmp/mo.txt /tmp/mb.txt)"; printf '%s\n' "$d" > "$out/diff_manifest_${tag}.txt"
   left="$(printf '%s\n' "$d" | grep '^<' | sed 's/^< *//')"
   bad="$(printf '%s\n' "$left" | grep -vE '^E: meta-data|android:name\(0x[0-9a-f]+\)="com\.android\.(stamp\.source|stamp\.type|vending\.derived\.apk\.id)"|android:value\(0x[0-9a-f]+\)="(https://play\.google\.com/store|STAMP_TYPE_DISTRIBUTION_APK)"|android:value\(0x[0-9a-f]+\)=[0-9]+$')"
@@ -535,8 +591,9 @@ fi
 if [[ $c_arsc -gt 0 ]]; then
   if [[ -n "$APKTOOL" ]] && rm -rf /tmp/do /tmp/db && $APKTOOL d -f --no-src --no-debug-info --frame-path /tmp/afw -o /tmp/do "$o" >/dev/null 2>&1 \
      && $APKTOOL d -f --no-src --no-debug-info --frame-path /tmp/afw -o /tmp/db "$b" >/dev/null 2>&1 && [[ -d /tmp/do/res && -d /tmp/db/res ]]; then
-    rd="$(diff -r /tmp/do/res /tmp/db/res 2>/dev/null)"; printf '%s\n' "$rd" > "$out/diff_resources_decoded_${tag}.txt"
-    if [[ -z "$(printf '%s' "$rd" | tr -d '[:space:]')" ]]; then a_arsc=$c_arsc; echo "      arsc: apktool-decoded res/ IDENTICAL (binary packing artifact)"
+    rd="$(diff -r /tmp/do/res /tmp/db/res)"; rdrc=$?; printf '%s\n' "$rd" > "$out/diff_resources_decoded_${tag}.txt"
+    if (( rdrc == 0 )); then a_arsc=$c_arsc; echo "      arsc: apktool-decoded res/ IDENTICAL (binary packing artifact)"
+    elif (( rdrc > 1 )); then echo "      arsc: NOT EARNED (decoded diff failed, rc $rdrc) -> material"
     else echo "      arsc: decoded res/ differs -> material:"; printf '%s\n' "$rd" | head -2 | sed 's/^/        /'; fi
   else echo "      arsc: NOT EARNED (apktool unavailable or decode failed) -> material"; fi
 fi
@@ -549,7 +606,7 @@ CMP_END
 tot_raw=0; tot_acc=0; tot_un=0; pair_notes=""
 for p in "${PAIRS[@]}"; do
   o="${p%%|*}"; b="${p#*|}"; tag="$(basename "$o" .apk)"
-  section "Comparing $(basename "$o") <-> ${b:+$(basename "$b")}${b:-<no counterpart>}"
+  section "Comparing $(basename "$o") <-> $( [[ -n "$b" ]] && basename "$b" || echo '<no counterpart>' )"
   if [[ -z "$b" || ! -f "$b" ]]; then tot_un=$((tot_un+1)); tot_raw=$((tot_raw+1)); pair_notes+="${tag}: no built counterpart (1 unaccounted); "; continue; fi
   crun -v "${o}:/official.apk:ro" -v "${b}:/built.apk:ro" -v "${CMP_DIR}:/out" -v "${TOOLS_DIR}:/tools" -v "${META_DIR}:/meta:ro" \
     -v "${img_ctx}/compare.sh:/compare.sh:ro" -e APKTOOL_URL="$APKTOOL_URL" -e APKTOOL_SHA256="$APKTOOL_SHA256" -e GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
