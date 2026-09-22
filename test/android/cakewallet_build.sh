@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cakewallet_build.sh - Cake Wallet (Android) reproducible build verification
-# Version:          v0.1.7
+# Version:          v0.1.8
 # Organization:     WalletScrutiny.com
 # Last modified by: Daniel Garcia
 # Last modified on: 2026-09-22
@@ -33,7 +33,7 @@
 # of any kind. Review before running. Never run as root.
 # Exit codes: 0 = identical, 1 = difference or build failure, 2 = bad parameters.
 
-SCRIPT_VERSION="v0.1.7"
+SCRIPT_VERSION="v0.1.8"
 SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
 SCRIPT_HASH="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
 echo "cakewallet_build.sh $SCRIPT_VERSION sha256:${SCRIPT_HASH:-unknown}"
@@ -559,11 +559,14 @@ dx="$(cd /tmp/o && ls classes*.dex 2>/dev/null | while read -r f; do cmp -s "$f"
 la="$(f=$(find /tmp/o -name libapp.so | head -1); [[ -n "$f" ]] && { cmp -s "$f" "/tmp/b/${f#/tmp/o/}" && echo IDENTICAL || echo DIFFERS; })"
 fa="$(diff -rq /tmp/o/assets/flutter_assets /tmp/b/assets/flutter_assets 2>/dev/null | grep -vc '^$')"
 echo "  native libs ${nsm}/${nso} identical; dex differing: ${dx:-none}; libapp.so (Dart AOT): ${la:-absent}; flutter_assets diffs: ${fa:-0}"
-nz=assets/flutter_assets/NOTICES.Z   # zlib-compressed licence text of the resolved pub packages
+nz=assets/flutter_assets/NOTICES.Z   # gzip-compressed licence text of the resolved pub packages
 if [[ -f /tmp/o/$nz && -f /tmp/b/$nz ]] && ! cmp -s /tmp/o/$nz /tmp/b/$nz; then
-  unz() { python3 -c 'import sys,zlib;sys.stdout.buffer.write(zlib.decompress(open(sys.argv[1],"rb").read()))' "$1" 2>/dev/null || { printf '\x1f\x8b\x08\0\0\0\0\0' | cat - "$1" | gzip -dc 2>/dev/null; }; }
-  diff <(unz /tmp/o/$nz) <(unz /tmp/b/$nz) > "$out/diff_notices_${tag}.txt"
-  echo "  NOTICES.Z (resolved packages' licences) differs: $(grep -c '^[<>]' "$out/diff_notices_${tag}.txt") lines, first: $(grep -m1 '^[<>]' "$out/diff_notices_${tag}.txt" | cut -c1-70)"
+  # wbits 47 auto-detects gzip or zlib; the image has python3 but no gzip binary.
+  unz() { python3 -c 'import sys,zlib;sys.stdout.buffer.write(zlib.decompress(open(sys.argv[1],"rb").read(),47))' "$1"; }
+  if unz /tmp/o/$nz > /tmp/no.txt && unz /tmp/b/$nz > /tmp/nb.txt; then
+    diff /tmp/no.txt /tmp/nb.txt > "$out/diff_notices_${tag}.txt"
+    echo "  NOTICES.Z (resolved packages' licences) differs: $(grep -c '^[<>]' "$out/diff_notices_${tag}.txt") lines, first: $(grep -m1 '^[<>]' "$out/diff_notices_${tag}.txt" | cut -c1-70)"
+  else echo "  NOTICES.Z differs; decompression FAILED, licence diff not available"; fi
 fi
 [[ -s "$out/native_${tag}.txt" ]] && { echo "  native evidence (first lines; full: native_${tag}.txt):"; head -4 "$out/native_${tag}.txt" | sed 's/^/    /'; }
 # Earned classes
