@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # unstoppablewallet_build.sh - Unstoppable Wallet Reproducible Build Verification
-# Version:       v0.5.1
+# Version:       v0.5.2
 # Organization:  WalletScrutiny.com
 # Last modified by: Danny Garcia
 # Last modified on: 2026-09-22
@@ -8,12 +8,12 @@
 # Host deps:     docker or podman only
 # Notes:         Play Store-only, split-only. --binary must be a DIRECTORY of device-pulled
 #                split APKs (base.apk + split_config.*) => AAB + bundletool per-split compare.
-#                Single-APK releases (<= v0.47.x) are NOT supported (use an older script).
+#                Single-APK releases (<= v0.47.x): use an older script.
 #                v0.49.0: zcash external; zano-kit built, ~290 MB prebuilt .a trusted.
 #                v0.50.1: compileSdk 37; thorchain-kit-android is built and published locally.
-#                v0.5.1: device-spec from official split names; exit 1 unless reproducible.
+#                v0.5.1-2: device-spec from split names; fail-closed compare; exit 1 unless reproducible.
 
-SCRIPT_VERSION="v0.5.1"
+SCRIPT_VERSION="v0.5.2"
 SCRIPT_NAME="unstoppablewallet_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 if [[ -f "$SCRIPT_PATH" ]]; then
@@ -897,7 +897,7 @@ for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
     rm -rf /tmp/o /tmp/b; mkdir -p /tmp/o /tmp/b
     # A failed unzip or diff must never read as "no differences".
     unzip -q -o "$o" -d /tmp/o; r1=$?; unzip -q -o "$b" -d /tmp/b; r2=$?
-    (( r1 < 2 && r2 < 2 )) && [[ -n $(find /tmp/o -type f -print -quit) && -n $(find /tmp/b -type f -print -quit) ]] || { echo "FATAL: unzip failed ($cfg: $r1/$r2)"; exit 3; }
+    (( r1 == 0 && r2 == 0 )) && [[ -n $(find /tmp/o -type f -print -quit) && -n $(find /tmp/b -type f -print -quit) ]] || { echo "FATAL: unzip failed ($cfg: $r1/$r2)"; exit 3; }
     echo "  files compared: $(find /tmp/o -type f | wc -l) official, $(find /tmp/b -type f | wc -l) built"
     while IFS= read -r so; do
         rel="${so#/tmp/o/}"
@@ -931,18 +931,18 @@ for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
     fi
     if [[ "$dec" -eq 1 ]] && grep -q '^Files /tmp/o/resources\.arsc ' <<<"$cnt"; then
         if [[ -d /tmp/do/res && -d /tmp/db/res ]]; then
-            rd=$(diff -r /tmp/do/res /tmp/db/res 2>/dev/null)
+            rd=$(diff -r /tmp/do/res /tmp/db/res); rr=$?
             printf '%s\n' "$rd" > "/out/diff_resources_decoded_${cfg}.txt"
             ch=$(printf '%s\n' "$rd" | grep -E '^[<>]')
             nx=$(printf '%s\n' "$ch" | grep -v 'com.google.firebase.crashlytics.mapping_file_id' | tr -d '\n\r')
-            if [[ -z "$(printf '%s' "$rd" | tr -d '[:space:]')" ]]; then
+            if (( rr == 0 )); then
                 echo "  resources.arsc: binary differs, decoded res/ IDENTICAL — non-semantic artifact, acceptable (WS #574)"
                 acc=$((acc + 1))
-            elif [[ -n "$ch" && -z "$nx" ]]; then
+            elif (( rr == 1 )) && [[ -n "$ch" && -z "$nx" ]]; then
                 echo "  resources.arsc: sole decoded change is crashlytics.mapping_file_id — build-time ID, acceptable (WS #574)"
                 acc=$((acc + 1))
             else
-                echo "  resources.arsc: decoded res/ DIFFERS ($(printf '%s\n' "$rd" | grep -c '^') lines) — full diff: diff_resources_decoded_${cfg}.txt"
+                echo "  resources.arsc: decoded res/ DIFFERS (rc $rr, $(printf '%s\n' "$rd" | grep -c '^') lines) — full diff: diff_resources_decoded_${cfg}.txt"
                 printf '%s\n' "$rd" | head -5 | sed 's/^/    /'
             fi
         else
@@ -951,9 +951,11 @@ for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
     fi
     if [[ "$dec" -eq 1 ]] && grep -q '^Files /tmp/o/AndroidManifest\.xml ' <<<"$cnt"; then
         if [[ -f /tmp/do/AndroidManifest.xml && -f /tmp/db/AndroidManifest.xml ]]; then
-            md=$(diff -u /tmp/do/AndroidManifest.xml /tmp/db/AndroidManifest.xml 2>/dev/null)
+            md=$(diff -u /tmp/do/AndroidManifest.xml /tmp/db/AndroidManifest.xml); mr=$?
             printf '%s\n' "$md" > "/out/diff_manifest_${cfg}.txt"
-            if [[ -z "$(printf '%s' "$md" | tr -d '[:space:]')" ]]; then
+            if (( mr > 1 )); then
+                echo "  AndroidManifest.xml: decoded diff failed (rc $mr) — not classified"
+            elif (( mr == 0 )); then
                 echo "  AndroidManifest.xml: binary differs, decoded XML IDENTICAL — binary-encoding artifact; NOT auto-accepted, human judgement per WS #574"
             else
                 classify_manifest_diff "$md" "$cfg"
