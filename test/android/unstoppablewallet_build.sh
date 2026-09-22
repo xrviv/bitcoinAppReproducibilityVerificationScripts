@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # unstoppablewallet_build.sh - Unstoppable Wallet Reproducible Build Verification
-# Version:       v0.5.0
+# Version:       v0.5.1
 # Organization:  WalletScrutiny.com
 # Last modified by: Danny Garcia
-# Last modified on: 2026-09-01
+# Last modified on: 2026-09-22
 # Project:       https://github.com/horizontalsystems/unstoppable-wallet-android
 # Host deps:     docker or podman only
 # Notes:         Play Store-only, split-only. --binary must be a DIRECTORY of device-pulled
 #                split APKs (base.apk + split_config.*) => AAB + bundletool per-split compare.
-#                Single-APK releases (<= v0.47.x) are NOT supported by v0.3.0 (use an older script).
-#                v0.49.0: zcash de-forked → external cash.z.ecc.android (not built); zano-kit-android
-#                built from source, but its ~290 MB prebuilt .a (Zano/Boost/OpenSSL) are trusted blobs.
+#                Single-APK releases (<= v0.47.x) are NOT supported (use an older script).
+#                v0.49.0: zcash external; zano-kit built, ~290 MB prebuilt .a trusted.
 #                v0.50.1: compileSdk 37; thorchain-kit-android is built and published locally.
+#                v0.5.1: device-spec from official split names; exit 1 unless reproducible.
 
-SCRIPT_VERSION="v0.5.0"
+SCRIPT_VERSION="v0.5.1"
 SCRIPT_NAME="unstoppablewallet_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 if [[ -f "$SCRIPT_PATH" ]]; then
@@ -128,8 +128,7 @@ if [[ -z "$apk_file" ]]; then
     exit 2
 fi
 
-# --binary must be a DIRECTORY of device-pulled split APKs (base.apk + split_config.*).
-# Unstoppable ships split-only; the universal single-APK path was removed in v0.3.0.
+# --binary: a DIRECTORY of device-pulled splits (split-only since v0.3.0).
 declare -a OFFICIAL_SPLITS=()
 if [[ ! -d "$apk_file" ]]; then
     log_error "--binary must be a DIRECTORY of split APKs (base.apk + split_config.*). Unstoppable is split-only."
@@ -144,7 +143,7 @@ if [[ ! -f "$OFFICIAL_DIR/base.apk" ]]; then
 fi
 while IFS= read -r f; do OFFICIAL_SPLITS+=("$f"); done \
     < <(find "$OFFICIAL_DIR" -maxdepth 1 -name "*.apk" | sort)
-# reject stray/unknown APKs so they can't pollute the official artifact set
+# reject stray APKs
 for f in "${OFFICIAL_SPLITS[@]}"; do
     bn=$(basename "$f")
     [[ "$bn" == "base.apk" || "$bn" == split_config*.apk ]] || {
@@ -254,7 +253,7 @@ echo "  Runtime:   ${CRUN} ($($CRUN --version 2>&1 | head -1))"
 echo "  Workspace: ${workspace}"
 echo "  Date:      $(date)"
 
-# One image is used for metadata extraction, source builds, and split comparison.
+# One image for metadata, source builds and split comparison.
 banner "SETUP: BUILD SHARED CONTAINER IMAGE"
 echo "  Started: $(date)"
 
@@ -325,7 +324,7 @@ signer_output=$("${APKSIGNER}" verify --verbose --print-certs /input/official.ap
     printf '%s\n' "$signer_output"
     exit 1
 }
-# Supports both legacy "Signer #1" and rotated SDK-range signer labels while excluding SourceStamp.
+# Handles legacy "Signer #1" and rotated SDK-range signer labels; excludes SourceStamp.
 signer_hash=$(printf '%s\n' "$signer_output" \
     | sed -nE '/^Signer( #[0-9]+| \(minSdkVersion=[^)]*\)) certificate SHA-256 digest:/ {s/.*digest: //;p;}' \
     | sort -u | paste -sd, -)
@@ -641,14 +640,12 @@ cd /build/deps/solana-kit-android
 sed -i "s/version = '1.0.0'/version = '$SOLANA_VER'/" solanakit/build.gradle
 ./gradlew :solanakit:publishToMavenLocal --no-daemon
 
-# Step 4g: zano-kit-android (new in v0.49.0; native C++/JNI). Build Kotlin SDK + libzanokit.so
-# from source + publish. CAVEAT: links ~290 MB prebuilt .a (Zano engine/Boost/OpenSSL) NOT rebuilt
-# (upstream builds them macOS-only) — trusted vendor blobs, flag in report. Needs NDK 27.0.12077973.
+# Step 4g: zano-kit (C++/JNI) from source; links ~290 MB prebuilt .a, not rebuilt. NDK 27.0.12077973.
 echo ""; echo "=== Step 4g: zano-kit-android === $(date)"
 echo "  [BLOB CAVEAT] zano links prebuilt .a (Zano engine/Boost/OpenSSL) — not rebuilt from source"
 cd /build/deps/zano-kit-android
 grep -qF "maven-publish" zanokit/build.gradle || sed -i "/plugins {/a\\    id 'maven-publish'" zanokit/build.gradle
-# AGP 8.11.1: components.release does not exist without the release-variant publishing opt-in.
+# AGP 8.11.1 needs the release-variant publishing opt-in.
 grep -qF "singleVariant('release')" zanokit/build.gradle || sed -i "/^android {/a\\    publishing { singleVariant('release') }" zanokit/build.gradle
 if grep -qF "release(MavenPublication)" zanokit/build.gradle; then
     sed -i "/artifactId = 'zano-kit-android'/{n;s/version = '[^']*'/version = '$ZANO_VER'/;}" zanokit/build.gradle
@@ -737,29 +734,28 @@ echo ""; echo "=== Step 6: Build wallet === $(date)"
 cd /build/wallet
 sed -i 's/org\.gradle\.jvmargs=.*/org.gradle.jvmargs=-Xmx4096M -Dkotlin.daemon.jvm.options="-Xmx4096M"/' gradle.properties
 rm -rf ~/.gradle/caches/
-# Build the AAB (source of Play's splits), derive a device-spec from the official
-    # split set, then bundletool-generate the device-matched splits (NOT --mode=universal).
+# Build the AAB; bundletool it with a device-spec from the official splits (not universal).
     ./gradlew :app:bundleBaseRelease --no-daemon --max-workers=2 --info > /output/wallet-build.log 2>&1
     AAB=$(find app/build/outputs/bundle -name "*.aab" | head -1)
     cp "$AAB" /output/app-base-release.aab
     AAPT2=$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort | tail -1)
-    DABIS=(); DDEN=""
-    for f in /official/*.apk; do case "$(basename "$f")" in
-        *config.arm64_v8a*)   DABIS+=("arm64-v8a") ;;
-        *config.armeabi_v7a*) DABIS+=("armeabi-v7a") ;;
-        *config.x86_64*)      DABIS+=("x86_64") ;;
-        *config.x86.apk)      DABIS+=("x86") ;;
-        *config.ldpi*) DDEN=120 ;; *config.mdpi*) DDEN=160 ;; *config.tvdpi*) DDEN=213 ;;
-        *config.hdpi*) DDEN=240 ;; *config.xhdpi*) DDEN=320 ;;
-        *config.xxhdpi*) DDEN=480 ;; *config.xxxhdpi*) DDEN=640 ;;
-    esac; done
-    [[ -z "$DDEN" ]] && DDEN=480
-    # sdkVersion = DEVICE API level (not app targetSdk); locales fixed to en. Both provisional —
-    # a wrong device-spec yields a mismatched split set, which the config set-match guard fails on.
+    # Device-spec from the official splits' split= names; unknown configs stay unmatched.
+    DABIS=(); DDEN=""; DLOC=()
+    for f in /official/*.apk; do c=$("$AAPT2" dump badging "$f" 2>/dev/null | sed -n "s/.*split='config\.\([^']*\)'.*/\1/p" | head -1)
+        case "$c" in
+        "") ;; arm64_v8a) DABIS+=(arm64-v8a) ;; armeabi_v7a) DABIS+=(armeabi-v7a) ;; x86_64|x86|armeabi) DABIS+=("$c") ;;
+        ldpi) DDEN=120 ;; mdpi) DDEN=160 ;; tvdpi) DDEN=213 ;; hdpi) DDEN=240 ;;
+        xhdpi) DDEN=320 ;; xxhdpi) DDEN=480 ;; xxxhdpi) DDEN=640 ;;
+        [a-z][a-z]|[a-z][a-z][a-z]) DLOC+=("$c") ;;
+        *) echo "WARNING: unknown config split '$c' stays unmatched" ;;
+        esac; done
+    [[ -z "$DDEN" ]] && DDEN=480; [[ ${#DLOC[@]} -eq 0 ]] && DLOC=(en)
+    # sdkVersion = DEVICE API level (not app targetSdk).
     DSDK="${WS_DEVICE_SDK:-34}"
     DABIJSON=$(printf '"%s",' "${DABIS[@]}"); DABIJSON="[${DABIJSON%,}]"
-    printf '{"supportedAbis":%s,"supportedLocales":["en"],"screenDensity":%s,"sdkVersion":%s}\n' \
-        "$DABIJSON" "$DDEN" "$DSDK" > /tmp/device-spec.json
+    DLOCJSON=$(printf '"%s",' "${DLOC[@]}"); DLOCJSON="[${DLOCJSON%,}]"
+    printf '{"supportedAbis":%s,"supportedLocales":%s,"screenDensity":%s,"sdkVersion":%s}\n' \
+        "$DABIJSON" "$DLOCJSON" "$DDEN" "$DSDK" > /tmp/device-spec.json
     cp /tmp/device-spec.json /output/device-spec.json
     echo "=== device-spec.json ==="; cat /tmp/device-spec.json
     java -jar /opt/bundletool.jar build-apks --bundle="$AAB" \
@@ -791,8 +787,7 @@ sha256sum /output/built-splits/*.apk
 
 echo ""; echo "=== Dependency resolution check ==="
 WLOG=/output/wallet-build.log
-# grep -c prints 0 on no match but exits 1, so keep its output while neutralising the status.
-# `|| true` forces exit 0 while keeping grep's "0" on stdout (NOT `|| echo 0`, which appends a 2nd 0 → "0\n0").
+# `|| true` keeps grep -c's 0 on no match.
 HS_LOCAL=$(grep -E "horizontalsystems" "$WLOG" 2>/dev/null | grep -Ec "\.m2/repository/com/github/horizontalsystems|mavenLocal" || true); HS_LOCAL=${HS_LOCAL:-0}
 HS_JITPACK=$(grep -Eci "Downloading https://jitpack\\.io/com/github/horizontalsystems|Downloaded from .*jitpack\\.io/com/github/horizontalsystems" "$WLOG" 2>/dev/null || true); HS_JITPACK=${HS_JITPACK:-0}
 echo "  HS packages from mavenLocal: $HS_LOCAL  (expected: >0)"
@@ -863,14 +858,18 @@ cat > "$p5_ctx/p5.sh" <<'P5_SPLIT_END'
 #!/bin/bash
 set -uo pipefail
 AAPT2=$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort | tail -1)
-# config identity from the APK manifest: base/master has no split= → "base"; configs → token
+APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort | tail -1)
+# One-sided diff entries -> root-relative paths, dirs expanded.
+norm() { while IFS= read -r l; do
+  if [[ "$l" =~ ^Only\ in\ (/tmp/[ob])(/[^:]*)?:\ (.*)$ ]]; then r="${BASH_REMATCH[1]}"; d="${BASH_REMATCH[2]#/}"; p="${d:+$d/}${BASH_REMATCH[3]}"
+    if [[ -d "$r/$p" ]]; then (cd "$r" && find "$p" -type f | sort | sed "s|^|Only in $r: |"); else echo "Only in $r: $p"; fi
+  else printf '%s\n' "$l"; fi; done; }
+# config identity from split=; base/master has none -> "base"
 cfg_of() { local s; s=$("$AAPT2" dump badging "$1" 2>/dev/null | sed -n "s/.*split='\([^']*\)'.*/\1/p" | head -1); s="${s#config.}"; [[ -z "$s" ]] && s="base"; printf '%s' "$s"; }
 classify_manifest_diff() {
     local md="$1" cfg="$2" mch mnx
     mch=$(printf '%s\n' "$md" | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)')
-    # Google Play injects these distribution/source-stamp entries after the developer
-    # build. Removing them can also turn an empty <application> pair into a self-closing
-    # tag, so accept only those exact wrapper lines alongside the three metadata names.
+    # Only Play-injected metadata (and the self-closed <application> it leaves) passes.
     mnx=$(printf '%s\n' "$mch" | grep -vE \
         '^[+-][[:space:]]*<meta-data android:name="(com\.android\.vending\.derived\.apk\.id|com\.android\.stamp\.source|com\.android\.stamp\.type)"[^>]*/>$|^[+-][[:space:]]*<application android:extractNativeLibs="true" android:hasCode="false"(/>|>)$|^[+-][[:space:]]*</application>$' \
         | tr -d '\n\r')
@@ -896,7 +895,9 @@ for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
         echo "$cfg MISSING" >> /out/p5-summary.txt; MISS=$((MISS + 1)); continue
     fi
     rm -rf /tmp/o /tmp/b; mkdir -p /tmp/o /tmp/b
-    unzip -q -o "$o" -d /tmp/o; unzip -q -o "$b" -d /tmp/b
+    # A failed unzip or diff must never read as "no differences".
+    unzip -q -o "$o" -d /tmp/o; r1=$?; unzip -q -o "$b" -d /tmp/b; r2=$?
+    (( r1 < 2 && r2 < 2 )) && [[ -n $(find /tmp/o -type f -print -quit) && -n $(find /tmp/b -type f -print -quit) ]] || { echo "FATAL: unzip failed ($cfg: $r1/$r2)"; exit 3; }
     echo "  files compared: $(find /tmp/o -type f | wc -l) official, $(find /tmp/b -type f | wc -l) built"
     while IFS= read -r so; do
         rel="${so#/tmp/o/}"
@@ -908,23 +909,27 @@ for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
             echo "  native MISSING-IN-BUILT $rel"
         fi
     done < <(find /tmp/o -name '*.so' -type f | sort)
-    draw=$(diff -rq /tmp/o /tmp/b 2>/dev/null)
+    draw=$(diff -rq /tmp/o /tmp/b); rc=$?
+    (( rc < 2 )) || { echo "FATAL: diff failed ($cfg: rc $rc)"; exit 3; }
+    draw=$(norm <<<"$draw") || { echo "FATAL: norm failed ($cfg)"; exit 3; }
     printf '%s\n' "$draw"
-    # Exclude Google Play SourceStamp (stamp-cert-sha256) from counted diffs — Play-injected artifact, not developer output
-    cnt=$(printf '%s\n' "$draw" | grep -v 'stamp-cert-sha256')
-    n=$(printf '%s\n' "$cnt" | grep -vc '^$'); m=$(printf '%s\n' "$cnt" | grep -Ec '\.(SF|RSA|DSA|EC)( |$)|MANIFEST\.MF( |$)'); nn=$((n - m))
+    # SourceStamp: only root, official-only, 32 B, apksigner-verified.
+    ss='Only in /tmp/o: stamp-cert-sha256'; cnt="$draw"; st=0
+    if grep -qxF "$ss" <<<"$draw" && [[ $(stat -c%s /tmp/o/stamp-cert-sha256) == 32 ]] && grep -q 'Verified for SourceStamp: true' <<<"$("$APKSIGNER" verify --verbose "$o" 2>/dev/null)"; then cnt=$(grep -vxF "$ss" <<<"$draw"); st=1; fi
+    # Signing: official-only JAR signature files in root META-INF/.
+    n=$(grep -vc '^$' <<<"$cnt"); m=$(grep -Ec '^Only in /tmp/o: META-INF/([^/]+\.(SF|RSA|DSA|EC)|MANIFEST\.MF)$' <<<"$cnt"); nn=$((n - m))
     acc=0
-    if printf '%s\n' "$cnt" | grep -qE 'resources\.arsc|AndroidManifest\.xml'; then
+    if grep -qE '^Files /tmp/o/(resources\.arsc|AndroidManifest\.xml) ' <<<"$cnt"; then
         rm -rf /tmp/do /tmp/db
         dec=1
         $APKTOOL d -f --no-src --no-debug-info "$o" -o /tmp/do >/dev/null 2>&1 || dec=0
         $APKTOOL d -f --no-src --no-debug-info "$b" -o /tmp/db >/dev/null 2>&1 || dec=0
-        # A failed decode must never read as "identical" — no acceptance without a verified decode.
+        # A failed decode never reads as identical.
         [[ "$dec" -eq 1 ]] || echo "  DECODE FAILED — no semantic classification possible for this config"
     else
         dec=0
     fi
-    if [[ "$dec" -eq 1 ]] && printf '%s\n' "$cnt" | grep -q 'resources\.arsc'; then
+    if [[ "$dec" -eq 1 ]] && grep -q '^Files /tmp/o/resources\.arsc ' <<<"$cnt"; then
         if [[ -d /tmp/do/res && -d /tmp/db/res ]]; then
             rd=$(diff -r /tmp/do/res /tmp/db/res 2>/dev/null)
             printf '%s\n' "$rd" > "/out/diff_resources_decoded_${cfg}.txt"
@@ -944,7 +949,7 @@ for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
             echo "  resources.arsc: decoded res/ missing on one side — not classified"
         fi
     fi
-    if [[ "$dec" -eq 1 ]] && printf '%s\n' "$cnt" | grep -q 'AndroidManifest\.xml'; then
+    if [[ "$dec" -eq 1 ]] && grep -q '^Files /tmp/o/AndroidManifest\.xml ' <<<"$cnt"; then
         if [[ -f /tmp/do/AndroidManifest.xml && -f /tmp/db/AndroidManifest.xml ]]; then
             md=$(diff -u /tmp/do/AndroidManifest.xml /tmp/db/AndroidManifest.xml 2>/dev/null)
             printf '%s\n' "$md" > "/out/diff_manifest_${cfg}.txt"
@@ -957,7 +962,7 @@ for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
             echo "  AndroidManifest.xml: decoded manifest missing on one side — not classified"
         fi
     fi
-    echo "  diffs: $n total ($m META-INF, $nn non-META-INF; stamp-cert-sha256 excluded as Play SourceStamp; $acc acceptable per WS #574)"
+    echo "  diffs: $n total ($m META-INF, $nn non-META-INF; SourceStamp excluded: $st; $acc acceptable per WS #574)"
     echo "$cfg $n $m $nn $acc" >> /out/p5-summary.txt
     T=$((T + n)); M=$((M + m)); N=$((N + nn)); ACC=$((ACC + acc))
 done
@@ -1018,8 +1023,8 @@ echo "jitpack:        no Horizontal Systems fallback allowed"
 [[ -n "${git_tag_info}" ]] && echo "${git_tag_info}"
 echo "===== End Results ====="
 
-generate_yaml "${P5_VERDICT}" "Source-built split comparison: ${diff_count} total difference(s) (${diff_metainf_count} META-INF, ${diff_non_metainf_count} other), of which ${accepted_count} are acceptable per WS issue 574 (decoded-identical resources, crashlytics mapping ID, or decoded manifest changes limited to Google Play distribution metadata) and ${material_count} are material. Official APK SHA-256: ${app_hash}. Horizontal Systems dependencies were built locally; JitPack fallback was prohibited. The former JitPack baseline comparison was removed because commit artifacts are not durably available."
+generate_yaml "${P5_VERDICT}" "Split comparison: ${diff_count} diff(s) (${diff_metainf_count} META-INF signing), ${accepted_count} acceptable per WS #574 (decoded-identical resources, crashlytics mapping ID, Play manifest metadata), ${material_count} material, ${missing_cfgs} unmatched split(s). Official APK SHA-256: ${app_hash}. HS deps built locally, no JitPack fallback."
 
 echo ""
-echo "Exit code: 0"
-exit 0
+[[ "$P5_VERDICT" == "reproducible" ]] && { echo "Exit code: 0"; exit 0; }
+echo "Exit code: 1"; exit 1
