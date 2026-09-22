@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # pcash_play_build.sh - P.CASH Terminal (Google Play) reproducible build verification
-# Version:          v0.7.1
+# Version:          v0.7.2
 # Organization:     WalletScrutiny.com
-# Last Modified:    2026-09-18
+# Last Modified:    2026-09-22
 # App ID:           cash.p.terminal
 # Project:          https://github.com/piratecash/pcash-wallet
 # Play Store:       https://play.google.com/store/apps/details?id=cash.p.terminal
@@ -15,7 +15,7 @@
 # no warranty of any kind. Review before running.
 # Exit codes: 0 = identical, 1 = difference or build failure, 2 = bad parameters.
 
-SCRIPT_VERSION="v0.7.1"
+SCRIPT_VERSION="v0.7.2"
 
 SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
 SCRIPT_HASH="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
@@ -456,9 +456,13 @@ export GRADLE_USER_HOME=/tmp/gradle-home
 mkdir -p "$GRADLE_USER_HOME"
 
 echo "=== Clone ${REPO_URL} === $(date)"
-git clone "$REPO_URL" /build/src || { echo "FATAL: clone failed"; exit 1; }
-cd /build/src
-git config --global --add safe.directory /build/src
+# The checkout directory name is the Gradle root project name unless settings.gradle pins it
+# (upstream 5bc084d32, 2026-09-19); it leaks into KMP module names and so into the dex.
+# Releases are built in pcash-wallet-android, so check out under that name.
+SRC=/build/pcash-wallet-android
+git clone "$REPO_URL" "$SRC" || { echo "FATAL: clone failed"; exit 1; }
+cd "$SRC"
+git config --global --add safe.directory "$SRC"
 
 gradle_ver() { git show "$1:app/build.gradle" 2>/dev/null | grep -m1 "$2" | sed "s/.*$2 *\"\{0,1\}\([^\" ]*\).*/\1/"; }
 
@@ -505,7 +509,7 @@ echo "=== Revision under build ==="
 git log -1 --pretty=format:'%H %ci %s' ; echo
 git rev-parse HEAD > /output/commit.txt
 git rev-parse --short=10 HEAD > /output/expected_git_hash.txt
-agp="$(sed -n 's/^gradle = "\([^"]*\)".*/\1/p' gradle/libs.versions.toml 2>/dev/null | head -1)"
+agp="$(sed -n 's/^\(gradle\|androidGradlePlugin\) = "\([^"]*\)".*/\2/p' gradle/libs.versions.toml 2>/dev/null | head -1)"
 printf '%s\n' "$agp" > /output/agp.txt
 echo "AGP at this revision: ${agp:-?}"
 
