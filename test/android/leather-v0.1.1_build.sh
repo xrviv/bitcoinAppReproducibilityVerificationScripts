@@ -2,7 +2,7 @@
 # ==============================================================================
 # leather_build.sh - Leather (Android) Reproducible Build Verification
 # ==============================================================================
-# Version:          v0.1.0
+# Version:          v0.1.1
 # Organization:     WalletScrutiny.com
 # Last modified by: Danny Garcia
 # Last modified on: 2026-09-23
@@ -47,7 +47,7 @@
 # Exit codes: 0 = reproducible, 1 = differences or build failure, 2 = invalid parameters.
 # ==============================================================================
 
-SCRIPT_VERSION="v0.1.0"
+SCRIPT_VERSION="v0.1.1"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_HASH="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
 echo "$(basename "$SCRIPT_PATH") $SCRIPT_VERSION sha256:${SCRIPT_HASH:-unknown}"
@@ -259,14 +259,22 @@ else
   # Upstream releases by dispatching the production workflow on `dev`: take the newest successful
   # public run whose commit declares this version.
   A=(); [[ -n "${GITHUB_TOKEN:-}" ]] && A=(-H "Authorization: Bearer $GITHUB_TOKEN")
+  [[ -n "${GITHUB_TOKEN:-}" ]] || echo "  WARNING: no GITHUB_TOKEN: the anonymous runs API can return a stale list (seen 2026-09-23: newest run missing)"
   curl -fsSL "${A[@]}" "$RUNS_API" > /out/runs.json 2>/dev/null
+  # A run list older than the tag cannot hold the tag's release run: say so instead of quietly using the tag.
+  newest="$(node -e 'const r=(require("/out/runs.json").workflow_runs||[])[0]; console.log(r ? Math.floor(Date.parse(r.created_at)/1000) : 0)' 2>/dev/null)"
+  stale=""
+  if [[ -n "$tagc" && "${newest:-0}" -lt "$(git show -s --format=%ct "$tagc")" ]]; then
+    stale="release-run lookup inconclusive: newest run returned predates the tag (stale list, or no release run since the tag); pass --commit or GITHUB_TOKEN"
+    echo "  WARNING: ${stale}"
+  fi
   c=""
   for s in $(node -e 'for (const r of (require("/out/runs.json").workflow_runs||[])) console.log(r.head_sha)' 2>/dev/null); do
     git cat-file -e "$s" 2>/dev/null || git fetch -q origin "$s" 2>/dev/null
     [[ "$(cfgv "$s")" == "$V" ]] && { c="$s"; break; }
   done
   if [[ -n "$c" ]]; then src="newest successful mobile:deploy-production run declaring ${V}"
-  elif [[ -n "$tagc" ]]; then c="$tagc"; src="tag ${TAG} (no successful release run found for ${V})"
+  elif [[ -n "$tagc" ]]; then c="$tagc"; src="tag ${TAG} (${stale:-no successful release run found for ${V}})"
   else echo "FATAL: neither a release run nor tag ${TAG} declares ${V}"; exit 4; fi
 fi
 git checkout -q "$c" || exit 2
@@ -281,6 +289,9 @@ fi
 [[ "$(cfgv HEAD)" == "$V" ]] || echo "  WARNING: app.config.ts declares $(cfgv HEAD), not ${V}"
 
 export CI=true PROVISION_MOBILE=true SENTRY_DISABLE_AUTO_UPLOAD=true COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+# Gradle takes user.home from the passwd entry, not $HOME; under podman --userns=keep-id that put its cache in
+# /home/runner/work/.gradle, and CMake embeds the cache path in native libs. Upstream's is /home/runner/.gradle.
+export GRADLE_USER_HOME="${HOME}/.gradle"
 echo "  node $(node --version), $(java -version 2>&1 | head -1)"
 echo "=== pnpm install --ignore-scripts === $(date)"
 pnpm install --ignore-scripts > /out/pnpm-install.log 2>&1 || { tail -30 /out/pnpm-install.log; echo "FATAL: pnpm install failed"; exit 3; }
