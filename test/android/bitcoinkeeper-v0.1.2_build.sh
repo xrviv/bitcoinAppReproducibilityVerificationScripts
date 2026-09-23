@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # bitcoinkeeper_build.sh - Bitcoin Keeper (Android) reproducible build verification
-# Version:          v0.1.1
+# Version:          v0.1.2
+# Last modified by: Danny Garcia
+# Last modified on: 2026-09-23
 # Organization:     WalletScrutiny.com
 # App ID:           io.hexawallet.bitcoinkeeper
 # Project:          https://github.com/bithyve/bitcoin-keeper
@@ -10,7 +12,7 @@
 # No warranty; review before running.
 # Exit codes: 0 = identical, 1 = difference or build failure, 2 = bad parameters.
 
-SCRIPT_VERSION="v0.1.1"
+SCRIPT_VERSION="v0.1.2"
 
 SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
 SCRIPT_HASH="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
@@ -23,12 +25,10 @@ SCRIPT_NAME="bitcoinkeeper_build.sh"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_ID="io.hexawallet.bitcoinkeeper"
 REPO_URL="https://github.com/bithyve/bitcoin-keeper"
-# Releases are built on a developer's Mac; three inputs of that machine end up in the
-# artifact and change per release (2.5.13: /Users/vaibhav + Node 22.21.1; 2.5.14:
-# /Users/devaccount + Node 25.9.0). They are read from the official APKs and mirrored.
+# Releases are built on a developer's Mac; its HOME, checkout path and Node end up in the
+# artifact. Read from the official APKs and mirrored.
 BUILD_HOME="/Users/vaibhav"; SRC_DIR=""; NODE_VERSION=""
-# 1.18.2+ names language splits with Android's legacy codes (iw, in) in res/xml/splits0.xml
-# exactly as Play does; 1.14 to 1.18.1 wrote he/id and never matched the official base.apk.
+# 1.18.2+ writes legacy language codes (iw, in) in res/xml/splits0.xml as Play does.
 BT_VER="1.18.3"
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
@@ -43,7 +43,7 @@ section() { printf -- '\n-- %s --\n' "$*"; }
 phase() { banner "$*"; echo "  $(date)"; }
 sha256of() { sha256sum "$1" | awk '{print $1}'; }
 
-# The YAML lands in the script's directory (ABS reads it there); the $PWD copy is convenience.
+# The YAML lands in the script's directory (ABS reads it there).
 execution_dir="$SCRIPT_DIR"
 invocation_dir="$(pwd -P)"
 
@@ -203,7 +203,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Official artifacts are copied under canonical names: base.apk, split_config.<cfg>.apk.
+# Official artifacts get canonical names: base.apk, split_config.<cfg>.apk.
 canonical_name() {
   case "$1" in
     base.apk|base-master.apk|standalone.apk) echo "base.apk" ;;
@@ -386,14 +386,14 @@ info="$("$BT/aapt2" dump badging $A 2>/dev/null)"
 pkg="$(printf '%s\n' "$info" | grep '^package:' | sed "s/^package: name='\([^']*\)'.*/\1/")"
 vname="$(printf '%s\n' "$info" | grep '^package:' | sed "s/.*versionName='\([^']*\)'.*/\1/")"
 vcode="$(printf '%s\n' "$info" | grep '^package:' | sed "s/.*versionCode='\([^']*\)'.*/\1/")"
-# aapt2 labels it minSdkVersion: (aapt1 printed sdkVersion:); the xmltree manifest is the fallback.
+# aapt2: minSdkVersion: (aapt1: sdkVersion:); xmltree is the fallback.
 minsdk="$(printf '%s\n' "$info" | sed -n "s/^minSdkVersion:'\([0-9]*\)'.*/\1/p" | head -1)"
 split_name="$(printf '%s\n' "$info" | sed -n "s/.*split='\([^']*\)'.*/\1/p" | head -1)"
 abis="$(printf '%s\n' "$info" | sed -n "s/^native-code: //p" | tr -d "'" | tr ' ' ',')"
 sv="$("$BT/apksigner" verify --verbose --print-certs $A 2>/dev/null)"
 signer="$(printf '%s\n' "$sv" | awk '/Signer #1 certificate SHA-256/ {print $NF; exit}')"
 stamp="$(printf '%s\n' "$sv" | grep -c 'Verified for SourceStamp: true')"
-# grep -c reads to EOF: grep -q would SIGPIPE unzip under pipefail and leave has_lib=0 on a fat APK.
+# grep -c reads to EOF: grep -q would SIGPIPE unzip under pipefail (has_lib=0 on a fat APK).
 has_lib=0; [[ "$(unzip -Z1 $A 2>/dev/null | grep -c '^lib/')" -gt 0 ]] && has_lib=1
 vcs="$(unzip -p $A META-INF/version-control-info.textproto 2>/dev/null | tr '\n' ' ' | cut -c1-80)"
 agp="$(unzip -p $A META-INF/com/android/build/gradle/app-metadata.properties 2>/dev/null \
@@ -578,9 +578,8 @@ cp /dotenv .env
 echo "=== .env restored from the official BuildConfig: $(wc -l < .env) keys ==="
 
 echo "=== yarn install --frozen-lockfile === $(date)"
-# The prepare hook (setup.sh) runs rn-nodeify, tries `pod install` and writes a macOS sdk.dir
-# into android/local.properties (replaced below). posthog-node 5.33.3 (yarn.lock) wants node
-# ^20.20 || >=22.22 while 2.5.13 was bundled with 22.21.1: upstream ignores engines, so does this.
+# setup.sh (prepare hook) runs rn-nodeify, tries `pod install`, writes a macOS sdk.dir (replaced
+# below). Engines are ignored as upstream does (posthog-node vs the bundling Node).
 yarn install --frozen-lockfile --non-interactive --ignore-engines > /output/yarn-install.log 2>&1 || { tail -40 /output/yarn-install.log; echo "FATAL: yarn install failed"; exit 3; }
 tail -3 /output/yarn-install.log
 printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
@@ -602,7 +601,10 @@ git diff | grep -E '^[-+] ' | head -6
 
 echo "=== Gradle ${GRADLE_TASK} === $(date)"
 cd android
-./gradlew "$GRADLE_TASK" --no-daemon --stacktrace --console=plain > /output/gradle-build.log 2>&1
+# 1adf4f66 names a keystore absent from git in gradle.properties; -P uses a throwaway key.
+keytool -genkeypair -keystore /tmp/ws.jks -storepass wsverify -alias ws -keyalg RSA -dname CN=WS >/dev/null 2>&1
+./gradlew "$GRADLE_TASK" -PMYAPP_RELEASE_STORE_FILE=/tmp/ws.jks -PMYAPP_RELEASE_KEY_ALIAS=ws -PMYAPP_RELEASE_STORE_PASSWORD=wsverify \
+  -PMYAPP_RELEASE_KEY_PASSWORD=wsverify --no-daemon --stacktrace --console=plain > /output/gradle-build.log 2>&1
 rc=$?
 grep -E '^> Task :app:(createBundle|externalNativeBuild|package|bundle)|BUILD (SUCCESSFUL|FAILED)|FAILURE|What went wrong' /output/gradle-build.log | head -12
 echo "=== SDK components present after Gradle (platforms / build-tools / ndk / cmake) ==="
