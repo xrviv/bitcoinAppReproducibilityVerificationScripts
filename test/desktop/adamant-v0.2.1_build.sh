@@ -2,7 +2,7 @@
 # ==============================================================================
 # adamant_build.sh - ADAMANT Messenger Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.0
+# Version:       v0.2.1
 # Organization:  WalletScrutiny.com
 # Project:       https://github.com/Adamant-im/adamant-im
 # Last modified by: Danny Garcia, Bob
@@ -63,7 +63,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="v0.2.0"
+SCRIPT_VERSION="v0.2.1"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256="$(sha256sum "${SCRIPT_PATH}" 2>/dev/null | awk '{print $1}' || true)"
 SCRIPT_SHA256="${SCRIPT_SHA256:-N/A}"
@@ -429,6 +429,7 @@ FILES_MATCH=0
 FILES_DIFFER=0
 diffs_shown=0
 diffs_shown_cap=8
+: > asar-differ.txt
 while IFS= read -r rel; do
     [ -z "${rel}" ] && continue
     file_index=$((file_index + 1))
@@ -460,6 +461,7 @@ while IFS= read -r rel; do
     # Full diff for each differing regular file goes to diff-file-<rel>.txt; only the
     # first 8 are also previewed inline (5 lines each) so a large diff can't swamp the log.
     if [ "${status}" = "DIFFER" ] && [ -f "${of}" ] && [ -f "${bf}" ] && [ ! -L "${of}" ] && [ ! -L "${bf}" ]; then
+        [ "${rel##*.}" = "asar" ] && echo "${rel}" >> asar-differ.txt
         safe_name="$(echo "${rel}" | tr '/' '_')"
         diff -u "${of}" "${bf}" > "diff-file-${safe_name}.txt" 2>&1 || true
         if [ "${diffs_shown}" -lt "${diffs_shown_cap}" ]; then
@@ -482,6 +484,106 @@ OFFICIAL_SIZE=$(stat -c%s "${OFFICIAL}")
 BUILT_SIZE=$(stat -c%s "${BUILT}")
 echo "official binary size: ${OFFICIAL_SIZE} bytes"
 echo "built binary size:    ${BUILT_SIZE} bytes"
+echo ""
+
+# app.asar contents (diagnostic: the verdict is already set by the payload diff). Unpacked
+# with our own reader, never upstream's asar tool (which the build installed), and every
+# entry is checked against the SHA-256 the archive records for it in its own header.
+asar_extract() {
+    python3 - "$1" "$2" <<'ASAR_PY'
+import hashlib, json, os, struct, sys
+src, dest = sys.argv[1], sys.argv[2]
+data = open(src, 'rb').read()
+base = 8 + struct.unpack_from('<I', data, 4)[0]
+header = json.loads(data[16:16 + struct.unpack_from('<I', data, 12)[0]])
+count = bad = 0
+def walk(node, rel):
+    global count, bad
+    for name, e in node.get('files', {}).items():
+        if name in ('', '.', '..') or '/' in name or '\\' in name or '\0' in name:
+            sys.exit('unsafe entry name %r' % name)
+        p = os.path.join(rel, name)
+        out = os.path.join(dest, p)
+        if 'files' in e:
+            os.makedirs(out, exist_ok=True)
+            walk(e, p)
+        elif 'link' in e:
+            os.symlink(e['link'], out)
+        else:
+            if e.get('unpacked'):
+                u = os.path.join(src + '.unpacked', p)
+                b = open(u, 'rb').read() if os.path.isfile(u) else b'(missing from .asar.unpacked)\n'
+            else:
+                off = base + int(e['offset'])
+                b = data[off:off + int(e['size'])]
+                if len(b) != int(e['size']):
+                    sys.exit('truncated entry ' + p)
+            ig = e.get('integrity') or {}
+            if ig.get('algorithm') == 'SHA256' and hashlib.sha256(b).hexdigest() != ig.get('hash'):
+                bad += 1
+                print('[WARN] %s: %s does not match the SHA-256 in the archive header' % (src, p))
+            with open(out, 'wb') as f:
+                f.write(b)
+            if e.get('executable'):
+                os.chmod(out, 0o755)
+            count += 1
+os.makedirs(dest)
+walk(header, '')
+print('%s: %d entries unpacked, %d header-hash mismatches' % (src, count, bad))
+ASAR_PY
+}
+: > asar-summary.txt
+ASAR_ENTRIES_DIFFER=0
+while IFS= read -r arel; do
+    [ -z "${arel}" ] && continue
+    asafe="$(echo "${arel}" | tr '/' '_')"
+    ao="asar-official-${asafe}"
+    ab="asar-built-${asafe}"
+    rm -rf "${ao}" "${ab}"
+    if ! asar_extract "official-extracted/${arel}" "${ao}" || ! asar_extract "built-extracted/${arel}" "${ab}"; then
+        echo "Inside ${arel}: could not be unpacked (see log)" | tee -a asar-summary.txt
+        continue
+    fi
+    echo ""
+    echo "Phase: Contents of ${arel} (official vs built)"
+    echo "------------------------------------------------------"
+    a_paths="$(cat <(cd "${ao}" && find . \( -type f -o -type l \) | sed 's|^\./||') \
+        <(cd "${ab}" && find . \( -type f -o -type l \) | sed 's|^\./||') | sort -u)"
+    a_total=$(printf '%s\n' "${a_paths}" | grep -c . || true)
+    a_diff=0
+    a_shown=0
+    : > "asar-manifest-${asafe}.txt"
+    while IFS= read -r e; do
+        [ -z "${e}" ] && continue
+        o="${ao}/${e}"
+        b="${ab}/${e}"
+        oh="(missing)"
+        bh="(missing)"
+        if [ -L "${o}" ]; then oh="symlink -> $(readlink "${o}")"; elif [ -f "${o}" ]; then oh="$(sha256sum "${o}" | cut -d' ' -f1)"; fi
+        if [ -L "${b}" ]; then bh="symlink -> $(readlink "${b}")"; elif [ -f "${b}" ]; then bh="$(sha256sum "${b}" | cut -d' ' -f1)"; fi
+        st="MATCH"
+        if [ "${oh}" = "(missing)" ] || [ "${oh}" != "${bh}" ]; then st="DIFFER"; a_diff=$((a_diff + 1)); fi
+        echo "[${st}] ${e} official=${oh} built=${bh}" >> "asar-manifest-${asafe}.txt"
+        [ "${st}" = "MATCH" ] && continue
+        echo "  DIFFER ${e}  official=${oh} built=${bh}"
+        if [ -f "${o}" ] && [ -f "${b}" ] && [ ! -L "${o}" ] && [ ! -L "${b}" ]; then
+            ef="diff-asar-${asafe}_$(echo "${e}" | tr '/' '_').txt"
+            diff -u "${o}" "${b}" > "${ef}" 2>&1 || true
+            if [ "${a_shown}" -lt 8 ]; then
+                a_shown=$((a_shown + 1))
+                echo "    -> diff ($(wc -l < "${ef}") line(s), full: ${ef}), first 5 changed lines (200 chars max):"
+                { grep -E '^[-+][^-+]' "${ef}" || true; } | head -5 | cut -c1-200 | sed 's/^/       /' || true
+            fi
+        fi
+    done <<ASAR_PATHS_EOF
+${a_paths}
+ASAR_PATHS_EOF
+    {
+        echo "Inside ${arel}: ${a_total} entries, $((a_total - a_diff)) identical, ${a_diff} differ (full: asar-manifest-${asafe}.txt)"
+        { grep '^\[DIFFER\]' "asar-manifest-${asafe}.txt" || true; } | head -20 | sed -E 's/^\[DIFFER\] ([^ ]*) .*/  differs: \1/' || true
+    } | tee -a asar-summary.txt
+    ASAR_ENTRIES_DIFFER=$((ASAR_ENTRIES_DIFFER + a_diff))
+done < asar-differ.txt
 echo ""
 
 # SquashFS superblock field-by-field comparison, plus the trailer after the SquashFS
@@ -573,6 +675,8 @@ echo "  - diff-appimage-payload.txt        raw 'diff -r' of the two unpacked tre
 echo "  - diff-appimage-metadata.txt       permissions/type/symlink-target diff"
 echo "  - diff-file-<name>.txt             full diff for each individually differing file (if any)"
 echo "  - squashfs-superblock-diff.txt     SquashFS superblock fields + trailer hashes"
+echo "  - asar-manifest-<name>.txt         per-entry hashes inside a differing .asar archive"
+echo "  - diff-asar-<name>_<entry>.txt     full diff for each differing entry inside it"
 echo "  - official-${BUILT_NAME} / built-${BUILT_NAME}   the raw AppImages themselves"
 echo "  - official-extracted/ / built-extracted/          full unpacked trees"
 echo ""
@@ -590,6 +694,7 @@ echo ""
     echo "FILES_TOTAL=${FILES_TOTAL}"
     echo "FILES_MATCH=${FILES_MATCH}"
     echo "FILES_DIFFER=${FILES_DIFFER}"
+    echo "ASAR_ENTRIES_DIFFER=${ASAR_ENTRIES_DIFFER}"
     echo "OFFICIAL_SIZE=${OFFICIAL_SIZE}"
     echo "BUILT_SIZE=${BUILT_SIZE}"
 } > RESULT.env
@@ -658,11 +763,11 @@ main() {
     [[ -f "${out}/RESULT.env" && -f "${out}/src.env" ]] || die_failed "RESULT.env/src.env missing after the comparison step."
     local OFFICIAL_SHA256="" BUILT_SHA256="" LAUNCHER_MATCH="" LAUNCHER_SIZE="" OFFICIAL_LAUNCHER_SHA256=""
     local BUILT_LAUNCHER_SHA256="" PAYLOAD_DIFF_LINES="" METADATA_DIFF_LINES="" FILES_TOTAL="" FILES_MATCH=""
-    local FILES_DIFFER="" OFFICIAL_SIZE="" BUILT_SIZE=""
+    local FILES_DIFFER="" OFFICIAL_SIZE="" BUILT_SIZE="" ASAR_ENTRIES_DIFFER=""
     local COMMIT="" TAG_COMMIT="" TAG_TYPE="" PKG_VERSION="" NVMRC="" NODE_V="" NPM_V=""
     load_env_file "${out}/RESULT.env" OFFICIAL_SHA256 BUILT_SHA256 LAUNCHER_MATCH LAUNCHER_SIZE \
         OFFICIAL_LAUNCHER_SHA256 BUILT_LAUNCHER_SHA256 PAYLOAD_DIFF_LINES METADATA_DIFF_LINES \
-        FILES_TOTAL FILES_MATCH FILES_DIFFER OFFICIAL_SIZE BUILT_SIZE
+        FILES_TOTAL FILES_MATCH FILES_DIFFER OFFICIAL_SIZE BUILT_SIZE ASAR_ENTRIES_DIFFER
     load_env_file "${out}/src.env" COMMIT TAG_COMMIT TAG_TYPE PKG_VERSION NVMRC NODE_V NPM_V
     [[ "${PAYLOAD_DIFF_LINES}" =~ ^[0-9]+$ && "${METADATA_DIFF_LINES}" =~ ^[0-9]+$ && "${LAUNCHER_MATCH}" =~ ^[01]$ ]] \
         || die_failed "RESULT.env is incomplete; no verdict computed."
@@ -689,6 +794,14 @@ main() {
     else
         verdict="not_reproducible"
     fi
+    # Paths in the results and YAML are relative to the execution directory: a report
+    # quotes this block, and a reader elsewhere has no /home/<user>.
+    local rel_out="${WORK_DIR#"${execution_dir}"/}/out"
+    local tag_desc="not found"
+    case "${TAG_TYPE}" in
+        commit) tag_desc="lightweight tag (no tag object, cannot carry a signature)" ;;
+        tag) tag_desc="annotated tag (tag object)" ;;
+    esac
     local match_line="0 (DOESN'T MATCH)" builds_line="BUILDS DO NOT MATCH BINARIES"
     if [[ "${verdict}" == "reproducible" ]]; then
         match_line="1 (MATCHES)"; builds_line="BUILDS MATCH BINARIES"
@@ -717,12 +830,15 @@ main() {
     echo "  built    sha256 ${BUILT_LAUNCHER_SHA256}"
     echo "AppImage size: official ${OFFICIAL_SIZE} bytes, built ${BUILT_SIZE} bytes"
     echo "Payload files: ${FILES_TOTAL} total, ${FILES_MATCH} identical, ${FILES_DIFFER} differ"
-    echo "Payload diff: ${PAYLOAD_DIFF_LINES} line(s) (full: ${out}/diff-appimage-payload.txt)"
+    echo "Payload diff: ${PAYLOAD_DIFF_LINES} line(s) (full: ${rel_out}/diff-appimage-payload.txt)"
     if [[ "${PAYLOAD_DIFF_LINES}" -gt 0 ]]; then
         echo "Diff preview (first 5 of ${PAYLOAD_DIFF_LINES} line(s)):"
-        head -5 "${out}/diff-appimage-payload.txt"
+        head -5 "${out}/diff-appimage-payload.txt" | cut -c1-200 | cat -v
     fi
-    echo "Metadata diff (modes/types/symlinks): ${METADATA_DIFF_LINES} line(s) (full: ${out}/diff-appimage-metadata.txt)"
+    if [[ -s "${out}/asar-summary.txt" ]]; then
+        head -25 "${out}/asar-summary.txt" | cut -c1-200 | cat -v
+    fi
+    echo "Metadata diff (modes/types/symlinks): ${METADATA_DIFF_LINES} line(s) (full: ${rel_out}/diff-appimage-metadata.txt)"
     if [[ "${OFFICIAL_SHA256}" != "${BUILT_SHA256}" ]]; then
         echo "Outer AppImage hash differs (SquashFS mkfs_time + appended blockmap, see"
         echo "squashfs-superblock-diff.txt); the verdict is taken on launcher + payload + metadata."
@@ -730,7 +846,7 @@ main() {
     echo ""
     echo "Revision, tag (and its signature):"
     echo "Ref built: ${source_ref} = ${COMMIT}"
-    echo "Tag v${APP_VERSION}: ${TAG_TYPE} object -> ${TAG_COMMIT}"
+    echo "Tag v${APP_VERSION}: ${tag_desc} -> ${TAG_COMMIT}"
     echo "Signature verification: not implemented"
     echo "Toolchain: ${NODE_IMAGE_TAG} node ${NODE_V} npm ${NPM_V}"
     if [[ -n "${warnings}" ]]; then
@@ -741,9 +857,9 @@ main() {
     echo "===== End Results ====="
     echo ""
     echo "Run a full"
-    echo "diff -r --no-dereference ${out}/official-extracted ${out}/built-extracted"
+    echo "diff -r --no-dereference ${rel_out}/official-extracted ${rel_out}/built-extracted"
     echo "or"
-    echo "diffoscope ${out}/official-${built_name} ${out}/built-${built_name}"
+    echo "diffoscope ${rel_out}/official-${built_name} ${rel_out}/built-${built_name}"
     echo ""
 
     local notes="Rebuilt ${source_ref} (${COMMIT}) in ${NODE_IMAGE_TAG} (node ${NODE_V}, npm ${NPM_V}):
@@ -752,9 +868,10 @@ Official AppImage sha256 ${OFFICIAL_SHA256}; built ${BUILT_SHA256}.
 Launcher (first ${LAUNCHER_SIZE} bytes, ELF runtime): ${launcher_state}.
 Payload unpacked with unsquashfs (official file never executed):
 ${FILES_MATCH}/${FILES_TOTAL} files identical, metadata diff ${METADATA_DIFF_LINES} line(s).
+Entries differing inside differing .asar archives: ${ASAR_ENTRIES_DIFFER:-0} (asar-manifest-*.txt).
 Outer AppImage hash is not used for the verdict: the SquashFS superblock carries a
 build-time mkfs_time and electron-builder appends a blockmap computed over the image.
-Full evidence (diffs, manifest, superblock table) in ${out}.
+Full evidence (diffs, manifests, superblock table) in ${rel_out}.
 No official SHA256SUMS manifest exists to cross-check the download."
     if [[ -n "${warnings}" ]]; then
         notes+="
