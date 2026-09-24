@@ -2,9 +2,9 @@
 # ==============================================================================
 # zeus_build.sh - Zeus Lightning Wallet Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.3.1
+# Version:       v0.3.2
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-08-27
+# Last Modified: 2026-09-24
 # Project:       https://github.com/ZeusLN/zeus
 # ==============================================================================
 # LICENSE: MIT License
@@ -34,6 +34,9 @@
 #   derived.apk.id) as acceptable by default. Signing files are matched by NAME, never by the
 #   META-INF/ path prefix: that directory also carries services/ bindings, version-control-info
 #   and androidx.*.version markers, which are app payload and are counted.
+# - Pins React Native's react_native_dev_server_ip to the value in the official APK. The RN
+#   Gradle plugin otherwise writes the build container's own IPv4 into resources.arsc, so the
+#   result depended on which address Docker happened to assign (172.17.0.2 vs .3).
 # - Supports multiple architectures (universal, arm64-v8a, armeabi-v7a, x86, x86_64)
 # - Generates COMPARISON_RESULTS.yaml and standardized verification summary output
 
@@ -42,7 +45,7 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 # Constants
 # ------------------------------------------------------------------------------
-SCRIPT_VERSION="v0.3.1"
+SCRIPT_VERSION="v0.3.2"
 APP_ID="app.zeusln.zeus"
 REPO_URL="https://github.com/ZeusLN/zeus.git"
 WS_CONTAINER="docker.io/walletscrutiny/android:5"
@@ -81,6 +84,7 @@ app_hash=""
 signer=""
 commit_hash=""
 additional_info=""
+dev_server_ip=""
 
 # Play artifact acceptance tracking
 manifest_play_only="false"
@@ -326,6 +330,27 @@ container_aapt_version() {
             sed -n "s/^[[:space:]]*versionCode:[[:space:]]*'\''\([^'\'']*\)'\''/\1/p" "$tmpdir/out/apktool.yml" | head -n1
             ;;
         esac
+      fi
+      rm -rf "$tmpdir"
+    '
+}
+
+# React Native's Gradle plugin writes the build host's first non-loopback IPv4 into the string
+# resource react_native_dev_server_ip unless the project property reactNativeDevServerIp is set
+# (@react-native/gradle-plugin AgpConfiguratorUtils.configureDevServerLocation). Read the value
+# the official APK carries so the build can be pinned to it.
+container_dev_server_ip() {
+  local apk_path="$1"
+  local apk_dir apk_name
+  apk_dir="$(dirname "$apk_path")"
+  apk_name="$(basename "$apk_path")"
+  $CONTAINER_CMD run --rm \
+    --volume "${apk_dir}:/apk${VOLUME_RO_SUFFIX}" \
+    "$WS_CONTAINER" \
+    sh -c '
+      tmpdir=$(mktemp -d)
+      if apktool d -f -s -o "$tmpdir/out" "/apk/'"${apk_name}"'" >/dev/null 2>&1; then
+        sed -n "s|.*<string name=\"react_native_dev_server_ip\">\([^<]*\)</string>.*|\1|p" "$tmpdir/out/res/values/strings.xml" | head -n1
       fi
       rm -rf "$tmpdir"
     '
@@ -627,6 +652,16 @@ else
   fi
 fi
 
+# Pin react_native_dev_server_ip to the official value (see container_dev_server_ip)
+dev_server_ip="$(container_dev_server_ip "${downloaded_apk}" || true)"
+if [[ "${dev_server_ip}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+  log_info "Official react_native_dev_server_ip: ${dev_server_ip} (build will be pinned to it)"
+else
+  log_warn "Could not read react_native_dev_server_ip from the official APK; build will not be pinned"
+  append_additional_info "react_native_dev_server_ip: not found in official APK; build not pinned (value follows the build container's IP)."
+  dev_server_ip=""
+fi
+
 # Resolve git_ref now that version_name is known
 if [[ -n "${requested_tag}" ]]; then
   log_info "Using git ref override: ${requested_tag} (instead of default v${version_name})"
@@ -717,6 +752,18 @@ if grep -q "docker run --rm" "${build_script_run}"; then
   if grep -q "docker run --rm --user ${user_spec}" "${build_script_run}" && ! grep -q "ANDROID_SDK_HOME" "${build_script_run}"; then
     sed -i "s/docker run --rm --user ${user_spec}/docker run --rm --user ${user_spec} -e HOME=\/tmp -e ANDROID_SDK_HOME=\/tmp -e ANDROID_PREFS_ROOT=\/tmp -e GRADLE_USER_HOME=\/tmp\/\.gradle/" "${build_script_run}"
     log_info "Patched build.sh to set HOME/ANDROID_SDK_HOME/ANDROID_PREFS_ROOT/GRADLE_USER_HOME"
+  fi
+fi
+
+if [[ -n "${dev_server_ip}" ]]; then
+  if grep -q "docker run --rm" "${build_script_run}"; then
+    # Gradle maps ORG_GRADLE_PROJECT_<name> to the project property <name>
+    sed -i "s/docker run --rm/docker run --rm -e ORG_GRADLE_PROJECT_reactNativeDevServerIp=${dev_server_ip}/" "${build_script_run}"
+    log_info "Patched build.sh to pin reactNativeDevServerIp=${dev_server_ip}"
+    append_additional_info "react_native_dev_server_ip pinned to ${dev_server_ip}, read from the official APK (Gradle property reactNativeDevServerIp)."
+  else
+    log_warn "build.sh has no 'docker run --rm' line; reactNativeDevServerIp NOT pinned"
+    append_additional_info "react_native_dev_server_ip: could not patch build.sh; build not pinned."
   fi
 fi
 
