@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
 # bluewallet_build.sh - BlueWallet (Google Play) reproducible build verification
-# Version:          v0.1.1
+# Version:          v0.1.2
 # Organization:     WalletScrutiny.com
-# Last Modified:    2026-09-16
+# Last Modified:    2026-09-25
 # App ID:           io.bluewallet.bluewallet
 # Project:          https://github.com/BlueWallet/BlueWallet
 # Play Store:       https://play.google.com/store/apps/details?id=io.bluewallet.bluewallet
 #
 # Play ships the single universal APK that upstream's BuildReleaseApk workflow
 # produces (fastlane lane build_release_apk), re-signed by Play App Signing.
+# The same build is also shipped signed with BlueWallet's own key (no SourceStamp, no Play
+# meta-data); v0.1.2 verifies that artifact too.
 # Design notes, history and rationale: ws-notes script-notes/android/io.bluewallet.bluewallet/changelog.md
 #
 # Provided for technical analysis and reproducible build verification only, with
 # no warranty of any kind. Review before running.
 # Exit codes: 0 = identical, 1 = difference or build failure, 2 = bad parameters.
 
-SCRIPT_VERSION="v0.1.1"
+SCRIPT_VERSION="v0.1.2"
 
 SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
 SCRIPT_HASH="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
@@ -165,7 +167,8 @@ echo "  No host JDK, node, Gradle, Android SDK or apktool is required or used."
 
 RUN_ID="bluewallet-$(date +%s)-$$"
 IMG="ws-bluewallet-${RUN_ID}"
-workspace="${execution_dir}/bluewallet_verification_${RUN_ID}"
+# Per-run workspace in the caller's directory (shared build host: never a fixed or shared path).
+workspace="${invocation_dir}/bluewallet_verification_${RUN_ID}"
 META_DIR="${workspace}/metadata"
 BUILD_DIR="${workspace}/source-build"
 CMP_DIR="${workspace}/comparison"
@@ -173,13 +176,15 @@ img_ctx=""
 
 mkdir -p "$META_DIR" "$BUILD_DIR" "$CMP_DIR"
 
-# Runs as root in the container on purpose: it must be able to chown.
+# Runs as root in the container on purpose: it must be able to chown. Under rootless
+# podman, container root IS the caller, so 0:0 hands the files back; docker needs the uid.
 ensure_user_ownership() {
-  local path="$1"
+  local path="$1" owner="${HOST_UID}:${HOST_GID}"
+  [[ "$CONTAINER_CMD" == "podman" ]] && owner="0:0"
   [[ -e "$path" ]] || return 0
   $CONTAINER_CMD image inspect "$IMG" >/dev/null 2>&1 || return 0
   $CONTAINER_CMD run --rm -v "${path}:/target" "$IMG" \
-    sh -c "chown -R ${HOST_UID}:${HOST_GID} /target" >/dev/null 2>&1 || \
+    sh -c "chown -R ${owner} /target" >/dev/null 2>&1 || \
     log_warn "Could not normalise ownership for ${path}"
 }
 
@@ -205,7 +210,7 @@ EOF
 
 phase "SETUP: BUILD CONTAINER IMAGE"
 
-img_ctx="$(mktemp -d)"
+img_ctx="$(mktemp -d -p "$workspace" ctx.XXXXXX)"
 
 # Pins are what BuildReleaseApk run 11977 (the run that produced 8.0.1) used:
 # node 24.18.0 (setup-node "24"), Temurin 17.0.19+10, SDK 36 / build-tools 36.0.0 /
@@ -601,6 +606,15 @@ manifest_ok() {
   fi
   n=$(printf '%s\n' "$left" | grep -c '^E: meta-data')
   m=$(printf '%s\n' "$left" | grep -c 'android:name(0x[0-9a-f]*)="com\.android\.')
+  # Non-Play artifact (BlueWallet's own signing key, no SourceStamp): no Play meta-data is
+  # expected, so the manifest is earned only if nothing at all is left after the UUID.
+  if [[ "$n" -eq 0 && -z "$(printf '%s' "$left" | tr -d '[:space:]')" ]]; then
+    if "$BT/apksigner" verify --verbose "$o" 2>/dev/null | grep -q 'Verified for SourceStamp: true'; then
+      echo "      manifest: SourceStamp present but no Play meta-data block"; return 1
+    fi
+    echo "      manifest: identical once BUILD_UUID is equated (no SourceStamp: not Play-distributed, no Play meta-data expected)"
+    return 0
+  fi
   [[ "$n" -ge 1 && "$n" -eq "$m" ]] || { echo "      manifest: $n block(s) vs $m Play name(s)"; return 1; }
   echo "      manifest: ${n} official-only Play meta-data block(s), none built-only:"
   printf '%s\n' "$left" | grep -vE '^E: meta-data' | sed 's/^A: [^ ]*android:/        /'
