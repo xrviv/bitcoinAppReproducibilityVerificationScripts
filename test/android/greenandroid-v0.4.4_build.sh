@@ -2,9 +2,10 @@
 # ==============================================================================
 # greenandroid_build.sh - Blockstream Green Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.4.0
+# Version:       v0.4.4
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-09-01
+# Last Modified: 2026-09-28
+# Last modified by: Danny Garcia
 # Project:       https://github.com/Blockstream/green_android
 # ==============================================================================
 # LICENSE: MIT License
@@ -13,41 +14,28 @@
 # ~/work/ws-notes/script-notes/android/com.greenaddress.greenbits_android_wallet/changelog.md
 # ==============================================================================
 #
-# TECHNICAL AND LEGAL DISCLAIMER:
-# Provided for reproducible build verification and legitimate security research only, as-is and
-# without warranty as to security, functionality or fitness for any purpose. Users assume all
-# risks, are responsible for compliance with applicable laws, and should examine this script
+# DISCLAIMER: for reproducible build verification and legitimate security research only, as-is,
+# without warranty. Users assume all risks and legal compliance, and should examine this script
 # before running it. The developers assume no liability for any misuse.
 #
-# SCRIPT SUMMARY:
-# Phase 1 — GDK from source:
-#   - Clones GDK at the tag pinned in green_android's gdk/fetch_android_binaries.sh
-#   - Builds GDK Docker image from GDK's own docker/android/Dockerfile
-#     (NDK r26b, Debian Bullseye, JDK 11, Rust 1.85; compiles all C deps)
-#   - Builds GDK for armeabi-v7a + arm64-v8a inside that image
-#   - Downloads official GDK tarball, verifies SHA256
-#   - Compares built .so + Java wrapper files vs official → gdk_verdict
-# Phase 2 — Green from source (using Phase 1 GDK):
-#   - Clones green_android at the release tag
-#   - Places Phase 1 .so files into gdk/src/main/jniLibs/ (Gradle skips auto-download)
-#   - Builds Green Docker image from contrib/Dockerfile
-#   - Runs ./gradlew useBlockstreamKeys assembleProductionGoogleRelease
-#   - Compares built APK vs official → apk_verdict
-# Output:
-#   - Both verdicts reported separately (per-artifact model)
-#   - COMPARISON_RESULTS.yaml verdict reflects APK comparison
-#   - GDK build time warning: Phase 1 image build is slow on first run; cached layers are reused
+# SUMMARY: Phase 1 builds GDK (tag from gdk/fetch_android_binaries.sh) with GDK's
+# docker/android/Dockerfile and compares it with the official tarball; Phase 2 builds the app from
+# release_<version> with contrib/Dockerfile and compares the APK. The official artifact kind
+# (google-play / github-release / fdroid / unknown) is detected from the file itself (signing
+# block, SourceStamp, GOOGPLAY.*, signer) and selects the accepted differences.
 
 set -euo pipefail
+set -E  # ERR trap (ftbfs YAML) must also fire for failures inside functions
 
-# ------------------------------------------------------------------------------
 # Constants
-# ------------------------------------------------------------------------------
-SCRIPT_VERSION="v0.4.0"
+SCRIPT_VERSION="v0.4.4"
 APP_ID="com.greenaddress.greenbits_android_wallet"
 REPO_URL="https://github.com/Blockstream/green_android.git"
 GDK_REPO_URL="https://github.com/Blockstream/gdk.git"
-WS_CONTAINER="docker.io/walletscrutiny/android:5"
+WS_CONTAINER="docker.io/walletscrutiny/android:5@sha256:eabd60543f19831feef6db22e9a1ada0ef469eef723119f1c96bd836198614c3"
+BLOCKSTREAM_PLAY_SIGNER="32f9cc00b13fbeace51e2fb51df482044e42ad34a9bd912f179fedb16a42970e"  # Play + GitHub releases
+FDROID_SIGNER="376ef6f4b01bb8c54d941b471280485c70c27d108f7eaaa3a2233b7d70b50a59"  # f-droid.org index-v2, 5.7.0
+PLAY_STAMP_CERT="3257d599a49d2c961a471ca9843f59d341a405884583fc087df4237b733bbd6d"  # Google Play SourceStamp signer
 
 EXIT_SUCCESS=0
 EXIT_FAILED=1
@@ -56,8 +44,7 @@ EXIT_INVALID=2
 execution_dir="$(pwd)"
 script_name="$(basename "$0")"
 
-# --- Self-identification (script-notes/script-version-and-hash.md, 2026-08-17) ---
-# Hash THIS file before doing anything else, so a reader can tie a verdict to exact bytes.
+# Self-identification (script-notes/script-version-and-hash.md): hash THIS file first.
 script_path="$(readlink -f "$0")"
 if [[ -f "${script_path}" ]]; then
   script_sha256="$(sha256sum "${script_path}" | awk '{print $1}')"
@@ -89,22 +76,28 @@ gdk_verdict="unknown"
 gdk_diff_output=""
 gdk_has_diffs=false
 
-# Play artifact acceptance tracking
+# Official artifact kind and Play material (detected from the file, never from its name)
+artifact_kind="unknown"
+frosting_len=""
+stamp_block=false
+googplay_entries=0
+stamp_verified=false
 manifest_play_only="false"
+manifest_lines=0
 res_diff_count=0
-play_artifacts_present="false"
 stamp_official_state="absent"
 stamp_built_state="absent"
+yaml_final=false
 
 work_dir=""
 build_image_tag=""
+fdroid_build_image_tag=""
+app_run_image=""
 build_flavor=""
 gradle_task=""
 apk_is_fdroid=false
 
-# ------------------------------------------------------------------------------
 # Logging helpers (plain text; no ANSI in results)
-# ------------------------------------------------------------------------------
 log_info() {
   echo "[INFO] $*"
 }
@@ -128,6 +121,7 @@ append_additional_info() {
 
 die_invalid() {
   log_error "$*"
+  printf 'script_version: %s\nverdict: ftbfs\nnotes: |\n  Invalid invocation: %s\n' "${SCRIPT_VERSION}" "$*" > "${execution_dir}/COMPARISON_RESULTS.yaml"
   echo "Exit code: ${EXIT_INVALID}"
   exit "${EXIT_INVALID}"
 }
@@ -149,10 +143,17 @@ on_error() {
   exit "${EXIT_FAILED}"
 }
 trap 'on_error $LINENO' ERR
+reclaim_workspace() {
+  trap - ERR; set +e  # nothing on the EXIT path may reach on_error (v0.4.3: a failed rmi rewrote the verdict as ftbfs)
+  [[ -n "${CONTAINER_CMD:-}" ]] || return 0
+  local owner="$(id -u):$(id -g)"; [[ "${CONTAINER_CMD}" == podman ]] && owner="0:0"
+  [[ -n "${work_dir:-}" && -d "${work_dir}" ]] && $CONTAINER_CMD run --rm -v "${work_dir}:/w${VOLUME_RW_SUFFIX}" "$WS_CONTAINER" sh -c "chown -R ${owner} /w; chmod -R u+rwX /w" >/dev/null 2>&1 || true
+  local i; for i in "${gdk_image_tag:-}" "${build_image_tag:-}" "${fdroid_build_image_tag:-}"; do
+    [[ -n "$i" ]] && $CONTAINER_CMD rmi "$i" >/dev/null 2>&1 || true; done; return 0
+}
+trap reclaim_workspace EXIT
 
-# ------------------------------------------------------------------------------
 # Container runtime detection
-# ------------------------------------------------------------------------------
 CONTAINER_CMD=""
 VOLUME_RO_SUFFIX=""
 VOLUME_RW_SUFFIX=""
@@ -172,13 +173,8 @@ else
   die_invalid "Neither podman nor docker is available. Install one to continue."
 fi
 
-# ------------------------------------------------------------------------------
-# Workspace removal helper
-# ------------------------------------------------------------------------------
-# Files created inside containers are owned by root and may have restricted
-# permissions. Remove from inside a container (running as root) so host
-# permission checks are bypassed entirely. Mount the PARENT so the container
-# can delete the directory entry itself.
+# Workspace removal: container files may be root-owned, so delete from inside a container (as root),
+# mounting the PARENT so the directory entry itself can go.
 remove_workspace_dir() {
   local dir="$1"
   [[ -d "$dir" ]] || return 0
@@ -188,9 +184,7 @@ remove_workspace_dir() {
     rm -rf "/parent/$(basename "${dir}")"
 }
 
-# ------------------------------------------------------------------------------
 # Usage
-# ------------------------------------------------------------------------------
 usage() {
   cat <<EOF
 NAME
@@ -203,45 +197,33 @@ SYNOPSIS
        ${script_name} --help
 
 DESCRIPTION
-       Builds GDK from source using the GDK project's own Docker build environment,
-       then builds Blockstream Green using that from-source GDK and Green's upstream
-       contrib/Dockerfile. Compares built APK to the official APK.
-
-       Two verdicts are reported:
-         gdk_verdict  - built GDK .so files vs official pre-built tarball
-         apk_verdict  - built APK vs official APK (COMPARISON_RESULTS.yaml verdict)
-
-       WARNING: Phase 1 (GDK Docker image build) compiles all C dependencies from
-       source (openssl, boost, tor, libwally-core, Rust) for 4 ABIs. Runtime
-       varies; first uncached builds may be much longer.
+       Builds GDK from source with GDK's docker/android/Dockerfile, then Green with
+       contrib/Dockerfile on that GDK, and compares both against the official GDK
+       tarball and APK (gdk_verdict, apk_verdict). The official artifact kind
+       (google-play, github-release, fdroid, unknown) is detected from the file.
+       Phase 1 compiles openssl, boost, tor, libwally and Rust for 4 ABIs: slow.
 
 OPTIONS
-       --version <version>     Override version (optional). If omitted, auto-detected
-                               from the APK. Must match APK if both are provided.
-                               Examples: 5.2.0, 5.1.4
-       --apk <file>            Path to official APK (required).
-       --binary <file>         Alias for --apk for build-server compatibility.
-       --arch <arch>            Architecture label for YAML output
-                               (default: universal)
+       --version <version>     Version (optional; auto-detected from the APK, must match it)
+       --apk <file>            Path to the official APK (required)
+       --binary <file>         Alias for --apk (build server)
+       --arch <arch>           Architecture label (default: universal)
        --type <type>           Build type (accepted for build server compat)
        --cleanup               Remove temporary files after completion
        --script-version        Print script version and exit
        --help                  Show this help and exit
 
 EXIT CODES
-       0    Reproducible (only META-INF / Play distribution differences)
+       0    Reproducible (only signing files, plus verified Play material for a Play artifact)
        1    Differences found or build failure
        2    Invalid parameters or configuration
 
 EXAMPLES
-       ${script_name} --binary ~/Downloads/com.greenaddress.greenbits_android_wallet_v5.2.0.apk
-       ${script_name} --apk ~/Downloads/green_5.2.0.apk --version 5.2.0
+       ${script_name} --binary ~/Downloads/com.greenaddress.greenbits_android_wallet_v5.7.0.apk
 EOF
 }
 
-# ------------------------------------------------------------------------------
 # Argument parsing
-# ------------------------------------------------------------------------------
 while [[ "$#" -gt 0 ]]; do
   case $1 in
     --version) requested_version="$2"; shift ;;
@@ -261,6 +243,14 @@ if [[ -z "${downloaded_apk}" ]]; then
   die_invalid "You must provide --binary or --apk with the path to the official APK."
 fi
 
+if [[ -d "${downloaded_apk}" ]]; then
+  mapfile -t _apks < <(find "${downloaded_apk}" -maxdepth 1 -type f -name '*.apk' | sort)
+  [[ ${#_apks[@]} -eq 1 ]] || die_invalid "--binary directory must hold exactly one .apk (found ${#_apks[@]})"
+  downloaded_apk="${_apks[0]}"
+fi
+[[ -f "${downloaded_apk}" ]] || die_invalid "--binary not found: ${downloaded_apk}"
+downloaded_apk="$(readlink -f "${downloaded_apk}")"
+
 if [[ "$(id -u)" -eq 0 ]]; then
   die_invalid "Do not run this script as root."
 fi
@@ -277,9 +267,7 @@ fi
 
 version_name="${requested_version}"
 
-# ------------------------------------------------------------------------------
 # Helper functions (containerized)
-# ------------------------------------------------------------------------------
 container_sha256() {
   local file_path="$1"
   local file_dir file_name
@@ -361,9 +349,43 @@ git_in_container() {
     sh -c "${cmd}"
 }
 
+# APK Signing Block pairs of an APK, on the host with coreutils only: "<id hex> <value length> <value offset>".
+sigblock_ids() {
+  local f="$1" tl eocd cd blk pos len
+  tl="$(tail -c 65557 "$f" | wc -c)"
+  eocd="$(tail -c 65557 "$f" | LC_ALL=C grep -obUa "$(printf 'PK\005\006')" | tail -n1 | cut -d: -f1)" || true
+  [[ -n "${eocd}" ]] || return 0
+  eocd=$(( $(stat -c %s "$f") - tl + eocd ))
+  cd="$(od -An -tu4 -j $((eocd + 16)) -N 4 "$f" | tr -d ' ')"
+  [[ "$(dd if="$f" bs=1 skip=$((cd - 16)) count=16 2>/dev/null)" == "APK Sig Block 42" ]] || return 0
+  blk="$(od -An -tu8 -j $((cd - 24)) -N 8 "$f" | tr -d ' ')"
+  pos=$((cd - blk))
+  while (( pos < cd - 24 )); do
+    len="$(od -An -tu8 -j ${pos} -N 8 "$f" | tr -d ' ')"
+    printf '%s %s %s\n' "$(od -An -tx4 -j $((pos + 8)) -N 4 "$f" | tr -d ' ')" "$((len - 4))" "$((pos + 12))"
+    pos=$((pos + 8 + len))
+  done
+}
+
+# Does a DER certificate inside the SourceStamp block of $1 hash to $2? (apksigner 0.9 cannot verify stamps.)
+stamp_cert_matches() {
+  local f="$1" want="$2" len off hex i l
+  read -r _ len off < <(sigblock_ids "$f" | grep -E '^(6dff800d|2b09189e) ') || return 1
+  hex="$(od -An -tx1 -v -j "${off}" -N "${len}" "$f" | tr -d ' \n')"
+  for ((i = 0; i < ${#hex} - 8; i += 2)); do
+    [[ "${hex:i:4}" == 3082 ]] || continue
+    l=$(( 16#${hex:i+4:4} + 4 ))
+    [[ "$(dd if="$f" bs=1 skip=$((off + i / 2)) count=${l} 2>/dev/null | sha256sum | cut -c1-64)" == "${want}" ]] && return 0
+  done
+  return 1
+}
+
 generate_error_yaml() {
   local status="$1"
   local yaml_file="${execution_dir}/COMPARISON_RESULTS.yaml"
+  if [[ "${yaml_final}" == true ]]; then
+    log_warn "Final COMPARISON_RESULTS.yaml kept; not overwriting it with ${status}"; return 0
+  fi
   cat > "$yaml_file" <<EOF
 script_version: ${SCRIPT_VERSION}
 verdict: ${status}
@@ -382,11 +404,12 @@ notes: |
   Green APK flavor: ${build_flavor}
   Green APK verdict: ${yaml_verdict}
   Green APK built using GDK compiled from source via GDK's docker/android/Dockerfile.
+  Official artifact kind: ${artifact_kind}
   Expected APK differences (do not affect reproducibility verdict):
-  - META-INF/*: APK signing files
-  - AndroidManifest.xml: com.android.vending.derived.apk.id injected by Google Play
-  - stamp-cert-sha256: Certificate stamp from Google Play
+  - META-INF root signing files (*.SF, *.RSA/DSA/EC, MANIFEST.MF): the local build is unsigned
+${yaml_play_notes}
 EOF
+  yaml_final=true
 }
 
 generate_diff_summary() {
@@ -415,16 +438,15 @@ generate_diff_summary() {
     return 0
   fi
 
-  local manifest_diff manifest_changes
-  local manifest_lines=0
-  local manifest_snip
+  local manifest_diff manifest_changes manifest_snip
+  manifest_lines=0
 
   manifest_diff="$(diff -u "${official_dir}/AndroidManifest.xml" "${built_dir}/AndroidManifest.xml" || true)"
   manifest_changes="$(echo "${manifest_diff}" | grep -E '^[+-]' | grep -vE '^\+\+\+|^---|^@@' || true)"
   if [[ -z "${manifest_changes}" ]]; then
     manifest_play_only="true"
-  elif echo "${manifest_changes}" | grep -v "com.android.vending.derived.apk.id" >/dev/null 2>&1; then
-    manifest_play_only="false"
+  elif echo "${manifest_changes}" | grep -vE '^-.*com\.android\.vending\.derived\.apk\.id' >/dev/null 2>&1; then
+    manifest_play_only="false"  # anything beyond official-only derived.apk.id lines counts
   else
     manifest_play_only="true"
   fi
@@ -456,78 +478,25 @@ generate_diff_summary() {
     append_additional_info "${res_snip}"
   fi
 
-  # Check for stamp-cert-sha256
-  local stamp_official="" stamp_built=""
-  stamp_official_state="absent"
+  # SourceStamp: verified when the entry names Google Play's stamp signer and the block's certificate hashes to it.
   stamp_built_state="absent"
-
-  stamp_official="$(${CONTAINER_CMD} run --rm \
-    --volume "$(dirname "${downloaded_apk}"):/apk${VOLUME_RO_SUFFIX}" \
-    "${WS_CONTAINER}" \
-    sh -c "zipinfo -1 /apk/$(basename "${downloaded_apk}") | grep -E '^stamp-cert-sha256$' || true")"
-
-  stamp_built="$(${CONTAINER_CMD} run --rm \
-    --volume "$(dirname "${built_apk}"):/apk${VOLUME_RO_SUFFIX}" \
-    "${WS_CONTAINER}" \
-    sh -c "zipinfo -1 /apk/$(basename "${built_apk}") | grep -E '^stamp-cert-sha256$' || true")"
-
-  if [[ -n "${stamp_official}" ]]; then
-    stamp_official_state="present"
-  fi
-  if [[ -n "${stamp_built}" ]]; then
-    stamp_built_state="present"
-  fi
-
+  ${CONTAINER_CMD} run --rm --volume "$(dirname "${built_apk}"):/apk${VOLUME_RO_SUFFIX}" "${WS_CONTAINER}" \
+    sh -c "zipinfo -1 /apk/$(basename "${built_apk}") | grep -qx stamp-cert-sha256" && stamp_built_state="present"
   append_additional_info "stamp-cert-sha256: official ${stamp_official_state}, built ${stamp_built_state}"
-
   if [[ "${stamp_official_state}" == "present" ]]; then
-    local stamp_hex_lines stamp_b64 stamp_len
-    stamp_len="$(${CONTAINER_CMD} run --rm \
-      --volume "$(dirname "${downloaded_apk}"):/apk${VOLUME_RO_SUFFIX}" \
-      "${WS_CONTAINER}" \
-      sh -c "unzip -p /apk/$(basename "${downloaded_apk}") stamp-cert-sha256 2>/dev/null | wc -c | tr -d ' '")"
-
-    stamp_hex_lines="$(${CONTAINER_CMD} run --rm \
-      --volume "$(dirname "${downloaded_apk}"):/apk${VOLUME_RO_SUFFIX}" \
-      "${WS_CONTAINER}" \
-      sh -c "unzip -p /apk/$(basename "${downloaded_apk}") stamp-cert-sha256 2>/dev/null | od -An -tx1 -w16 -v | head -n 5")"
-
-    stamp_b64="$(${CONTAINER_CMD} run --rm \
-      --volume "$(dirname "${downloaded_apk}"):/apk${VOLUME_RO_SUFFIX}" \
-      "${WS_CONTAINER}" \
-      sh -c "unzip -p /apk/$(basename "${downloaded_apk}") stamp-cert-sha256 2>/dev/null | base64 -w 64 | head -n 1")"
-
-    append_additional_info "stamp-cert-sha256 bytes: ${stamp_len}"
-    if [[ -n "${stamp_hex_lines}" ]]; then
-      append_additional_info "stamp-cert-sha256 hex (up to 5 lines):"
-      while IFS= read -r line; do
-        append_additional_info "${line}"
-      done <<< "${stamp_hex_lines}"
+    local stamp_hex
+    stamp_hex="$(${CONTAINER_CMD} run --rm --volume "$(dirname "${downloaded_apk}"):/apk${VOLUME_RO_SUFFIX}" "${WS_CONTAINER}" \
+      sh -c "unzip -p /apk/$(basename "${downloaded_apk}") stamp-cert-sha256 2>/dev/null | od -An -tx1 -v | tr -d ' \n'")"
+    append_additional_info "stamp-cert-sha256 hex: ${stamp_hex}"
+    if [[ "${stamp_hex}" == "${PLAY_STAMP_CERT}" && "${stamp_block}" == true ]] && stamp_cert_matches "${downloaded_apk}" "${stamp_hex}"; then
+      stamp_verified=true
     fi
-    if [[ -n "${stamp_b64}" ]]; then
-      append_additional_info "stamp-cert-sha256 base64 (first line): ${stamp_b64}"
-    fi
-  fi
-
-  # Detect Play artifacts
-  local play_sig=""
-  play_sig="$(${CONTAINER_CMD} run --rm \
-    --volume "$(dirname "${downloaded_apk}"):/apk${VOLUME_RO_SUFFIX}" \
-    "${WS_CONTAINER}" \
-    sh -c "zipinfo -1 /apk/$(basename "${downloaded_apk}") | grep -E '^META-INF/GOOGPLAY\\.' || true")"
-
-  if [[ -n "${play_sig}" || "${stamp_official_state}" == "present" ]]; then
-    play_artifacts_present="true"
-    append_additional_info "Note: Google Play distribution artifacts detected (GOOGPLAY.* / stamp-cert-sha256)."
-  else
-    play_artifacts_present="false"
+    append_additional_info "SourceStamp verified (Play stamp signer named, block certificate matches): ${stamp_verified}"
   fi
 }
 
 
-# ------------------------------------------------------------------------------
 # Input preparation
-# ------------------------------------------------------------------------------
 if [[ "${downloaded_apk}" != /* ]]; then
   downloaded_apk="${execution_dir}/${downloaded_apk}"
 fi
@@ -566,10 +535,8 @@ elif [[ -n "${version_name_from_apk}" && "${requested_version}" != "${version_na
   die_invalid "--version ${requested_version} does not match APK version ${version_name_from_apk}."
 fi
 
-# Detect build flavor from signer certificate.
-# Blockstream's Play Store signing key is stable and distinct from F-Droid's key.
-# Unsigned APKs (empty signer) are GitHub/Play releases — use productionGoogle.
-BLOCKSTREAM_PLAY_SIGNER="32f9cc00b13fbeace51e2fb51df482044e42ad34a9bd912f179fedb16a42970e"
+# Detect build flavor from signer certificate (Blockstream's key is used for Play and GitHub, F-Droid
+# has its own). An unsigned/unreadable signer keeps productionGoogle but the artifact kind is unknown.
 signer_normalized="$(echo "${signer}" | tr '[:upper:]' '[:lower:]' | tr -d ':')"
 log_info "APK signer (raw):        ${signer:-none}"
 log_info "APK signer (normalized): ${signer_normalized:-none}"
@@ -589,20 +556,45 @@ else
   append_additional_info "APK flavor: F-Droid (signer does not match Blockstream Play key)"
 fi
 
-# ------------------------------------------------------------------------------
-# Workspace setup
-# ------------------------------------------------------------------------------
-work_dir="${execution_dir}/workdir_${APP_ID}_${version_name}_${build_arch}"
-if [[ -d "${work_dir}" ]]; then
-  log_info "Removing existing workspace: ${work_dir}"
-  remove_workspace_dir "${work_dir}"
+# Artifact kind from the file: frosting block 0x2146444e, SourceStamp block 0x6dff800d/0x2b09189e, entries, signer.
+_pl="$(${CONTAINER_CMD} run --rm --volume "$(dirname "${downloaded_apk}"):/apk${VOLUME_RO_SUFFIX}" "${WS_CONTAINER}" \
+  sh -c "zipinfo -1 /apk/$(basename "${downloaded_apk}") | grep -E '^(stamp-cert-sha256|META-INF/GOOGPLAY\\.[^/]*)$' || true")"
+grep -qx 'stamp-cert-sha256' <<< "${_pl}" && stamp_official_state="present"
+googplay_entries="$(grep -c '^META-INF/GOOGPLAY' <<< "${_pl}" || true)"
+_ids="$(sigblock_ids "${downloaded_apk}")"
+frosting_len="$(awk '$1 == "2146444e" {print $2}' <<< "${_ids}")"
+grep -qE '^(6dff800d|2b09189e) ' <<< "${_ids}" && stamp_block=true
+_fr="${frosting_len:+${frosting_len} B}"; _fr="${_fr:-absent}"
+play_material=false
+[[ -n "${frosting_len}" || "${googplay_entries}" -gt 0 || "${stamp_official_state}" == present || "${stamp_block}" == true ]] && play_material=true
+if [[ -z "${signer_normalized}" || "${signer}" == "unknown" ]]; then
+  artifact_kind="unknown"; _why="unsigned or unreadable signer"
+elif [[ "${signer_normalized}" == "${BLOCKSTREAM_PLAY_SIGNER}" ]]; then
+  if [[ "${play_material}" == true ]]; then artifact_kind="google-play"; _why="Blockstream signer with Play material"
+  else artifact_kind="github-release"; _why="Blockstream signer, no Play material"; fi
+elif [[ "${signer_normalized}" == "${FDROID_SIGNER}" && "${play_material}" == false ]]; then
+  artifact_kind="fdroid"; _why="F-Droid signer"
+else
+  artifact_kind="unknown"; _why="signer ${signer_normalized} not known, Play material: ${play_material}"
+fi
+log_info "Artifact kind: ${artifact_kind} (${_why}; frosting block: ${_fr}, SourceStamp block: ${stamp_block}, stamp-cert-sha256: ${stamp_official_state}, GOOGPLAY entries: ${googplay_entries})"
+append_additional_info "Official artifact kind: ${artifact_kind} (${_why}; frosting ${_fr}, SourceStamp block ${stamp_block}, GOOGPLAY entries ${googplay_entries})"
+if [[ "${artifact_kind}" == "google-play" ]]; then
+  yaml_play_notes="  - AndroidManifest.xml: com.android.vending.derived.apk.id injected by Google Play (official only)
+  - stamp-cert-sha256: Google Play SourceStamp (official only, verified against the signing block)"
+else
+  yaml_play_notes="  - No Google Play material is expected for kind ${artifact_kind}; any that appears counts as a difference"
 fi
 
-mkdir -p "${work_dir}"
+# Workspace: per run, in the caller's directory, exclusive create (plain mkdir; retry with a new epoch).
+for _try in 1 2 3; do
+  work_dir="${execution_dir}/greenandroid_verification_${version_name}_${build_arch}_$(date +%s)-$$"
+  mkdir "${work_dir}" 2>/dev/null && break
+  work_dir=""; sleep 1
+done
+[[ -n "${work_dir}" ]] || die_failed "Could not create an exclusive workspace in ${execution_dir}"
 
-# ------------------------------------------------------------------------------
 # Phase 1a: Clone green_android (needed to read GDK tag)
-# ------------------------------------------------------------------------------
 log_info "Cloning Blockstream Green repository in container..."
 $CONTAINER_CMD run --rm \
   --volume "${work_dir}:/workspace${VOLUME_RW_SUFFIX}" \
@@ -613,9 +605,7 @@ $CONTAINER_CMD run --rm \
 commit_hash="$(git_in_container "git rev-parse HEAD")"
 log_info "Checked out release_${version_name} at commit ${commit_hash}"
 
-# ------------------------------------------------------------------------------
 # Phase 1b: Read GDK tag and SHA256 from green_android repo
-# ------------------------------------------------------------------------------
 gdk_fetch_script="${work_dir}/app/gdk/fetch_android_binaries.sh"
 if [[ ! -f "${gdk_fetch_script}" ]]; then
   die_failed "Could not find gdk/fetch_android_binaries.sh in cloned repo"
@@ -628,15 +618,13 @@ if [[ -z "${gdk_tag}" || -z "${gdk_sha256_official}" ]]; then
   die_failed "Could not parse GDK TAGNAME or SHA256 from gdk/fetch_android_binaries.sh"
 fi
 
-# For F-Droid, the official recipe reads the GDK tag from gdk/prepare_gdk_clang.sh instead.
-# Cross-check and warn if they differ (for 5.4.0 both are release_0.77.3).
+# F-Droid's recipe reads the GDK tag from gdk/prepare_gdk_clang.sh; cross-check and warn if they differ.
 if [[ "${apk_is_fdroid}" == "true" ]]; then
   gdk_clang_script="${work_dir}/app/gdk/prepare_gdk_clang.sh"
   if [[ -f "${gdk_clang_script}" ]]; then
     gdk_tag_clang="$(grep 'TAGNAME=' "${gdk_clang_script}" | head -1 | cut -d'"' -f2)"
     if [[ -n "${gdk_tag_clang}" && "${gdk_tag_clang}" != "${gdk_tag}" ]]; then
-      log_warn "GDK tag mismatch: fetch_android_binaries.sh says ${gdk_tag}, prepare_gdk_clang.sh says ${gdk_tag_clang}"
-      log_warn "Using ${gdk_tag} from fetch_android_binaries.sh — verify manually"
+      log_warn "GDK tag mismatch: fetch_android_binaries.sh ${gdk_tag}, prepare_gdk_clang.sh ${gdk_tag_clang}; using the former"
     else
       log_info "GDK tag cross-check: fetch_android_binaries.sh and prepare_gdk_clang.sh both say ${gdk_tag}"
     fi
@@ -647,9 +635,7 @@ gdk_tarball_name="gdk-${gdk_tag}"
 gdk_tarball_url="https://github.com/Blockstream/gdk/releases/download/${gdk_tag}/${gdk_tarball_name}.tar.gz"
 log_info "GDK tag: ${gdk_tag} | Official SHA256: ${gdk_sha256_official}"
 
-# ------------------------------------------------------------------------------
 # Phase 1c: Clone GDK repository
-# ------------------------------------------------------------------------------
 gdk_src_dir="${work_dir}/gdk_source"
 mkdir -p "${gdk_src_dir}"
 
@@ -668,7 +654,16 @@ sed -i \
   -e 's|^FROM debian:|FROM docker.io/library/debian:|g' \
   -e 's|^FROM rust:|FROM docker.io/library/rust:|g' \
   "${gdk_src_dir}/src/docker/android/Dockerfile"
-log_info "GDK Dockerfile image names qualified for Podman compatibility"
+
+# bullseye-security pool gone after LTS end (index still lists it: apt 404): pin to a snapshot.
+DEB_SNAP="20260901T000000Z"
+snap_deps() {
+  [[ -f "$1" ]] || { log_warn "No $1; bullseye snapshot not applied"; return 0; }
+  local t; t="$(mktemp -p "$(dirname "$1")")"
+  { head -n1 "$1"; printf '%s\n' "sed -i -E 's#https?://(deb|security)\\.debian\\.org/(debian(-security)?)#http://snapshot.debian.org/archive/\\2/${DEB_SNAP}#' /etc/apt/sources.list" "echo 'Acquire::Check-Valid-Until \"false\";' > /etc/apt/apt.conf.d/99ws-snapshot"; tail -n +2 "$1"; } > "$t" && cat "$t" > "$1" && rm -f "$t"
+  log_info "apt sources pinned to snapshot.debian.org ${DEB_SNAP}: ${1##*/}"
+}
+snap_deps "${gdk_src_dir}/src/docker/android/install_deps.sh"
 
 if [[ "${apk_is_fdroid}" == "true" ]]; then
   log_info "F-Droid path: adding swig and virtualenv to GDK image..."
@@ -687,13 +682,9 @@ if [[ "${apk_is_fdroid}" == "true" ]]; then
     "${work_dir}/app/gdk/prepare_gdk_clang.sh"
 fi
 
-# ------------------------------------------------------------------------------
 # Phase 1d: Build GDK Docker image
-# ------------------------------------------------------------------------------
 gdk_image_tag="gdk_android_builder_${version_name}_$$"
-log_info "Building GDK Docker image from docker/android/Dockerfile..."
-log_info "WARNING: This compiles openssl, boost, tor, libwally, Rust for 4 ABIs."
-log_info "WARNING: Phase 1 build time varies; first uncached run may be much longer. Do not interrupt."
+log_info "Building GDK Docker image from docker/android/Dockerfile (openssl, boost, tor, libwally, Rust for 4 ABIs; slow, do not interrupt)..."
 
 if [[ "${CONTAINER_CMD}" == "docker" ]]; then
   DOCKER_BUILDKIT=1 $CONTAINER_CMD build \
@@ -709,9 +700,7 @@ fi
 
 log_info "GDK Docker image built: ${gdk_image_tag}"
 
-# ------------------------------------------------------------------------------
 # Phase 1e: Build GDK from source for armeabi-v7a and arm64-v8a
-# ------------------------------------------------------------------------------
 gdk_built_dir="${work_dir}/gdk_built"
 mkdir -p "${gdk_built_dir}/armeabi-v7a" "${gdk_built_dir}/arm64-v8a"
 
@@ -734,22 +723,17 @@ else
   log_info "F-Droid GDK build via prepare_gdk_clang.sh complete"
 fi
 
-# ------------------------------------------------------------------------------
-# Phase 1f–1g: Download/verify official GDK tarball and compare (Play Store only)
-# F-Droid: GDK built via prepare_gdk_clang.sh; comparison done at APK level
-# ------------------------------------------------------------------------------
+# Phase 1f-1g: official GDK tarball + comparison (F-Droid: built via prepare_gdk_clang.sh, APK diff covers it)
 if [[ "${apk_is_fdroid}" == "true" ]]; then
   gdk_verdict="not_compared"
   gdk_diff_lines="GDK comparison skipped for F-Droid path — built via prepare_gdk_clang.sh\n"
   log_info "F-Droid path: skipping GDK tarball comparison (APK diff covers this)"
 fi
 
-gdk_diff_file="${execution_dir}/diff_gdk_binaries.txt"
+gdk_diff_file="${work_dir}/diff_gdk_binaries.txt"
 
 if [[ "${apk_is_fdroid}" == "false" ]]; then
-# ------------------------------------------------------------------------------
 # Phase 1f: Download and verify official GDK tarball
-# ------------------------------------------------------------------------------
 gdk_official_dir="${work_dir}/gdk_official"
 mkdir -p "${gdk_official_dir}"
 
@@ -772,9 +756,7 @@ $CONTAINER_CMD run --rm \
 
 log_info "Official GDK extracted to: ${gdk_official_dir}/${gdk_tarball_name}/"
 
-# ------------------------------------------------------------------------------
 # Phase 1g: Compare official vs from-source GDK binaries
-# ------------------------------------------------------------------------------
 log_info "Comparing official GDK binaries vs from-source build..."
 gdk_diff_lines=""
 
@@ -842,10 +824,13 @@ append_additional_info "GDK tag: ${gdk_tag}"
 append_additional_info "GDK official SHA256 (tarball): ${gdk_sha256_official}"
 append_additional_info "GDK binary verdict: ${gdk_verdict}"
 if [[ -n "${gdk_diff_lines}" ]]; then
-  append_additional_info "GDK diff details:"
+  append_additional_info "GDK diff details (first 5 lines; full list: ${gdk_diff_file}):"
+  _gn=0
   while IFS= read -r dline; do
-    append_additional_info "  ${dline}"
+    _gn=$((_gn + 1))
+    [[ "${_gn}" -le 5 ]] && append_additional_info "  ${dline}"
   done < <(printf '%b' "${gdk_diff_lines}")
+  [[ "${_gn}" -gt 5 ]] && append_additional_info "  ... (${_gn} lines total)"
 fi
 
 fi # end Play Store GDK comparison gate
@@ -854,10 +839,7 @@ fi # end Play Store GDK comparison gate
 printf '%b' "${gdk_diff_lines}" > "${gdk_diff_file}"
 log_info "GDK diff file written to: ${gdk_diff_file}"
 
-# ------------------------------------------------------------------------------
-# Phase 1h: Place from-source GDK into green_android tree (Play Store only)
-# F-Droid: prepare_gdk_clang.sh places .so into gdk/src/main/jniLibs directly
-# ------------------------------------------------------------------------------
+# Phase 1h: place from-source GDK into the green_android tree (F-Droid: prepare_gdk_clang.sh did it)
 if [[ "${apk_is_fdroid}" == "false" ]]; then
   log_info "Placing from-source GDK into green_android tree..."
   jni_libs_dir="${work_dir}/app/gdk/src/main/jniLibs"
@@ -881,13 +863,11 @@ if [[ "${apk_is_fdroid}" == "false" ]]; then
     "$WS_CONTAINER" \
     sh -c "cp /src/green_gdk/GDK.java /dest/green_gdk/GDK.java && cp /src/libwally/Wally.java /dest/libwally/Wally.java"
 
-  log_info "From-source GDK placed in green_android tree. Gradle will skip fetchAndroidBinaries."
 fi
 
-# ------------------------------------------------------------------------------
 # Phase 2a: Build Green Docker image from contrib/Dockerfile
-# ------------------------------------------------------------------------------
 build_image_tag="green_builder_${version_name}_$$"
+snap_deps "${work_dir}/app/contrib/bullseye_deps.sh"
 log_info "Building Blockstream Green Docker image from contrib/Dockerfile..."
 log_info "Image tag: ${build_image_tag}"
 
@@ -897,25 +877,23 @@ $CONTAINER_CMD build \
   "${work_dir}/app/contrib/"
 
 log_info "Green Docker image built: ${build_image_tag}"
+app_run_image="${build_image_tag}"
 
 if [[ "${apk_is_fdroid}" == "true" ]]; then
   fdroid_build_image_tag="green_fdroid_builder_${version_name}_$$"
   log_info "F-Droid path: building derived image with JDK 21 (from eclipse-temurin)..."
   $CONTAINER_CMD build -t "${fdroid_build_image_tag}" - <<EOF
-FROM docker.io/library/eclipse-temurin:21-jdk AS jdk21
+FROM docker.io/library/eclipse-temurin:21-jdk@sha256:4d06038800655fe1211760cd561de70ef2ed7a47f5d69255e9834414602b7026 AS jdk21
 FROM ${build_image_tag}
 COPY --from=jdk21 /opt/java/openjdk /opt/java/openjdk-21
 ENV JAVA_HOME_21=/opt/java/openjdk-21
 EOF
-  build_image_tag="${fdroid_build_image_tag}"
-  log_info "F-Droid build image with JDK 21: ${build_image_tag}"
+  app_run_image="${fdroid_build_image_tag}"
+  log_info "F-Droid build image with JDK 21: ${app_run_image}"
 fi
 
-# ------------------------------------------------------------------------------
 # Phase 2b: Build Green APK using from-source GDK
-# ------------------------------------------------------------------------------
 log_info "Building Blockstream Green APK (${gradle_task}) with from-source GDK..."
-log_info "This may take 15-40 minutes..."
 
 if [[ "${apk_is_fdroid}" == "false" ]]; then
   green_build_cmd="set -e; cd /ga; ./gradlew useBlockstreamKeys"
@@ -939,7 +917,7 @@ $CONTAINER_CMD run --rm \
   -e HOME=/tmp \
   -e GRADLE_USER_HOME=/tmp/.gradle \
   -e ANDROID_PREFS_ROOT=/tmp \
-  "${build_image_tag}" \
+  "${app_run_image}" \
   -c "${green_build_cmd}"
 
 # Find built APK
@@ -961,9 +939,7 @@ fi
 
 log_info "APK built successfully: ${built_apk}"
 
-# ------------------------------------------------------------------------------
 # Phase 2c: Compare built APK vs official
-# ------------------------------------------------------------------------------
 from_play_unzipped="${work_dir}/fromPlay_${APP_ID}_${version_code}"
 from_build_unzipped="${work_dir}/fromBuild_${APP_ID}_${version_code}"
 remove_workspace_dir "${from_play_unzipped}"
@@ -990,19 +966,18 @@ diff_brief="$($CONTAINER_CMD run --rm \
   "$WS_CONTAINER" \
   sh -c "diff -qr '$(basename "${from_play_unzipped}")' '$(basename "${from_build_unzipped}")' || true")"
 
-# Filter root META-INF SIGNING files by NAME, never the META-INF/ directory by path: it also
-# carries services/ bindings, version-control-info.textproto, app-metadata.properties and the
-# androidx.*.version markers, which are payload/provenance and must be counted.
-# See ws-notes/script-notes/meta-inf-filter-scope.md (2026-08-27). Matches only files DIRECTLY
-# under root META-INF/, so a META-INF inside a bundled jar/aar stays counted.
-# DIRECTION MATTERS: the local build is unsigned, so an "Only in" signing file is expected on the
-# OFFICIAL side alone. One appearing only in OUR build means something signed it - material, never
-# filtered. Hence the "Only in" exclusion is anchored to the official directory by name.
+# Filter root META-INF SIGNING files by NAME, never META-INF/ by path (services/, version-control-info,
+# app-metadata, androidx.*.version count); see script-notes/meta-inf-filter-scope.md. DIRECTION: the
+# local build is unsigned, so an "Only in" signing file is expected on the OFFICIAL side alone.
 SIGN_NAME='[^/]*(\.(SF|RSA|DSA|EC)|MANIFEST\.MF)'
 official_dir_re="$(basename "${from_play_unzipped}" | sed 's/[][\.^$*+?(){}|\/]/\\&/g')"
 filtered_diff="$(echo "${diff_brief}" \
   | grep -vE "^Only in ${official_dir_re}/META-INF: ${SIGN_NAME}$" \
   | grep -vE "^Files [^/ ]+/META-INF/${SIGN_NAME} and " || true)"
+if [[ "${artifact_kind}" != "google-play" ]]; then  # Play signing entries count outside a Play artifact
+  _gp="$(echo "${diff_brief}" | grep 'META-INF[/:] *GOOGPLAY\.' || true)"
+  [[ -n "${_gp}" ]] && filtered_diff="${filtered_diff}"$'\n'"${_gp}"
+fi
 filtered_diff_compact="$(echo "${filtered_diff}" | tr -d '\n\r')"
 if [[ -z "${diff_brief}" || -z "${filtered_diff_compact}" ]]; then
   diff_count=0
@@ -1014,17 +989,14 @@ diff_display="$(echo "${diff_brief}" | sed "s|$(basename "${from_play_unzipped}"
 
 generate_diff_summary
 
+# Play-only differences are accepted for a google-play artifact only, each verified above.
 play_accept=false
-if [[ "${play_artifacts_present}" == "true" && "${manifest_play_only}" == "true" && "${res_diff_count}" -eq 0 ]]; then
+if [[ "${artifact_kind}" == "google-play" && "${manifest_play_only}" == "true" && "${res_diff_count}" -eq 0 ]]; then
   allowed_play=true
   while IFS= read -r line; do
     [[ -z "${line}" ]] && continue
-    if echo "${line}" | grep -q "AndroidManifest.xml"; then
-      continue
-    fi
-    if echo "${line}" | grep -q "stamp-cert-sha256"; then
-      continue
-    fi
+    [[ "${manifest_lines}" -gt 0 ]] && grep -q "AndroidManifest.xml" <<< "${line}" && continue
+    [[ "${stamp_verified}" == true ]] && grep -qE "^Only in ${official_dir_re}: stamp-cert-sha256$" <<< "${line}" && continue
     allowed_play=false
     break
   done <<< "${filtered_diff}"
@@ -1050,19 +1022,15 @@ elif [[ "${play_accept}" == "true" ]]; then
   exit_code="${EXIT_SUCCESS}"
   append_additional_info "Play-only diffs accepted; APK verdict set to reproducible."
 else
-  apk_verdict="differences found"
+  apk_verdict="not_reproducible"
 fi
 
 built_hash="$(container_sha256 "${built_apk}")"
 
-# ------------------------------------------------------------------------------
 # Results files
-# ------------------------------------------------------------------------------
 generate_comparison_yaml "${yaml_status}"
 
-# ------------------------------------------------------------------------------
 # Git signature verification (containerized)
-# ------------------------------------------------------------------------------
 tag_type="commit-only"
 tag_signature_status="[INFO] No tag found"
 commit_signature_status="[WARNING] No valid signature found on commit"
@@ -1076,8 +1044,8 @@ if git_in_container "command -v gpg >/dev/null 2>&1"; then
 fi
 
 if [[ "${gpg_available}" == false ]]; then
-  tag_signature_status="[INFO] gpg not available in container — signature verification skipped"
-  commit_signature_status="[INFO] gpg not available in container — signature verification skipped"
+  tag_signature_status="[INFO] gpg not available in container: signature verification skipped"
+  commit_signature_status="${tag_signature_status}"
   if git_in_container "git rev-parse --verify 'refs/tags/${tag_ref}' >/dev/null 2>&1"; then
     if git_in_container "test \"\$(git cat-file -t 'refs/tags/${tag_ref}')\" = 'tag'"; then
       tag_type="annotated"
@@ -1133,13 +1101,10 @@ else
   fi
 fi
 
-# ------------------------------------------------------------------------------
 # Standardized verification output
-# ------------------------------------------------------------------------------
 diff_guide="
 Run a full
 diff --recursive ${from_play_unzipped} ${from_build_unzipped}
-meld ${from_play_unzipped} ${from_build_unzipped}
 or
 diffoscope \"${downloaded_apk}\" ${built_apk}
 for more details.
@@ -1150,8 +1115,10 @@ if [[ "${should_cleanup}" == true ]]; then
 fi
 
 echo "===== Begin Results ====="
+echo "verdict:           ${yaml_status}"
 echo "appId:             ${APP_ID}"
 echo "signer:            ${signer}"
+echo "artifactKind:      ${artifact_kind}"
 echo "apkVersionName:    ${version_name_from_apk}"
 echo "apkVersionCode:    ${version_code}"
 echo "gdkTag:            ${gdk_tag}"
@@ -1164,7 +1131,10 @@ echo "scriptVersion:     ${SCRIPT_VERSION}"
 echo "scriptHash:        ${script_sha256}"
 echo ""
 echo "Diff:"
-echo "${diff_display}"
+printf '%s\n' "${diff_display}" > "${work_dir}/diff_apk_full.txt"
+head -n 5 "${work_dir}/diff_apk_full.txt"
+_n="$(grep -c . "${work_dir}/diff_apk_full.txt" || true)"
+[[ "${_n}" -gt 5 ]] && echo "... (${_n} lines; full list: ${work_dir}/diff_apk_full.txt)"
 echo ""
 echo "Revision, tag (and its signature):"
 
@@ -1208,14 +1178,15 @@ echo ""
 echo "===== End Results ====="
 echo "${diff_guide}"
 
-# ------------------------------------------------------------------------------
 # Cleanup
-# ------------------------------------------------------------------------------
 if $CONTAINER_CMD rmi "${gdk_image_tag}" >/dev/null 2>&1; then
-  log_info "Removed GDK build image: ${gdk_image_tag}"
+  log_info "Removed GDK build image: ${gdk_image_tag}"; gdk_image_tag=""
 fi
 if $CONTAINER_CMD rmi "${build_image_tag}" >/dev/null 2>&1; then
-  log_info "Removed Green build image: ${build_image_tag}"
+  log_info "Removed Green build image: ${build_image_tag}"; build_image_tag=""
+fi
+if [[ -n "${fdroid_build_image_tag}" ]] && $CONTAINER_CMD rmi "${fdroid_build_image_tag}" >/dev/null 2>&1; then
+  log_info "Removed F-Droid build image: ${fdroid_build_image_tag}"; fdroid_build_image_tag=""
 fi
 
 if [[ "${should_cleanup}" == true ]]; then
