@@ -3,7 +3,7 @@
 # sparrow_uploader.sh - Upload verified Sparrow Desktop release artifacts to Blossom
 #                       and register each on Nostr (NIP-94 / kind 1063).
 #
-# Version: v0.1.0
+# Version: v0.3.1
 #
 # WHAT THIS DOES
 #   Mirrors the WalletScrutiny Android uploader (BlossomHelper.kt) and the Passport Prime
@@ -42,7 +42,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.3.0"
+SCRIPT_VERSION="v0.3.1"
 APP_ID="sparrow"
 PLATFORM="desktop"
 PAGE_URL="https://walletscrutiny.com/desktop/sparrow/"
@@ -283,9 +283,7 @@ for t in "${TYPES[@]}"; do
     fi
 
     blossom_url="${BLOSSOM_SERVER}/${hash}"
-    content="Sparrow Desktop v${V} (${t}: ${file}) - WalletScrutiny verified artifact.
-SHA256 is the official download hash. Reproducibility verdict: ${PAGE_URL}"
-
+    content="Uploaded by Danny's CLI uploader"
     EVENT_TAGS=(
         -t "url=${blossom_url}"
         -t "x=${hash}"

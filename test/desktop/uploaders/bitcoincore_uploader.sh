@@ -4,7 +4,7 @@
 #                           and register each on Nostr (NIP-94 / kind 1063), so the
 #                           WalletScrutiny web UI lists them as "to be verified".
 #
-# Version: v0.1.0
+# Version: v0.1.2
 #
 # WHAT THIS DOES
 #   Mirrors bitcoinknots_uploader.sh. For each official Bitcoin Core desktop artifact
@@ -51,7 +51,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.1"
+SCRIPT_VERSION="v0.1.2"
 APP_ID="bitcoincore"
 PLATFORM="desktop"
 PAGE_URL="https://walletscrutiny.com/desktop/bitcoincore/"
@@ -469,9 +469,7 @@ for k in "${KEYS[@]}"; do
     fi
 
     blossom_url="${BLOSSOM_SERVER}/${hash}"
-    content="Bitcoin Core Desktop v${V} (${k}: ${file}) - WalletScrutiny registered artifact.
-SHA256 is the official download hash. Reproducibility verdict: ${PAGE_URL}"
-
+    content="Uploaded by Danny's CLI uploader"
     EVENT_TAGS=(
         -t "url=${blossom_url}"
         -t "x=${hash}"
