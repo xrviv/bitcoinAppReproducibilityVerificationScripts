@@ -1,23 +1,27 @@
 #!/bin/bash
-# bitkey_build.sh v0.2.30 — Bitkey Android Play Store split APK verification
+# bitkey_build.sh v0.2.32 — Bitkey Android Play Store split APK verification
 # Organization: WalletScrutiny.com
+
+readonly SCRIPT_VERSION="v0.2.32"
+SCRIPT_HASH="$(sha256sum "$(readlink -f "${BASH_SOURCE[0]}")" | awk '{print $1}')"
+echo "$(basename "${BASH_SOURCE[0]}") ${SCRIPT_VERSION} sha256:${SCRIPT_HASH}"
 
 set -euo pipefail
 
 EXEC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly EXEC_DIR
-LOG_DIR="${EXEC_DIR}/build-logs"
+LOG_DIR=""
 
-readonly SCRIPT_VERSION="v0.2.30"
 readonly SCRIPT_NAME="bitkey_build.sh"
 readonly APP_ID="world.bitkey.app"
 readonly REPO_URL="https://github.com/proto-at-block/bitkey.git"
 readonly DEFAULT_REF="main"
 readonly BUNDLETOOL_VERSION="1.15.6"
-readonly ANDROID_BUILD_TOOLS_VERSION="35.0.0"
-# Ubuntu archive snapshot near Bitkey's release date — restores the exact pinned
-# .debs after the live mirror retires them (keeps compiler/JDK pins faithful). Bump per release.
-readonly UBUNTU_SNAPSHOT="20260701T000000Z"
+# Fallback; ENV ANDROID_BUILD_TOOLS_VERSION from Bitkey's Dockerfile wins after clone.
+ANDROID_BUILD_TOOLS_VERSION="35.0.0"
+# Ubuntu snapshot keeping the pinned .debs installable after the live mirror retires them.
+# Derived from the release commit date; export UBUNTU_SNAPSHOT=YYYYMMDDT000000Z to override.
+UBUNTU_SNAPSHOT="${UBUNTU_SNAPSHOT:-}"
 readonly HELPER_GIT_IMAGE="docker.io/alpine/git:2.47.2"
 readonly WS_CONTAINER="docker.io/walletscrutiny/android:5"
 
@@ -31,7 +35,6 @@ ARCH=""
 TYPE=""
 APK_INPUT=""
 WORK_DIR=""
-WORK_DIR_INITIAL=""
 CONTAINER_CMD=""
 CONTAINER_RUN_EXTRA=""
 VOLUME_RO=":ro"
@@ -132,6 +135,7 @@ print_results_block() {
     printf 'verdict:        %s\n' "${verdict_label}"
     printf 'appHash:        %s\n' "${OFFICIAL_HASH:-unknown}"
     printf 'commit:         %s\n' "${COMMIT_HASH:-unknown}"
+    printf 'scriptVersion:  %s\nscriptHash:     %s\n' "${SCRIPT_VERSION}" "${SCRIPT_HASH}"
     echo
     print_diff_preview
     echo
@@ -182,6 +186,11 @@ cleanup_on_exit() {
     local exit_code=$?
     set +e
     { exec 1>&5 2>&6; } 2>/dev/null || true
+    # The build container writes as root under docker (as the caller under rootless podman: 0:0 maps to it).
+    if [[ -n "${CONTAINER_CMD}" && -n "${WORK_DIR:-}" && -d "${WORK_DIR}" ]]; then
+        local owner="$(id -u):$(id -g)"; [[ "${CONTAINER_CMD}" == podman ]] && owner="0:0"
+        ${CONTAINER_CMD} run --rm --entrypoint chown -v "${WORK_DIR}:/work${VOLUME_RW}" "${HELPER_GIT_IMAGE}" -R "${owner}" /work >/dev/null 2>&1 || true
+    fi
     if [[ -n "${EXACT_BASE_IMAGE}" ]]; then
         ${CONTAINER_CMD:-docker} image rm -f "${EXACT_BASE_IMAGE}" >/dev/null 2>&1 || true
     fi
@@ -230,13 +239,9 @@ build_ref_from_version() {
     printf 'app/%s\n' "${version}"
 }
 
+# Per-run workspace under the caller's working directory: never a fixed path another run or user may own.
 work_dir_for() {
-    local version_part="$1"
-    local arch_part="$2"
-    printf '/tmp/test_%s_%s_%s\n' \
-        "${APP_ID}" \
-        "$(sanitize_path_component "${version_part}")" \
-        "$(sanitize_path_component "${arch_part}")"
+    printf '%s/bitkey_verification_%s_%s-%s\n' "$(pwd -P)" "$(sanitize_path_component "$1")" "$(date +%s)" "$$"
 }
 
 official_source_dir()     { printf '%s/official/source\n' "${WORK_DIR}"; }
@@ -385,7 +390,7 @@ build_bitkey_image() {
     if [[ -n "${build_vars_file}" ]]; then
         extra=(--build-arg "REPRODUCIBLE_BUILD_VARIABLES=$(tr -d '\n' < "${build_vars_file}")")
     fi
-    patched_df="$(mktemp --suffix=.Dockerfile)"
+    patched_df="$(mktemp -p "${WORK_DIR}" --suffix=.Dockerfile)"
     patch_bitkey_dockerfile "${repo_dir}/app/verifiable-build/android/Dockerfile" "${patched_df}"
     log_info "Building Bitkey ${target} image: ${image}"
     ${CONTAINER_CMD} build \
@@ -416,6 +421,29 @@ clone_ref_into_repo() {
 git_commit_hash_from_repo() {
     local rel_dir="$1"
     run_git_container "git -C '${rel_dir}' rev-parse HEAD"
+}
+
+# Snapshot = release commit date + 1 day; build-tools path follows Bitkey's Dockerfile. No per-release bump.
+resolve_build_pins_from_repo() {
+    local rel_dir="$1" commit_ts df_tools
+    if [[ -z "${UBUNTU_SNAPSHOT}" ]]; then
+        commit_ts="$(run_git_container "git -C '${rel_dir}' log -1 --format=%ct HEAD" | tr -d '\r[:space:]')"
+        if [[ ! "${commit_ts}" =~ ^[0-9]+$ ]]; then
+            log_fail "Could not read the release commit date."
+            emit_failure_and_exit "Could not read the release commit date." "${EXIT_FAILED}"
+        fi
+        UBUNTU_SNAPSHOT="$(date -u -d "@$((commit_ts + 86400))" +%Y%m%dT000000Z)"
+        log_info "Ubuntu snapshot derived from commit date: ${UBUNTU_SNAPSHOT}"
+    elif [[ "${UBUNTU_SNAPSHOT}" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
+        log_info "Ubuntu snapshot override: ${UBUNTU_SNAPSHOT}"
+    else
+        log_fail "UBUNTU_SNAPSHOT must look like 20261002T000000Z."
+        emit_failure_and_exit "Invalid UBUNTU_SNAPSHOT override." "${EXIT_INVALID}"
+    fi
+    df_tools="$(sed -n 's/^ENV ANDROID_BUILD_TOOLS_VERSION="\([^"]*\)".*/\1/p' \
+        "${WORK_DIR}/${rel_dir}/app/verifiable-build/android/Dockerfile" | head -n1)"
+    [[ -n "${df_tools}" ]] && ANDROID_BUILD_TOOLS_VERSION="${df_tools}"
+    log_info "Android build-tools inside Bitkey's image: ${ANDROID_BUILD_TOOLS_VERSION}"
 }
 
 extract_apk_field() {
@@ -557,19 +585,6 @@ official_base_apk() {
         return 0
     fi
     find_base_apk_in_dir "$(official_source_dir)" 2>/dev/null
-}
-
-ensure_work_dir_named_for_version() {
-    local version_part="$1"
-    local arch_part="$2"
-    local final_dir
-    final_dir="$(work_dir_for "${version_part}" "${arch_part}")"
-    if [[ "${WORK_DIR}" == "${final_dir}" ]]; then
-        return 0
-    fi
-    rm -rf "${final_dir}"
-    mv "${WORK_DIR}" "${final_dir}"
-    WORK_DIR="${final_dir}"
 }
 
 
@@ -715,7 +730,7 @@ detect_apk_metadata_field() {
 
 detect_version_from_binary() {
     local tmp_dir
-    tmp_dir="$(mktemp -d)"
+    tmp_dir="$(mktemp -d -p "${WORK_DIR}")"
 
     local base_apk=""
     if [[ -f "${APK_INPUT}" ]]; then
@@ -1158,16 +1173,13 @@ if [[ -z "${APK_INPUT}" ]]; then
 fi
 
 APK_INPUT="$(realpath "${APK_INPUT}")"
-mkdir -p "${LOG_DIR}"
+WORK_DIR="$(work_dir_for "${VERSION:-auto}")"
+LOG_DIR="${WORK_DIR}/build-logs"
+mkdir -p "${LOG_DIR}" "$(comparison_dir)" "$(outputs_dir)"
 exec 5>&1 6>&2
 
 exec > >(tee "${LOG_DIR}/phase1-preflight.log" >&5) 2>&1
 detect_container_runtime
-
-WORK_DIR_INITIAL="$(work_dir_for "${VERSION:-autoversion}" "${ARCH:-auto}")"
-WORK_DIR="${WORK_DIR_INITIAL}"
-rm -rf "${WORK_DIR}"
-mkdir -p "${WORK_DIR}" "$(comparison_dir)" "$(outputs_dir)"
 log_info "Workspace: ${WORK_DIR}"
 exec 1>&5 2>&6
 
@@ -1175,8 +1187,6 @@ exec > >(tee "${LOG_DIR}/phase2-resolve.log" >&5) 2>&1
 if [[ -z "${VERSION}" ]]; then
     log_info "Version not provided. Detecting from --binary input (host aapt2 or WS container)."
     detect_version_from_binary
-    ensure_work_dir_named_for_version "${VERSION}" "${ARCH:-auto}"
-    log_info "Workspace renamed to: ${WORK_DIR}"
 fi
 
 clone_ref_into_repo "$(build_ref_from_version "${VERSION}")" "repo-exact" "false"
@@ -1186,6 +1196,7 @@ run_git_container "git -C 'repo-exact' submodule update --init --depth 1 \
     firmware/third-party/memfault-firmware-sdk"
 COMMIT_HASH="$(git_commit_hash_from_repo "repo-exact")"
 log_info "Resolved Bitkey commit: ${COMMIT_HASH}"
+resolve_build_pins_from_repo "repo-exact"
 exec 1>&5 2>&6
 
 exec > >(tee "${LOG_DIR}/phase3-prepare.log" >&5) 2>&1
@@ -1249,7 +1260,7 @@ if [[ -f "$(comparison_dir)/diff-classes-dex.txt" ]]; then
 fi
 RESULT_DONE=true
 generate_comparison_yaml "${VERDICT}" "${NOTES}"
-print_results_block "differences found"
+print_results_block "not_reproducible"
 log_warn "Bitkey verification found differences."
 print_exit_code "${EXIT_FAILED}"
 exec 1>&5 2>&6
