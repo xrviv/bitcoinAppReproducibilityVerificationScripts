@@ -1,8 +1,8 @@
 #!/bin/bash
-# bitbox02_build.sh v3.14.0 - WalletScrutiny verification script for BitBox02
+# bitbox02_build.sh v3.15.0 - WalletScrutiny verification script for BitBox02
 # Organization: WalletScrutiny.com
-# Last modified by: Daniel Garcia
-# Last modified on: 2026-09-05 (v3.14.0)
+# Last modified by: Bob (WalletScrutiny verification agent)
+# Last modified on: 2026-10-08
 # Usage: bitbox02_build.sh --version VERSION [--type TYPE] [--binary PATH] [--arch ARCH]
 #
 # Verifies BitBox02 firmware reproducibility: builds from source via the upstream
@@ -13,7 +13,7 @@
 set -eE
 
 # ---- Globals ----------------------------------------------------------------
-SCRIPT_VERSION="v3.14.0"
+SCRIPT_VERSION="v3.15.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # readlink -f, not $0: a relative or symlinked invocation would otherwise hash nothing.
 SCRIPT_PATH="$(readlink -f "$0")"
@@ -38,6 +38,16 @@ GREEN='\033[1;32m'
 RED='\033[1;31m'
 NC='\033[0m'
 
+# Per-run resources; empty until created so the EXIT trap knows what exists.
+CONTAINER_CMD=""
+workDir=""
+IMAGE_TAG=""
+CTR_NAME=""
+CTR_PID=""
+VERDICT_WRITTEN=0
+
+log_warn() { echo -e "${YELLOW}Warning: $*${NC}"; }
+
 # ---- Self-identification ----------------------------------------------------
 # Never fails the run: a hashing problem is not a build outcome.
 sha256_of() {
@@ -53,13 +63,83 @@ write_results() {
   notes="${notes//\"/\'}"
   notes="${notes//$'\n'/ }"
   notes="${notes//$'\r'/ }"
-  cat > "$RESULTS_FILE" << EOF
+  cat > "$RESULTS_FILE" << EOY
 script_version: ${SCRIPT_VERSION}
 verdict: ${verdict}
 notes: "${notes}"
-EOF
+EOY
+  VERDICT_WRITTEN=1
   echo -e "${GREEN}Results written to: $RESULTS_FILE${NC}"
 }
+
+# ---- Ownership helpers ------------------------------------------------------
+# Docker containers run as real root; chown inside the container correctly sets
+# host ownership to HOST_UID:HOST_GID.
+#
+# Rootless Podman maps container root (UID 0) to the real host user, so files
+# created as root are already accessible. However chown to a non-zero UID inside
+# a rootless Podman container maps to a subordinate host UID (~subuid range), making
+# files inaccessible. Strategy: skip in-container chown for Podman; use
+# podman unshare chown on the host side instead.
+INNER_CHOWN=":"
+
+repair_ownership() {
+  if [[ "$CONTAINER_CMD" == "podman" ]]; then
+    # Inside podman unshare, UID 0 maps to the real host user (the rootless namespace
+    # puts the caller at UID 0). Using HOST_UID:HOST_GID here would map to the subuid
+    # range instead, making files inaccessible.
+    podman unshare chown -R 0:0 "$1" 2>/dev/null || true
+  fi
+}
+
+# Hands the whole workspace back to the caller; never fails the script.
+hand_back_workspace() {
+  [[ -n "$workDir" && -d "$workDir" ]] || return 0
+  if [[ "$CONTAINER_CMD" == "podman" ]]; then
+    podman unshare chown -R 0:0 "$workDir" 2>/dev/null || true
+  elif [[ "$CONTAINER_CMD" == "docker" ]]; then
+    docker run --rm --volume "$workDir:/w" alpine \
+      chown -R "${HOST_UID}:${HOST_GID}" /w >/dev/null 2>&1 || true
+  fi
+  local stray
+  stray="$(find "$workDir" ! -uid "$HOST_UID" -print -quit 2>/dev/null || true)"
+  if [[ -n "$stray" ]]; then
+    log_warn "could not hand back ownership of: $stray"
+  else
+    echo "Workspace ownership: all files owned by uid ${HOST_UID} ($workDir)"
+  fi
+}
+
+# ---- EXIT / signal traps ----------------------------------------------------
+# Runs on every exit (success, failure, interrupt): stops this run's container,
+# removes this run's image, hands the workspace back, and guarantees a verdict.
+finish() {
+  local rc=$?
+  trap - ERR INT TERM
+  set +e
+  # Kill the container first: its PID 1 (sh) ignores a forwarded SIGTERM.
+  if [[ -n "$CONTAINER_CMD" && -n "$CTR_NAME" ]]; then
+    $CONTAINER_CMD kill "$CTR_NAME" >/dev/null 2>&1
+    $CONTAINER_CMD rm -f "$CTR_NAME" >/dev/null 2>&1
+  fi
+  if [[ -n "$CTR_PID" ]] && kill -0 "$CTR_PID" 2>/dev/null; then
+    kill "$CTR_PID" 2>/dev/null; wait "$CTR_PID" 2>/dev/null
+  fi
+  if [[ -n "$CONTAINER_CMD" && -n "$IMAGE_TAG" ]]; then
+    $CONTAINER_CMD rmi --force "$IMAGE_TAG" >/dev/null 2>&1
+  fi
+  hand_back_workspace
+  if [[ "$VERDICT_WRITTEN" -eq 0 ]]; then
+    write_results "ftbfs" "BitBox02 v${version:-?} (${firmwareType}): run ended without a verdict (exit ${rc})."
+  fi
+  case "$rc" in
+    0|1|2) exit "$rc" ;;
+    *)     exit "$EXIT_FAIL" ;;
+  esac
+}
+trap finish EXIT
+trap 'echo; echo "Interrupted (SIGINT)."; exit 130' INT
+trap 'echo; echo "Terminated (SIGTERM)."; exit 143' TERM
 
 # ---- ERR trap ---------------------------------------------------------------
 handle_err() {
@@ -69,6 +149,17 @@ handle_err() {
   exit "$EXIT_FAIL"
 }
 trap handle_err ERR
+
+# Runs a container in the background and waits for it, so INT/TERM reach the
+# traps immediately instead of after the container finishes.
+ctr_run() {
+  $CONTAINER_CMD run --name "$CTR_NAME" "$@" &
+  CTR_PID=$!
+  wait "$CTR_PID"
+  local rc=$?
+  CTR_PID=""
+  return "$rc"
+}
 
 # ---- Root check -------------------------------------------------------------
 if [[ "$(id -u)" -eq 0 ]]; then
@@ -97,9 +188,13 @@ echo "Script:  $(basename "$SCRIPT_PATH") ${SCRIPT_VERSION}"
 echo "         sha256: ${SCRIPT_SHA256}"
 echo
 
+# A stale result from an earlier run must never be mistaken for this run's verdict.
+rm -f "$RESULTS_FILE"
+
 # ---- Container runtime detection --------------------------------------------
 if command -v docker &>/dev/null && docker info &>/dev/null; then
   CONTAINER_CMD="docker"
+  INNER_CHOWN="chown -R ${HOST_UID}:${HOST_GID}"
 elif command -v podman &>/dev/null; then
   CONTAINER_CMD="podman"
 elif command -v docker &>/dev/null; then
@@ -113,30 +208,6 @@ else
 fi
 echo "Container runtime: $CONTAINER_CMD"
 
-# ---- Ownership helpers ------------------------------------------------------
-# Docker containers run as real root; chown inside the container correctly sets
-# host ownership to HOST_UID:HOST_GID.
-#
-# Rootless Podman maps container root (UID 0) to the real host user, so files
-# created as root are already accessible. However chown to a non-zero UID inside
-# a rootless Podman container maps to a subordinate host UID (~subuid range), making
-# files inaccessible. Strategy: skip in-container chown for Podman; use
-# podman unshare chown on the host side instead.
-if [[ "$CONTAINER_CMD" == "docker" ]]; then
-  INNER_CHOWN="chown -R ${HOST_UID}:${HOST_GID}"
-else
-  INNER_CHOWN=":"
-fi
-
-repair_ownership() {
-  if [[ "$CONTAINER_CMD" == "podman" ]]; then
-    # Inside podman unshare, UID 0 maps to the real host user (the rootless namespace
-    # puts the caller at UID 0). Using HOST_UID:HOST_GID here would map to the subuid
-    # range instead, making files inaccessible.
-    podman unshare chown -R 0:0 "$1" 2>/dev/null || true
-  fi
-}
-
 # ---- Usage ------------------------------------------------------------------
 usage() {
   echo 'NAME
@@ -148,7 +219,7 @@ SYNOPSIS
 DESCRIPTION
        --version   Firmware version (e.g., "9.25.0"). Required.
        --type      Firmware type: btc|multi (default: btc)
-       --binary    Path to official firmware binary. If omitted, downloaded automatically.
+       --binary    Official firmware file, or a directory containing it. If omitted, downloaded.
        --arch      Accepted for compatibility; ignored (build is always linux/amd64).
        --apk       Accepted for compatibility; ignored (not applicable to firmware).
 
@@ -166,10 +237,11 @@ while [[ "$#" -gt 0 ]]; do
     --binary)  binaryPath="${2:-}";   shift 2 || shift ;;
     --arch)    ARCH="${2:-}";         shift 2 || shift ;;
     --apk)                            shift 2 || shift ;;
-    --help)    usage; exit "$EXIT_OK" ;;
-    *)         echo "Warning: unknown argument '$1' (ignored)"; shift ;;
+    --help)    usage; trap - EXIT; exit "$EXIT_OK" ;;
+    *)         log_warn "Ignoring unknown parameter: $1"; shift ;;
   esac
 done
+[[ -n "$ARCH" ]] && echo "Arch: ${ARCH} (ignored; firmware is always built for linux/amd64)"
 
 # ---- Validate inputs --------------------------------------------------------
 if [[ -z "$version" ]]; then
@@ -198,21 +270,8 @@ if [[ "$firmwareType" != "btc" && "$firmwareType" != "multi" ]]; then
   exit "$EXIT_INVALID"
 fi
 
-if [[ -n "$binaryPath" && ! -f "$binaryPath" ]]; then
-  echo -e "${RED}Error: binary file not found: $binaryPath${NC}"
-  write_results "ftbfs" "BitBox02: binary file not found: ${binaryPath}."
-  exit "$EXIT_INVALID"
-fi
-
-if [[ -n "$binaryPath" ]] && ! [[ "$binaryPath" =~ ^/ ]]; then
-  binaryPath="$PWD/$binaryPath"
-fi
-
 # ---- Type-specific variables ------------------------------------------------
 GIT_TAG="firmware/v${version}"
-RUN_ID="${version}_${firmwareType}_$$"
-workDir="$(pwd)/bitbox02-work_${RUN_ID}"
-IMAGE_TAG="bitbox02-firmware_${RUN_ID}"
 
 if [[ "$firmwareType" == "btc" ]]; then
   MAKE_COMMAND="make firmware-btc"
@@ -230,25 +289,58 @@ fi
 
 DOWNLOAD_URL="${repo}/releases/download/firmware%2Fv${version}/${SIGNED_FILENAME}"
 
+# --binary may be a directory (ABS passes one for multi-file submissions).
+if [[ -n "$binaryPath" && -d "$binaryPath" ]]; then
+  binaryPath="${binaryPath%/}/${SIGNED_FILENAME}"
+fi
+if [[ -n "$binaryPath" && ! -f "$binaryPath" ]]; then
+  echo -e "${RED}Error: binary file not found: $binaryPath${NC}"
+  write_results "ftbfs" "BitBox02: binary file not found: ${binaryPath}."
+  exit "$EXIT_INVALID"
+fi
+if [[ -n "$binaryPath" ]] && ! [[ "$binaryPath" =~ ^/ ]]; then
+  binaryPath="$PWD/$binaryPath"
+fi
+
 echo
 echo "Verifying BitBox02 firmware v${version} (${firmwareType})"
 echo
 
 # ---- Prepare workspace ------------------------------------------------------
-# Three isolated subdirectories keep the cloned repo completely clean:
+# Per-run directory under the caller's physical cwd, created exclusively: an
+# existing path may belong to another run or user and is never reused or deleted.
+# Subdirectories keep the cloned repo clean:
 #   src/      — cloned source (never written to after clone; git must stay clean)
-#   official/ — official signed firmware binary (separate from src so git sees nothing)
-#   out/      — comparison outputs (hash files, diag, stripped binary)
+#   official/ — official signed firmware binary
+#   out/      — comparison outputs (hash files, diag, stripped binary, byte diff)
 echo "Setting up verification environment..."
-rm -rf "$workDir"
-mkdir -p "$workDir/official" "$workDir/out"
+WORK_BASE="$(pwd -P)"
+for _attempt in 1 2 3; do
+  RUN_ID="$(date +%s)-$$"
+  candidate="${WORK_BASE}/bitbox02_verification_${version}_${firmwareType}_${RUN_ID}"
+  if mkdir "$candidate" 2>/dev/null; then
+    workDir="$candidate"
+    break
+  fi
+  log_warn "workspace ${candidate} already exists; retrying with a new run id"
+  sleep 1
+done
+if [[ -z "$workDir" ]]; then
+  echo -e "${RED}Error: could not create a fresh workspace under ${WORK_BASE}.${NC}"
+  write_results "ftbfs" "BitBox02 v${version} (${firmwareType}): could not create a fresh workspace (exists or not writable)."
+  exit "$EXIT_FAIL"
+fi
+mkdir "$workDir/official" "$workDir/out"
+IMAGE_TAG="bitbox02-firmware_${version}_${firmwareType}_${RUN_ID}"
+CTR_NAME="bitbox02-${firmwareType}-${RUN_ID}"
+echo "Workspace: $workDir"
 
 # ---- Clone inside container (no host git required) --------------------------
 echo "Cloning BitBox02 firmware repository at tag: $GIT_TAG"
 MAX_RETRIES=3
 retry_count=0
 while [[ $retry_count -lt $MAX_RETRIES ]]; do
-  if $CONTAINER_CMD run --rm \
+  if ctr_run --rm \
     --volume "$workDir:/work" \
     alpine \
     sh -c "
@@ -283,7 +375,7 @@ echo
 # Back up the original so we can restore it after docker build without needing git.
 cp "$workDir/src/Dockerfile" "$workDir/Dockerfile.orig"
 
-$CONTAINER_CMD run --rm \
+ctr_run --rm \
   --volume "$workDir/src:/src" \
   alpine \
   sh -c "
@@ -297,18 +389,23 @@ $CONTAINER_CMD run --rm \
 repair_ownership "$workDir/src/Dockerfile"
 
 # ---- Build Docker image -----------------------------------------------------
+# Backgrounded + wait so a signal can cancel the build through the trap.
 echo "Building Docker image (this may take 10-20 minutes)..."
-if ! $CONTAINER_CMD build \
+$CONTAINER_CMD build \
   --pull \
   --platform linux/amd64 \
   --force-rm \
   --no-cache \
   --tag "$IMAGE_TAG" \
-  "$workDir/src"; then
+  "$workDir/src" &
+CTR_PID=$!
+if ! wait "$CTR_PID"; then
+  CTR_PID=""
   echo -e "${RED}Docker build failed!${NC}"
   write_results "ftbfs" "BitBox02 v${version} (${firmwareType}): Docker image build failed."
   exit "$EXIT_FAIL"
 fi
+CTR_PID=""
 
 cp "$workDir/Dockerfile.orig" "$workDir/src/Dockerfile"
 
@@ -321,7 +418,7 @@ else
   echo "URL: $DOWNLOAD_URL"
   retry_count=0
   while [[ $retry_count -lt $MAX_RETRIES ]]; do
-    if $CONTAINER_CMD run --rm \
+    if ctr_run --rm \
       --volume "$workDir/official:/out" \
       alpine \
       sh -c "
@@ -336,7 +433,6 @@ else
     if [[ $retry_count -eq $MAX_RETRIES ]]; then
       echo -e "${RED}Failed to download firmware after $MAX_RETRIES attempts.${NC}"
       repair_ownership "$workDir/official"
-      $CONTAINER_CMD rmi "$IMAGE_TAG" --force 2>/dev/null || true
       write_results "ftbfs" "BitBox02 v${version} (${firmwareType}): failed to download official firmware."
       exit "$EXIT_FAIL"
     fi
@@ -348,7 +444,6 @@ fi
 
 if [[ ! -s "$workDir/official/$SIGNED_FILENAME" ]]; then
   echo -e "${RED}Firmware file missing or empty.${NC}"
-  $CONTAINER_CMD rmi "$IMAGE_TAG" --force 2>/dev/null || true
   write_results "ftbfs" "BitBox02 v${version} (${firmwareType}): firmware file missing or empty."
   exit "$EXIT_FAIL"
 fi
@@ -359,7 +454,7 @@ fi
 #   /official = official signed binary (read-only input)
 #   /out      = all comparison outputs (hash files, diagnostics, stripped binary)
 echo "Building firmware ($MAKE_COMMAND) and running comparison..."
-if ! $CONTAINER_CMD run --rm \
+if ! ctr_run --rm \
   --platform linux/amd64 \
   --volume "$workDir/src:/bb02" \
   --volume "$workDir/official:/official" \
@@ -398,6 +493,12 @@ if ! $CONTAINER_CMD run --rm \
     HEADER_BYTES=588
     dd if=\"\$SIGNED\" bs=1 skip=\"\${HEADER_BYTES}\" of=/out/p_stripped.bin 2>/dev/null
     sha256sum /out/p_stripped.bin | awk '{print \$1}' > /out/hash_stripped.txt
+
+    # Full byte-level diff (offset, official octal, built octal) when hashes differ;
+    # evidence only, the verdict comes from the hashes above.
+    if [[ \"\$(cat /out/hash_stripped.txt)\" != \"\$(cat /out/hash_built.txt)\" ]]; then
+      cmp -l /out/p_stripped.bin \"\$BUILT\" > /out/diff_full.txt 2>&1 || true
+    fi
 
     # Diagnostic: log file sizes and parser-derived hash for post-run analysis.
     python3 -c \"
@@ -474,7 +575,6 @@ print('device hash scheme: ' + scheme)
   repair_ownership "$workDir/src"
   repair_ownership "$workDir/out"
   echo -e "${RED}Build or comparison failed!${NC}"
-  $CONTAINER_CMD rmi "$IMAGE_TAG" --force 2>/dev/null || true
   write_results "ftbfs" "BitBox02 v${version} (${firmwareType}): firmware build or in-container comparison failed."
   exit "$EXIT_FAIL"
 fi
@@ -533,6 +633,14 @@ echo "scriptVersion: ${SCRIPT_VERSION}"
 echo "scriptHash:    ${SCRIPT_SHA256}"
 echo "===== End Results ====="
 
+# ---- Diff preview (at most 5 lines; full diff stays in the workspace) -------
+if [[ -s "$workDir/out/diff_full.txt" ]]; then
+  echo ""
+  echo "First differing bytes (offset, official octal, built octal), 5 of $(wc -l < "$workDir/out/diff_full.txt") lines:"
+  head -n 5 "$workDir/out/diff_full.txt"
+  echo "Full byte diff: $workDir/out/diff_full.txt"
+fi
+
 # ---- Write COMPARISON_RESULTS.yaml ------------------------------------------
 if [[ "$verdict" == "reproducible" ]]; then
   notes="BitBox02 v${version} (${firmwareType}) reproducible from source at ${GIT_TAG} (commit ${commit}). Comparison: first 588 bytes (4 magic + 584 sigdata) stripped from official signed binary; SHA-256 of remainder matches unsigned build output."
@@ -542,10 +650,7 @@ fi
 
 write_results "$verdict" "$notes"
 
-# ---- Cleanup ----------------------------------------------------------------
-echo "Cleaning up container resources..."
-$CONTAINER_CMD rmi "$IMAGE_TAG" --force 2>/dev/null || true
-
+# Image removal and workspace hand-back happen in the EXIT trap.
 echo
 echo "BitBox02 firmware verification finished!"
 echo "Results: $RESULTS_FILE"
