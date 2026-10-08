@@ -1,60 +1,20 @@
 #!/bin/bash
 #
 # nunchukdesktop_build.sh - Nunchuk Desktop Reproducible Build Verifier
-#
-# Version: v0.1.11
-#
-# Description:
-#   Reproducible build verification for Nunchuk Desktop (Linux x86_64 AppImage).
-#   Builds from source using UPSTREAM'S OWN committed recipe -- reproducible-builds/
-#   Dockerfile.linux and build_linux.sh at the release tag, source bind-mounted at /project --
-#   exactly as reproducible-builds/README.md instructs verifiers, then compares the result
-#   against the official release.
-#
-#   From 2.6.6 the verdict is the WHOLE ZIP, byte for byte. Upstream derives SOURCE_DATE_EPOCH
-#   from the tag commit, normalizes every AppDir timestamp and permission, pins the AppImage
-#   runtime and appimagetool (1.9.1) by sha256, and zips under TZ=UTC. Through 2.6.5 this was
-#   impossible -- appimagetool stamped wall-clock time into the squashfs superblock -- and only
-#   extracted contents could be compared. That extracted comparison is GONE: it discards the very
-#   packing and runtime bytes a reproducibility claim is about, so it can never produce a pass.
-#
-#   2.6.6 also deleted the three compile-time OAUTH_* defines (social login moved to the system
-#   browser), removing the one input a third-party verifier could not supply.
-#
-#   OWNERSHIP IS VERDICT-CRITICAL. Upstream's recipe assumes rootful Docker, where a host-owned
-#   checkout appears inside the container as the host user's UID. Under rootless Podman it appears
-#   as UID 0, and that alone changes the compiled bytes. The checkout is therefore chowned to the
-#   caller's UID before the build and handed back afterwards, so the work directory stays
-#   removable by an ordinary user. Evidence: changelog v0.1.11.
-#
-#   The distributed artifact is a ZIP wrapping the AppImage, so two hashes are meaningful.
-#   appHash is the artifact EXACTLY AS DOWNLOADED (the ZIP) per
-#   verification-result-summary-format.md; the AppImage's own hash is printed alongside it as
-#   the payload compared. See the hash legend printed before the results block.
-#
-#   Provenance is checked in-script: the SHA256SUMS signature is verified against a PINNED
-#   release-key fingerprint, and the measured digest cross-checked against that signed
-#   manifest. Both are verdict-neutral.
-#
-# Usage:
-#   nunchukdesktop_build.sh --version VERSION [--arch ARCH] [--type TYPE] [--binary FILE]
-#
-# Required:
-#   --version VERSION    App version without v prefix (e.g. 1.9.50)
-#
-# Optional:
-#   --binary FILE        Path to the official release ZIP (skips download)
-#   --arch ARCH          Architecture (only x86_64-linux-gnu supported; default)
-#   --type TYPE          Build type (only appimage supported; default)
-#
+# Version: v0.1.13
+# Last modified on: 2026-10-08
 # Organization: WalletScrutiny.com
-# Repository: https://gitlab.com/walletscrutiny/walletScrutinyCom
-# Changelog: ~/work/ws-notes/script-notes/desktop/nunchuk/changelog.md
+#
+# Rebuilds the Linux x86_64 AppImage ZIP with upstream's reproducible-builds/ recipe at the release
+# tag (2.6.6+) and compares the whole ZIP byte for byte with the official release. The build image
+# is pinned to release day: dated ubuntu:noble-* base + Ubuntu/PPA apt snapshot.
+#
+# Usage: nunchukdesktop_build.sh --version VERSION [--binary ZIP] [--arch x86_64-linux-gnu] [--type appimage]
 #
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.11"
+SCRIPT_VERSION="v0.1.13"
 APP_ID="nunchuk"
 APP_NAME="Nunchuk Desktop"
 GH_REPO="nunchuk-io/nunchuk-desktop"
@@ -68,19 +28,21 @@ APP_ARCH="x86_64-linux-gnu"
 APP_TYPE="appimage"
 BINARY_PATH=""
 CONTAINER_CMD=""
-# Clone runs in this image so podman/docker stays the only host dependency (ABS rule).
-# Digest-pinned: this image both creates the checkout and answers ls-remote, so a mutable
-# tag could fabricate both. Its entrypoint IS git, so arguments are git subcommands.
+# Digest-pinned git image: clones and resolves the tag inside a container.
 GIT_IMAGE="${GIT_IMAGE:-docker.io/alpine/git@sha256:6f8eae2205a85c51106a9650e574a37fb1d5e4f645e5f6ea57cb57b9462cd4cf}"
 WORK_DIR=""
+IMAGE_NAME=""
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256=""
 UPSTREAM_DOCKERFILE_SHA256=""
+# Release-day pins; empty = derived. Override: UBUNTU_SNAPSHOT=YYYYMMDDTHHMMSSZ, UBUNTU_BASE=<image>.
+UBUNTU_SNAPSHOT="${UBUNTU_SNAPSHOT:-}"
+UBUNTU_BASE="${UBUNTU_BASE:-}"
+VERDICT_WRITTEN=false
+NO_VERDICT_BY_DESIGN=false
 
-# Release-manifest signature verification. The fingerprint is PINNED: a good signature from some
-# other key is not a pass. Authority for this fingerprint is upstream's own nunchuk-io/docs
-# repository, so it establishes continuity of control, not identity — see the report limitation.
+# Pinned release-key fingerprint: a good signature from any other key is not a pass.
 NUNCHUK_RELEASE_KEY_FPR="8C8ECD3F660CA53CD878792A6E38A462ED2EF525"
 SIG_MANIFEST_STATUS="[WARNING] Manifest signature not checked"
 SIG_DIGEST_STATUS="[WARNING] Digest not checked against a signed manifest"
@@ -91,8 +53,7 @@ SIG_TAG_STATUS="[WARNING] Tag signature not checked by this script"
 SIG_WARNINGS=""
 PROVENANCE_FATAL=""
 
-# Artifact identity. OFFICIAL_ARTIFACT_* describes the file exactly as distributed (the release
-# ZIP, or whatever --binary pointed at); OFFICIAL_APPIMAGE_SHA256 is the payload actually compared.
+# OFFICIAL_ARTIFACT_* = file as distributed (ZIP); OFFICIAL_APPIMAGE_SHA256 = payload compared.
 OFFICIAL_ARTIFACT_NAME=""
 OFFICIAL_ARTIFACT_SHA256=""
 OFFICIAL_APPIMAGE_SHA256=""
@@ -122,14 +83,11 @@ die_build() {
     exit "${EXIT_DIFF}"
 }
 
-# The manifest carries a good signature from the pinned key, and the artifact we downloaded is NOT
-# the one it covers. No verdict about that file could be honest, and no allowed verdict means "could
-# not validly check" — so emit NO COMPARISON_RESULTS.yaml and REMOVE any stale one. ABS treats a
-# missing/verdict-less YAML as publish-nothing (verifications.mjs:873-877) and searches recursively,
-# so a leftover from an earlier run would otherwise be published in this run's name.
+# Signed manifest disagrees with the downloaded file: emit no verdict, remove any stale YAML.
 die_provenance() {
     log_error "PROVENANCE FAILURE: $1"
     log_error "No verdict is emitted: the artifact compared is not the file upstream signed."
+    NO_VERDICT_BY_DESIGN=true
     rm -f "${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
     log_info "COMPARISON_RESULTS.yaml removed; nothing will be published for this run."
     exit "${EXIT_DIFF}"
@@ -148,6 +106,7 @@ write_yaml() {
         printf 'script_version: %s\nverdict: %s\n' \
             "$SCRIPT_VERSION" "$verdict" > "$yaml_file"
     fi
+    VERDICT_WRITTEN=true
     log_info "COMPARISON_RESULTS.yaml written to: $yaml_file"
 }
 
@@ -157,13 +116,11 @@ sha256_of() {
 }
 
 check_build_inputs() {
-    # 2.6.6 deleted the three compile-time OAUTH_* defines, so there is no longer an input this
-    # script cannot supply. Rationale: changelog v0.1.10.
     log_info "No compile-time secrets required: upstream removed the OAuth defines at 2.6.6."
 }
 
 comparison_context_note() {
-    printf '%s' "Built with upstream reproducible-builds/Dockerfile.linux and build_linux.sh at tag ${APP_VERSION} (Dockerfile sha256 ${UPSTREAM_DOCKERFILE_SHA256})."
+    printf '%s' "Built with upstream reproducible-builds/Dockerfile.linux and build_linux.sh at tag ${APP_VERSION} (Dockerfile sha256 ${UPSTREAM_DOCKERFILE_SHA256}), base image ${UBUNTU_BASE}, apt pinned to Ubuntu and PPA snapshot ${UBUNTU_SNAPSHOT}."
 }
 
 
@@ -222,9 +179,7 @@ parse_args() {
         die_invalid "--version is required"
     fi
 
-    # Reject recognized-but-unsupported arch/type so a wrong combo can't masquerade as a
-    # Linux AppImage result. Only x86_64-linux-gnu/appimage is implemented (Windows/macOS
-    # are separate, not-yet-supported targets).
+    # Only x86_64-linux-gnu / appimage is implemented.
     if [[ "$APP_ARCH" != "x86_64-linux-gnu" ]]; then
         die_invalid "Unsupported --arch '${APP_ARCH}'; only x86_64-linux-gnu is implemented"
     fi
@@ -233,10 +188,7 @@ parse_args() {
 
     fi
 
-    # 2.6.6 is the first release this script can verify: it is where upstream set SOURCE_DATE_EPOCH
-    # and deleted the compile-time OAUTH_* defines. Earlier tags need the input handling removed in
-    # v0.1.10, so a run against them would apply logic that cannot verify them. Refuse rather than
-    # emit a verdict that looks valid. Enforced, not just documented.
+    # 2.6.6 is the first verifiable release (SOURCE_DATE_EPOCH set, OAuth defines removed).
     if [[ "$(printf '%s\n' "2.6.6" "$APP_VERSION" | sort -V | head -1)" != "2.6.6" ]]; then
         die_invalid "Version ${APP_VERSION} predates 2.6.6; this script cannot verify it (see changelog v0.1.10)"
     fi
@@ -265,7 +217,9 @@ OPTIONAL:
   --type TYPE          appimage (default, only supported value)
 
 OPTIONAL ENVIRONMENT:
-  GITHUB_TOKEN          Used for the release download only, to avoid rate limiting
+  GITHUB_TOKEN          Used for GitHub downloads and API lookups, to avoid rate limiting
+  UBUNTU_SNAPSHOT       apt snapshot ID (YYYYMMDDTHHMMSSZ); default: release ZIP upload time
+  UBUNTU_BASE           Base image; default: newest ubuntu:noble-* tag pushed before the snapshot
 
 EXAMPLES:
   nunchukdesktop_build.sh --version 2.6.6
@@ -282,13 +236,46 @@ OUTPUT:
 EOF
 }
 
+# Per-run workspace under the caller's directory: exclusive create, never reused or deleted.
 setup_workdir() {
-    # Use a unique work dir per version+arch+type+PID so parallel ABS runs do not collide.
-    local suffix="${APP_VERSION}_${APP_ARCH}_${APP_TYPE}_$$"
+    local suffix="${APP_VERSION}_${APP_ARCH}_${APP_TYPE}"
     suffix="${suffix//[^a-zA-Z0-9._-]/_}"
-    WORK_DIR="/tmp/nunchuk_${suffix}"
-    mkdir -p "$WORK_DIR"
-    log_info "Work directory: $WORK_DIR"
+    local base tries
+    base="$(pwd -P)"
+    for tries in 1 2 3; do
+        WORK_DIR="${base}/nunchuk_verification_${suffix}_$(date +%s)-$$"
+        if mkdir "$WORK_DIR" 2>/dev/null; then
+            trap reclaim_workspace EXIT
+            trap 'exit 130' INT; trap 'exit 143' TERM
+            log_info "Work directory: $WORK_DIR"
+            return 0
+        fi
+        sleep 1
+    done
+    WORK_DIR=""
+    die_build "Could not create a per-run workspace under ${base}"
+}
+
+# EXIT trap: drop this run's image, hand the workspace back; never fails.
+reclaim_workspace() {
+    set +e
+    # No verdict yet (killed or internal error): record ftbfs, unless withheld on purpose.
+    if [[ "$VERDICT_WRITTEN" != true && "$NO_VERDICT_BY_DESIGN" != true ]]; then
+        write_yaml "ftbfs" "Run ended before a verdict was written (interrupted or internal error)"
+    fi
+    if [[ -n "$IMAGE_NAME" ]]; then
+        "$CONTAINER_CMD" rmi "$IMAGE_NAME" > /dev/null 2>&1
+    fi
+    [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]] || return 0
+    # Only call the container runtime if the build left foreign-owned files behind.
+    if [[ -n "$(find "$WORK_DIR" ! -uid "$(id -u)" -print -quit 2>/dev/null)" ]]; then
+        restore_host_owner "$WORK_DIR"
+    fi
+    chmod -R u+rwX "$WORK_DIR" > /dev/null 2>&1
+    if [[ -n "$(find "$WORK_DIR" ! -uid "$(id -u)" -print -quit 2>/dev/null)" ]]; then
+        log_warn "Workspace still has files not owned by uid $(id -u): ${WORK_DIR}"
+    fi
+    return 0
 }
 
 add_sig_warning() {
@@ -303,10 +290,7 @@ sig_skip() {
     log_warn "$1 (verdict unaffected)"
 }
 
-# Verify the release manifest signature, then cross-check the measured digest against the manifest
-# that signature covers: a good signature alone does not say we compared the signed file. A failure
-# here is fatal only when the signature is good AND the file disagrees (see die_provenance);
-# everything else is advisory. Rationale: changelog v0.1.8.
+# Verify the SHA256SUMS signature, then cross-check our digest against it (advisory).
 verify_official_signature() {
     local sums_url="https://github.com/${GH_REPO}/releases/download/${APP_VERSION}/SHA256SUMS"
     local sums="${WORK_DIR}/SHA256SUMS"
@@ -338,9 +322,7 @@ verify_official_signature() {
     local gnupg_home="${WORK_DIR}/gnupg"
     mkdir -p "$gnupg_home"; chmod 700 "$gnupg_home"
 
-    # Plain HTTPS, not `gpg --recv-keys`: the latter needs dirmngr, which fails on hosts allowing
-    # ordinary HTTPS but not dirmngr's own network path.
-    # Not keys.openpgp.org: it serves this key with user IDs stripped; gpg skips such a key.
+    # Plain HTTPS from keyserver.ubuntu.com (no dirmngr; keys.openpgp.org strips user IDs).
     local imported=false
     local keyfile="${WORK_DIR}/release-key.asc"
     local src="https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x${NUNCHUK_RELEASE_KEY_FPR}"
@@ -349,8 +331,6 @@ verify_official_signature() {
             && GNUPGHOME="$gnupg_home" gpg --batch --quiet --import "$keyfile" >/dev/null 2>&1 \
             && GNUPGHOME="$gnupg_home" gpg --batch --with-colons --fingerprint 2>/dev/null \
                  | grep -q "^fpr:::::::::${NUNCHUK_RELEASE_KEY_FPR}:"; then
-        # The fingerprint check confirms the pinned key actually landed: a lookup service returning
-        # some other key must not silently become trusted.
         imported=true
         log_ok "Release key ${NUNCHUK_RELEASE_KEY_FPR} imported"
     fi
@@ -361,8 +341,7 @@ verify_official_signature() {
         return 0
     fi
 
-    # SHA256SUMS.asc is CLEARSIGNED (2.6.4/2.6.5): the digests it covers are INSIDE it; the
-    # separate SHA256SUMS is unsigned. Detached form still handled.
+    # SHA256SUMS.asc is clearsigned; the detached form is also handled.
     local gpg_out="" gpg_rc=0 sig_form="clearsigned"
     local verified_manifest="${WORK_DIR}/SHA256SUMS.verified"
 
@@ -377,9 +356,7 @@ verify_official_signature() {
         cp "$sums" "$verified_manifest" 2>/dev/null || true
     fi
 
-    # GOODSIG alone accepts any imported key, so require VALIDSIG on the pinned fingerprint.
-    # VALIDSIG names the SIGNING key in field 3 and the PRIMARY last; matching only field 3 would
-    # falsely reject a legitimate signing subkey. Accept either, report what signed.
+    # Require VALIDSIG on the pinned key (signing subkey or primary).
     local sig_key="" pri_key="" vline
     vline="$(grep -m1 "^\[GNUPG:\] VALIDSIG " <<<"$gpg_out" || true)"
     if [[ -n "$vline" ]]; then
@@ -402,7 +379,6 @@ verify_official_signature() {
         SIG_KEY_USED="Manifest signed with: ${sig_key:-unknown}"
         add_sig_warning "The manifest is signed by a key other than the pinned fingerprint. Treat the key as rotated or the artifact as suspect until upstream confirms which."
         log_warn "Manifest signed by an unexpected key: ${sig_key:-unknown}"
-        # Valid, just not OUR key — the payload it covers is still what to cross-check against.
         check_digest_against_manifest "$verified_manifest" "unverified"
     else
         SIG_MANIFEST_STATUS="[WARNING] No valid signature on SHA256SUMS"
@@ -419,9 +395,7 @@ verify_official_signature() {
     fi
 }
 
-# Cross-check the measured digest against the manifest entry for our filename. $2 carries the
-# manifest's standing so the line never reads stronger than its backing, and gates PROVENANCE_FATAL.
-# Sets globals — capturing with $() would run add_sig_warning in a subshell and discard warnings.
+# Exact filename match in the manifest; sets globals (no subshell).
 check_digest_against_manifest() {
     local sums="$1" manifest_state="$2"
     local want="${OFFICIAL_ARTIFACT_SHA256:-}" name="${OFFICIAL_ARTIFACT_NAME:-}"
@@ -430,9 +404,6 @@ check_digest_against_manifest() {
         SIG_DIGEST_STATUS="[WARNING] No readable manifest, or no measured digest, to compare"
         return 0
     fi
-    # EXACT equality, never a regex: `$2 ~ "^[*]?" name "$"` treated the name as a pattern, so
-    # "nunchuk-linux-v2x6y5azip" matched "nunchuk-linux-v2.6.5.zip" and reported [OK]. Collecting
-    # ALL entries matters too — taking the first accepted a conflicting duplicate.
     local matches count listed
     matches="$(awk -v n="$name" '$2 == n || $2 == "*" n {print $1}' "$sums" 2>/dev/null || true)"
     count="$(printf '%s\n' "$matches" | grep -c . || true)"
@@ -470,14 +441,12 @@ check_digest_against_manifest() {
 }
 
 prepare_official() {
-    # Obtain the official release ZIP: the provided --binary, or the GitHub download,
-    # or download the release ZIP from GitHub and extract the AppImage from it.
+    # Official release ZIP: --binary or GitHub download; extract the AppImage.
     local official_appimage="${WORK_DIR}/official.AppImage"
 
     if [[ -n "$BINARY_PATH" ]]; then
         log_info "Using provided binary: $(basename "$BINARY_PATH")"
         local bname; bname="$(basename "$BINARY_PATH")"
-        # The provided file IS the distributed artifact, whatever its form.
         OFFICIAL_ARTIFACT_NAME="$bname"
         OFFICIAL_ARTIFACT_SHA256="$(sha256_of "$BINARY_PATH")"
         log_ok "Official artifact as provided: ${bname}"
@@ -493,8 +462,7 @@ prepare_official() {
             fi
             cp "$found" "$official_appimage"
         else
-            # The verdict is the whole distributed ZIP. A bare .AppImage is not that artifact, and
-            # accepting one would compare an AppImage hash against a ZIP hash. Refuse instead.
+            # Only the released .zip is accepted: the verdict is the whole ZIP.
             die_invalid "--binary must be the released .zip, got: $bname"
         fi
     else
@@ -502,13 +470,11 @@ prepare_official() {
         local dl_url="https://github.com/${GH_REPO}/releases/download/${APP_VERSION}/${zip_name}"
         local zip_path="${WORK_DIR}/${zip_name}"
         log_info "Downloading official release: $dl_url"
-        # Download release ZIP; pass GitHub token header if available to avoid rate limiting.
         if ! wget -q ${GITHUB_TOKEN:+--header="Authorization: token ${GITHUB_TOKEN}"} \
                 -O "$zip_path" "$dl_url"; then
             die_build "Failed to download: $dl_url"
         fi
-        # Hash the distributed artifact as downloaded, BEFORE unpacking it. This is the value a
-        # user can reproduce with sha256sum against the release page, and the one to publish.
+        # appHash = the ZIP as downloaded, hashed before unpacking.
         OFFICIAL_ARTIFACT_NAME="$zip_name"
         OFFICIAL_ARTIFACT_SHA256="$(sha256_of "$zip_path")"
         log_ok "Official artifact as downloaded: ${zip_name} ($(stat -c%s "$zip_path") bytes)"
@@ -532,17 +498,12 @@ prepare_official() {
 
 # Run git inside a container against WORK_DIR mounted at /w.
 git_c() {
-    # safe.directory: the checkout is chowned back to the caller, so a later git container
-    # (running as root) sees another uid's repo and refuses without this. Upstream does the same.
+    # safe.directory: the checkout may belong to another uid.
     "$CONTAINER_CMD" run --rm -v "${WORK_DIR}:/w" -w /w "$GIT_IMAGE" \
         -c safe.directory='*' "$@"
 }
 
-# Give a container-written tree back to the caller. Needed ONLY when the engine runs rootful, where
-# container root is real root. Under any rootless engine -- podman or docker -- container root
-# already maps to the invoking user, and chowning to a numeric uid there lands on a subuid instead.
-# So test how the engine actually runs, never its executable name.
-# True when the engine runs rootless, where container UID 0 maps to the invoking user.
+# True when the engine runs rootless (container UID 0 = caller).
 is_rootless() {
     local r=""
     case "$CONTAINER_CMD" in
@@ -553,23 +514,14 @@ is_rootless() {
     [[ "$r" == "true" ]]
 }
 
-# Make the bind-mounted checkout appear INSIDE the build container as the caller's UID.
-#
-# This is verdict-critical, not cosmetic. Upstream's README assumes rootful Docker, where a
-# host-owned checkout appears in the container as the host user's own UID. Under rootless Podman
-# the same checkout appears as UID 0, and that difference CHANGES THE COMPILED BYTES. Measured
-# 2026-08-25 with one image, one clone and one command, varying only this: /project as UID 1001
-# reproduced the release exactly (57489e88...), /project as UID 0 did not (aa29927c...).
-# Rationale and evidence: changelog v0.1.11.
+# /project must appear as the caller's UID, as under rootful Docker; UID 0 changes the output.
 set_build_owner() {
     "$CONTAINER_CMD" run --rm -v "${1}:/w" --entrypoint chown "$GIT_IMAGE" \
         -R "$(id -u):$(id -g)" /w > /dev/null 2>&1 \
         || die_build "Could not set build ownership on ${1}; the build would not match upstream's"
 }
 
-# Hand the tree back so an ordinary user can delete it without podman unshare or sudo.
-# Under a rootless engine the caller IS container UID 0; under a rootful one the caller keeps its
-# own numeric UID. Never fatal: a verdict already reached must not be lost to a cleanup problem.
+# Hand the tree back to the caller; never fatal.
 restore_host_owner() {
     local uid gid
     uid="$(id -u)"; gid="$(id -g)"
@@ -579,9 +531,55 @@ restore_host_owner() {
         || log_warn "Could not restore ownership of ${1}; deleting it may need 'podman unshare rm -rf'"
 }
 
+# apt snapshot = release ZIP upload time; base = newest noble-* tag pushed before it.
+resolve_release_pins() {
+    local sde="$1" t
+    local gh=(wget -qO- ${GITHUB_TOKEN:+--header="Authorization: token ${GITHUB_TOKEN}"})
+    if [[ -z "$UBUNTU_SNAPSHOT" ]]; then
+        t="$("${gh[@]}" "https://api.github.com/repos/${GH_REPO}/releases/tags/${APP_VERSION}" 2>/dev/null \
+            | grep -oE '"(name|created_at)": *"[^"]*"' \
+            | awk -F'"' -v n="nunchuk-linux-v${APP_VERSION}.zip" '$2=="name"{h=($4==n)} $2=="created_at"&&h{print $4; exit}' || true)"
+        if [[ "$t" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+            UBUNTU_SNAPSHOT="$(tr -d ':-' <<<"$t")"
+            log_info "apt snapshot = release ZIP upload time: ${UBUNTU_SNAPSHOT}"
+        else
+            UBUNTU_SNAPSHOT="$(date -u -d "@$((sde + 86400))" +%Y%m%dT%H%M%SZ)"
+            log_warn "Release upload time not available; apt snapshot = tag commit + 1 day: ${UBUNTU_SNAPSHOT}"
+        fi
+    fi
+    [[ "$UBUNTU_SNAPSHOT" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] \
+        || die_invalid "UBUNTU_SNAPSHOT must look like 20260821T123445Z, got: ${UBUNTU_SNAPSHOT}"
+    if [[ -z "$UBUNTU_BASE" ]]; then
+        local iso="${UBUNTU_SNAPSHOT:0:4}-${UBUNTU_SNAPSHOT:4:2}-${UBUNTU_SNAPSHOT:6:2}T${UBUNTU_SNAPSHOT:9:2}:${UBUNTU_SNAPSHOT:11:2}:${UBUNTU_SNAPSHOT:13:2}Z"
+        t="$(wget -qO- "https://hub.docker.com/v2/repositories/library/ubuntu/tags?name=noble-&page_size=100" 2>/dev/null \
+            | grep -oE '"(last_updated|name)":"[^"]*"' | paste - - \
+            | sed -nE 's/.*"last_updated":"([^"]+)".*"name":"(noble-[0-9]{8}(\.[0-9]+)?)".*/\1 \2/p' \
+            | awk -v s="$iso" '$1 <= s' | sort | tail -1 | awk '{print $2}' || true)"
+        # No silent fallback to the moving tag: that is the drift this version exists to remove.
+        [[ -n "$t" ]] || die_build "Could not pick a dated ubuntu:noble-* base image for ${iso}; set UBUNTU_BASE"
+        UBUNTU_BASE="docker.io/library/ubuntu:${t}"
+    fi
+    log_info "Base image: ${UBUNTU_BASE}"
+}
+
+# Upstream Dockerfile + 2 lines: dated FROM, apt snapshot (TLS check off for snapshot hosts; GPG still on).
+pin_dockerfile() {
+    local src="$1" dst="$2"
+    grep -qE '^FROM ubuntu:24\.04[[:space:]]*$' "$src" \
+        || die_build "Upstream Dockerfile.linux no longer starts FROM ubuntu:24.04; pinning not applied"
+    awk -v base="$UBUNTU_BASE" -v snap="$UBUNTU_SNAPSHOT" '
+        /^FROM ubuntu:24\.04[[:space:]]*$/ && !done {
+            print "FROM " base
+            printf "RUN printf '\''APT::Snapshot \"%s\";\\nAcquire::https::snapshot.ubuntu.com::Verify-Peer \"false\";\\nAcquire::https::snapshot.ppa.launchpadcontent.net::Verify-Peer \"false\";\\n'\'' > /etc/apt/apt.conf.d/50ws-snapshot\n", snap
+            done = 1; next
+        }
+        { print }' "$src" > "$dst"
+    log_info "Pinned Dockerfile (upstream + 2 lines): sha256 $(sha256_of "$dst")"
+    diff "$src" "$dst" | grep '^[<>]' || true
+}
+
 run_build() {
-    # Builds the way reproducible-builds/README.md tells verifiers to: upstream's committed
-    # Dockerfile.linux and build_linux.sh, source bind-mounted at /project. Rationale: changelog v0.1.10.
+    # Upstream's Dockerfile.linux + build_linux.sh, source at /project, as its README instructs.
     local src="${WORK_DIR}/src"
     log_info "Cloning ${GH_REPO} at tag ${APP_VERSION} (in a container)..."
     rm -rf "$src"
@@ -589,12 +587,7 @@ run_build() {
             --branch "${APP_VERSION}" "https://github.com/${GH_REPO}.git" /w/src; then
         die_build "Could not clone ${GH_REPO} at tag ${APP_VERSION}"
     fi
-    # Bind the reported commit to the checkout that will actually be built. resolve_commit() asks
-    # the remote; rev-parse asks the tree we cloned. A tag moved mid-run, or a name collision,
-    # shows up here instead of silently mislabelling the result.
-    # Fails CLOSED. An unavailable tag lookup is not a pass: skipping the comparison there would
-    # leave the collision hole open exactly when the independent check is missing, and would still
-    # print a tag attribution nothing established.
+    # Checkout HEAD must equal the remote tag commit; fails closed.
     resolve_commit
     [[ "$RESOLVED_COMMIT" =~ ^[0-9a-f]{40}$ ]] \
         || die_build "Could not resolve tag ${APP_VERSION} to a commit; refusing to attribute a build to it"
@@ -604,8 +597,6 @@ run_build() {
         || die_build "Checkout HEAD ${head} does not match tag ${APP_VERSION} commit ${RESOLVED_COMMIT}"
     log_ok "Checkout HEAD matches tag ${APP_VERSION}: ${head}"
 
-    # build_linux.sh derives SOURCE_DATE_EPOCH from `git log -1 --format=%ct`. Report it so the
-    # recording shows the value the packaging step normalizes every timestamp to.
     local sde; sde="$(git_c -C /w/src log -1 --format=%ct | tr -dc 0-9)" || sde=""
     [[ -n "$sde" ]] || die_build "Could not read the tag commit time; SOURCE_DATE_EPOCH unset"
     log_info "SOURCE_DATE_EPOCH from tag commit: ${sde} ($(date -u -d "@${sde}" '+%Y-%m-%d %H:%M:%S UTC'))"
@@ -614,8 +605,13 @@ run_build() {
     [[ -f "$dockerfile" ]] || die_build "Upstream reproducible-builds/Dockerfile.linux not found at tag ${APP_VERSION}"
     UPSTREAM_DOCKERFILE_SHA256="$(sha256_of "$dockerfile")"
     log_info "Upstream Dockerfile.linux sha256: ${UPSTREAM_DOCKERFILE_SHA256}"
+    resolve_release_pins "$sde"
+    # Kept in WORK_DIR, outside the bind-mounted source tree, so the build sees upstream's files only.
+    pin_dockerfile "$dockerfile" "${WORK_DIR}/Dockerfile.pinned"
+    dockerfile="${WORK_DIR}/Dockerfile.pinned"
 
-    local image_name="nunchuk-verifier-${APP_VERSION}-$$"
+    local image_name="nunchuk-verifier-${APP_VERSION}-$(date +%s)-$$"
+    IMAGE_NAME="$image_name"
     log_info "Building upstream image -- 20-40 min on first run..."
     local attempt image_built=false
     for attempt in 1 2 3; do
@@ -629,8 +625,7 @@ run_build() {
     done
     [[ "$image_built" == true ]] || die_build "Container image build failed after 3 attempts"
 
-    # Ownership is set here, after the image build: `$CONTAINER_CMD build` reads the context as
-    # the host user, so the tree must still be host-readable up to this point.
+    # Ownership set after the image build, which reads the context as the host user.
     log_info "Setting build ownership so /project matches upstream's rootful-Docker semantics..."
     set_build_owner "${WORK_DIR}"
 
@@ -651,13 +646,10 @@ run_build() {
     [[ -f "$out_zip" ]] || die_build "Upstream build produced no ZIP at ${out_zip}"
     cp "$out_zip" "${WORK_DIR}/built.zip"
 
-    # The ZIP is the artifact upstream's README says to diff, so hash it as built.
     BUILT_ARTIFACT_SHA256="$(sha256_of "${WORK_DIR}/built.zip")"
     log_ok "Built artifact: nunchuk-linux-v${APP_VERSION}.zip ($(stat -c%s "${WORK_DIR}/built.zip") bytes)"
     log_ok "  sha256: ${BUILT_ARTIFACT_SHA256}"
 
-    # Also unpack the AppImage: if the ZIPs differ it localizes the difference, and if they
-    # match it localizes where the archives diverge.
     rm -rf "${WORK_DIR}/built_zip"
     unzip -q "${WORK_DIR}/built.zip" -d "${WORK_DIR}/built_zip"
     local found; found="$(find "${WORK_DIR}/built_zip" -name "*.AppImage" -print -quit)"
@@ -670,11 +662,7 @@ run_build() {
 }
 
 compare_artifacts() {
-    # The verdict is the whole distributed ZIP, byte for byte -- nothing else can produce a pass.
-    # Equal SHA-256 over the complete archive already implies identical member count, names,
-    # metadata, compression and bytes, so no extra structural check is needed. The extracted
-    # comparison that earlier versions used to reach a pass is gone: it discards exactly the
-    # packing and runtime bytes that a reproducibility claim is about.
+    # Verdict = the whole ZIP byte for byte; nothing else can pass.
     echo ""
     echo "======================================================"
     echo "ARTIFACT COMPARISON (whole ZIP, byte for byte)"
@@ -695,8 +683,6 @@ compare_artifacts() {
         return 0
     fi
 
-    # State only what was measured. Equal AppImage hashes do NOT prove the rest of the archive
-    # matches: each ZIP is only required to contain an AppImage, so members could differ too.
     local detail
     if [[ "$OFFICIAL_APPIMAGE_SHA256" == "$BUILT_APPIMAGE_SHA256" ]]; then
         detail="The AppImage members match (${OFFICIAL_APPIMAGE_SHA256}); the archives differ elsewhere."
@@ -711,11 +697,7 @@ compare_artifacts() {
     return 1
 }
 
-# Resolve the git commit that tag APP_VERSION points at (dereferences annotated tags).
-# Network is already required for the build, so a remote lookup here is acceptable.
-# Resolves the tag to a commit AND classifies it, from one `git ls-remote`: an annotated tag answers
-# on both peeled (`^{}`) and unpeeled refs, a lightweight tag only once. Sets globals — a command
-# substitution would run this in a subshell and lose SIG_TAG_TYPE.
+# Tag commit and type (annotated/lightweight) from one ls-remote; sets globals.
 resolve_commit() {
     local out ref n
     out="$(git_c ls-remote "https://github.com/${GH_REPO}.git" \
@@ -728,9 +710,7 @@ resolve_commit() {
     else SIG_TAG_TYPE="unknown"; fi
 }
 
-# Plain-language legend for the several meaningful hashes this app produces. Kept OUTSIDE the
-# Begin/End Results markers so that block stays a clean key: value list (dannys-amendments.md,
-# "Ambiguous Artifact Hashes"; reference implementation blockstreamjade_build.sh v0.2.0).
+# Hash legend, printed outside the results block.
 print_hash_legend() {
     echo ""
     echo "HASH LEGEND"
@@ -746,25 +726,16 @@ print_hash_legend() {
     echo "  scriptHash       sha256 of this script, identifying which tooling produced these results."
 }
 
-# Standardized WalletScrutiny verification summary (verification-result-summary-format.md).
-# Parsed by the legacy test.sh format; the machine verdict still lives in COMPARISON_RESULTS.yaml.
+# Results block (verification-result-summary-format.md); verdict also in COMPARISON_RESULTS.yaml.
 emit_verification_summary() {
-    local yaml_verdict summary_verdict commit
-    yaml_verdict="$(awk '/^verdict:/{print $2}' "${SCRIPT_DIR}/COMPARISON_RESULTS.yaml" 2>/dev/null)"
-    case "$yaml_verdict" in
-        reproducible)     summary_verdict="reproducible" ;;
-        not_reproducible) summary_verdict="differences found" ;;
-        ftbfs)            summary_verdict="" ;;
-        *)                summary_verdict="$yaml_verdict" ;;
-    esac
+    local summary_verdict commit
+    # Same value as the YAML: one of reproducible / not_reproducible / ftbfs, nothing else.
+    summary_verdict="$(awk '/^verdict:/{print $2}' "${SCRIPT_DIR}/COMPARISON_RESULTS.yaml" 2>/dev/null)"
     [[ "$RESOLVED_COMMIT" == "unknown" ]] && resolve_commit
     commit="$RESOLVED_COMMIT"
 
     print_hash_legend
 
-    # appHash is the artifact EXACTLY AS DOWNLOADED (the release ZIP), per
-    # verification-result-summary-format.md and test.sh:149. Through v0.1.6 this field wrongly
-    # carried the inner AppImage hash — the same defect class as GitLab issue 957.
     echo ""
     echo "===== Begin Results ====="
     echo "appId:          ${APP_ID}"
@@ -791,8 +762,6 @@ emit_verification_summary() {
         echo "Rebuilt  AppImage member: ${BUILT_APPIMAGE_SHA256}"
     fi
 
-    # Section 4 of verification-result-summary-format.md. The meaningful signature here is over the
-    # release manifest, not the AppImage (unsigned), so the manifest line leads.
     echo ""
     echo "Revision, tag (and its signature):"
     echo "tag:            ${APP_VERSION}"
@@ -824,11 +793,12 @@ main() {
     echo "======================================================"
     echo ""
 
-    # Self-identify before doing anything else, so a recording of this run always shows which
-    # bytes of tooling produced the result without the operator having to remember to hash it.
+    # Self-identify first.
     SCRIPT_SHA256="$(sha256_of "$SCRIPT_PATH")"
     log_info "Script:  $(basename "$SCRIPT_PATH") ${SCRIPT_VERSION}"
     log_info "         sha256: ${SCRIPT_SHA256}"
+    # Never let ABS read a verdict left by an earlier run in this directory.
+    rm -f "${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
 
     parse_args "$@"
     detect_container_cmd
@@ -841,8 +811,6 @@ main() {
     echo ""
 
     prepare_official
-    # Provenance checks run after the digest is measured and before the build, so a signature
-    # problem shows up early in the recording. Neither can change the verdict.
     verify_official_signature
     [[ -n "$PROVENANCE_FATAL" ]] && die_provenance "$PROVENANCE_FATAL"
     check_build_inputs
