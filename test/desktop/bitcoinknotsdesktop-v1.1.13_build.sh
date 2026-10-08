@@ -2,10 +2,10 @@
 # ==============================================================================
 # bitcoinknotsdesktop_build.sh - Bitcoin Knots Reproducible Build Verification
 # ==============================================================================
-# Version:       v1.1.12
+# Version:       v1.1.13
 # Organization:  WalletScrutiny.com
 # Last modified by: Daniel Andrei R. Garcia
-# Last modified on: 2026-09-04
+# Last modified on: 2026-09-29
 # Project:       https://github.com/bitcoinknots/bitcoin
 # ==============================================================================
 # LICENSE: MIT License
@@ -54,7 +54,7 @@
 set -euo pipefail
 
 # Script metadata
-SCRIPT_VERSION="v1.1.12"
+SCRIPT_VERSION="v1.1.13"
 SCRIPT_NAME="bitcoinknotsdesktop_build.sh"
 
 # Script self-identification. Resolved via readlink -f so a relative invocation or a
@@ -72,6 +72,8 @@ REPO_URL="https://github.com/bitcoinknots/bitcoin"
 DEFAULT_VERSION="29.3.knots20260507"
 CONTAINER_NAME=""
 IMAGE_NAME=""
+WORK_DIR=""
+TEMP_IMAGEFILE=""
 
 # Global variables for tracking
 OUTPUT_DIR=""
@@ -197,6 +199,49 @@ set_unique_names() {
 
     CONTAINER_NAME="ws-bitcoinknots-verifier-${version_component}-${arch_component}-${type_component}-${suffix}"
     IMAGE_NAME="ws-bitcoinknots-image-${version_component}-${arch_component}-${type_component}-${suffix}"
+}
+
+# Per-run workspace under the caller's directory: exclusive create, never reused.
+create_workspace() {
+    local base tries=0
+    base="$(pwd -P)"
+    while [[ $tries -lt 3 ]]; do
+        WORK_DIR="${base}/knots_verification_${1#v}_${2}_${3}_$(date +%s)-$$"
+        if mkdir "$WORK_DIR" 2>/dev/null; then
+            trap reclaim_workspace EXIT
+            log_info "Workspace: ${WORK_DIR}"
+            return 0
+        fi
+        tries=$((tries + 1))
+        sleep 1
+    done
+    log_error "Could not create per-run workspace under ${base}"
+    generate_error_yaml "${PWD}/COMPARISON_RESULTS.yaml" "Could not create per-run workspace" "ftbfs"
+    exit 2
+}
+
+# EXIT trap: hand the workspace back to the invoking user on every path. Nothing in
+# here may fail the script or touch COMPARISON_RESULTS.yaml.
+reclaim_workspace() {
+    trap - ERR
+    set +e
+    [[ -n "$TEMP_IMAGEFILE" ]] && rm -f "$TEMP_IMAGEFILE"
+    [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]] || return 0
+    local uid gid
+    uid=$(id -u)
+    gid=$(id -g)
+    if [[ "$CONTAINER_CMD" == "podman" ]]; then
+        podman unshare chown -R 0:0 "$WORK_DIR" >/dev/null 2>&1
+    fi
+    chown -R "${uid}:${gid}" "$WORK_DIR" >/dev/null 2>&1
+    if [[ "$CONTAINER_CMD" == "docker" ]] && [[ -n "$(find "$WORK_DIR" ! -uid "$uid" -print -quit 2>/dev/null)" ]]; then
+        docker run --rm -v "${WORK_DIR}:/w" alpine:3.22 chown -R "${uid}:${gid}" /w >/dev/null 2>&1
+    fi
+    chmod -R u+rwX "$WORK_DIR" >/dev/null 2>&1
+    if [[ -n "$(find "$WORK_DIR" ! -uid "$uid" -print -quit 2>/dev/null)" ]]; then
+        log_warning "Workspace still has files not owned by uid ${uid}: ${WORK_DIR}"
+    fi
+    return 0
 }
 
 is_optional_artifact() {
@@ -747,7 +792,7 @@ download_official_checksums() {
     local temp_dir
     local container_temp_dir
 
-    temp_dir=$(mktemp -d)
+    temp_dir=$(mktemp -d -p "$WORK_DIR")
 
     if ! container_temp_dir=$(${CONTAINER_CMD} exec "$CONTAINER_NAME" mktemp -d /tmp/ws_official_sha.XXXXXX 2>/dev/null); then
         log_error "Failed to create temporary directory inside container for checksums"
@@ -880,34 +925,16 @@ verify_checksums() {
     container_built_hash=$(${CONTAINER_CMD} exec "$CONTAINER_NAME" sha256sum "/built/${main_artifact}" 2>/dev/null | awk '{print $1}')
     container_official_hash=$(${CONTAINER_CMD} exec "$CONTAINER_NAME" sha256sum "/official/${main_artifact}" 2>/dev/null | awk '{print $1}')
 
-    # Create local directories for extraction. Clear them first: they are never
-    # otherwise emptied, so a same-named artifact left by an earlier run could
-    # satisfy the comparison instead of this run's output.
-    local official_dir="$PWD/official"
-    local built_dir="$PWD/built"
+    # Staging directories live in this run's own workspace, so nothing from an
+    # earlier or parallel run can satisfy the comparison. Confirm they are empty.
+    local official_dir="$WORK_DIR/official"
+    local built_dir="$WORK_DIR/built"
     local stale_dir
-    for stale_dir in "$official_dir" "$built_dir"; do
-        case "$stale_dir" in
-            */official|*/built)
-                rm -rf "$stale_dir"
-                ;;
-            *)
-                log_error "Refusing to clear unexpected staging path: $stale_dir"
-                generate_error_yaml "${PWD}/COMPARISON_RESULTS.yaml" "Unexpected staging path, refused to clear: $stale_dir"
-                return 1
-                ;;
-        esac
-    done
     mkdir -p "$official_dir" "$built_dir"
-
-    # The clear above can fail without aborting (errexit is off here), and on a
-    # rootful runtime the leftovers may be root-owned with no sudo available.
-    # Confirm both directories really are empty rather than assuming it.
     for stale_dir in "$official_dir" "$built_dir"; do
         if [[ -n "$(ls -A "$stale_dir" 2>/dev/null)" ]]; then
-            log_error "Staging directory not empty after clearing: $stale_dir"
-            log_error "Remove it manually before re-running; stale artifacts must not be compared."
-            generate_error_yaml "${PWD}/COMPARISON_RESULTS.yaml" "Could not clear staging directory: $stale_dir"
+            log_error "Staging directory not empty: $stale_dir"
+            generate_error_yaml "${PWD}/COMPARISON_RESULTS.yaml" "Staging directory not empty: $stale_dir"
             return 1
         fi
     done
@@ -1049,10 +1076,12 @@ verify_checksums() {
     if [[ "$verdict" == "reproducible" ]]; then
         log_success "Verdict: REPRODUCIBLE"
         log_info "Build server output: ${comparison_file}"
+        log_info "Workspace: ${WORK_DIR}"
         return 0
     else
         log_warning "Verdict: NOT REPRODUCIBLE"
         log_info "Build server output: ${comparison_file}"
+        log_info "Workspace: ${WORK_DIR}"
         log_info "Official checksums: https://github.com/bitcoinknots/bitcoin/releases/download/${version}/SHA256SUMS"
         return 1
     fi
@@ -1188,12 +1217,13 @@ main() {
         cleanup_containers
     fi
 
-    # Create temporary imagefile
-    local temp_imagefile=$(mktemp)
-    trap "rm -f $temp_imagefile" EXIT
+    create_workspace "$version" "$arch" "$build_type"
 
-    create_imagefile "$temp_imagefile"
-    build_container "$temp_imagefile"
+    # Create temporary imagefile inside the workspace
+    TEMP_IMAGEFILE=$(mktemp -p "$WORK_DIR" imagefile.XXXXXX)
+
+    create_imagefile "$TEMP_IMAGEFILE"
+    build_container "$TEMP_IMAGEFILE"
     start_container
     prepare_bitcoin_build "$version" "$guix_arch"
     execute_build "$version" "$guix_arch"
