@@ -1,8 +1,8 @@
 #!/bin/bash
-# bitbanana_build.sh v0.7.0 — BitBanana Android reproducible build verification
+# bitbanana_build.sh v0.7.1 — BitBanana Android reproducible build verification
 # Organization: WalletScrutiny.com
 # Last modified by: Danny Garcia
-# Last modified on: 2026-08-18
+# Last modified on: 2026-09-25
 # Project: https://github.com/michaelWuensch/BitBanana
 # Scope: Google Play AAB / split-APK delivery. Builds the app bundle from source,
 #        materialises a device-specific APK set with bundletool, and compares it
@@ -19,7 +19,7 @@
 set -euo pipefail
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.7.0"
+readonly SCRIPT_VERSION="v0.7.1"
 readonly SCRIPT_NAME="bitbanana_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 readonly SCRIPT_PATH
@@ -234,8 +234,10 @@ parse_arguments() {
     a_safe=$(sanitize_tag "${ARCH:-splits}")
     s_safe=$(sanitize_tag "$SCRIPT_VERSION")
 
-    WORK_DIR="/tmp/test_${APP_ID}_${v_safe}_${a_safe}_${t_safe}"
-    IMAGE_NAME="bitbanana-aab-${v_safe}-${a_safe}-${t_safe}-${s_safe}"
+    # Per run, in the caller's directory: a fixed /tmp path is shared by every user (ABS included).
+    local run_id; run_id="$(date +%s)-$$"
+    WORK_DIR="$(pwd -P)/bitbanana_verification_${v_safe}_${a_safe}_${t_safe}_${run_id}"
+    IMAGE_NAME="bitbanana-aab-${v_safe}-${a_safe}-${t_safe}-${s_safe}-${run_id}"
     log_info "Work directory: ${WORK_DIR}"
     log_info "Container image tag: ${IMAGE_NAME}"
 }
@@ -284,6 +286,8 @@ on_exit() {
         generate_yaml "ftbfs" "Script aborted before a comparison was produced."
     fi
     normalize_ownership
+    [[ -n "${IMAGE_NAME:-}" && -n "${CONTAINER_RUNTIME:-}" ]] && ${CONTAINER_RUNTIME} rmi "${IMAGE_NAME}" >/dev/null 2>&1
+    return 0
 }
 trap on_exit EXIT
 

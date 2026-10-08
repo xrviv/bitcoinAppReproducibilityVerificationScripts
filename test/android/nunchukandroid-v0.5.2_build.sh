@@ -1,12 +1,12 @@
 #!/bin/bash
 # nunchukandroid_build.sh — Nunchuk Android Reproducible Build Verification
-# Version: v0.5.1
+# Version: v0.5.2
 # Organization: WalletScrutiny.com
 # License: MIT
 set -euo pipefail
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.5.1"
+readonly SCRIPT_VERSION="v0.5.2"
 readonly SCRIPT_NAME="nunchukandroid_build.sh"
 readonly APP_ID="io.nunchuk.android"
 readonly REPO_URL="https://github.com/nunchuk-io/nunchuk-android.git"
@@ -336,7 +336,7 @@ parse_arguments() {
     ARCH_SAFE="${ARCH//-/_}"
     REF_SUFFIX="${REQUESTED_REV:-${REQUESTED_TAG:-}}"; REF_SUFFIX="${REF_SUFFIX//[^A-Za-z0-9._-]/_}"
     IMAGE_TAG="${NUNCHUK_IMAGE_BASE}:${VERSION_SAFE}${REF_SUFFIX:+-${REF_SUFFIX}}"
-    WORK_DIR="/tmp/test_${APP_ID}_${VERSION_SAFE}_${ARCH_SAFE}${REF_SUFFIX:+_${REF_SUFFIX}}"
+    WORK_DIR="$(pwd -P)/nunchuk_verification_${VERSION_SAFE}_${ARCH_SAFE}_$(date +%s)-$$"
     log_info "${SCRIPT_NAME} ${SCRIPT_VERSION}"
     log_info "Build mode: ${BUILD_MODE}"
     log_info "Work directory: ${WORK_DIR}"

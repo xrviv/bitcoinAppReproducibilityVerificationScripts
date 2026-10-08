@@ -1,9 +1,9 @@
 #!/bin/bash
-# coconut_build.sh v0.1.16 — Coconut Wallet (onl.coconut.wallet) Android reproducible build
+# coconut_build.sh v0.1.17 — Coconut Wallet (onl.coconut.wallet) Android reproducible build
 # verification
 # Organization: WalletScrutiny.com
 # Last modified by: Daniel Garcia
-# Last modified on: 2026-09-11
+# Last modified on: 2026-09-25
 # Project: https://github.com/noncelab/coconut_wallet
 #
 # TECHNICAL DISCLAIMER:
@@ -32,7 +32,7 @@ set -euo pipefail
 
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.1.16"
+readonly SCRIPT_VERSION="v0.1.17"
 readonly SCRIPT_NAME="coconut_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 readonly SCRIPT_PATH
@@ -223,7 +223,7 @@ fi
 log_ok "Using ${CONTAINER_RUNTIME} as container runtime"
 
 RUN_ID="$(date +%s)-$$"
-WORK_DIR="/tmp/test_${APP_ID}_${version_arg:-unset}_${RUN_ID}"
+WORK_DIR="$(pwd -P)/coconut_verification_${version_arg:-unset}_${RUN_ID}"  # per run, caller dir (never /tmp)
 mkdir -p "${WORK_DIR}/official" "${WORK_DIR}/comparison" "${WORK_DIR}/tools"
 readonly WORK_DIR
 cp "${OFFICIAL_SPLITS[@]}" "${WORK_DIR}/official/"

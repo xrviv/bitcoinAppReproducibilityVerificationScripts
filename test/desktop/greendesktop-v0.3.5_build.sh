@@ -1,53 +1,57 @@
 #!/bin/bash
-#
+# ==============================================================================
 # greendesktop_build.sh - Blockstream Green Desktop (green_qt) Reproducible Build Verifier
+# ==============================================================================
+# Version:          v0.3.5
+# Organization:     WalletScrutiny.com
+# Last modified by: Danny Garcia
+# Last modified on: 2026-09-25
+# App ID:           blockstreamgreen
+# Project:          https://github.com/Blockstream/green_qt
+# Repository:       https://gitlab.com/walletscrutiny/walletScrutinyCom
+# ==============================================================================
+# IMPORTANT: DO NOT include a changelog in this header.
+# ==============================================================================
 #
-# Version: v0.3.4
+# SCRIPT SUMMARY:
+#   Reproducible build verification for the Blockstream Green Desktop Linux
+#   AppImage. Builds green_qt and its full native dependency chain (GDK, LWK,
+#   GLSDK, sentry-native/crashpad, countly, zxing, hidapi, libusb,
+#   kdsingleapplication, libserialport, gpgme, leveldb) from source inside one
+#   container image, packages via upstream's own tools/appimage.sh, and compares
+#   the extracted squashfs payload against the official release AppImage
+#   file-by-file.
 #
-# Description:
-#   Reproducible build verification for Blockstream Green Desktop Linux AppImage.
-#   Builds green_qt and its full native dependency chain (GDK, LWK, GLSDK,
-#   sentry-native/crashpad, countly, zxing, hidapi, libusb, kdsingleapplication,
-#   libserialport, gpgme, leveldb) from source inside a single container image,
-#   packages via upstream's own tools/appimage.sh, and compares the extracted
-#   squashfs payload against the official release AppImage file-by-file.
+#   The official AppImage is authenticated in the container before use: the
+#   release's SHA256SUMS.asc is verified against Blockstream's release-signing
+#   key, pinned by full fingerprint, and the AppImage hash must be listed in the
+#   signed text. The outcome is printed in the results block.
 #
 #   Qt is fetched as the official prebuilt via aqtinstall (token-free;
-#   binary-equivalence to the official online-installer Qt was confirmed by
-#   hash comparison during the 3.4.0 investigation). Since v0.3.3 the Qt
-#   version and module list are read from upstream's ci/linux-x86_64/Dockerfile
-#   at the release tag (the qt.qt6.NNNN.* / extensions.*.NNNN.* installer ids)
-#   instead of being hard-coded: Linux Qt was 6.11.0 through 3.5.2, 6.11.1 at
-#   3.5.3 and 6.11.2 at 3.5.4. v0.3.2 and earlier pinned 6.11.0, so their 3.5.3
-#   and 3.5.4 verdicts diffed every bundled libQt6*.so by construction. The
-#   version actually used is printed in the results and recorded in
-#   qt-version.txt in the out dir. The build runs with the versioned Qt path
-#   (/qt/<version>/gcc_64/bin) first on PATH, exactly as upstream's ENV PATH
-#   does: v0.3.3 built through a /qt/current symlink, which made the
-#   pre-packaging RUNPATH 6 bytes shorter and left a different patchelf filler
-#   (27 vs 33 'X') plus a different Build ID in usr/bin/blockstream at 3.5.4.
-#   The image also records its full dpkg package list (build-image-packages.txt)
-#   so bundled Ubuntu system libraries can be attributed to package revisions.
+#   binary-equivalence to the online-installer Qt was confirmed by hash during
+#   the 3.4.0 investigation). The Qt version and module list are read from
+#   upstream's ci/linux-x86_64/Dockerfile at the release tag. The build runs
+#   with the versioned Qt path (/qt/<version>/gcc_64/bin) first on PATH, as
+#   upstream's ENV PATH does. The image records its full dpkg package list
+#   (build-image-packages.txt) so bundled Ubuntu system libraries can be
+#   attributed to package revisions.
 #
-#   From 3.5.0 the build mirrors upstream CI more closely: it drives
-#   tools/ci/build.sh (qt-cmake --preset ci, --parallel 4) and packages with
-#   tools/appimage.sh --plugin-qt, both taken from the pinned checkout. The
-#   AppImage packaging tools are pinned and SHA256-checked by upstream's own
-#   ci/linux-x86_64/download-appimage-binaries.sh, so this script no longer
-#   carries its own pins.
+#   The build drives upstream's tools/ci/build.sh (qt-cmake --preset ci,
+#   --parallel 4) and packages with tools/appimage.sh --plugin-qt, both from
+#   the pinned checkout. The AppImage packaging tools are pinned and
+#   SHA256-checked by upstream's ci/linux-x86_64/download-appimage-binaries.sh;
+#   if those pins are stale the current continuous assets are used and every
+#   substitution is reported per tool. The AppImage runtime stub is downloaded
+#   once, SHA256-checked, and handed to appimagetool with --runtime-file.
+#   The executable and every library as they were before linuxdeploy stripped
+#   them are kept in the out dir (pre-packaging/).
 #
 #   Known upstream limitations (documented, not worked around):
 #   - liblwk.so release builds are nondeterministic upstream
 #     (https://github.com/Blockstream/lwk/issues/165)
-#   (libglsdk.so, the Greenlight SDK Rust cdylib added in 3.4.1, was previously
-#   assumed nondeterministic by analogy with liblwk. That is retired: it reproduced
-#   byte-for-byte with an identical GNU Build ID at both 3.4.1 and 3.5.0.)
-#   - https://github.com/Blockstream/green_qt/issues/187 reported checkout-time
-#     QML mtimes, an OpenSSL build timestamp, and unpinned 'continuous' AppImage
-#     tools. As of 3.5.0 upstream has addressed the mtimes (SOURCE_DATE_EPOCH +
-#     git ls-files touch, replicated below) and the tool pinning (SHA256 checks).
-#     The OpenSSL timestamp is unconfirmed either way at 3.5.0 — check the diff.
-#   A not_reproducible verdict is still expected while lwk#165 is open; the diff
+#   - Build IDs depend on the checkout path baked into RelWithDebInfo debug
+#     info at link time; upstream's CI path is not published.
+#   A not_reproducible verdict is expected while lwk#165 is open; the diff
 #   files this script produces are the evidence for human review.
 #
 # Usage:
@@ -55,16 +59,18 @@
 #   greendesktop_build.sh --binary /path/to/Blockstream-x86_64.AppImage [--version VERSION]
 #
 # Only host requirement: podman or docker. No credentials needed.
-#
-# Organization: WalletScrutiny.com
-# Repository: https://gitlab.com/walletscrutiny/walletScrutinyCom
-#
+# Exit codes: 0 = reproducible, 1 = not reproducible / build failure, 2 = invalid parameters.
+# ==============================================================================
+
+SCRIPT_VERSION="v0.3.5"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_HASH="$(sha256sum "${SCRIPT_PATH}" 2>/dev/null | cut -d' ' -f1)"
+echo "$(basename "${SCRIPT_PATH}") ${SCRIPT_VERSION} sha256:${SCRIPT_HASH:-unknown}"
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.3.4"
 APP_ID="blockstreamgreen"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(dirname "${SCRIPT_PATH}")"
 
 EXIT_SUCCESS=0
 EXIT_BUILD_FAILED=1
@@ -74,33 +80,40 @@ GREEN_REPO="https://github.com/Blockstream/green_qt"
 APPIMAGE_NAME="Blockstream-x86_64.AppImage"
 SUPPORTED_ARCH="x86_64-linux-gnu"
 SUPPORTED_TYPE="appimage"
+# Base image pinned by digest: docker.io/library/ubuntu:jammy, linux/amd64 manifest as of 2026-09-25.
+BASE_IMAGE="docker.io/library/ubuntu@sha256:281c5745f657873d78e5531fc5ba8575f46ab7769b94550ac99543f122679986"
+# Blockstream's release-signing key ("GreenAddress Team <info@greenaddress.it>"), full fingerprint.
+# SHA256SUMS.asc of every release_* is a clearsigned message from this key.
+SIGNING_KEY_FPR="04BEBF2E35A2AF2FFDF1FA5DE7F054AA2E76E792"
+# AppImage type2 runtime stub that appimagetool embeds; continuous asset as of 2026-09-25.
+# appimagetool downloads it unchecked unless given --runtime-file, so it is fetched here with a hash check.
+APPIMAGE_RUNTIME_URL="https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64"
+APPIMAGE_RUNTIME_SHA256="1cc49bcf1e2ccd593c379adb17c9f85a36d619088296504de95b1d06215aebbf"
 
 # AppImage packaging tools are pinned and SHA256-verified by upstream's own
 # ci/linux-x86_64/download-appimage-binaries.sh, run in the final image stage
-# and taken from the pinned checkout. This script carries no pins of its own.
-# NOTE: upstream fetches those tools from the rolling 'continuous' release tag
-# and verifies recorded hashes. Those assets get rebuilt upstream (plugin-qt was
-# rebuilt 2026-08-22, which broke the release_3.5.2 pins and FTBFSed v0.3.1).
-# Upstream CI itself never re-runs that check: it builds from a prebuilt image
-# (LINUX_IMAGE sha256 pin in ci/linux-x86_64.yml) created while the pins were
-# fresh. Since v0.3.2 this script therefore tries upstream's pinned check first
-# and, only if it fails, falls back to the CURRENT continuous assets; the
-# sha256 of every tool actually used is always recorded in
-# appimage-tools-used.txt in the out dir, and a stale-pin fallback is called
-# out in the results and notes. The fallback can only introduce spurious
-# packaging diffs (false not_reproducible), never a false reproducible: the
-# payload comparison itself never runs through these tools.
+# from the pinned checkout. Upstream fetches them from rolling 'continuous'
+# release tags that get rebuilt, so the pins go stale; upstream CI never re-runs
+# the check because it builds from a prebuilt image (LINUX_IMAGE digest in
+# ci/linux-x86_64.yml). The script tries upstream's pinned check first and only
+# then falls back to the current continuous assets. Per tool, the pinned hash,
+# the hash used and the tool's own version line are recorded and printed in the
+# results block. The fallback can only cause spurious packaging diffs (false
+# not_reproducible), never a false reproducible: the payload comparison itself
+# never runs through these tools.
 
 APP_VERSION=""
 APP_ARCH="${SUPPORTED_ARCH}"
 APP_TYPE="${SUPPORTED_TYPE}"
 BINARY_PATH=""
 NO_CACHE=false
-KEEP_WORKDIR=true
 DOCKER_CMD="${DOCKER_CMD:-}"
 WORK_DIR=""
 IMAGE_TAG=""
+OWNER=""
 GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
 
 # ----------------------------------------------------------------------------
 # Helpers
@@ -125,13 +138,42 @@ write_yaml() {
     log_info "COMPARISON_RESULTS.yaml written to ${SCRIPT_DIR}"
 }
 
+print_results_header() {
+    echo ""
+    echo "===== Begin Results ====="
+    echo "appId:          ${APP_ID}"
+    echo "signer:         Blockstream (GitHub release)"
+    echo "versionName:    ${APP_VERSION:-unknown}"
+    echo "arch:           ${APP_ARCH}"
+    echo "type:           ${APP_TYPE}"
+    echo "verdict:        $1"
+    echo "appHash:        ${OFFICIAL_SHA256:-unknown}"
+    echo "builtHash:      ${BUILT_SHA256:-unknown}"
+    echo "commit:         ${COMMIT:-unknown}"
+    echo "scriptVersion:  ${SCRIPT_VERSION}"
+    echo "scriptHash:     ${SCRIPT_HASH:-unknown}"
+    [[ -n "${SIGNATURE:-}" ]] && echo "signature:      ${SIGNATURE}"
+    return 0
+}
+
+# Every failure path: reason printed, YAML written with verdict ftbfs, results block with what is known.
+fail() {
+    local code="$1"; local reason="$2"
+    trap - ERR
+    log_fail "${reason}"
+    write_yaml "ftbfs" "${reason}"
+    print_results_header "ftbfs"
+    echo ""
+    echo "NOT BUILT: ${reason}"
+    echo "===== End Results ====="
+    exit "${code}"
+}
+
 on_error() {
     local rc=$?
-    trap - ERR
-    log_fail "Script failed (exit ${rc}). See output above."
-    write_yaml "ftbfs" "Build or comparison step failed before a verdict could be computed. Work dir: ${WORK_DIR:-unset}"
-    cleanup_image
-    exit "${EXIT_BUILD_FAILED}"
+    # shellcheck disable=SC1091
+    [[ -n "${WORK_DIR}" && -f "${WORK_DIR}/out/RESULT.env" ]] && source "${WORK_DIR}/out/RESULT.env"
+    fail "${EXIT_BUILD_FAILED}" "Build or comparison step failed (exit ${rc}) before a verdict could be computed; see the output above. Work dir: ${WORK_DIR:-unset}"
 }
 trap on_error ERR
 
@@ -142,9 +184,23 @@ cleanup_image() {
     fi
 }
 
+# The build container runs as root and writes into the bind-mounted out dir.
+# On success and on every failure, give the files back to the caller:
+# rootless podman maps container root to the caller (0:0 inside), rootful
+# docker needs the caller's real ids.
+chown_back() {
+    if [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" && -n "${DOCKER_CMD}" && -n "${OWNER}" ]]; then
+        "${DOCKER_CMD}" run --rm -v "${WORK_DIR}:/t" "${BASE_IMAGE}" chown -R "${OWNER}" /t >/dev/null 2>&1 || true
+    fi
+}
+on_exit() {
+    chown_back
+    cleanup_image
+}
+trap on_exit EXIT
+
 die_invalid() {
-    log_fail "$1"
-    exit "${EXIT_INVALID_PARAMS}"
+    fail "${EXIT_INVALID_PARAMS}" "Invalid invocation: $1"
 }
 
 require_value() {
@@ -164,12 +220,13 @@ detect_container_cmd() {
     else
         die_invalid "Neither podman nor docker found in PATH (only host requirement)"
     fi
+    if [[ "${DOCKER_CMD}" == *podman* ]]; then OWNER="0:0"; else OWNER="${HOST_UID}:${HOST_GID}"; fi
     log_info "Container engine: ${DOCKER_CMD}"
 }
 
 usage() {
     cat <<USAGE
-greendesktop_build.sh ${SCRIPT_VERSION} - Blockstream Green Desktop reproducible build verifier
+$(basename "${SCRIPT_PATH}") ${SCRIPT_VERSION} - Blockstream Green Desktop reproducible build verifier
 
 Usage:
   $0 --version VERSION [--arch x86_64-linux-gnu] [--type appimage]
@@ -196,7 +253,7 @@ USAGE
 parse_arguments() {
     if [[ $# -eq 0 ]]; then
         usage
-        exit "${EXIT_INVALID_PARAMS}"
+        die_invalid "no parameters given"
     fi
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -208,7 +265,7 @@ parse_arguments() {
             --arch)    require_value "$1" "${2:-}"; APP_ARCH="$2"; shift 2 ;;
             --type)    require_value "$1" "${2:-}"; APP_TYPE="$2"; shift 2 ;;
             --no-cache) NO_CACHE=true; shift ;;
-            --help|-h) usage; exit "${EXIT_SUCCESS}" ;;
+            --help) usage; exit "${EXIT_SUCCESS}" ;;
             *)
                 log_warn "Unknown argument: $1 (ignored)"
                 shift ;;
@@ -238,7 +295,7 @@ detect_version_from_binary() {
     log_info "Detecting version from provided AppImage (in container)..."
     local detected
     detected="$("${DOCKER_CMD}" run --rm -v "${BINARY_PATH}:/in/app.AppImage:ro" \
-        docker.io/library/ubuntu:jammy bash -c '
+        "${BASE_IMAGE}" bash -c '
         set -e
         cd /tmp
         cp /in/app.AppImage .
@@ -268,7 +325,8 @@ detect_version_from_binary() {
 write_dockerfile() {
     cat > "${WORK_DIR}/Dockerfile" <<'DOCKERFILE_EOF'
 ARG GREEN_REF=master
-FROM docker.io/library/ubuntu:jammy AS src
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE} AS src
 ARG GREEN_REF
 RUN apt-get update -qq && apt-get install -yqq --no-install-recommends git ca-certificates
 RUN git clone https://github.com/Blockstream/green_qt /green_qt && \
@@ -276,7 +334,7 @@ RUN git clone https://github.com/Blockstream/green_qt /green_qt && \
     git checkout "${GREEN_REF}" && \
     git rev-parse HEAD > /green_qt_commit.txt && cat /green_qt_commit.txt
 
-FROM docker.io/library/ubuntu:jammy AS base0
+FROM ${BASE_IMAGE} AS base0
 COPY --from=src /green_qt/ci/linux-x86_64/setup.sh .
 RUN ./setup.sh
 ENV PREFIX=/depends/linux-x86_64
@@ -379,13 +437,14 @@ COPY --from=src /green_qt_commit.txt /green_qt_commit.txt
 # Upstream's own pinned + SHA256-checked AppImage tools; tools/appimage.sh
 # expects them at image root (it does `cp /linuxdeploy-x86_64.AppImage .`).
 # The pins point at rolling 'continuous' assets that upstream rebuilds; when a
-# rebuild makes the pins stale (hit at 3.5.2: plugin-qt rebuilt 2026-08-22),
-# fall back to the current assets and leave /appimage-tools-pins-stale as a
-# marker. The hashes of the tools actually used are always recorded.
+# rebuild makes a pin stale, fall back to the current assets and leave
+# /appimage-tools-pins-stale as a marker. /appimage-tools-report.txt gets one
+# line per tool: pinned hash, hash used, substituted or not, the tool's own
+# version line.
 COPY --from=src /green_qt/ci/linux-x86_64/download-appimage-binaries.sh .
 RUN ./download-appimage-binaries.sh || ( \
       echo "[WS] WARNING: upstream AppImage tool pins are stale (continuous assets rebuilt upstream)" && \
-      echo "[WS] Falling back to current continuous assets; hashes recorded in appimage-tools-used.txt" && \
+      echo "[WS] Falling back to current continuous assets; per-tool report in appimage-tools-report.txt" && \
       rm -f linuxdeploy-x86_64.AppImage linuxdeploy-plugin-qt-x86_64.AppImage appimagetool-x86_64.AppImage && \
       curl -fsSL -o linuxdeploy-x86_64.AppImage https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage && \
       curl -fsSL -o linuxdeploy-plugin-qt-x86_64.AppImage https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage && \
@@ -393,7 +452,39 @@ RUN ./download-appimage-binaries.sh || ( \
       chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-qt-x86_64.AppImage appimagetool-x86_64.AppImage && \
       touch /appimage-tools-pins-stale \
     ) && \
-    sha256sum linuxdeploy-x86_64.AppImage linuxdeploy-plugin-qt-x86_64.AppImage appimagetool-x86_64.AppImage | tee /appimage-tools-used.txt
+    sha256sum linuxdeploy-x86_64.AppImage linuxdeploy-plugin-qt-x86_64.AppImage appimagetool-x86_64.AppImage | tee /appimage-tools-used.txt && \
+    export APPIMAGE_EXTRACT_AND_RUN=1 && : > /appimage-tools-report.txt && \
+    for t in linuxdeploy-x86_64.AppImage linuxdeploy-plugin-qt-x86_64.AppImage appimagetool-x86_64.AppImage; do \
+      pinned="$(grep -oE "[0-9a-f]{64}  ${t}" download-appimage-binaries.sh | cut -c1-64 | head -n1)"; \
+      used="$(sha256sum "${t}" | cut -c1-64)"; \
+      if [ "${pinned}" = "${used}" ]; then state="matches pin"; else state="SUBSTITUTED"; fi; \
+      ver="$( { "./${t}" --version; "./${t}" --plugin-version; } 2>&1 | grep -m1 -E "git (commit|version)" | tr -d '\r' || true)"; \
+      echo "${t}: ${state}; pinned ${pinned:-none}; used ${used}; ${ver:-version line unavailable}" >> /appimage-tools-report.txt; \
+    done && cat /appimage-tools-report.txt
+# AppImage runtime stub: appimagetool fetches it from a rolling release URL without any
+# hash check unless it is given --runtime-file. Fetch it once here, check it against the
+# pin, and put a wrapper at the path tools/appimage.sh invokes, so upstream's packaging
+# script runs unchanged but with the checked runtime. A stale runtime pin falls back to
+# the current asset and is reported like a stale tool pin.
+ARG APPIMAGE_RUNTIME_URL
+ARG APPIMAGE_RUNTIME_SHA256
+RUN curl -fsSL -o /appimage-runtime-x86_64 "${APPIMAGE_RUNTIME_URL}" && \
+    used="$(sha256sum /appimage-runtime-x86_64 | cut -c1-64)" && \
+    if [ "${used}" = "${APPIMAGE_RUNTIME_SHA256}" ]; then state="matches pin"; else state="SUBSTITUTED (pin stale, current asset used)"; touch /appimage-runtime-pin-stale; fi && \
+    echo "runtime-x86_64: ${state}; pinned ${APPIMAGE_RUNTIME_SHA256}; used ${used}" | tee -a /appimage-tools-report.txt && \
+    mv /appimagetool-x86_64.AppImage /appimagetool-real-x86_64.AppImage && \
+    printf '%s\n' '#!/bin/sh' 'exec env TARGET_APPIMAGE=/appimagetool-real-x86_64.AppImage /appimagetool-real-x86_64.AppImage --runtime-file /appimage-runtime-x86_64 "$@"' > /appimagetool-x86_64.AppImage && \
+    chmod +x /appimagetool-x86_64.AppImage
+# Release-signing key for SHA256SUMS.asc, pinned by fingerprint. Fetched here so the
+# inner build verifies offline; the import is checked against the pin.
+ARG SIGNING_KEY_FPR
+RUN apt-get update -qq && apt-get install -yqq --no-install-recommends gnupg && rm -rf /var/lib/apt/lists/* && \
+    export GNUPGHOME=/release-key && mkdir -m 700 -p "${GNUPGHOME}" && \
+    ( curl -fsSL -o /release-key.asc "https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x${SIGNING_KEY_FPR}" && \
+      gpg --batch -q --import /release-key.asc ) || \
+    gpg --batch -q --keyserver hkps://keyserver.ubuntu.com --recv-keys "${SIGNING_KEY_FPR}" && \
+    gpg --batch --with-colons --fingerprint | grep -q "^fpr:::::::::${SIGNING_KEY_FPR}:" && \
+    echo "[WS] release-signing key ${SIGNING_KEY_FPR} imported"
 COPY inner_build.sh /usr/local/bin/inner_build.sh
 RUN chmod +x /usr/local/bin/inner_build.sh
 DOCKERFILE_EOF
@@ -407,17 +498,18 @@ DOCKERFILE_EOF
 write_inner_script() {
     cat > "${WORK_DIR}/inner_build.sh" <<'INNER_EOF'
 #!/bin/bash
-# Runs inside the build image. Inputs (env): GREEN_VERSION, GITHUB_TOKEN (optional).
+# Runs inside the build image. Inputs (env): GREEN_VERSION, SIGNING_KEY_FPR, GITHUB_TOKEN (optional).
 # /out must be mounted; if /out/official-<name> exists it is used (user-provided
 # --binary), otherwise the official AppImage is downloaded from GitHub releases.
-# AppImage packaging tools are already baked into the image at / by upstream's
-# ci/linux-x86_64/download-appimage-binaries.sh (pinned + SHA256-checked there).
+# Either way the release's SHA256SUMS.asc is verified against the pinned key and
+# the official file's hash must be listed in it.
 set -euo pipefail
 
 OUT=/out
 APPIMAGE_NAME="Blockstream-x86_64.AppImage"
 RELEASE_URL="https://github.com/Blockstream/green_qt/releases/download/release_${GREEN_VERSION}"
 export APPIMAGE_EXTRACT_AND_RUN=1
+export GNUPGHOME=/release-key
 AUTH_ARGS=()
 [ -n "${GITHUB_TOKEN:-}" ] && AUTH_ARGS=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
 
@@ -426,21 +518,41 @@ AUTH_ARGS=()
 export PATH="/qt/$(cat /qt-version.txt)/gcc_64/bin:${PATH}"
 echo "[BUILD] qt-cmake: $(command -v qt-cmake)"
 
-# --- [1/6] official AppImage ---
+# --- [1/6] official AppImage + release signature ---
 cd "${OUT}"
 if [ ! -f "official-${APPIMAGE_NAME}" ]; then
     echo "[BUILD] Downloading official AppImage (release_${GREEN_VERSION})..."
     curl -fL "${AUTH_ARGS[@]}" -o "official-${APPIMAGE_NAME}" "${RELEASE_URL}/${APPIMAGE_NAME}"
-    curl -fL "${AUTH_ARGS[@]}" -O "${RELEASE_URL}/SHA256SUMS.asc"
-    expected_sha="$(grep "${APPIMAGE_NAME}" SHA256SUMS.asc | grep -o '^[0-9a-f]\{64\}' || true)"
-    actual_sha="$(sha256sum "official-${APPIMAGE_NAME}" | cut -d' ' -f1)"
-    echo "[BUILD] official sha256: ${actual_sha} (SHA256SUMS.asc: ${expected_sha:-UNPARSED})"
-    if [ -n "${expected_sha}" ] && [ "${expected_sha}" != "${actual_sha}" ]; then
-        echo "[BUILD] FAIL: official AppImage sha256 mismatch vs SHA256SUMS.asc"; exit 1
-    fi
 else
     echo "[BUILD] Using provided official AppImage"
 fi
+curl -fL "${AUTH_ARGS[@]}" -o SHA256SUMS.asc "${RELEASE_URL}/SHA256SUMS.asc"
+actual_sha="$(sha256sum "official-${APPIMAGE_NAME}" | cut -d' ' -f1)"
+# Verify the clearsigned SHA256SUMS.asc with the pinned key, then read the hash list
+# from the verified text only (never from the unverified .asc).
+SIGNATURE="FAILED"
+rm -f SHA256SUMS.verified
+status="$(gpg --batch --status-fd 1 --output SHA256SUMS.verified --decrypt SHA256SUMS.asc 2>/dev/null || true)"
+sig_fpr="$(echo "${status}" | grep -oE 'VALIDSIG [0-9A-F]{40} .* [0-9A-F]{40}$' | awk '{print $NF}' | head -n1 || true)"
+if echo "${status}" | grep -q '^\[GNUPG:\] GOODSIG' && [ "${sig_fpr}" = "${SIGNING_KEY_FPR}" ] && [ -s SHA256SUMS.verified ]; then
+    expected_sha="$(grep -E "^[0-9a-f]{64}  (\./)?${APPIMAGE_NAME}$" SHA256SUMS.verified | cut -c1-64 | head -n1 || true)"
+    if [ "${expected_sha}" = "${actual_sha}" ]; then
+        SIGNATURE="verified (SHA256SUMS.asc signed by ${SIGNING_KEY_FPR}, ${APPIMAGE_NAME} listed)"
+    elif [ -z "${expected_sha}" ]; then
+        SIGNATURE="FAILED (signature good, but ${APPIMAGE_NAME} is not listed in the signed SHA256SUMS)"
+    else
+        SIGNATURE="FAILED (signature good, but official file sha256 ${actual_sha} is not the listed ${expected_sha})"
+    fi
+else
+    SIGNATURE="FAILED (SHA256SUMS.asc signature not valid for key ${SIGNING_KEY_FPR})"
+fi
+echo "[BUILD] official sha256: ${actual_sha}"
+echo "[BUILD] release signature: ${SIGNATURE}"
+echo "SIGNATURE=\"${SIGNATURE}\"" > RESULT.env
+case "${SIGNATURE}" in
+    verified*) ;;
+    *) echo "[BUILD] FAIL: official artifact not authenticated; no verdict without a verified official file"; exit 1 ;;
+esac
 
 # --- [2/6] extract official + sentry DSN (key + project) ---
 rm -rf official-extracted squashfs-root
@@ -533,6 +645,25 @@ mv build/blockstream .
 tools/appimage.sh --plugin-qt /work/green_qt
 cp "${APPIMAGE_NAME}" "${OUT}/built-${APPIMAGE_NAME}"
 
+# Keep the executable and every bundled library as they were before linuxdeploy
+# copied, stripped and re-pathed them, so Build ID and RUNPATH questions can be
+# answered from the pre-packaging files directly. Sources, in linuxdeploy's own
+# order of precedence: the build tree, the dependency prefix, Qt, the system.
+mkdir -p "${OUT}/pre-packaging"
+cp -p blockstream "${OUT}/pre-packaging/blockstream"
+[ -f build/crashpad_handler ] && cp -p build/crashpad_handler "${OUT}/pre-packaging/" || true
+for f in "${PREFIX}"/bin/crashpad_handler; do [ -f "$f" ] && cp -p "$f" "${OUT}/pre-packaging/" || true; done
+rm -rf /tmp/built-peek && mkdir -p /tmp/built-peek && (cd /tmp/built-peek && "${OUT}/built-${APPIMAGE_NAME}" --appimage-extract 'usr/lib/*' >/dev/null 2>&1 || true)
+for so in /tmp/built-peek/squashfs-root/usr/lib/*; do
+    [ -f "${so}" ] || continue
+    name="$(basename "${so}")"
+    for src in "${PREFIX}/lib/${name}" "/qt/$(cat /qt-version.txt)/gcc_64/lib/${name}" "/lib/x86_64-linux-gnu/${name}" "/usr/lib/x86_64-linux-gnu/${name}"; do
+        if [ -e "${src}" ]; then cp -pL "${src}" "${OUT}/pre-packaging/${name}"; break; fi
+    done
+done
+(cd "${OUT}/pre-packaging" && sha256sum -- * > SHA256SUMS && for f in *; do [ "$f" = SHA256SUMS ] && continue; printf '%s %s\n' "$f" "$(readelf -n "$f" 2>/dev/null | grep -oE 'Build ID: [0-9a-f]+' | cut -d' ' -f3)"; done > BUILD-IDS)
+echo "[BUILD] pre-packaging copies kept: $(ls "${OUT}/pre-packaging" | wc -l) files"
+
 # --- [5/6] extraction + comparison ---
 cd "${OUT}"
 rm -rf built-extracted squashfs-root
@@ -547,11 +678,14 @@ diff meta-official.txt meta-built.txt > diff-appimage-metadata.txt 2>&1 || true
 
 # --- [6/6] machine-readable result ---
 cp /appimage-tools-used.txt "${OUT}/appimage-tools-used.txt"
+cp /appimage-tools-report.txt "${OUT}/appimage-tools-report.txt"
 cp /qt-version.txt "${OUT}/qt-version.txt"
 dpkg-query -W -f '${binary:Package} ${Version}\n' | sort > "${OUT}/build-image-packages.txt"
 TOOLS_PINS="upstream"
 [ -f /appimage-tools-pins-stale ] && TOOLS_PINS="stale-fallback"
+[ -f /appimage-runtime-pin-stale ] && TOOLS_PINS="${TOOLS_PINS}+runtime-stale"
 {
+    echo "SIGNATURE=\"${SIGNATURE}\""
     echo "OFFICIAL_SHA256=$(sha256sum "official-${APPIMAGE_NAME}" | cut -d' ' -f1)"
     echo "BUILT_SHA256=$(sha256sum "built-${APPIMAGE_NAME}" | cut -d' ' -f1)"
     echo "PAYLOAD_DIFF_LINES=$(wc -l < diff-appimage-payload.txt)"
@@ -583,8 +717,6 @@ main() {
     execution_dir="$(pwd)"
     WORK_DIR="$(mktemp -d "${execution_dir}/greendesktop_${safe_ver}_${APP_ARCH}_XXXXXX")"
     mkdir -p "${WORK_DIR}/out"
-    log_info "Script version: ${SCRIPT_VERSION}"
-    log_info "Script sha256: $(sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1)"
     log_info "App: ${APP_ID} ${APP_VERSION} (${APP_ARCH}, ${APP_TYPE})"
     log_info "Work dir: ${WORK_DIR}"
 
@@ -597,7 +729,10 @@ main() {
     write_inner_script
 
     IMAGE_TAG="greendesktop-build-$$-$(date +%s):${safe_ver}"
-    local build_args=(--build-arg "GREEN_REF=release_${APP_VERSION}")
+    local build_args=(--build-arg "GREEN_REF=release_${APP_VERSION}" --build-arg "BASE_IMAGE=${BASE_IMAGE}"
+                      --build-arg "SIGNING_KEY_FPR=${SIGNING_KEY_FPR}"
+                      --build-arg "APPIMAGE_RUNTIME_URL=${APPIMAGE_RUNTIME_URL}"
+                      --build-arg "APPIMAGE_RUNTIME_SHA256=${APPIMAGE_RUNTIME_SHA256}")
     [[ "${NO_CACHE}" == true ]] && build_args+=(--no-cache)
     log_info "Building container image ${IMAGE_TAG} (first run: ~60-120 min; GDK dominates)..."
     "${DOCKER_CMD}" build -t "${IMAGE_TAG}" "${build_args[@]}" -f "${WORK_DIR}/Dockerfile" "${WORK_DIR}"
@@ -606,14 +741,16 @@ main() {
     "${DOCKER_CMD}" run --rm \
         -v "${WORK_DIR}/out:/out" \
         -e GREEN_VERSION="${APP_VERSION}" \
+        -e SIGNING_KEY_FPR="${SIGNING_KEY_FPR}" \
         -e GITHUB_TOKEN="${GITHUB_TOKEN}" \
         "${IMAGE_TAG}" /usr/local/bin/inner_build.sh
 
     # ---- verdict ----
     local out="${WORK_DIR}/out"
-    [[ -f "${out}/RESULT.env" ]] || { log_fail "RESULT.env missing"; exit "${EXIT_BUILD_FAILED}"; }
+    [[ -f "${out}/RESULT.env" ]] || fail "${EXIT_BUILD_FAILED}" "RESULT.env missing: the container build did not reach the comparison"
     # shellcheck disable=SC1091
     source "${out}/RESULT.env"
+    [[ -n "${BUILT_SHA256:-}" ]] || fail "${EXIT_BUILD_FAILED}" "No built AppImage recorded; release signature: ${SIGNATURE:-unknown}"
 
     local verdict
     if [[ "${PAYLOAD_DIFF_LINES}" -eq 0 ]]; then
@@ -622,17 +759,7 @@ main() {
         verdict="not_reproducible"
     fi
 
-    echo ""
-    echo "===== Begin Results ====="
-    echo "appId:          ${APP_ID}"
-    echo "signer:         Blockstream (GitHub release)"
-    echo "versionName:    ${APP_VERSION}"
-    echo "arch:           ${APP_ARCH}"
-    echo "type:           ${APP_TYPE}"
-    echo "verdict:        ${verdict}"
-    echo "appHash:        ${OFFICIAL_SHA256}"
-    echo "builtHash:      ${BUILT_SHA256}"
-    echo "commit:         ${COMMIT}"
+    print_results_header "${verdict}"
     echo "qt:             ${QT_VERSION:-unknown} (from upstream ci/linux-x86_64/Dockerfile at release_${APP_VERSION})"
     echo ""
     echo "Payload diff: ${PAYLOAD_DIFF_LINES} line(s) (full: ${out}/diff-appimage-payload.txt)"
@@ -641,12 +768,14 @@ main() {
         head -5 "${out}/diff-appimage-payload.txt"
     fi
     echo "Metadata diff (modes/types/symlinks): ${METADATA_DIFF_LINES} line(s) (full: ${out}/diff-appimage-metadata.txt)"
-    echo "AppImage tools: ${TOOLS_PINS:-upstream} (hashes used: ${out}/appimage-tools-used.txt)"
-    if [[ "${TOOLS_PINS:-upstream}" == "stale-fallback" ]]; then
-        echo "WARNING: upstream's AppImage tool pins were stale (continuous assets rebuilt);"
-        echo "         packaging used the current continuous assets. A payload diff limited to"
+    echo "AppImage tools: ${TOOLS_PINS:-upstream}"
+    sed 's/^/  /' "${out}/appimage-tools-report.txt"
+    if [[ "${TOOLS_PINS:-upstream}" != "upstream" ]]; then
+        echo "WARNING: a pinned packaging asset was stale (continuous asset rebuilt); the current"
+        echo "         asset was used, see the SUBSTITUTED line(s) above. A payload diff limited to"
         echo "         bundled Qt/library selection may stem from that tool drift."
     fi
+    echo "Pre-packaging copies: ${out}/pre-packaging (unstripped executable + libraries, SHA256SUMS, BUILD-IDS)"
     echo "===== End Results ====="
     echo ""
 
@@ -654,23 +783,21 @@ main() {
 Full diffs: diff-appimage-payload.txt, diff-appimage-metadata.txt in ${out}.
 Built with upstream's own tools/ci/build.sh and tools/appimage.sh from the pinned
 checkout, with SOURCE_DATE_EPOCH mtime normalisation as upstream CI does it.
-Known upstream nondeterminism: liblwk (Blockstream/lwk#165). libglsdk reproduces
-byte-for-byte, verified at 3.4.1 and 3.5.0. As of 3.5.0 upstream resolved all three
-items raised in Blockstream/green_qt#187: QML mtimes, the OpenSSL build timestamp
-(both via SOURCE_DATE_EPOCH) and the unpinned AppImage packaging tools.
+Known upstream nondeterminism: liblwk (Blockstream/lwk#165).
 Qt ${QT_VERSION:-unknown} prebuilt via aqtinstall, version and modules taken from upstream's
 ci/linux-x86_64/Dockerfile at release_${APP_VERSION} (modules: ${QT_MODULES:-unknown}).
-AppImage packaging tools: ${TOOLS_PINS:-upstream} (sha256 of the tools actually
-used: appimage-tools-used.txt in ${out})."
-    if [[ "${TOOLS_PINS:-upstream}" == "stale-fallback" ]]; then
+Release signature: ${SIGNATURE:-unknown}.
+AppImage packaging tools: ${TOOLS_PINS:-upstream} (per-tool pinned/used hashes in
+appimage-tools-report.txt in ${out}). Pre-packaging executable and libraries kept
+in ${out}/pre-packaging."
+    if [[ "${TOOLS_PINS:-upstream}" != "upstream" ]]; then
         notes="${notes}
-WARNING: upstream's pinned hashes for the rolling 'continuous' AppImage tools were
-stale at run time (assets rebuilt upstream), so packaging used the current continuous
-assets instead. Upstream CI does not hit this because it builds from a prebuilt image
-created while its pins were fresh."
+WARNING: a pinned packaging asset (upstream's rolling 'continuous' tool pins, or this
+script's runtime-stub pin) was stale at run time, so the current asset was used instead.
+Upstream CI does not hit this because it builds from a prebuilt image created while
+its pins were fresh."
     fi
     write_yaml "${verdict}" "${notes}"
-    cleanup_image
 
     log_info "Artifacts kept in ${WORK_DIR}/out (extracted trees, diffs, both AppImages, RESULT.env) — persistent, not /tmp"
     if [[ "${verdict}" == "reproducible" ]]; then
