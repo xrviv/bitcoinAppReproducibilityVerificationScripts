@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
 # unstoppablewallet_build.sh - Unstoppable Wallet Reproducible Build Verification
-# Version:       v0.5.2
+# Version:       v0.6.4
 # Organization:  WalletScrutiny.com
-# Last modified by: Danny Garcia
-# Last modified on: 2026-09-22
+# License:       MIT
+# Last modified by: Bob (WalletScrutiny agent)
+# Last modified on: 2026-10-07
 # Project:       https://github.com/horizontalsystems/unstoppable-wallet-android
 # Host deps:     docker or podman only
-# Notes:         Play Store-only, split-only. --binary must be a DIRECTORY of device-pulled
-#                split APKs (base.apk + split_config.*) => AAB + bundletool per-split compare.
-#                Single-APK releases (<= v0.47.x): use an older script.
-#                v0.49.0: zcash external; zano-kit built, ~290 MB prebuilt .a trusted.
-#                v0.50.1: compileSdk 37; thorchain-kit-android is built and published locally.
-#                v0.5.1-2: device-spec from split names; fail-closed compare; exit 1 unless reproducible.
+# Disclaimer:    Provided as-is, without warranty. It checks whether the published APK matches a build
+#                of the tagged source; it does not audit the code. Use at your own risk.
+# Notes:         --binary = DIRECTORY of device-pulled Play splits => AAB + bundletool per-split compare;
+#                or ONE fat GitHub release APK (Zapstore ships it; installed as base.apk) =>
+#                whole-APK compare. Flavor by GitHub asset digest (google_play => assembleBaseRelease,
+#                github => assembleFdroidRelease), else by the flavor's BuildConfig key in the DEX.
+#                Lone Play base.apk, config split, non-upstream signer (F-Droid store build): exit 2.
+#                zano-kit built, ~290 MB prebuilt .a trusted; thorchain-kit built and published locally.
 
-SCRIPT_VERSION="v0.5.2"
-SCRIPT_NAME="unstoppablewallet_build.sh"
+SCRIPT_VERSION="v0.6.4"
 SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_NAME="$(basename "$SCRIPT_PATH")"
 if [[ -f "$SCRIPT_PATH" ]]; then
     SCRIPT_SHA256="$(sha256sum "$SCRIPT_PATH" | awk '{print $1}')"
 else
@@ -27,6 +30,7 @@ set -uo pipefail   # no -e: diff/cmp return 1 on differences
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_ID="io.horizontalsystems.bankwallet"
+UPSTREAM_SIGNER="c1899493e440489178b8748851b72cbed50c282aaa8c03ae236a4652f8c4f27b"   # GitHub + Play releases
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
 
@@ -41,58 +45,44 @@ log_success() { echo -e "${GREEN}[OK]${NC} $*"; }
 log_warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
-banner() {
-    echo ""; echo ""
-    echo "############################################################"
-    echo "##"
-    printf "##  %s\n" "$*"
-    echo "##"
-    echo "############################################################"
-}
-
-section() {
-    echo ""
-    echo "------------------------------------------------------------"
-    printf "  %s\n" "$*"
-    echo "------------------------------------------------------------"
-}
+HB="############################################################"
+SB="------------------------------------------------------------"
+banner()  { printf '\n\n%s\n##\n##  %s\n##\n%s\n' "$HB" "$*" "$HB"; }
+section() { printf '\n%s\n  %s\n%s\n' "$SB" "$*" "$SB"; }
 
 sha256of() { sha256sum "$1" | awk '{print $1}'; }
 
 execution_dir="$SCRIPT_DIR"
+RESULT_DONE=0
+rm -f "${execution_dir}/COMPARISON_RESULTS.yaml"   # never leave a previous run's verdict for ABS
 
-write_warning_yaml() {
-    local msg="$1"
+write_yaml() {
     cat > "${execution_dir}/COMPARISON_RESULTS.yaml" <<EOF
 script_version: ${SCRIPT_VERSION}
-verdict: ftbfs
+verdict: $1
 notes: |
-  ${msg}
+  $2
 EOF
-    log_warn "COMPARISON_RESULTS.yaml written with verdict: ftbfs"
+    RESULT_DONE=1
+    log_info "COMPARISON_RESULTS.yaml verdict: $1"
 }
+# die <code> <note>: ftbfs YAML, then exit (2 = bad input/env, 1 = build/compare failure)
+die() { write_yaml ftbfs "$2"; echo ""; echo "Exit code: $1"; exit "$1"; }
 
 if [[ "$EUID" -eq 0 ]]; then
     log_error "Do not run this script as root."
-    write_warning_yaml "Script was run as root; refusing to proceed"
-    echo ""; echo "Exit code: 2"
-    exit 2
+    die 2 "Script was run as root; refusing to proceed"
 fi
 
 
 version_arg=""
 apk_file=""
-arch_arg=""
-type_arg=""
 device_sdk_arg=""
 
 require_arg() {
     local flag="$1" val="${2:-}"
     if [[ -z "$val" || "$val" == --* ]]; then
-        log_error "${flag} requires a value (got: '${val:-<nothing>}')"
-        write_warning_yaml "${flag} requires a value"
-        echo ""; echo "Exit code: 2"
-        exit 2
+        die 2 "${flag} requires a value"
     fi
 }
 
@@ -101,10 +91,9 @@ while [[ $# -gt 0 ]]; do
         --version)  require_arg --version "${2:-}"; version_arg="$2";  shift 2 ;;
         --binary)   require_arg --binary  "${2:-}"; apk_file="$2";     shift 2 ;;
         --apk)      require_arg --apk     "${2:-}"; apk_file="$2";     shift 2 ;;
-        --arch)     require_arg --arch    "${2:-}"; arch_arg="$2";     shift 2 ;;
-        --type)     require_arg --type    "${2:-}"; type_arg="$2";     shift 2 ;;
+        --arch|--type) require_arg "$1" "${2:-}"; log_info "$1 $2 accepted (configs come from the official APK)"; shift 2 ;;
         --device-sdk) require_arg --device-sdk "${2:-}"; device_sdk_arg="$2"; shift 2 ;;
-        -h|--help)  echo "Usage: $SCRIPT_NAME --binary <dir-of-split-apks> [--version v] [--arch a] [--type t] [--device-sdk N]"; echo "Exit code: 0"; exit 0 ;;
+        -h|--help)  echo "Usage: $SCRIPT_NAME --binary <split-dir|fat-apk> [--version v]"; exit 0 ;;
         *)
             log_warn "Unknown parameter ignored: $1"
             shift
@@ -114,48 +103,44 @@ done
 
 DEVICE_SDK="${device_sdk_arg:-${WS_DEVICE_SDK:-36}}"
 if [[ ! "$DEVICE_SDK" =~ ^[0-9]+$ || "$DEVICE_SDK" -lt 21 || "$DEVICE_SDK" -gt 99 ]]; then
-    log_error "--device-sdk/WS_DEVICE_SDK must be an Android API level (21-99); got: ${DEVICE_SDK}"
-    write_warning_yaml "Invalid Android device SDK/API level: ${DEVICE_SDK}"
-    echo ""; echo "Exit code: 2"
-    exit 2
+    die 2 "Invalid Android device SDK/API level (21-99): ${DEVICE_SDK}"
 fi
 
 if [[ -z "$apk_file" ]]; then
-    log_error "--binary is required. Unstoppable Wallet is Play Store-only."
-    log_warn  "Obtain the APK via adb pull or an APK extractor app and pass via --binary."
-    write_warning_yaml "--binary not provided; Unstoppable Wallet is Play Store-only; cannot proceed without official APK"
-    echo ""; echo "Exit code: 2"
-    exit 2
+    log_error "--binary is required: the device-pulled split directory or one GitHub release APK."
+    die 2 "--binary not provided; cannot proceed without the official APK(s)"
 fi
 
-# --binary: a DIRECTORY of device-pulled splits (split-only since v0.3.0).
-declare -a OFFICIAL_SPLITS=()
-if [[ ! -d "$apk_file" ]]; then
-    log_error "--binary must be a DIRECTORY of split APKs (base.apk + split_config.*). Unstoppable is split-only."
-    write_warning_yaml "--binary must be a directory of device-pulled split APKs (base.apk + split_config.*)"
-    echo ""; echo "Exit code: 2"; exit 2
+declare -a OFFICIAL_SPLITS=() OFF_MOUNT=()
+INPUT_MODE=""
+if [[ -d "$apk_file" ]]; then
+    INPUT_MODE=splits
+    OFFICIAL_DIR=$(realpath "$apk_file")
+    [[ -f "$OFFICIAL_DIR/base.apk" ]] || { log_error "base.apk not found in $OFFICIAL_DIR (required)"
+        die 2 "Split set missing base.apk in ${OFFICIAL_DIR}"; }
+    while IFS= read -r f; do OFFICIAL_SPLITS+=("$f"); done \
+        < <(find "$OFFICIAL_DIR" -maxdepth 1 -name "*.apk" | sort)
+    for f in "${OFFICIAL_SPLITS[@]}"; do   # reject stray APKs
+        bn=$(basename "$f")
+        [[ "$bn" == "base.apk" || "$bn" == split_config*.apk ]] || {
+            log_error "Unexpected APK in split dir: $bn (only base.apk + split_config*.apk allowed)"
+            die 2 "Unexpected APK in split dir: ${bn}"; }
+    done
+    abi_split=0; for f in "$OFFICIAL_DIR"/split_config.{arm64_v8a,armeabi_v7a,x86_64,x86}.apk; do [[ -f "$f" ]] && abi_split=1; done
+    [[ "$abi_split" -eq 1 ]] || {
+        die 2 "Split directory has no ABI split (split_config.<abi>.apk); pass the full device-pulled set"; }
+    apk_file="$OFFICIAL_DIR/base.apk"   # base.apk drives Phase 0 metadata
+    OFF_MOUNT=(-v "${OFFICIAL_DIR}:/official:ro")
+    log_info "${#OFFICIAL_SPLITS[@]} official split(s) in ${OFFICIAL_DIR}"
+elif [[ -f "$apk_file" ]]; then
+    INPUT_MODE=fat
+    apk_file=$(realpath "$apk_file")
+    OFFICIAL_SPLITS=("$apk_file")
+    OFF_MOUNT=(-v "${apk_file}:/official/official.apk:ro")
+    log_info "Single APK: ${apk_file} (kind decided in Phase 0)"
+else
+    die 2 "--binary is neither a split directory nor an APK file: ${apk_file}"
 fi
-OFFICIAL_DIR=$(realpath "$apk_file")
-if [[ ! -f "$OFFICIAL_DIR/base.apk" ]]; then
-    log_error "base.apk not found in $OFFICIAL_DIR (required)"
-    write_warning_yaml "Split set missing base.apk in ${OFFICIAL_DIR}"
-    echo ""; echo "Exit code: 2"; exit 2
-fi
-while IFS= read -r f; do OFFICIAL_SPLITS+=("$f"); done \
-    < <(find "$OFFICIAL_DIR" -maxdepth 1 -name "*.apk" | sort)
-# reject stray APKs
-for f in "${OFFICIAL_SPLITS[@]}"; do
-    bn=$(basename "$f")
-    [[ "$bn" == "base.apk" || "$bn" == split_config*.apk ]] || {
-        log_error "Unexpected APK in split dir: $bn (only base.apk + split_config*.apk allowed)"
-        write_warning_yaml "Unexpected APK in split dir: ${bn}"; echo ""; echo "Exit code: 2"; exit 2; }
-done
-apk_file="$OFFICIAL_DIR/base.apk"   # base.apk drives Phase 0 metadata
-log_info "${#OFFICIAL_SPLITS[@]} official split(s) in ${OFFICIAL_DIR}"
-log_info "Device SDK/API for bundletool: ${DEVICE_SDK}"
-[[ -n "$arch_arg" ]]  && log_info "--arch ${arch_arg} accepted but not used (configs derived from official splits)"
-[[ -n "$type_arg" ]]  && log_info "--type ${type_arg} accepted but not used"
-[[ -n "$version_arg" ]] && log_info "--version ${version_arg} accepted; actual version derived from APK metadata"
 
 if [[ -z "${CRUN:-}" ]]; then
     if command -v docker &>/dev/null; then
@@ -164,103 +149,66 @@ if [[ -z "${CRUN:-}" ]]; then
         CRUN=podman
     else
         log_error "Neither docker nor podman found in PATH"
-        write_warning_yaml "Neither docker nor podman found in PATH"
-        echo ""; echo "Exit code: 2"
-        exit 2
+        die 2 "Neither docker nor podman found in PATH"
     fi
 fi
 
-MEM_LIMIT="${MEM_LIMIT:-20g}"
-MEM_ARGS=()
-[[ -n "$MEM_LIMIT" ]] && MEM_ARGS=(--memory="$MEM_LIMIT")
+MEM_ARGS=(--memory="${MEM_LIMIT:-20g}")
+ROOTLESS=0
+if [[ "$CRUN" == podman ]]; then
+    [[ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" == true ]] && ROOTLESS=1
+elif docker info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless; then ROOTLESS=1; fi
 
-banner "PRE-FLIGHT: HOST TOOL CHECK"
-
-printf "  %-12s OK  (%s)\n" "$CRUN" "$(command -v "$CRUN")"
-echo "  Host requirement satisfied."
-
-RUN_ID="unstoppable-$(date +%s)-$$"
+RUN_ID="$(date +%s)-$$"
 IMG_P3="ws-unstoppable-source-${RUN_ID}"
 CTR_P0="ws-unstoppable-p0-${RUN_ID}"
 CTR_P3="ws-unstoppable-source-ctr-${RUN_ID}"
+CTR_P5="ws-unstoppable-p5-${RUN_ID}"
 
-workspace="${execution_dir}/unstoppable_verification_${RUN_ID}"
+# Per-run workspace in the caller's directory (helper scripts inside, no /tmp).
+workspace="$(pwd -P)/unstoppable_verification_${version_arg:-unknown}_${RUN_ID}"
 P0_DIR="${workspace}/metadata"
 P3_DIR="${workspace}/source-build"
 P5_DIR="${workspace}/comparison"
-
-p3_ctx=""
-p0_ctx=""
-p5_ctx=""
+ctx="${workspace}/ctx"
 
 ensure_user_ownership() {
-    local path="$1" image="$2"
+    local path="$1" image="$2" own="${HOST_UID}:${HOST_GID}"
     [[ -e "$path" ]] || return 0
-    [[ -n "$image" ]] || return 0
-    $CRUN run --rm \
-        -v "${path}:/target" \
-        "$image" \
-        sh -c "chown -R ${HOST_UID}:${HOST_GID} /target" >/dev/null 2>&1 || \
-        log_warn "Could not fix ownership for ${path}"
-}
-
-generate_yaml() {
-    local verdict="$1" notes="$2"
-    cat > "${execution_dir}/COMPARISON_RESULTS.yaml" <<EOF
-script_version: ${SCRIPT_VERSION}
-verdict: ${verdict}
-notes: |
-  ${notes}
-EOF
-    log_info "COMPARISON_RESULTS.yaml written with verdict: ${verdict}"
-}
-
-generate_error_yaml() {
-    local verdict="${1:-ftbfs}" error_msg="${2:-Build failed}"
-    cat > "${execution_dir}/COMPARISON_RESULTS.yaml" <<EOF
-script_version: ${SCRIPT_VERSION}
-verdict: ${verdict}
-notes: |
-  ${error_msg}
-EOF
-    log_info "COMPARISON_RESULTS.yaml written with verdict: ${verdict}"
+    # Rootless runtime: container root == caller, so chown 0:0 (a host uid would land in the subuid range).
+    [[ "$ROOTLESS" -eq 1 ]] && own="0:0"
+    if [[ "$CRUN" == podman && "$ROOTLESS" -eq 1 ]]; then
+        podman unshare chown -R 0:0 "$path" >/dev/null 2>&1 || log_warn "Could not fix ownership for ${path}"
+    elif [[ -n "$image" ]]; then
+        $CRUN run --rm -v "${path}:/target" "$image" sh -c "chown -R ${own} /target" >/dev/null 2>&1 || \
+            log_warn "Could not fix ownership for ${path}"
+    fi
+    local stray; stray=$(find "$path" ! -uid "$HOST_UID" -print -quit 2>/dev/null)
+    [[ -n "$stray" ]] && log_warn "Not caller-owned: ${stray}"; return 0
 }
 
 cleanup() {
-    log_info "Cleaning up containers and images..."
-    $CRUN rm -f "$CTR_P3" 2>/dev/null || true
-    local own_image=""
-    if $CRUN image inspect "$IMG_P3" >/dev/null 2>&1; then
-        own_image="$IMG_P3"
-    fi
+    [[ "$RESULT_DONE" -eq 1 ]] || write_yaml ftbfs "Run ended before a verdict was written (interrupted or internal error)"
+    $CRUN rm -f "$CTR_P0" "$CTR_P3" "$CTR_P5" 2>/dev/null || true
+    local own_image=""; $CRUN image inspect "$IMG_P3" >/dev/null 2>&1 && own_image="$IMG_P3"
     ensure_user_ownership "$workspace" "$own_image"
     $CRUN rmi -f "$IMG_P3" 2>/dev/null || true
-    [[ -n "$p3_ctx" ]] && rm -rf "$p3_ctx" 2>/dev/null || true
-    [[ -n "$p0_ctx" ]] && rm -rf "$p0_ctx" 2>/dev/null || true
-    [[ -n "$p5_ctx" ]] && rm -rf "$p5_ctx" 2>/dev/null || true
-    log_success "Cleanup complete."
 }
-trap cleanup EXIT
+trap cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
 
-mkdir -p "$P0_DIR" "$P3_DIR" "$P5_DIR"
+mkdir -p "$P0_DIR" "$P3_DIR" "$P5_DIR" "$ctx"
 
 banner "UNSTOPPABLE WALLET REPRODUCIBLE BUILD VERIFICATION"
-echo "  Script:    ${SCRIPT_NAME} ${SCRIPT_VERSION}"
-echo "  App ID:    ${APP_ID}"
+echo "  Script:    ${SCRIPT_NAME} ${SCRIPT_VERSION}   App ID: ${APP_ID}   Device SDK: ${DEVICE_SDK}"
 echo "  APK:       ${apk_file}"
-echo "  Device SDK:${DEVICE_SDK}"
-echo "  Runtime:   ${CRUN} ($($CRUN --version 2>&1 | head -1))"
-echo "  Workspace: ${workspace}"
-echo "  Date:      $(date)"
+echo "  Runtime:   ${CRUN} ($($CRUN --version 2>&1 | head -1)), rootless=${ROOTLESS}"
+echo "  Workspace: ${workspace}   Date: $(date)"
 
-# One image for metadata, source builds and split comparison.
-banner "SETUP: BUILD SHARED CONTAINER IMAGE"
-echo "  Started: $(date)"
+banner "SETUP: BUILD CONTAINER IMAGE ($(date))"
 
-p3_ctx=$(mktemp -d)
-
-cat > "$p3_ctx/Dockerfile" <<'DOCKERFILE_P3'
-FROM ubuntu:24.04
+cat > "$ctx/Dockerfile" <<'DOCKERFILE_P3'
+# ubuntu:24.04 (noble) multi-arch index digest, pinned 2026-10-07
+FROM docker.io/library/ubuntu@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
 ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -290,26 +238,20 @@ RUN yes | sdkmanager --licenses && \
 
 ADD https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar /opt/bundletool.jar
 ADD https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar /opt/apktool.jar
+RUN echo "2d4ad908faea64047c1cc9cb747e6aa667c6ab192e09607bd16b67246a8cd6ae  /opt/bundletool.jar" | sha256sum -c - && \
+    echo "dbf930b076c6b9be08d57c449cacefc3bdd6b71ebd59b3066fc0e1f5b14f9423  /opt/apktool.jar" | sha256sum -c -
 
 WORKDIR /build
 DOCKERFILE_P3
 
 section "Building source-build image: ${IMG_P3}"
-if ! $CRUN build -t "$IMG_P3" -f "$p3_ctx/Dockerfile" "$p3_ctx"; then
-    log_error "Source-build image failed"
-    generate_error_yaml "ftbfs" "Source-build container image failed"
-    echo ""; echo "Exit code: 1"
-    exit 1
+if ! $CRUN build -t "$IMG_P3" -f "$ctx/Dockerfile" "$ctx"; then
+    die 1 "Source-build container image failed"
 fi
-log_success "Source-build image built: ${IMG_P3}"
 
-banner "PHASE 0: APK METADATA EXTRACTION"
-echo "  Extracting versionName, versionCode, signer from official APK..."
-echo "  Started: $(date)"
+banner "PHASE 0: APK METADATA EXTRACTION ($(date))"
 
-p0_ctx=$(mktemp -d)
-
-cat > "$p0_ctx/extract_meta.sh" <<'META_SCRIPT'
+cat > "$ctx/extract_meta.sh" <<'META_SCRIPT'
 #!/bin/bash
 set -euo pipefail
 
@@ -324,24 +266,32 @@ signer_output=$("${APKSIGNER}" verify --verbose --print-certs /input/official.ap
     printf '%s\n' "$signer_output"
     exit 1
 }
-# Handles legacy "Signer #1" and rotated SDK-range signer labels; excludes SourceStamp.
+# "Signer #1" or rotated SDK-range labels; SourceStamp excluded.
 signer_hash=$(printf '%s\n' "$signer_output" \
     | sed -nE '/^Signer( #[0-9]+| \(minSdkVersion=[^)]*\)) certificate SHA-256 digest:/ {s/.*digest: //;p;}' \
     | sort -u | paste -sd, -)
 
 pkg_name=$(echo "$apk_info" | grep -oP "^package: name='[^']+'" | sed "s/^package: name='//;s/'$//" || true)
+split_name=$(echo "$apk_info" | sed -n "s/.*split='\([^']*\)'.*/\1/p" | head -1)
+abis=$(echo "$apk_info" | sed -n "s/^native-code: //p" | tr -d "'" | head -1)
+echo "${split_name}" > /output/split_name.txt
+echo "${abis}"       > /output/abis.txt
+# bundletool output has splits0.xml or a SourceStamp; Gradle fat APKs do not.
+unzip -l /input/official.apk 2>/dev/null | grep -qE ' (res/xml/splits0\.xml|stamp-cert-sha256)$' && echo 1 > /output/universal.txt || echo 0 > /output/universal.txt
+# Release asset digests (sha256 name) for flavor detection; GITHUB_TOKEN optional.
+hdr=(); [[ -n "${GITHUB_TOKEN:-}" ]] && hdr=(--header="Authorization: Bearer ${GITHUB_TOKEN}")
+wget -qO- --timeout=30 "${hdr[@]}" "https://api.github.com/repos/horizontalsystems/unstoppable-wallet-android/releases/tags/${version_name}" 2>/dev/null \
+  | grep -oE '"(name|digest)": *"[^"]*"' | awk -F'"' '$2=="name"{n=$4} $2=="digest"{sub(/^sha256:/,"",$4); print $4, n}' > /output/gh_assets.txt || true
+echo "[META] GitHub release ${version_name}: $(wc -l < /output/gh_assets.txt) asset digest(s)"
 
 echo "${version_name:-unknown}" > /output/version_name.txt
 echo "${version_code:-unknown}" > /output/version_code.txt
 echo "${signer_hash:-unknown}"  > /output/signer.txt
 echo "${pkg_name:-unknown}"     > /output/pkg_name.txt
 
-echo "[META] versionName: ${version_name:-unknown}"
-echo "[META] versionCode: ${version_code:-unknown}"
-echo "[META] signer SHA-256: ${signer_hash:-unknown}"
-echo "[META] pkg_name: ${pkg_name:-unknown}"
+echo "[META] ${pkg_name:-unknown} versionName=${version_name:-unknown} versionCode=${version_code:-unknown} signer=${signer_hash:-unknown} split=${split_name:-<none>} native-code=${abis:-<none>}"
 META_SCRIPT
-chmod +x "$p0_ctx/extract_meta.sh"
+chmod +x "$ctx/extract_meta.sh"
 
 if ! $CRUN run \
     --rm \
@@ -349,13 +299,11 @@ if ! $CRUN run \
     "${MEM_ARGS[@]}" \
     -v "${apk_file}:/input/official.apk:ro" \
     -v "${P0_DIR}:/output" \
-    -v "${p0_ctx}/extract_meta.sh:/extract_meta.sh:ro" \
+    -e GITHUB_TOKEN \
+    -v "${ctx}/extract_meta.sh:/extract_meta.sh:ro" \
     "$IMG_P3" \
     bash /extract_meta.sh; then
-    log_error "Phase 0 metadata extraction failed"
-    generate_error_yaml "ftbfs" "APK metadata extraction failed"
-    echo ""; echo "Exit code: 1"
-    exit 1
+    die 2 "APK metadata extraction failed (not a valid, signed APK?)"
 fi
 
 wallet_version=$(cat "${P0_DIR}/version_name.txt" 2>/dev/null || echo "unknown")
@@ -366,26 +314,44 @@ app_hash=$(sha256of "$apk_file")
 pkg_id=$(cat "${P0_DIR}/pkg_name.txt" 2>/dev/null || echo "unknown")
 if [[ "$pkg_id" != "$APP_ID" ]]; then
     log_error "APK app ID mismatch: expected $APP_ID, got ${pkg_id}"
-    generate_error_yaml "ftbfs" "APK app ID mismatch: expected $APP_ID, got ${pkg_id}"
-    echo ""; echo "Exit code: 1"; exit 1
+    die 2 "APK app ID mismatch: expected $APP_ID, got ${pkg_id}"
 fi
 log_success "APK app ID verified: ${pkg_id}"
+if [[ "$INPUT_MODE" == fat ]]; then
+    split_name=$(cat "${P0_DIR}/split_name.txt" 2>/dev/null); abis=$(cat "${P0_DIR}/abis.txt" 2>/dev/null)
+    if [[ -n "$split_name" ]]; then
+        log_error "Single APK is the config split '${split_name}'; it cannot be verified alone."
+        die 2 "Single APK is config split '${split_name}'; pass the whole split directory (base.apk + split_config.*)"
+    elif [[ -z "$abis" ]]; then
+        log_error "Single APK has no native libraries: a lone Play base.apk cannot be verified alone."
+        die 2 "Single APK is a lone Play base.apk (no native libs); pass the whole split directory (base.apk + split_config.*)"
+    fi
+    # Kind by evidence, not file name: asset digest first, then the DEX key literal (in-container).
+    gh_asset=$(awk -v h="$app_hash" '$1==h{print $2; exit}' "${P0_DIR}/gh_assets.txt" 2>/dev/null)
+    case "$gh_asset" in
+        *_google_play_*) FLAVOR=base;   KIND_RULE="sha256 = GitHub release asset ${gh_asset}" ;;
+        *_github_*)      FLAVOR=fdroid; KIND_RULE="sha256 = GitHub release asset ${gh_asset}" ;;
+        "") [[ "$(cat "${P0_DIR}/universal.txt" 2>/dev/null)" == 1 ]] && die 2 "Single APK is a bundletool universal APK (splits0.xml/SourceStamp), not a GitHub release asset; pass the Play split directory"
+            if [[ "$signer" != "$UPSTREAM_SIGNER" ]]; then
+                die 2 "Fat APK is neither a GitHub release asset nor upstream-signed (signer ${signer}; F-Droid store build? use unstoppablefdroid_build.sh)"
+            fi
+            FLAVOR=auto; KIND_RULE="no GitHub asset digest match; upstream-signed; flavor from the BuildConfig key literal in the official DEX" ;;
+        *)  die 2 "Unrecognised GitHub release asset (neither google_play nor github flavor): ${gh_asset}" ;;
+    esac
+    log_success "Fat APK (ABIs: ${abis}), flavor ${FLAVOR}: ${KIND_RULE}"
+else
+    FLAVOR=base; KIND_RULE="directory input = Play split set (AAB + bundletool, base flavor)"
+fi
 
-log_success "APK metadata: v${wallet_version} (code ${version_code})"
-log_info    "Signer SHA-256: ${signer}"
-log_info    "Official APK SHA-256: ${app_hash}"
-log_info    "Official split APK SHA-256 values:"
+log_success "APK metadata: v${wallet_version} (code ${version_code}), signer ${signer}"
+log_info    "Official APK SHA-256 (appHash = first line):"
 for official_split in "${OFFICIAL_SPLITS[@]}"; do
     printf '  %s  %s\n' "$(sha256of "$official_split")" "$(basename "$official_split")"
 done
 
-banner "PHASE 1: BUILD DEPS FROM SOURCE + BUILD WALLET"
-echo "  Building horizontalsystems deps from source (zano: Kotlin/JNI wrapper only — links prebuilt .a blobs)."
-echo "  HS versions are derived from wallet app/build.gradle at runtime."
-echo "  Started: $(date)"
+banner "PHASE 1: HS DEPS FROM SOURCE + WALLET BUILD ($(date))"
 
-# __WALLET_VERSION__ is substituted by sed after the heredoc is written to file.
-cat > "$p3_ctx/build.sh" <<'BUILD_SCRIPT_END'
+cat > "$ctx/build.sh" <<'BUILD_SCRIPT_END'
 #!/bin/bash
 set -euxo pipefail
 
@@ -399,28 +365,27 @@ clone_at_commit() {
     git -C "$dir" submodule update --init --recursive
 }
 
+# Version catalog (gradle/libs.versions.toml, wallet >= 0.48.0): module -> version.ref -> version.
 extract_wallet_hs_version() {
-    local artifact="$1"
-    local wallet_gradle="$2"
-    local toml="/build/wallet/gradle/libs.versions.toml"
-    # Version catalog (libs.versions.toml) — used from v0.48.0+
-    if [[ -f "$toml" ]]; then
-        local ref
-        ref=$(grep -E "module\s*=\s*\"com\.github\.horizontalsystems:${artifact}\"" "$toml" \
-              | sed -E 's/.*version\.ref\s*=\s*"([^"]+)".*/\1/' | head -1 || true)
-        if [[ -n "$ref" ]]; then
-            grep -E "^\s*${ref}\s*=" "$toml" | sed -E 's/.*=\s*"([^"]+)".*/\1/' | head -1
-            return 0
-        fi
+    local toml="/build/wallet/gradle/libs.versions.toml" ref
+    ref=$(grep -E "module\s*=\s*\"com\.github\.horizontalsystems:$1\"" "$toml" \
+          | sed -E 's/.*version\.ref\s*=\s*"([^"]+)".*/\1/' | head -1 || true)
+    [[ -n "$ref" ]] || return 0   # empty -> caught by require_nonempty
+    grep -E "^\s*${ref}\s*=" "$toml" | sed -E 's/.*=\s*"([^"]+)".*/\1/' | head -1 || true
+}
+
+# ensure_pub <build.gradle> <artifactId> <version> [sv]: maven-publish + release publication at <version>;
+# sv adds the AGP 8 singleVariant opt-in.
+ensure_pub() {
+    local g="$1" a="$2" v="$3"
+    grep -qF "maven-publish" "$g" || sed -i "/plugins {/a\\    id 'maven-publish'" "$g"
+    [[ "${4:-}" == sv ]] && { grep -qF "singleVariant('release')" "$g" || sed -i "/^android {/a\\    publishing { singleVariant('release') }" "$g"; }
+    if grep -qF "release(MavenPublication)" "$g"; then
+        sed -i "/artifactId = '$a'/{n;s/version = '[^']*'/version = '$v'/;}" "$g"
+    else
+        printf "\nafterEvaluate {\n    publishing {\n        publications {\n            release(MavenPublication) {\n                from components.release\n                groupId = 'com.github.horizontalsystems'\n                artifactId = '%s'\n                version = '%s'\n            }\n        }\n    }\n}\n" "$a" "$v" >> "$g"
     fi
-    # Inline coordinates in build.gradle (pre-v0.48.0)
-    local line
-    line=$(grep -E "com\\.github\\.horizontalsystems:${artifact}:[^\"']+" "$wallet_gradle" | head -1 || true)
-    if [[ -z "$line" ]]; then
-        echo ""
-        return 1
-    fi
-    echo "$line" | sed -E "s/.*com\\.github\\.horizontalsystems:${artifact}:([^\"']+).*/\\1/"
+    grep -qF "version = '$v'" "$g" || { echo "ERROR: $a publication version not set to $v"; exit 1; }
 }
 
 require_nonempty() {
@@ -440,24 +405,11 @@ create_root_pom() {
     mkdir -p "$pom_dir"
     local pom_file="${pom_dir}/${artifact}-${version}.pom"
     {
-        echo '<?xml version="1.0" encoding="UTF-8"?>'
-        echo '<project xmlns="http://maven.apache.org/POM/4.0.0">'
-        echo '    <modelVersion>4.0.0</modelVersion>'
-        echo "    <groupId>${group}</groupId>"
-        echo "    <artifactId>${artifact}</artifactId>"
-        echo "    <version>${version}</version>"
-        echo '    <packaging>pom</packaging>'
-        echo '    <dependencies>'
+        printf '<?xml version="1.0" encoding="UTF-8"?>\n<project xmlns="http://maven.apache.org/POM/4.0.0">\n<modelVersion>4.0.0</modelVersion>\n<groupId>%s</groupId><artifactId>%s</artifactId><version>%s</version><packaging>pom</packaging>\n<dependencies>\n' "$group" "$artifact" "$version"
         for mod in "${modules[@]}"; do
-            echo '        <dependency>'
-            echo "            <groupId>${subgroup}</groupId>"
-            echo "            <artifactId>${mod}</artifactId>"
-            echo "            <version>${version}</version>"
-            echo '            <scope>compile</scope>'
-            echo '        </dependency>'
+            printf '<dependency><groupId>%s</groupId><artifactId>%s</artifactId><version>%s</version><scope>compile</scope></dependency>\n' "$subgroup" "$mod" "$version"
         done
-        echo '    </dependencies>'
-        echo '</project>'
+        printf '</dependencies>\n</project>\n'
     } > "$pom_file"
     local jar_file="${pom_dir}/${artifact}-${version}.jar"
     local tmpjar="/tmp/empty-jar-$$"
@@ -471,65 +423,56 @@ create_root_pom() {
 echo ""; echo "=== Step 1: Clone all repos === $(date)"
 
 git clone --depth 1 --branch __WALLET_VERSION__ "$GH/unstoppable-wallet-android.git" /build/wallet
+WS_FLAVOR="${WS_FLAVOR:-base}"
+if [[ "$WS_FLAVOR" == auto ]]; then
+    # base/fdroid differ only in BuildConfig literals; exactly one flavor's USWAP key sits in the official DEX.
+    kb=$(sed -nE 's/.*uswapApiKeyAndroid *= *"([^"]+)".*/\1/p' /build/wallet/app/build.gradle.kts | head -1)
+    kf=$(sed -nE 's/.*uswapApiKeyFdroid *= *"([^"]+)".*/\1/p' /build/wallet/app/build.gradle.kts | head -1)
+    mkdir -p /tmp/dx && unzip -qo -j /official/official.apk 'classes*.dex' -d /tmp/dx
+    hb=0; hf=0
+    [[ -n "$kb" ]] && hb=$(cat /tmp/dx/*.dex | grep -ac "$kb" || true)
+    [[ -n "$kf" ]] && hf=$(cat /tmp/dx/*.dex | grep -ac "$kf" || true)
+    if   (( hb > 0 && hf == 0 )); then WS_FLAVOR=base
+    elif (( hf > 0 && hb == 0 )); then WS_FLAVOR=fdroid
+    else echo "ERROR: flavor undetermined (DEX hits: base key $hb, fdroid key $hf)"; exit 64; fi
+    echo "Flavor by BuildConfig USWAP key literal in the official DEX: $WS_FLAVOR (base $hb, fdroid $hf)"
+fi
+echo "$WS_FLAVOR" > /output/flavor.txt
+[[ -f /build/wallet/gradle/libs.versions.toml ]] || { echo "ERROR: no gradle/libs.versions.toml (wallet < 0.48.0 is not supported)"; exit 1; }
+# The tag must describe the APK: defaultConfig versionName/versionCode vs the official APK's.
+src_vn=$(sed -nE 's/^\s*versionName = "([^"]+)".*/\1/p' /build/wallet/app/build.gradle.kts | head -1)
+src_vc=$(sed -nE 's/^\s*versionCode = ([0-9]+).*/\1/p' /build/wallet/app/build.gradle.kts | head -1)
+echo "Tag __WALLET_VERSION__ source: versionName=$src_vn versionCode=$src_vc | official APK: ${WS_VERSION_NAME:-?} / ${WS_VERSION_CODE:-?}"
+[[ "$src_vn" == "${WS_VERSION_NAME:-}" && "$src_vc" == "${WS_VERSION_CODE:-}" ]] || { echo "ERROR: tag __WALLET_VERSION__ does not describe the official APK"; exit 65; }
 
 compile_sdk=$(sed -nE 's/^[[:space:]]*compileSdk[[:space:]]*=[[:space:]]*"([0-9]+)".*/\1/p' \
     /build/wallet/gradle/libs.versions.toml | head -1)
 require_nonempty "compileSdk" "$compile_sdk"
 platform_dir=$(find "$ANDROID_HOME/platforms" -maxdepth 1 -type d \
     \( -name "android-${compile_sdk}" -o -name "android-${compile_sdk}.0" \) -print -quit)
-if [[ -z "$platform_dir" ]]; then
-    echo "ERROR: compileSdk ${compile_sdk} is not installed under $ANDROID_HOME/platforms"
-    echo "       Refusing to build dependencies before this environment defect is fixed."
-    exit 1
-fi
+[[ -n "$platform_dir" ]] || { echo "ERROR: compileSdk ${compile_sdk} not installed under $ANDROID_HOME/platforms"; exit 1; }
 echo "Compile SDK ${compile_sdk} present: ${platform_dir}"
 
-if [[ -f "/build/wallet/app/build.gradle.kts" ]]; then
-    wallet_gradle="/build/wallet/app/build.gradle.kts"
-elif [[ -f "/build/wallet/app/build.gradle" ]]; then
-    wallet_gradle="/build/wallet/app/build.gradle"
-else
-    echo "ERROR: wallet app/build.gradle(.kts) not found under /build/wallet/app/"
-    exit 1
-fi
+MONERO_VER=$(extract_wallet_hs_version "monero-kit-android")
+STELLAR_VER=$(extract_wallet_hs_version "stellar-kit-android")
+TON_VER=$(extract_wallet_hs_version "ton-kit-android")
+BITCOIN_VER=$(extract_wallet_hs_version "bitcoin-kit-android")
+ETHEREUM_VER=$(extract_wallet_hs_version "ethereum-kit-android")
+FEERATE_VER=$(extract_wallet_hs_version "blockchain-fee-rate-kit-android")
+MARKET_VER=$(extract_wallet_hs_version "market-kit-android")
+SOLANA_VER=$(extract_wallet_hs_version "solana-kit-android")
+TRON_VER=$(extract_wallet_hs_version "tron-kit-android")
+ZANO_VER=$(extract_wallet_hs_version "zano-kit-android")
+HD_WALLET_VER=$(extract_wallet_hs_version "hd-wallet-kit-android" || true)
+THORCHAIN_VER=$(extract_wallet_hs_version "thorchain-kit-android" || true)
 
-MONERO_VER=$(extract_wallet_hs_version "monero-kit-android" "$wallet_gradle")
-STELLAR_VER=$(extract_wallet_hs_version "stellar-kit-android" "$wallet_gradle")
-TON_VER=$(extract_wallet_hs_version "ton-kit-android" "$wallet_gradle")
-BITCOIN_VER=$(extract_wallet_hs_version "bitcoin-kit-android" "$wallet_gradle")
-ETHEREUM_VER=$(extract_wallet_hs_version "ethereum-kit-android" "$wallet_gradle")
-FEERATE_VER=$(extract_wallet_hs_version "blockchain-fee-rate-kit-android" "$wallet_gradle")
-MARKET_VER=$(extract_wallet_hs_version "market-kit-android" "$wallet_gradle")
-SOLANA_VER=$(extract_wallet_hs_version "solana-kit-android" "$wallet_gradle")
-TRON_VER=$(extract_wallet_hs_version "tron-kit-android" "$wallet_gradle")
-ZANO_VER=$(extract_wallet_hs_version "zano-kit-android" "$wallet_gradle")
-HD_WALLET_VER=$(extract_wallet_hs_version "hd-wallet-kit-android" "$wallet_gradle" || true)
-THORCHAIN_VER=$(extract_wallet_hs_version "thorchain-kit-android" "$wallet_gradle" || true)
-
-require_nonempty "monero-kit-android version" "$MONERO_VER"
-require_nonempty "stellar-kit-android version" "$STELLAR_VER"
-require_nonempty "ton-kit-android version" "$TON_VER"
-require_nonempty "bitcoin-kit-android version" "$BITCOIN_VER"
-require_nonempty "ethereum-kit-android version" "$ETHEREUM_VER"
-require_nonempty "blockchain-fee-rate-kit-android version" "$FEERATE_VER"
-require_nonempty "market-kit-android version" "$MARKET_VER"
-require_nonempty "solana-kit-android version" "$SOLANA_VER"
-require_nonempty "tron-kit-android version" "$TRON_VER"
-require_nonempty "zano-kit-android version" "$ZANO_VER"
-
-echo "Derived HS direct versions from wallet app/build.gradle:"
-echo "  monero-kit-android:               $MONERO_VER"
-echo "  stellar-kit-android:              $STELLAR_VER"
-echo "  ton-kit-android:                  $TON_VER"
-echo "  bitcoin-kit-android:              $BITCOIN_VER"
-echo "  ethereum-kit-android:             $ETHEREUM_VER"
-echo "  blockchain-fee-rate-kit-android:  $FEERATE_VER"
-echo "  market-kit-android:               $MARKET_VER"
-echo "  solana-kit-android:               $SOLANA_VER"
-echo "  tron-kit-android:                 $TRON_VER"
-echo "  zano-kit-android:                 $ZANO_VER"
-[[ -n "$HD_WALLET_VER" ]] && echo "  hd-wallet-kit-android:            $HD_WALLET_VER"
-[[ -n "$THORCHAIN_VER" ]] && echo "  thorchain-kit-android:             $THORCHAIN_VER"
+for kv in monero:$MONERO_VER stellar:$STELLAR_VER ton:$TON_VER bitcoin:$BITCOIN_VER ethereum:$ETHEREUM_VER \
+          blockchain-fee-rate:$FEERATE_VER market:$MARKET_VER solana:$SOLANA_VER tron:$TRON_VER zano:$ZANO_VER; do
+    require_nonempty "${kv%%:*}-kit-android version" "${kv#*:}"
+done
+echo "Derived HS versions (wallet version catalog): monero=$MONERO_VER stellar=$STELLAR_VER ton=$TON_VER" \
+     "bitcoin=$BITCOIN_VER ethereum=$ETHEREUM_VER feerate=$FEERATE_VER market=$MARKET_VER solana=$SOLANA_VER" \
+     "tron=$TRON_VER zano=$ZANO_VER hd-wallet=${HD_WALLET_VER:-<from deps>} thorchain=${THORCHAIN_VER:-<none>}"
 
 clone_at_commit "$GH/ton-kit-android.git"                     "$TON_VER"      /build/deps/ton-kit-android
 clone_at_commit "$GH/stellar-kit-android.git"                 "$STELLAR_VER"  /build/deps/stellar-kit-android
@@ -546,20 +489,11 @@ if [[ -n "$THORCHAIN_VER" ]]; then
     clone_at_commit "$GH/thorchain-kit-android.git"            "$THORCHAIN_VER" /build/deps/thorchain-kit-android
 fi
 
-if [[ -z "$HD_WALLET_VER" ]]; then
-    HD_WALLET_VER=$(grep -Eo "com\\.github\\.horizontalsystems:hd-wallet-kit-android:[^\"']+" \
-        /home/jitpack/build/bitcoincore/build.gradle 2>/dev/null \
-        | head -1 | sed -E 's/.*:hd-wallet-kit-android://')
-fi
-if [[ -z "$HD_WALLET_VER" ]]; then
-    HD_WALLET_VER=$(grep -Eo "com\\.github\\.horizontalsystems:hd-wallet-kit-android:[^\"']+" \
-        /build/deps/tron-kit-android/tronkit/build.gradle 2>/dev/null \
-        | head -1 | sed -E 's/.*:hd-wallet-kit-android://')
-fi
-if [[ -z "$HD_WALLET_VER" ]]; then
-    echo "ERROR: Could not derive hd-wallet-kit-android version from dependent repos"
-    exit 1
-fi
+for g in /home/jitpack/build/bitcoincore/build.gradle /build/deps/tron-kit-android/tronkit/build.gradle; do
+    [[ -z "$HD_WALLET_VER" ]] || break
+    HD_WALLET_VER=$(grep -Eo "com\\.github\\.horizontalsystems:hd-wallet-kit-android:[^\"']+" "$g" 2>/dev/null | head -1 | sed -E 's/.*:hd-wallet-kit-android://' || true)
+done
+require_nonempty "hd-wallet-kit-android version" "$HD_WALLET_VER"
 echo "  hd-wallet-kit-android (resolved direct or dependency pin): $HD_WALLET_VER"
 clone_at_commit "$GH/hd-wallet-kit-android.git" "$HD_WALLET_VER" /build/deps/hd-wallet-kit-android
 
@@ -601,27 +535,7 @@ fi
 
 echo ""; echo "=== Step 4c: stellar-kit-android === $(date)"
 cd /build/deps/stellar-kit-android
-grep -qF "maven-publish" stellarkit/build.gradle || sed -i "/plugins {/a\\    id 'maven-publish'" stellarkit/build.gradle
-if grep -qF "release(MavenPublication)" stellarkit/build.gradle; then
-    sed -i "/artifactId = 'stellar-kit-android'/{n;s/version = '[^']*'/version = '$STELLAR_VER'/;}" stellarkit/build.gradle
-else
-    cat >> stellarkit/build.gradle <<STELLAR_PUB
-
-afterEvaluate {
-    publishing {
-        publications {
-            release(MavenPublication) {
-                from components.release
-                groupId = 'com.github.horizontalsystems'
-                artifactId = 'stellar-kit-android'
-                version = '$STELLAR_VER'
-            }
-        }
-    }
-}
-STELLAR_PUB
-fi
-grep -qF "version = '$STELLAR_VER'" stellarkit/build.gradle || { echo "ERROR: stellar-kit publication version not set to $STELLAR_VER"; exit 1; }
+ensure_pub stellarkit/build.gradle stellar-kit-android "$STELLAR_VER"
 ./gradlew :stellarkit:publishToMavenLocal --no-daemon
 
 echo ""; echo "=== Step 4d: market-kit-android === $(date)"
@@ -640,33 +554,10 @@ cd /build/deps/solana-kit-android
 sed -i "s/version = '1.0.0'/version = '$SOLANA_VER'/" solanakit/build.gradle
 ./gradlew :solanakit:publishToMavenLocal --no-daemon
 
-# Step 4g: zano-kit (C++/JNI) from source; links ~290 MB prebuilt .a, not rebuilt. NDK 27.0.12077973.
 echo ""; echo "=== Step 4g: zano-kit-android === $(date)"
-echo "  [BLOB CAVEAT] zano links prebuilt .a (Zano engine/Boost/OpenSSL) — not rebuilt from source"
+echo "  [BLOB CAVEAT] zano links prebuilt .a (Zano engine/Boost/OpenSSL), not rebuilt"
 cd /build/deps/zano-kit-android
-grep -qF "maven-publish" zanokit/build.gradle || sed -i "/plugins {/a\\    id 'maven-publish'" zanokit/build.gradle
-# AGP 8.11.1 needs the release-variant publishing opt-in.
-grep -qF "singleVariant('release')" zanokit/build.gradle || sed -i "/^android {/a\\    publishing { singleVariant('release') }" zanokit/build.gradle
-if grep -qF "release(MavenPublication)" zanokit/build.gradle; then
-    sed -i "/artifactId = 'zano-kit-android'/{n;s/version = '[^']*'/version = '$ZANO_VER'/;}" zanokit/build.gradle
-else
-    cat >> zanokit/build.gradle <<ZANO_PUB
-
-afterEvaluate {
-    publishing {
-        publications {
-            release(MavenPublication) {
-                from components.release
-                groupId = 'com.github.horizontalsystems'
-                artifactId = 'zano-kit-android'
-                version = '$ZANO_VER'
-            }
-        }
-    }
-}
-ZANO_PUB
-fi
-grep -qF "version = '$ZANO_VER'" zanokit/build.gradle || { echo "ERROR: zano-kit publication version not set to $ZANO_VER"; exit 1; }
+ensure_pub zanokit/build.gradle zano-kit-android "$ZANO_VER" sv   # AGP 8.11.1
 ./gradlew :zanokit:publishToMavenLocal --no-daemon
 
 echo ""; echo "=== Step 5a: bitcoin-kit-android === $(date)"
@@ -705,41 +596,25 @@ sed -i "s/from components.release/from components.release\\n                grou
 echo ""; echo "=== Step 5d: monero-kit-android === $(date)"
 cd /build/deps/monero-kit-android
 sed -i '/maven.*jitpack/i\        mavenLocal()' settings.gradle
-grep -qF "maven-publish" monerokit/build.gradle || sed -i "/plugins {/a\\    id 'maven-publish'" monerokit/build.gradle
-# monero-kit is AGP 8.11.1 like zano and declares no publishing opt-in of its own.
-grep -qF "singleVariant('release')" monerokit/build.gradle || sed -i "/^android {/a\\    publishing { singleVariant('release') }" monerokit/build.gradle
-if grep -qF "release(MavenPublication)" monerokit/build.gradle; then
-    sed -i "/artifactId = 'monero-kit-android'/{n;s/version = '[^']*'/version = '$MONERO_VER'/;}" monerokit/build.gradle
-else
-    cat >> monerokit/build.gradle <<MONERO_PUB
-
-afterEvaluate {
-    publishing {
-        publications {
-            release(MavenPublication) {
-                from components.release
-                groupId = 'com.github.horizontalsystems'
-                artifactId = 'monero-kit-android'
-                version = '$MONERO_VER'
-            }
-        }
-    }
-}
-MONERO_PUB
-fi
-grep -qF "version = '$MONERO_VER'" monerokit/build.gradle || { echo "ERROR: monero-kit publication version not set to $MONERO_VER"; exit 1; }
+ensure_pub monerokit/build.gradle monero-kit-android "$MONERO_VER" sv   # AGP 8.11.1, like zano
 ./gradlew :monerokit:publishToMavenLocal --no-daemon
 
 echo ""; echo "=== Step 6: Build wallet === $(date)"
 cd /build/wallet
 sed -i 's/org\.gradle\.jvmargs=.*/org.gradle.jvmargs=-Xmx4096M -Dkotlin.daemon.jvm.options="-Xmx4096M"/' gradle.properties
 rm -rf ~/.gradle/caches/
-# Build the AAB; bundletool it with a device-spec from the official splits (not universal).
+mkdir -p /output/built-splits
+if [[ "${WS_INPUT_MODE:-splits}" == fat ]]; then
+    # build_apk.yml: assemble<Flavor>Release, then apksigner.
+    ./gradlew ":app:assemble${WS_FLAVOR^}Release" --no-daemon --max-workers=2 --info > /output/wallet-build.log 2>&1
+    find "app/build/outputs/apk/${WS_FLAVOR}/release" -name '*.apk' -exec cp -t /output/built-splits/ {} +
+    echo "=== built fat APK ==="; ls -lh /output/built-splits/
+else
     ./gradlew :app:bundleBaseRelease --no-daemon --max-workers=2 --info > /output/wallet-build.log 2>&1
     AAB=$(find app/build/outputs/bundle -name "*.aab" | head -1)
     cp "$AAB" /output/app-base-release.aab
     AAPT2=$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort | tail -1)
-    # Device-spec from the official splits' split= names; unknown configs stay unmatched.
+    # device-spec from the official split= names (not universal).
     DABIS=(); DDEN=""; DLOC=()
     for f in /official/*.apk; do c=$("$AAPT2" dump badging "$f" 2>/dev/null | sed -n "s/.*split='config\.\([^']*\)'.*/\1/p" | head -1)
         case "$c" in
@@ -761,10 +636,11 @@ rm -rf ~/.gradle/caches/
     java -jar /opt/bundletool.jar build-apks --bundle="$AAB" \
         --output=/output/built.apks --device-spec=/tmp/device-spec.json \
         --aapt2="$AAPT2" --overwrite
-    mkdir -p /output/built-splits /output/bt-extract
+    mkdir -p /output/bt-extract
     unzip -o /output/built.apks 'splits/*.apk' -d /output/bt-extract
     cp /output/bt-extract/splits/*.apk /output/built-splits/
     echo "=== built splits ==="; ls -lh /output/built-splits/
+fi
 
 echo ""; echo "=== Step 7: Collect outputs === $(date)"
 mkdir -p /output/patches
@@ -773,88 +649,80 @@ for dep_dir in /build/deps/*/; do
     git -C "$dep_dir" diff > "/output/patches/${dep_name}.patch" 2>/dev/null || true
 done
 
-echo ""; echo "=== Step 8: Git tag verification === $(date)"
+echo ""; echo "=== Step 8: Tag type === $(date)"
 git -C /build/wallet log -1 --pretty=format:"%H" > /output/commit.txt 2>/dev/null || true
-tag_obj_type=$(git -C /build/wallet cat-file -t __WALLET_VERSION__ 2>/dev/null || echo "unknown")
-if [[ "$tag_obj_type" == "tag" ]]; then
-    git -C /build/wallet tag -v __WALLET_VERSION__ > /output/git-tag-verify.txt 2>&1 || true
-else
-    echo "Tag __WALLET_VERSION__ is a ${tag_obj_type} (lightweight tag — GPG verification not possible; no signature to verify)" > /output/git-tag-verify.txt
-fi
+tt=$(git -C /build/wallet cat-file -t __WALLET_VERSION__ 2>/dev/null || echo unknown)
+[[ "$tt" == tag ]] && tt="annotated tag (signature not checked: no gpg in image)" || tt="lightweight ($tt)"
+echo "tagType:        __WALLET_VERSION__ is $tt" > /output/git-tag-verify.txt
 
 echo ""; echo "=== Source-build output ==="
 sha256sum /output/built-splits/*.apk
 
 echo ""; echo "=== Dependency resolution check ==="
 WLOG=/output/wallet-build.log
-# `|| true` keeps grep -c's 0 on no match.
 HS_LOCAL=$(grep -E "horizontalsystems" "$WLOG" 2>/dev/null | grep -Ec "\.m2/repository/com/github/horizontalsystems|mavenLocal" || true); HS_LOCAL=${HS_LOCAL:-0}
-HS_JITPACK=$(grep -Eci "Downloading https://jitpack\\.io/com/github/horizontalsystems|Downloaded from .*jitpack\\.io/com/github/horizontalsystems" "$WLOG" 2>/dev/null || true); HS_JITPACK=${HS_JITPACK:-0}
-echo "  HS packages from mavenLocal: $HS_LOCAL  (expected: >0)"
-echo "  HS packages from JitPack:    $HS_JITPACK (expected: 0)"
+JP_RE="Downloading https://jitpack\\.io/com/github/horizontalsystems|Downloaded from .*jitpack\\.io/com/github/horizontalsystems"
+HS_JITPACK=$(grep -Eci "$JP_RE" "$WLOG" 2>/dev/null || true); HS_JITPACK=${HS_JITPACK:-0}
+echo "  HS packages from mavenLocal: $HS_LOCAL (expected >0), from JitPack: $HS_JITPACK (expected 0)"
 if [[ "$HS_LOCAL" -eq 0 || "$HS_JITPACK" -gt 0 ]]; then
-    if [[ "$HS_JITPACK" -gt 0 ]]; then
-        echo "  JitPack URLs detected:"
-        grep -Ei "Downloading https://jitpack\\.io/com/github/horizontalsystems|Downloaded from .*jitpack\\.io/com/github/horizontalsystems" "$WLOG" | sed 's/^/    /' || true
-    fi
-    echo "ERROR: dependency source check failed (mavenLocal=$HS_LOCAL, JitPack=$HS_JITPACK)"
-    echo "       The APK verdict would not prove a full source build. Aborting."
+    [[ "$HS_JITPACK" -gt 0 ]] && { grep -Ei "$JP_RE" "$WLOG" | head -5 | sed 's/^/    /' || true; }
+    echo "ERROR: dependency source check failed (mavenLocal=$HS_LOCAL, JitPack=$HS_JITPACK); verdict would not prove a source build"
     exit 1
 fi
 
 echo ""; echo "=== All builds complete at $(date) ==="
 BUILD_SCRIPT_END
 
-sed -i "s/__WALLET_VERSION__/${wallet_version}/g" "$p3_ctx/build.sh"
-chmod +x "$p3_ctx/build.sh"
+sed -i "s/__WALLET_VERSION__/${wallet_version}/g" "$ctx/build.sh"
+chmod +x "$ctx/build.sh"
 
 $CRUN rm -f "$CTR_P3" 2>/dev/null || true
 
-section "Running source build container (~120 min)"
-echo "  Started: $(date)"
-set +e
+section "Running source build container (~120 min, $(date))"
+# & + wait: INT/TERM traps fire at once (cleanup removes the container).
 $CRUN run \
     --name "$CTR_P3" \
     "${MEM_ARGS[@]}" \
-    -e "WS_DEVICE_SDK=${DEVICE_SDK}" \
-    -v "${OFFICIAL_DIR}:/official:ro" \
+    -e "WS_DEVICE_SDK=${DEVICE_SDK}" -e "WS_INPUT_MODE=${INPUT_MODE}" -e "WS_FLAVOR=${FLAVOR}" \
+    -e "WS_VERSION_NAME=${wallet_version}" -e "WS_VERSION_CODE=${version_code}" \
+    "${OFF_MOUNT[@]}" \
     -v "$P3_DIR:/output" \
-    -v "$p3_ctx/build.sh:/build/build.sh:ro" \
+    -v "$ctx/build.sh:/build/build.sh:ro" \
     "$IMG_P3" \
-    bash /build/build.sh 2>&1 | tee "$P3_DIR/container-build.log"
-P3_EXIT=${PIPESTATUS[0]}
-set +e   # keep -e OFF (script uses set -uo pipefail without -e; see line 38)
+    bash /build/build.sh 2>&1 | tee "$P3_DIR/container-build.log" &
+wait $!; P3_EXIT=$?
 
 if [[ $P3_EXIT -ne 0 ]]; then
     log_error "Source-build container exited with code $P3_EXIT"
-    generate_error_yaml "ftbfs" "From-source build failed (exit ${P3_EXIT})"
-    echo ""; echo "Exit code: 1"
-    exit 1
+    [[ $P3_EXIT -eq 64 ]] && die 2 "Fat APK flavor undetermined: no GitHub asset digest match and the official DEX carries neither flavor's BuildConfig key"
+    [[ $P3_EXIT -eq 65 ]] && die 1 "Source tag ${wallet_version} has a different versionName/versionCode than the official APK (${wallet_version}/${version_code})"
+    die 1 "From-source build failed (exit ${P3_EXIT})"
 fi
+[[ -s "$P3_DIR/flavor.txt" ]] && FLAVOR=$(cat "$P3_DIR/flavor.txt")
 $CRUN rm -f "$CTR_P3" 2>/dev/null || true
 
 section "Source-build results"
 P3_SPLITS_DIR="$P3_DIR/built-splits"
 P3_NSPLITS=$(find "$P3_SPLITS_DIR" -maxdepth 1 -name "*.apk" 2>/dev/null | wc -l)
 if [[ "$P3_NSPLITS" -eq 0 ]]; then
-    log_error "Source build produced no splits in $P3_SPLITS_DIR"
-    generate_error_yaml "ftbfs" "Source build produced no split APKs"
-    echo ""; echo "Exit code: 1"; exit 1
+    log_error "Source build produced no APK in $P3_SPLITS_DIR"
+    die 1 "Source build produced no APK"
 fi
-echo "  Source-built splits:   $P3_NSPLITS"
-echo "  Official splits:       ${#OFFICIAL_SPLITS[@]}"
-echo "  Finished: $(date)"
+echo "  Source-built APK(s): $P3_NSPLITS, official: ${#OFFICIAL_SPLITS[@]}, finished $(date)"
 
 commit="unknown"
 [[ -f "$P3_DIR/commit.txt" ]] && commit=$(cat "$P3_DIR/commit.txt")
 git_tag_info=""
 [[ -f "$P3_DIR/git-tag-verify.txt" ]] && git_tag_info=$(cat "$P3_DIR/git-tag-verify.txt")
 
-banner "PHASE 2: PER-SPLIT CONTENTS COMPARISON"
-echo "  Official split vs built split, paired by config identity; contents-only (signing ignored)."
-echo "  Started: $(date)"
-p5_ctx=$(mktemp -d)
-cat > "$p5_ctx/p5.sh" <<'P5_SPLIT_END'
+if [[ "$INPUT_MODE" == fat ]]; then
+    CMP_LABEL="Whole-APK comparison (fat GitHub/Zapstore APK vs :app:assemble${FLAVOR^}Release)"
+else
+    CMP_LABEL="Per-split comparison (Play split set vs AAB + bundletool)"
+fi
+banner "PHASE 2: APK CONTENTS COMPARISON ($(date))"
+echo "  ${CMP_LABEL}; signing files excluded by name."
+cat > "$ctx/p5.sh" <<'P5_SPLIT_END'
 #!/bin/bash
 set -uo pipefail
 AAPT2=$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort | tail -1)
@@ -874,7 +742,7 @@ classify_manifest_diff() {
         '^[+-][[:space:]]*<meta-data android:name="(com\.android\.vending\.derived\.apk\.id|com\.android\.stamp\.source|com\.android\.stamp\.type)"[^>]*/>$|^[+-][[:space:]]*<application android:extractNativeLibs="true" android:hasCode="false"(/>|>)$|^[+-][[:space:]]*</application>$' \
         | tr -d '\n\r')
     if [[ -n "$mch" && -z "$mnx" ]]; then
-        echo "  AndroidManifest.xml: sole decoded changes are Google Play distribution metadata — acceptable"
+        echo "  AndroidManifest.xml: only Google Play distribution metadata differs — acceptable"
         acc=$((acc + 1))
     else
         echo "  AndroidManifest.xml: decoded XML DIFFERS ($(printf '%s\n' "$md" | grep -c '^') lines) — full diff: diff_manifest_${cfg}.txt"
@@ -912,7 +780,9 @@ for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
     draw=$(diff -rq /tmp/o /tmp/b); rc=$?
     (( rc < 2 )) || { echo "FATAL: diff failed ($cfg: rc $rc)"; exit 3; }
     draw=$(norm <<<"$draw") || { echo "FATAL: norm failed ($cfg)"; exit 3; }
-    printf '%s\n' "$draw"
+    printf '%s\n' "$draw" > "/out/diff-unzipped-${cfg}.txt"
+    echo "  raw diff (unfiltered): $(grep -c . <<<"$draw") entries, first 5; full list: comparison/diff-unzipped-${cfg}.txt"
+    grep . <<<"$draw" | head -5 | sed 's/^/    /'
     # SourceStamp: only root, official-only, 32 B, apksigner-verified.
     ss='Only in /tmp/o: stamp-cert-sha256'; cnt="$draw"; st=0
     if grep -qxF "$ss" <<<"$draw" && [[ $(stat -c%s /tmp/o/stamp-cert-sha256) == 32 ]] && grep -q 'Verified for SourceStamp: true' <<<"$("$APKSIGNER" verify --verbose "$o" 2>/dev/null)"; then cnt=$(grep -vxF "$ss" <<<"$draw"); st=1; fi
@@ -936,10 +806,10 @@ for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
             ch=$(printf '%s\n' "$rd" | grep -E '^[<>]')
             nx=$(printf '%s\n' "$ch" | grep -v 'com.google.firebase.crashlytics.mapping_file_id' | tr -d '\n\r')
             if (( rr == 0 )); then
-                echo "  resources.arsc: binary differs, decoded res/ IDENTICAL — non-semantic artifact, acceptable (WS #574)"
+                echo "  resources.arsc: binary differs, decoded res/ IDENTICAL — acceptable (WS #574)"
                 acc=$((acc + 1))
             elif (( rr == 1 )) && [[ -n "$ch" && -z "$nx" ]]; then
-                echo "  resources.arsc: sole decoded change is crashlytics.mapping_file_id — build-time ID, acceptable (WS #574)"
+                echo "  resources.arsc: only crashlytics.mapping_file_id differs — build-time ID, acceptable (WS #574)"
                 acc=$((acc + 1))
             else
                 echo "  resources.arsc: decoded res/ DIFFERS (rc $rr, $(printf '%s\n' "$rd" | grep -c '^') lines) — full diff: diff_resources_decoded_${cfg}.txt"
@@ -971,17 +841,16 @@ done
 echo "TOTALS $T $M $N $MISS $ACC" >> /out/p5-summary.txt
 echo "=== per-split comparison complete ==="
 P5_SPLIT_END
-$CRUN run --rm \
-    -v "$OFFICIAL_DIR:/official:ro" \
+$CRUN run --rm --name "$CTR_P5" "${MEM_ARGS[@]}" \
+    "${OFF_MOUNT[@]}" \
     -v "$P3_DIR/built-splits:/built:ro" \
     -v "$P5_DIR:/out" \
-    -v "$p5_ctx/p5.sh:/p5.sh:ro" \
+    -v "$ctx/p5.sh:/p5.sh:ro" \
     "$IMG_P3" bash /p5.sh 2>&1 | tee "$P5_DIR/p5-split.log"
 P5_EXIT=${PIPESTATUS[0]}
 if [[ $P5_EXIT -ne 0 ]] || ! grep -q '^TOTALS' "$P5_DIR/p5-summary.txt" 2>/dev/null; then
-    log_error "Split comparison failed (exit $P5_EXIT) or produced no summary"
-    generate_error_yaml "ftbfs" "Per-split comparison failed (exit ${P5_EXIT})"
-    echo ""; echo "Exit code: 1"; exit 1
+    log_error "Comparison failed (exit $P5_EXIT) or produced no summary"
+    die 1 "APK comparison failed (exit ${P5_EXIT})"
 fi
 read -r _ diff_count diff_metainf_count diff_non_metainf_count missing_cfgs accepted_count \
     < <(grep '^TOTALS' "$P5_DIR/p5-summary.txt")
@@ -990,11 +859,9 @@ diff_non_metainf_count="${diff_non_metainf_count:-1}"; missing_cfgs="${missing_c
 accepted_count="${accepted_count:-0}"
 material_count=$((diff_non_metainf_count - accepted_count))
 [[ "$material_count" -lt 0 ]] && material_count=0
-section "Phase 2: VERDICT (judged on non-signature diffs)"
+section "VERDICT (non-signature diffs)"
 echo "  Totals: ${diff_count} diff(s) (${diff_metainf_count} META-INF, ${diff_non_metainf_count} non-META-INF), ${missing_cfgs} unmatched config(s)"
-echo "  Acceptable per WS #574 (decoded resources / Google Play manifest metadata): ${accepted_count}"
-echo "  Material (verdict-bearing) diffs: ${material_count}"
-echo "  Acceptable-diffs policy: https://gitlab.com/walletscrutiny/walletScrutinyCom/-/issues/574"
+echo "  Acceptable per WS #574: ${accepted_count}; material (verdict-bearing): ${material_count}"
 if [[ "$missing_cfgs" -gt 0 ]]; then
     log_warn "Verdict: NOT_REPRODUCIBLE — ${missing_cfgs} config(s) present on only one side"
     P5_VERDICT="not_reproducible"
@@ -1017,15 +884,15 @@ echo "appHash:        ${app_hash}"
 echo "commit:         ${commit}"
 echo "scriptVersion:  ${SCRIPT_VERSION}"
 echo "scriptHash:     ${SCRIPT_SHA256}"
+echo "===== End Results ====="
 echo "comparisonDiffs: ${diff_count}"
 echo "acceptableDiffs: ${accepted_count} (WS #574)"
 echo "materialDiffs:  ${material_count}"
-echo "method:         source-built splits vs official Play splits"
-echo "jitpack:        no Horizontal Systems fallback allowed"
+echo "method:         ${CMP_LABEL}"
+echo "inputKind:      ${INPUT_MODE}, flavor ${FLAVOR} (${KIND_RULE})"
 [[ -n "${git_tag_info}" ]] && echo "${git_tag_info}"
-echo "===== End Results ====="
 
-generate_yaml "${P5_VERDICT}" "Split comparison: ${diff_count} diff(s) (${diff_metainf_count} META-INF signing), ${accepted_count} acceptable per WS #574 (decoded-identical resources, crashlytics mapping ID, Play manifest metadata), ${material_count} material, ${missing_cfgs} unmatched split(s). Official APK SHA-256: ${app_hash}. HS deps built locally, no JitPack fallback."
+write_yaml "${P5_VERDICT}" "Input: ${INPUT_MODE}, flavor ${FLAVOR} (${KIND_RULE}). ${CMP_LABEL}: ${diff_count} diff(s) (${diff_metainf_count} META-INF signing), ${accepted_count} acceptable per WS #574, ${material_count} material, ${missing_cfgs} unmatched split(s). Official APK SHA-256: ${app_hash}. HS deps built locally, no JitPack fallback."
 
 echo ""
 [[ "$P5_VERDICT" == "reproducible" ]] && { echo "Exit code: 0"; exit 0; }
