@@ -1,8 +1,8 @@
 #!/bin/bash
-# bitbox2nova_build.sh v3.5.0 - WalletScrutiny verification script for BitBox02 Nova
+# bitbox2nova_build.sh v3.6.0 - WalletScrutiny verification script for BitBox02 Nova
 # Organization: WalletScrutiny.com
-# Last modified by: Bob (WalletScrutiny verification agent)
-# Last modified on: 2026-10-08
+# Last modified by: Dan-Opus-5.5 (WalletScrutiny agent)
+# Last modified on: 2026-10-09
 # Usage: bitbox2nova_build.sh --version VERSION [--type TYPE] [--binary PATH] [--arch ARCH]
 #
 # Verifies BitBox02 Nova firmware reproducibility: builds from source via the upstream
@@ -13,7 +13,7 @@
 set -eE
 
 # ---- Globals ----------------------------------------------------------------
-SCRIPT_VERSION="v3.5.0"
+SCRIPT_VERSION="v3.6.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # readlink -f, not $0: a relative or symlinked invocation would otherwise hash nothing.
 SCRIPT_PATH="$(readlink -f "$0")"
@@ -63,11 +63,16 @@ write_results() {
   notes="${notes//\"/\'}"
   notes="${notes//$'\n'/ }"
   notes="${notes//$'\r'/ }"
-  cat > "$RESULTS_FILE" << EOY
+  # Written to a temp file and renamed, so a reader never sees a half-written file.
+  # Parallel runs from one directory still share this file; a copy stays in the workspace.
+  local tmp="${RESULTS_FILE}.$$"
+  cat > "$tmp" << EOY
 script_version: ${SCRIPT_VERSION}
 verdict: ${verdict}
 notes: "${notes}"
 EOY
+  mv -f "$tmp" "$RESULTS_FILE"
+  if [[ -n "$workDir" && -d "$workDir" ]]; then cp "$RESULTS_FILE" "$workDir/COMPARISON_RESULTS.yaml" 2>/dev/null || true; fi
   VERDICT_WRITTEN=1
   echo -e "${GREEN}Results written to: $RESULTS_FILE${NC}"
 }
@@ -277,6 +282,7 @@ if [[ "$firmwareType" == "btc" ]]; then
   MAKE_COMMAND="make firmware-btc"
   BUILT_FIRMWARE_PATH="build/bin/firmware-btc.bin"
   SIGNED_FILENAME="firmware-bitbox02nova-btconly.v${version}.signed.bin"
+  SIGNED_GLOB="firmware-bitbox02nova-btconly.*.signed.bin"
   # Pre-v9.25.1 BTC-only editions used a separate tag; from v9.25.1 unified under firmware/vX.
   LEGACY_TAG="firmware-btc-only/v${version}"
   # Product id per src/bootloader/bootloader_product.h (magic 0x48714774).
@@ -285,14 +291,30 @@ else
   MAKE_COMMAND="make firmware"
   BUILT_FIRMWARE_PATH="build/bin/firmware.bin"
   SIGNED_FILENAME="firmware-bitbox02nova-multi.v${version}.signed.bin"
+  SIGNED_GLOB="firmware-bitbox02nova-multi.*.signed.bin"
   LEGACY_TAG=""
   # Product id per src/bootloader/bootloader_product.h (magic 0x5b648ceb).
   EXPECTED_PRODUCT_ID=3
 fi
 
-# --binary may be a directory (ABS passes one for multi-file submissions).
+# --binary may be a directory (ABS passes one for multi-file submissions). Prefer the
+# release file name; otherwise take the single file matching this type's builds: pattern.
 if [[ -n "$binaryPath" && -d "$binaryPath" ]]; then
-  binaryPath="${binaryPath%/}/${SIGNED_FILENAME}"
+  binDir="${binaryPath%/}"
+  if [[ -f "$binDir/$SIGNED_FILENAME" ]]; then
+    binaryPath="$binDir/$SIGNED_FILENAME"
+  else
+    shopt -s nullglob
+    matches=("$binDir"/$SIGNED_GLOB)
+    shopt -u nullglob
+    if [[ "${#matches[@]}" -eq 1 ]]; then
+      binaryPath="${matches[0]}"
+    else
+      echo -e "${RED}Error: expected one ${SIGNED_GLOB} in ${binDir}, found ${#matches[@]}.${NC}"
+      write_results "ftbfs" "BitBox02 Nova: expected one ${SIGNED_GLOB} in the --binary directory, found ${#matches[@]}."
+      exit "$EXIT_INVALID"
+    fi
+  fi
 fi
 if [[ -n "$binaryPath" && ! -f "$binaryPath" ]]; then
   echo -e "${RED}Error: binary file not found: $binaryPath${NC}"
@@ -643,13 +665,28 @@ else
   echo -e "${RED}NOT REPRODUCIBLE: firmware hashes differ${NC}"
 fi
 
+cat <<LEGEND
+
+----- What these hashes mean -----
+appHash       SHA-256 of the signed firmware exactly as downloaded from the GitHub
+              release. THIS is the official download hash to publish.
+deviceHash    The hash the device shows at boot (bootloader 1.2.2 or later). A user
+              comparing the device screen must use this one, not appHash.
+unsignedHash  The official file with its first 588 bytes (edition marker and
+              signatures) removed. Published nowhere, shown by no device.
+builtHash     SHA-256 of the unsigned firmware this script built from source.
+
+MATCH means builtHash == unsignedHash. Do not publish unsignedHash or builtHash
+as the official hash.
+LEGEND
+
 echo ""
 echo "===== Begin Results ====="
 echo "firmware:     BitBox02 Nova"
 echo "version:      $version"
 echo "type:         $firmwareType"
 echo "verdict:      $verdict"
-echo "signedHash:   $signedHash"
+echo "appHash:      $signedHash"
 echo "builtHash:    $builtHash"
 echo "unsignedHash: $downloadStrippedSigHash"
 echo "deviceHash:   $downloadFirmwareHash"
