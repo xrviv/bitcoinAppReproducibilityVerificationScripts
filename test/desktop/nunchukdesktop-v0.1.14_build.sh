@@ -1,8 +1,8 @@
 #!/bin/bash
 #
 # nunchukdesktop_build.sh - Nunchuk Desktop Reproducible Build Verifier
-# Version: v0.1.13
-# Last modified on: 2026-10-08
+# Version: v0.1.14
+# Last modified on: 2026-10-09
 # Organization: WalletScrutiny.com
 #
 # Rebuilds the Linux x86_64 AppImage ZIP with upstream's reproducible-builds/ recipe at the release
@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.13"
+SCRIPT_VERSION="v0.1.14"
 APP_ID="nunchuk"
 APP_NAME="Nunchuk Desktop"
 GH_REPO="nunchuk-io/nunchuk-desktop"
@@ -32,6 +32,8 @@ CONTAINER_CMD=""
 GIT_IMAGE="${GIT_IMAGE:-docker.io/alpine/git@sha256:6f8eae2205a85c51106a9650e574a37fb1d5e4f645e5f6ea57cb57b9462cd4cf}"
 WORK_DIR=""
 IMAGE_NAME=""
+HWI_IMAGE=""
+HWI_SHA256=""
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256=""
@@ -120,7 +122,7 @@ check_build_inputs() {
 }
 
 comparison_context_note() {
-    printf '%s' "Built with upstream reproducible-builds/Dockerfile.linux and build_linux.sh at tag ${APP_VERSION} (Dockerfile sha256 ${UPSTREAM_DOCKERFILE_SHA256}), base image ${UBUNTU_BASE}, apt pinned to Ubuntu and PPA snapshot ${UBUNTU_SNAPSHOT}."
+    printf '%s' "Built with upstream reproducible-builds/Dockerfile.linux and build_linux.sh at tag ${APP_VERSION} (Dockerfile sha256 ${UPSTREAM_DOCKERFILE_SHA256}), base image ${UBUNTU_BASE}, apt pinned to Ubuntu and PPA snapshot ${UBUNTU_SNAPSHOT}.${HWI_SHA256:+ Bundled hwi built from source, sha256 ${HWI_SHA256}.}"
 }
 
 
@@ -223,7 +225,7 @@ OPTIONAL ENVIRONMENT:
 
 EXAMPLES:
   nunchukdesktop_build.sh --version 2.6.6
-  nunchukdesktop_build.sh --version 2.6.6 --binary ~/Downloads/nunchuk-linux-v2.6.6.zip
+  nunchukdesktop_build.sh --version 2.9.0 --binary ~/Downloads/nunchuk-linux-x86_64-v2.9.0.zip
 
 EXIT CODES:
   0  Identical (rebuilt ZIP byte-for-byte equal to the released ZIP)
@@ -265,6 +267,9 @@ reclaim_workspace() {
     fi
     if [[ -n "$IMAGE_NAME" ]]; then
         "$CONTAINER_CMD" rmi "$IMAGE_NAME" > /dev/null 2>&1
+    fi
+    if [[ -n "$HWI_IMAGE" ]]; then
+        "$CONTAINER_CMD" rmi "$HWI_IMAGE" > /dev/null 2>&1
     fi
     [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]] || return 0
     # Only call the container runtime if the build left foreign-owned files behind.
@@ -440,6 +445,15 @@ check_digest_against_manifest() {
     fi
 }
 
+# Release ZIP name: nunchuk-linux-x86_64-v<V> from 2.9.0 (Qt 6, aarch64 added), nunchuk-linux-v<V> before.
+zip_stem() {
+    if [[ "$(printf '%s\n' 2.9.0 "$APP_VERSION" | sort -V | head -1)" == "2.9.0" ]]; then
+        printf 'nunchuk-linux-x86_64-v%s' "$APP_VERSION"
+    else
+        printf 'nunchuk-linux-v%s' "$APP_VERSION"
+    fi
+}
+
 prepare_official() {
     # Official release ZIP: --binary or GitHub download; extract the AppImage.
     local official_appimage="${WORK_DIR}/official.AppImage"
@@ -466,7 +480,7 @@ prepare_official() {
             die_invalid "--binary must be the released .zip, got: $bname"
         fi
     else
-        local zip_name="nunchuk-linux-v${APP_VERSION}.zip"
+        local zip_name; zip_name="$(zip_stem).zip"
         local dl_url="https://github.com/${GH_REPO}/releases/download/${APP_VERSION}/${zip_name}"
         local zip_path="${WORK_DIR}/${zip_name}"
         log_info "Downloading official release: $dl_url"
@@ -538,7 +552,7 @@ resolve_release_pins() {
     if [[ -z "$UBUNTU_SNAPSHOT" ]]; then
         t="$("${gh[@]}" "https://api.github.com/repos/${GH_REPO}/releases/tags/${APP_VERSION}" 2>/dev/null \
             | grep -oE '"(name|created_at)": *"[^"]*"' \
-            | awk -F'"' -v n="nunchuk-linux-v${APP_VERSION}.zip" '$2=="name"{h=($4==n)} $2=="created_at"&&h{print $4; exit}' || true)"
+            | awk -F'"' -v n="$(zip_stem).zip" '$2=="name"{h=($4==n)} $2=="created_at"&&h{print $4; exit}' || true)"
         if [[ "$t" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
             UBUNTU_SNAPSHOT="$(tr -d ':-' <<<"$t")"
             log_info "apt snapshot = release ZIP upload time: ${UBUNTU_SNAPSHOT}"
@@ -578,6 +592,36 @@ pin_dockerfile() {
     diff "$src" "$dst" | grep '^[<>]' || true
 }
 
+# HWI from source at the fork commit upstream's CI pins (build-linux.yml HWI_TAG/HWI_COMMIT),
+# with the fork's contrib/build.Dockerfile + build_bin.sh --without-gui, into hwi-prebuilt/.
+build_hwi() {
+    local src="$1" wf="${1}/.github/workflows/build-linux.yml" tag commit head
+    tag="$(sed -nE 's/^[[:space:]]*HWI_TAG:[[:space:]]*([^[:space:]#]+).*/\1/p' "$wf" | head -1)"
+    commit="$(sed -nE 's/^[[:space:]]*HWI_COMMIT:[[:space:]]*([0-9a-f]{40}).*/\1/p' "$wf" | head -1)"
+    [[ -n "$tag" && -n "$commit" ]] || die_build "HWI_TAG/HWI_COMMIT not found in upstream build-linux.yml"
+    log_info "Building HWI ${tag} (${commit}) from source, as upstream's CI does..."
+    rm -rf "${WORK_DIR}/hwi-src"
+    git_c clone --depth 1 --branch "$tag" https://github.com/nogibi/HWI.git /w/hwi-src \
+        || die_build "Could not clone nogibi/HWI at ${tag}"
+    head="$(git_c -C /w/hwi-src rev-parse HEAD | tr -dc '0-9a-f')" || head=""
+    [[ "$head" == "$commit" ]] || die_build "HWI checkout ${head} is not the pinned commit ${commit}"
+    HWI_IMAGE="nunchuk-hwi-${APP_VERSION}-$(date +%s)-$$"
+    "$CONTAINER_CMD" build --platform linux/amd64 -t "$HWI_IMAGE" \
+        -f "${WORK_DIR}/hwi-src/contrib/build.Dockerfile" "${WORK_DIR}/hwi-src" \
+        || die_build "HWI builder image failed"
+    mkdir -p "${src}/hwi-prebuilt"
+    "$CONTAINER_CMD" run --platform linux/amd64 --rm \
+        -v "${WORK_DIR}/hwi-src:/hwi-src" -v "${src}/hwi-prebuilt:/out" -w /hwi-src "$HWI_IMAGE" \
+        bash -c 'set -euo pipefail; bash contrib/build_bin.sh --without-gui
+                 b="$(find dist -type f -name hwi -print -quit)"; [[ -n "$b" ]]; install -m 0755 "$b" /out/hwi' \
+        || die_build "HWI build failed"
+    "$CONTAINER_CMD" rmi "$HWI_IMAGE" > /dev/null 2>&1 || true
+    HWI_IMAGE=""
+    [[ -x "${src}/hwi-prebuilt/hwi" ]] || die_build "HWI build produced no executable"
+    HWI_SHA256="$(sha256_of "${src}/hwi-prebuilt/hwi")"
+    log_ok "HWI built: hwi sha256 ${HWI_SHA256}"
+}
+
 run_build() {
     # Upstream's Dockerfile.linux + build_linux.sh, source at /project, as its README instructs.
     local src="${WORK_DIR}/src"
@@ -615,7 +659,10 @@ run_build() {
     log_info "Building upstream image -- 20-40 min on first run..."
     local attempt image_built=false
     for attempt in 1 2 3; do
+        # x86_64 build args as upstream's README/CI pass them (2.9.0+; unused before).
         if "$CONTAINER_CMD" build --platform linux/amd64 \
+                --build-arg APPIMAGE_ARCH=x86_64 --build-arg QT_HOST=linux \
+                --build-arg QT_ARCH=linux_gcc_64 --build-arg QT_DIR_NAME=gcc_64 \
                 -t "$image_name" -f "$dockerfile" "$src"; then
             image_built=true
             break
@@ -625,13 +672,18 @@ run_build() {
     done
     [[ "$image_built" == true ]] || die_build "Container image build failed after 3 attempts"
 
+    # From 2.9.0 the AppImage bundles hwi, which upstream's CI builds first into hwi-prebuilt/.
+    if grep -q 'hwi-prebuilt' "${src}/reproducible-builds/package_linux.sh" 2>/dev/null; then
+        build_hwi "$src"
+    fi
+
     # Ownership set after the image build, which reads the context as the host user.
     log_info "Setting build ownership so /project matches upstream's rootful-Docker semantics..."
     set_build_owner "${WORK_DIR}"
 
     log_info "Running upstream build_linux.sh inside the container..."
     if ! "$CONTAINER_CMD" run --platform linux/amd64 --rm \
-            -e TAG="${APP_VERSION}" \
+            -e TAG="${APP_VERSION}" -e ARCH=x86_64 \
             -v "${src}:/project" -w /project \
             "$image_name" bash ./reproducible-builds/build_linux.sh; then
         restore_host_owner "${WORK_DIR}"
@@ -642,12 +694,12 @@ run_build() {
     restore_host_owner "${WORK_DIR}"
     "$CONTAINER_CMD" rmi "$image_name" > /dev/null 2>&1 || true
 
-    local out_zip="${src}/nunchuk-linux-v${APP_VERSION}/nunchuk-linux-v${APP_VERSION}.zip"
+    local out_zip; out_zip="${src}/$(zip_stem)/$(zip_stem).zip"
     [[ -f "$out_zip" ]] || die_build "Upstream build produced no ZIP at ${out_zip}"
     cp "$out_zip" "${WORK_DIR}/built.zip"
 
     BUILT_ARTIFACT_SHA256="$(sha256_of "${WORK_DIR}/built.zip")"
-    log_ok "Built artifact: nunchuk-linux-v${APP_VERSION}.zip ($(stat -c%s "${WORK_DIR}/built.zip") bytes)"
+    log_ok "Built artifact: $(zip_stem).zip ($(stat -c%s "${WORK_DIR}/built.zip") bytes)"
     log_ok "  sha256: ${BUILT_ARTIFACT_SHA256}"
 
     rm -rf "${WORK_DIR}/built_zip"
@@ -669,7 +721,7 @@ compare_artifacts() {
     echo "======================================================"
     echo "Official: ${OFFICIAL_ARTIFACT_NAME}"
     echo "  ${OFFICIAL_ARTIFACT_SHA256}"
-    echo "Rebuilt:  nunchuk-linux-v${APP_VERSION}.zip"
+    echo "Rebuilt:  $(zip_stem).zip"
     echo "  ${BUILT_ARTIFACT_SHA256}"
     echo "Official AppImage: ${OFFICIAL_APPIMAGE_SHA256}"
     echo "Rebuilt  AppImage: ${BUILT_APPIMAGE_SHA256}"
