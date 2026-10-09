@@ -1,11 +1,11 @@
 #!/bin/bash
 # ==============================================================================
-# electrumandroid_build.sh - Electrum Android Reproducible Build Verification
+# electrumandroid-v2.4.0_build.sh - Electrum Android Reproducible Build Verification
 # ==============================================================================
-# Version:          v2.3.0
+# Version:          v2.4.0
 # Organization:     WalletScrutiny.com
-# Last modified by: Danny Garcia
-# Last modified on: 2026-09-23
+# Last modified by: Bob (WalletScrutiny agent)
+# Last modified on: 2026-10-09
 # Project:          https://github.com/spesmilo/electrum
 # ==============================================================================
 # LICENSE: MIT License
@@ -25,8 +25,14 @@
 # The developers assume no liability for any misuse or legal consequences arising from use.
 # By using this script, you acknowledge these disclaimers and accept full responsibility.
 
-SCRIPT_VERSION="v2.3.0"
-echo "Starting electrumandroid_build.sh script version ${SCRIPT_VERSION}"
+# Self-identification first: name, version and own sha256, before anything else runs.
+SCRIPT_VERSION="v2.4.0"
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+SCRIPT_NAME="$(basename "$SCRIPT_PATH")"
+SCRIPT_SHA256="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
+: "${SCRIPT_SHA256:=N/A}"
+echo "Starting ${SCRIPT_NAME} script version ${SCRIPT_VERSION}"
+echo "Script sha256: ${SCRIPT_SHA256}"
 
 set -eo pipefail
 
@@ -44,83 +50,23 @@ sleep 3
 echo
 
 # Global Variables
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-workDir="$SCRIPT_DIR/electrum-work"
-DIFF_FILE="$workDir/diff_full.txt"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd -P)"
 RESULTS_FILE="$SCRIPT_DIR/COMPARISON_RESULTS.yaml"
-LOG_DIR="$SCRIPT_DIR/build-logs"
 wsContainer="docker.io/walletscrutiny/android:5"
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
 RESULTS_WRITTEN=0
-BUILD_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-BUILD_RUN_LABEL="walletscrutiny.run=${BUILD_RUN_ID}"
-BUILD_TARGET_LABEL=""
+FINAL_VERDICT=""
+CONTAINER_CMD=""
+ROOTLESS=0
+CTR_PID=""
+# Per-run resources: empty until created, so the EXIT trap only touches what this run made.
+RUN_ID=""
+workDir=""
+LOG_DIR=""
+DIFF_FILE=""
+BUILD_RUN_LABEL=""
 BUILD_IMAGE_TAG=""
-
-cleanup() {
-  if [ -n "${CONTAINER_CMD:-}" ]; then
-    echo "Cleaning up Docker resources..."
-    local run_containers run_images
-    run_containers=$($CONTAINER_CMD ps -aq --filter "label=${BUILD_RUN_LABEL}" 2>/dev/null || true)
-    run_images=$($CONTAINER_CMD images -q --filter "label=${BUILD_RUN_LABEL}" 2>/dev/null || true)
-
-    if [ -n "$run_containers" ]; then
-      echo "$run_containers" | xargs -r $CONTAINER_CMD rm -f >/dev/null 2>&1 || true
-    fi
-    if [ -n "$run_images" ]; then
-      echo "$run_images" | xargs -r $CONTAINER_CMD rmi -f >/dev/null 2>&1 || true
-    fi
-
-    if [ -n "${BUILD_IMAGE_TAG:-}" ]; then
-      $CONTAINER_CMD rmi "$BUILD_IMAGE_TAG" -f 2>/dev/null || true
-    fi
-    $CONTAINER_CMD rmi electrum-android:local -f 2>/dev/null || true
-    $CONTAINER_CMD image prune -f 2>/dev/null || true
-  fi
-}
-
-on_exit() {
-  local exit_code=$?
-  local yellow="${YELLOW:-}"
-  local nc="${NC:-}"
-  cleanup
-
-  if [ "$exit_code" -ne 0 ] && [ "$RESULTS_WRITTEN" -eq 0 ]; then
-    cat > "$RESULTS_FILE" << EOF
-script_version: ${SCRIPT_VERSION}
-verdict: ftbfs
-notes: |
-  Script failed before completing verification summary output.
-  See terminal logs for the failing step.
-EOF
-    echo -e "${yellow}Fallback results written to: $RESULTS_FILE${nc}"
-  fi
-
-  echo
-  if [ -f "$DIFF_FILE" ]; then
-    echo "Full diff data can be found here: $DIFF_FILE"
-    echo "Quick view command:"
-    echo "  sed -n '1,120p' \"$DIFF_FILE\""
-  else
-    echo "Full diff data can be found here: (not generated in this run)"
-  fi
-  echo "Results YAML can be found here: $RESULTS_FILE"
-  echo "Build logs: $LOG_DIR/"
-  echo "Exit code: $exit_code"
-}
-
-trap on_exit EXIT
-
-# Detect container runtime
-if command -v podman &> /dev/null; then
-    CONTAINER_CMD="podman"
-    echo "Using Podman for containerization"
-elif command -v docker &> /dev/null; then
-    CONTAINER_CMD="docker"
-    echo "Using Docker for containerization"
-else
-    echo "Error: Neither podman nor docker found. Please install Docker or Podman."
-    exit 1
-fi
 
 # Color constants
 YELLOW='\033[1;33m'
@@ -128,6 +74,120 @@ GREEN='\033[1;32m'
 RED='\033[1;31m'
 CYAN='\033[1;36m'
 NC='\033[0m'
+
+# A verdict left by an earlier run must never be mistaken for this run's.
+rm -f "$RESULTS_FILE"
+
+write_ftbfs() {
+  cat > "$RESULTS_FILE" << EOF
+script_version: ${SCRIPT_VERSION}
+verdict: ftbfs
+notes: |
+  $1
+EOF
+  RESULTS_WRITTEN=1
+  FINAL_VERDICT="ftbfs"
+}
+
+# Runs a long container command in the background and waits for it, so INT/TERM
+# reach the traps at once instead of after the container finishes.
+ctr_wait() {
+  local rc=0
+  "$@" &
+  CTR_PID=$!
+  wait "$CTR_PID" || rc=$?
+  CTR_PID=""
+  return "$rc"
+}
+
+# Removes only what this run created: its labeled containers and images, its image tag.
+cleanup() {
+  [ -n "$CONTAINER_CMD" ] || return 0
+  local ids
+  if [ -n "$BUILD_RUN_LABEL" ]; then
+    ids=$($CONTAINER_CMD ps -aq --filter "label=${BUILD_RUN_LABEL}" 2>/dev/null || true)
+    if [ -n "$ids" ]; then
+      echo "$ids" | xargs -r $CONTAINER_CMD kill >/dev/null 2>&1 || true
+      echo "$ids" | xargs -r $CONTAINER_CMD rm -f >/dev/null 2>&1 || true
+    fi
+  fi
+  if [ -n "$CTR_PID" ] && kill -0 "$CTR_PID" 2>/dev/null; then
+    kill "$CTR_PID" 2>/dev/null || true
+    wait "$CTR_PID" 2>/dev/null || true
+  fi
+  if [ -n "$BUILD_RUN_LABEL" ]; then
+    ids=$($CONTAINER_CMD images -q --filter "label=${BUILD_RUN_LABEL}" 2>/dev/null || true)
+    [ -n "$ids" ] && { echo "$ids" | xargs -r $CONTAINER_CMD rmi -f >/dev/null 2>&1 || true; }
+  fi
+  [ -n "$BUILD_IMAGE_TAG" ] && { $CONTAINER_CMD rmi -f "$BUILD_IMAGE_TAG" >/dev/null 2>&1 || true; }
+  return 0
+}
+
+# Hands the workspace back to the caller; never fails the script or changes the verdict.
+# Rootless runtime: container root == caller, so chown 0:0 (a host uid would map into the subuid range).
+hand_back_workspace() {
+  [ -n "$workDir" ] && [ -d "$workDir" ] || return 0
+  local own="${HOST_UID}:${HOST_GID}" stray
+  [ "$ROOTLESS" -eq 1 ] && own="0:0"
+  if [ "$CONTAINER_CMD" = podman ] && [ "$ROOTLESS" -eq 1 ]; then
+    podman unshare chown -R 0:0 "$workDir" >/dev/null 2>&1 || true
+  elif [ -n "$CONTAINER_CMD" ]; then
+    $CONTAINER_CMD run --rm --user root --volume "$workDir:/w" $wsContainer \
+      chown -R "$own" /w >/dev/null 2>&1 || true
+  fi
+  stray=$(find "$workDir" ! -uid "$HOST_UID" -print -quit 2>/dev/null || true)
+  if [ -n "$stray" ]; then
+    echo -e "${YELLOW}Warning: not caller-owned after hand-back: $stray${NC}"
+  else
+    echo "Workspace ownership: all files owned by uid ${HOST_UID} ($workDir)"
+  fi
+  return 0
+}
+
+# Runs on every exit (success, failure, interrupt): stops this run's containers,
+# removes its image, hands the workspace back and guarantees a verdict.
+on_exit() {
+  local rc=$?
+  trap - INT TERM
+  set +e
+  cleanup
+  hand_back_workspace
+  if [ "$RESULTS_WRITTEN" -eq 0 ]; then
+    write_ftbfs "Run ended before a verdict was written (exit code $rc: build failure, invalid input or interruption). See terminal logs for the failing step."
+    echo -e "${YELLOW}Fallback results written to: $RESULTS_FILE${NC}"
+  fi
+  echo
+  if [ -n "$DIFF_FILE" ] && [ -f "$DIFF_FILE" ]; then
+    echo "Full diff data can be found here: $DIFF_FILE"
+    echo "Quick view command:"
+    echo "  sed -n '1,120p' \"$DIFF_FILE\""
+  else
+    echo "Full diff data can be found here: (not generated in this run)"
+  fi
+  echo "Results YAML can be found here: $RESULTS_FILE"
+  [ -n "$LOG_DIR" ] && echo "Build logs: $LOG_DIR/"
+  case "$rc" in 0|1|2) ;; *) rc=1 ;; esac
+  echo "Exit code: $rc"
+  exit "$rc"
+}
+
+trap on_exit EXIT
+trap 'echo; echo "Interrupted (SIGINT)."; exit 130' INT
+trap 'echo; echo "Terminated (SIGTERM)."; exit 143' TERM
+
+# Detect a container runtime that actually works (docker needs its daemon).
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  CONTAINER_CMD="docker"
+  docker info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless && ROOTLESS=1 || true
+elif command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
+  CONTAINER_CMD="podman"
+  [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = "true" ] && ROOTLESS=1 || true
+else
+  echo -e "${RED}Error: no working container runtime (docker info and podman info both failed).${NC}"
+  write_ftbfs "No working container runtime: docker info and podman info both failed. Install or start docker or podman."
+  exit 1
+fi
+echo "Using ${CONTAINER_CMD} for containerization (rootless=${ROOTLESS})"
 
 # Electrum constants
 repo="https://github.com/spesmilo/electrum"
@@ -441,70 +501,128 @@ generate_filtered_build_log() {
 
 usage() {
   echo 'NAME
-       electrumandroid_build.sh - verify Electrum wallet build
+       electrumandroid-v2.4.0_build.sh - verify Electrum wallet build
 
 SYNOPSIS
-       electrumandroid_build.sh --apk APK_FILE
-       electrumandroid_build.sh --binary APK_FILE
+       electrumandroid-v2.4.0_build.sh --binary APK_FILE [--version V] [--arch A] [--type T]
 
 DESCRIPTION
        This command verifies builds of Electrum wallet.
-       Version is automatically extracted from the APK.
+       Version and architecture are extracted from the APK.
 
-       --apk       The apk file to test
-       --binary    Alias for --apk (accepted for build server compatibility)
+       --binary    The apk file to test (a directory holding base.apk is accepted)
+       --apk       Alias for --binary
+       --version, --arch, --type
+                   Accepted for build server compatibility; values are taken from the APK
+       Unknown parameters are ignored with a warning.
+
+EXIT CODES
+       0 reproducible, 1 not reproducible or build failure, 2 invalid input
 
 EXAMPLES
-       electrumandroid_build.sh --apk electrum.apk
-       electrumandroid_build.sh --binary /path/to/electrum.apk'
+       electrumandroid-v2.4.0_build.sh --binary /path/to/electrum.apk'
 }
 
 # Parse arguments
-while [[ "$#" -gt 0 ]]; do
+downloadedApk=""
+while [ "$#" -gt 0 ]; do
   case $1 in
-    --apk|--binary) downloadedApk="$2"; shift ;;
-    --help) usage; exit 0 ;;
-    *) echo "Warning: Ignoring unknown parameter: $1" ;;
+    --apk|--binary)
+      [ -n "${2:-}" ] || { echo "Error: $1 needs a value"; usage; exit 2; }
+      downloadedApk="$2"; shift 2 ;;
+    --help) trap - EXIT; usage; exit 0 ;;
+    --*)
+      # A value that does not look like a flag belongs to this parameter.
+      opt="$1"; val=""
+      case "${2:-}" in ""|--*) ;; *) val="$2"; shift ;; esac
+      case $opt in
+        --version|--arch|--type) echo "Note: $opt $val accepted as a hint; values are read from the APK" ;;
+        *) echo "Warning: Ignoring unknown parameter: $opt $val" ;;
+      esac
+      shift ;;
+    *) echo "Warning: Ignoring unknown parameter: $1"; shift ;;
   esac
-  shift
 done
 
 # Validate inputs
-if [ ! -f "$downloadedApk" ]; then
-  echo "APK file not found!"
+if [ "$HOST_UID" -eq 0 ]; then
+  echo "Do not run this script as root."
+  exit 2
+fi
+if [ -z "$downloadedApk" ]; then
+  echo "No APK given (--binary APK_FILE)."
   echo
   usage
-  exit 1
+  exit 2
+fi
+if [ -d "$downloadedApk" ] && [ -f "$downloadedApk/base.apk" ]; then
+  downloadedApk="$downloadedApk/base.apk"
+fi
+if [ ! -f "$downloadedApk" ]; then
+  echo "APK file not found: $downloadedApk"
+  echo
+  usage
+  exit 2
 fi
 
 # Make path absolute
-if ! [[ $downloadedApk =~ ^/.* ]]; then
-  downloadedApk="$PWD/$downloadedApk"
-fi
+case $downloadedApk in /*) ;; *) downloadedApk="$(pwd -P)/$downloadedApk" ;; esac
 
-# Verify app ID using aapt2 first — fail fast before costly apktool decompilation
-extractedAppId=$($CONTAINER_CMD run --rm \
+# Verify app ID using aapt2 first — fail fast before costly apktool decompilation.
+# The same line gives the versionName used to name the workspace.
+badging=$($CONTAINER_CMD run --rm \
   --volume "$(dirname "$downloadedApk"):/apk:ro" \
   $wsContainer \
-  sh -c "/opt/android-sdk/build-tools/29.0.3/aapt2 dump badging /apk/$(basename "$downloadedApk") 2>/dev/null | grep '^package:' | sed \"s/^package: name='//;s/'.*//\"")
+  sh -c "/opt/android-sdk/build-tools/29.0.3/aapt2 dump badging /apk/$(basename "$downloadedApk") 2>/dev/null | grep '^package:'" || true)
+extractedAppId=$(echo "$badging" | sed -n "s/^package: name='\([^']*\)'.*/\1/p")
+hintVersion=$(echo "$badging" | sed -n "s/.* versionName='\([^']*\)'.*/\1/p")
 
 if [ -z "$extractedAppId" ]; then
-  echo "appId could not be determined"
-  exit 1
+  echo "appId could not be determined (not a readable APK?)"
+  exit 2
 fi
 
 if [ "$extractedAppId" != "$appId" ]; then
   echo "This script is only for Electrum wallet (org.electrum.electrum)"
   echo "Detected appId: $extractedAppId"
+  exit 2
+fi
+
+# Detect architecture
+build_arch=$(determine_architectures "$downloadedApk")
+echo "Detected architecture: $build_arch"
+
+# Per-run workspace in the caller's directory, created exclusively; never deleted,
+# renamed or reused. Every per-run resource name carries RUN_ID.
+safe_version="$(printf '%s' "${hintVersion:-unknown}" | tr -c '[:alnum:]._-' '-')"
+safe_arch="$(printf '%s' "$build_arch" | tr -c '[:alnum:]._-' '-')"
+WORK_BASE="$(pwd -P)"
+for _try in 1 2 3; do
+  RUN_ID="$(date +%s)-$$"
+  candidate="$WORK_BASE/electrum_verification_${safe_version}_${safe_arch}_${RUN_ID}"
+  if mkdir "$candidate" 2>/dev/null; then
+    workDir="$candidate"
+    break
+  fi
+  echo "Workspace $candidate already exists; retrying with a new run id"
+  sleep 1
+done
+if [ -z "$workDir" ]; then
+  echo -e "${RED}Error: could not create a fresh workspace under $WORK_BASE${NC}"
+  write_ftbfs "Could not create a fresh workspace under $WORK_BASE (exists or not writable)."
   exit 1
 fi
+LOG_DIR="$workDir/build-logs"
+DIFF_FILE="$workDir/diff_full.txt"
+BUILD_RUN_LABEL="walletscrutiny.run=${RUN_ID}"
+mkdir "$LOG_DIR"
+echo "Workspace: $workDir"
 
 # Extract APK metadata
 appHash=$($CONTAINER_CMD run --rm \
   --volume "$(dirname "$downloadedApk"):/apk:ro" \
   $wsContainer sha256sum "/apk/$(basename "$downloadedApk")" | awk '{print $1;}')
-# Use a unique extraction folder every run to avoid collisions with stale root-owned paths.
-fromPlayFolder=$(mktemp -d "/tmp/fromPlay${appHash}.XXXXXX")
+fromPlayFolder="$workDir/apktool-official"
 signer=$(getSigner "$downloadedApk")
 echo "Extracting APK content..."
 containerApktool "$fromPlayFolder" "$downloadedApk" || exit 1
@@ -512,29 +630,19 @@ containerApktool "$fromPlayFolder" "$downloadedApk" || exit 1
 versionName=$(cat "$fromPlayFolder/apktool.yml" | grep versionName | sed 's/.*\: //g' | sed "s/'//g")
 versionCode=$(cat "$fromPlayFolder/apktool.yml" | grep versionCode | sed 's/.*\: //g' | sed "s/'//g")
 
-# Best-effort cleanup of apktool extraction folder.
-$CONTAINER_CMD run --rm \
-  --user root \
-  --volume /tmp:/tmp \
-  $wsContainer rm -rf "$fromPlayFolder" >/dev/null 2>&1 || true
-
 if [ -z "$versionName" ]; then
   echo "versionName could not be determined"
-  exit 1
+  exit 2
 fi
 
 if [ -z "$versionCode" ]; then
   echo "versionCode could not be determined"
-  exit 1
+  exit 2
 fi
 
 echo
 echo "Testing \"$downloadedApk\" ($appId version $versionName)"
 echo
-
-# Detect architecture
-build_arch=$(determine_architectures "$downloadedApk")
-echo "Detected architecture: $build_arch"
 
 # Use versionName directly as tag - don't strip anything
 tag="$versionName"
@@ -558,131 +666,103 @@ normalize_source_permissions() {
 }
 
 prepare() {
-  echo "Setting up workspace..."
-  # Use container as root to remove workDir — build artifacts may be root-owned from previous runs
-  if [ -d "$workDir" ]; then
-    $CONTAINER_CMD run --rm \
-      --user root \
-      --volume "$(dirname "$workDir")":/parent \
-      $wsContainer \
-      rm -rf "/parent/$(basename "$workDir")" || true
-  fi
-  mkdir -p "$workDir"
-
   echo "Cloning repository..."
-  $CONTAINER_CMD run --rm \
+  ctr_wait $CONTAINER_CMD run --rm \
+    --label "$BUILD_RUN_LABEL" \
     --volume "$workDir":/workspace \
     $wsContainer \
-    git clone --quiet --recurse-submodules "$repo" /workspace/app
+    git clone --quiet --recurse-submodules "$repo" /workspace/app || return 1
 
   echo "Checking out version: $tag"
-  $CONTAINER_CMD run --rm \
+  ctr_wait $CONTAINER_CMD run --rm \
+    --label "$BUILD_RUN_LABEL" \
     --volume "$workDir/app":/workspace \
     --workdir /workspace \
     $wsContainer \
     sh -c "git fetch --quiet --tags && \
            (git checkout --quiet 'refs/tags/$tag' || git checkout --quiet '$tag') && \
-           git submodule update --init --recursive"
+           git submodule update --init --recursive" || return 1
 
   commit=$($CONTAINER_CMD run --rm \
     --volume "$workDir/app":/workspace \
     --workdir /workspace \
-    $wsContainer git rev-parse HEAD)
+    $wsContainer git rev-parse HEAD) || return 1
 
-  normalize_source_permissions "$workDir/app"
+  normalize_source_permissions "$workDir/app" || return 1
 
   echo -e "${GREEN}Environment prepared${NC}"
 }
 
 build_electrum() {
-  local app_hash_short safe_version safe_arch target_slug
-  local existing_target_containers existing_target_images
+  local app_hash_short uid gid
 
   app_hash_short="${appHash:0:12}"
-  safe_version="$(echo "$versionName" | tr -c '[:alnum:]._-' '-')"
-  safe_arch="$(echo "$build_arch" | tr -c '[:alnum:]._-' '-')"
-  target_slug="${appId}-${safe_version}-${safe_arch}-${app_hash_short}"
-  BUILD_TARGET_LABEL="walletscrutiny.target=${target_slug}"
-  BUILD_IMAGE_TAG="electrum-android:${target_slug}-${BUILD_RUN_ID}"
+  BUILD_IMAGE_TAG="electrum-android:${appId}-${safe_version}-${safe_arch}-${app_hash_short}-${RUN_ID}"
 
-  existing_target_containers=$($CONTAINER_CMD ps -aq --filter "label=${BUILD_TARGET_LABEL}" 2>/dev/null || true)
-  existing_target_images=$($CONTAINER_CMD images -q --filter "label=${BUILD_TARGET_LABEL}" 2>/dev/null || true)
-  if [ -n "$existing_target_containers" ] || [ -n "$existing_target_images" ]; then
-    echo -e "${RED}Stale container/image artifacts detected for this target.${NC}"
-    echo "Target label: ${BUILD_TARGET_LABEL}"
-    echo "Please clean stale artifacts first, then rerun."
+  echo "Building Electrum from source..."
+  if [ ! -f "$workDir/app/contrib/android/Dockerfile" ]; then
+    echo -e "${RED}Missing contrib/android/Dockerfile${NC}"
     return 1
   fi
 
-  echo "Building Electrum from source..."
-  (
-    cd "$workDir/app" || exit 1
-    
-    if [ ! -f contrib/android/Dockerfile ]; then
-      echo -e "${RED}Missing contrib/android/Dockerfile${NC}"
-      exit 1
-    fi
-    
-    cp contrib/deterministic-build/requirements-build-android.txt contrib/android/ || true
-    
-    # Always use UID 1000 for container to avoid conflicts
-    uid=1000
-    gid=1000
-    
-    echo "Building Docker image..."
-    echo "Image tag for this run: $BUILD_IMAGE_TAG"
-    if ! $CONTAINER_CMD build \
-      --pull \
-      --no-cache \
-      --tag "$BUILD_IMAGE_TAG" \
-      --label "$BUILD_RUN_LABEL" \
-      --label "$BUILD_TARGET_LABEL" \
-      --file contrib/android/Dockerfile \
-      --build-arg UID="$uid" \
-      --build-arg GID="$gid" \
-      .; then
-      echo -e "${RED}Docker build failed!${NC}"
-      exit 1
-    fi
-    
-    mkdir -p "$workDir/app/.gradle"
-    mkdir -p "$workDir/app/dist"
-    chmod -R 777 "$workDir/app/dist" 2>/dev/null || true
-    
-    echo "Starting containerized build for architecture: $build_arch"
-    echo "This may take 15-30 minutes..."
-    
-    if ! $CONTAINER_CMD run --rm \
-      --label "$BUILD_RUN_LABEL" \
-      --label "$BUILD_TARGET_LABEL" \
-      --user root \
-      --env GIT_PAGER=cat \
-      --env PAGER=cat \
-      --env VIRTUAL_ENV=/opt/venv \
-      --env PATH="/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-      --env BUILDOZER_WARN_ON_ROOT=0 \
-      --volume "$workDir/app:/home/user/wspace/electrum" \
-      --volume "$workDir/app/.gradle:/home/user/.gradle" \
-      --workdir /home/user/wspace/electrum \
-      "$BUILD_IMAGE_TAG" \
-      bash -lc "umask 0022 && set -x && \
-        source /opt/venv/bin/activate && \
-        git config --global --add safe.directory /home/user/wspace/electrum && \
-        mkdir -p dist && \
-        find /home/user/wspace/electrum -type d -exec chmod 755 {} + && \
-        find /home/user/wspace/electrum -type f -exec chmod 644 {} + && \
-        git config --global --add safe.directory '*' && \
-        git ls-files -s | grep '^100755' | cut -f2 | while IFS= read -r path; do chmod 755 \"\$path\"; done && \
-        git submodule foreach --recursive 'git ls-files -s | grep \"^100755\" | cut -f2 | while IFS= read -r path; do chmod 755 \"\$path\"; done' && \
-        ./contrib/android/make_apk.sh qml '$build_arch' release-unsigned"; then
-      echo -e "${RED}Build failed!${NC}"
-      exit 1
-    fi
-    
-    echo -e "${GREEN}Build completed successfully!${NC}"
-  ) || return 1
+  cp "$workDir/app/contrib/deterministic-build/requirements-build-android.txt" "$workDir/app/contrib/android/" || true
 
-  # Find built APK in parent shell so updated builtApk value persists for result()
+  # Always use UID 1000 for container to avoid conflicts
+  uid=1000
+  gid=1000
+
+  echo "Building Docker image..."
+  echo "Image tag for this run: $BUILD_IMAGE_TAG"
+  if ! ctr_wait $CONTAINER_CMD build \
+    --pull \
+    --no-cache \
+    --tag "$BUILD_IMAGE_TAG" \
+    --label "$BUILD_RUN_LABEL" \
+    --file "$workDir/app/contrib/android/Dockerfile" \
+    --build-arg UID="$uid" \
+    --build-arg GID="$gid" \
+    "$workDir/app"; then
+    echo -e "${RED}Docker build failed!${NC}"
+    return 1
+  fi
+
+  mkdir -p "$workDir/app/.gradle"
+  mkdir -p "$workDir/app/dist"
+  chmod -R 777 "$workDir/app/dist" 2>/dev/null || true
+
+  echo "Starting containerized build for architecture: $build_arch"
+  echo "This may take 15-30 minutes..."
+
+  if ! ctr_wait $CONTAINER_CMD run --rm \
+    --name "electrum-build-${RUN_ID}" \
+    --label "$BUILD_RUN_LABEL" \
+    --user root \
+    --env GIT_PAGER=cat \
+    --env PAGER=cat \
+    --env VIRTUAL_ENV=/opt/venv \
+    --env PATH="/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    --env BUILDOZER_WARN_ON_ROOT=0 \
+    --volume "$workDir/app:/home/user/wspace/electrum" \
+    --volume "$workDir/app/.gradle:/home/user/.gradle" \
+    --workdir /home/user/wspace/electrum \
+    "$BUILD_IMAGE_TAG" \
+    bash -lc "umask 0022 && set -x && \
+      source /opt/venv/bin/activate && \
+      git config --global --add safe.directory /home/user/wspace/electrum && \
+      mkdir -p dist && \
+      find /home/user/wspace/electrum -type d -exec chmod 755 {} + && \
+      find /home/user/wspace/electrum -type f -exec chmod 644 {} + && \
+      git config --global --add safe.directory '*' && \
+      git ls-files -s | grep '^100755' | cut -f2 | while IFS= read -r path; do chmod 755 \"\$path\"; done && \
+      git submodule foreach --recursive 'git ls-files -s | grep \"^100755\" | cut -f2 | while IFS= read -r path; do chmod 755 \"\$path\"; done' && \
+      ./contrib/android/make_apk.sh qml '$build_arch' release-unsigned"; then
+    echo -e "${RED}Build failed!${NC}"
+    return 1
+  fi
+
+  echo -e "${GREEN}Build completed successfully!${NC}"
+
+  # Find built APK
   echo "Searching for built APK..."
 
   # First try the expected location
@@ -691,37 +771,36 @@ build_electrum() {
   else
     # Search in buildozer output directories
     builtApk=$(find "$workDir/app/.buildozer" -type f \( -name "*Electrum*${build_arch}*release*.apk" -o -name "*electrum*${build_arch}*release*.apk" \) 2>/dev/null | head -1)
-    
+
     if [ -z "$builtApk" ]; then
       # Search more broadly for any arm64 APK
       builtApk=$(find "$workDir/app/.buildozer" -type f -name "*${build_arch}*.apk" 2>/dev/null | grep -i electrum | head -1)
     fi
-    
+
     if [ -z "$builtApk" ]; then
       # Last resort: search for any APK in dist directories
       builtApk=$(find "$workDir/app/.buildozer/android/platform/build-${build_arch}/dists" -type f -name "*.apk" 2>/dev/null | head -1)
     fi
-    
+
     if [ -z "$builtApk" ]; then
       # Ultimate fallback: any APK anywhere
       builtApk=$(find "$workDir/app" -type f -name "*.apk" 2>/dev/null | head -1)
     fi
   fi
-  
+
   if [ -z "$builtApk" ] || [ ! -f "$builtApk" ]; then
     echo -e "${RED}Error: Built APK not found${NC}"
     echo "Checking build outputs:"
     find "$workDir/app" -name "*.apk" -type f 2>/dev/null || echo "No APK files found"
     return 1
   fi
-  
+
   echo -e "${GREEN}Built APK found: $builtApk${NC}"
   echo "APK size: $(ls -lh "$builtApk" | awk '{print $5}')"
 }
 
 result() {
   echo "Running comparison inside container (isolated /tmp — no host extraction dirs)..."
-  mkdir -p "$workDir"
 
   # Run extraction and diff entirely inside the container.
   # Container uses its own ephemeral /tmp — no host-side extraction dirs created,
@@ -746,6 +825,8 @@ result() {
       echo "verdict:        ftbfs"
       echo "appHash:        $appHash"
       echo "commit:         $commit"
+      echo "scriptVersion:  $SCRIPT_VERSION"
+      echo "scriptHash:     $SCRIPT_SHA256"
       echo "===== End Results ====="
       write_results "ftbfs"
       return 0
@@ -890,6 +971,8 @@ $pyOut
   echo "builtHash:      $builtHash"
   echo "commit:         $commit"
   echo "architecture:   $build_arch"
+  echo "scriptVersion:  $SCRIPT_VERSION"
+  echo "scriptHash:     $SCRIPT_SHA256"
   echo ""
 
   if [ -n "$excludedDiffs" ]; then
@@ -927,12 +1010,7 @@ write_results() {
   local status=$1
 
   if [ "$status" = "ftbfs" ]; then
-    cat > "$RESULTS_FILE" << EOF
-script_version: ${SCRIPT_VERSION}
-verdict: ftbfs
-notes: |
-  Comparison stage failed before completing; see terminal logs.
-EOF
+    write_ftbfs "Comparison stage failed before completing; see terminal logs."
   else
     {
       echo "script_version: ${SCRIPT_VERSION}"
@@ -946,15 +1024,15 @@ EOF
         printf '%s' "$innerFailNotes" | sed 's/^/  Verdict-affecting: /'
       fi
     } > "$RESULTS_FILE"
+    RESULTS_WRITTEN=1
+    FINAL_VERDICT="$status"
   fi
 
-  RESULTS_WRITTEN=1
   echo -e "${GREEN}Results written to: $RESULTS_FILE${NC}"
   cp "$RESULTS_FILE" "$LOG_DIR/phase4-results-yaml.log" 2>/dev/null || true
 }
 
 # Main execution
-mkdir -p "$LOG_DIR"
 echo "Starting Electrum wallet verification..."
 echo "This process may take 15-30 minutes depending on your system."
 echo "Build logs: $LOG_DIR/"
@@ -990,4 +1068,8 @@ echo
 echo "Electrum verification finished!"
 echo "COMPARISON_RESULTS.yaml: $RESULTS_FILE"
 echo "Build logs: $LOG_DIR/"
-exit 0
+# Exit codes: 0 reproducible, 1 not reproducible or build failure, 2 invalid input
+case "$FINAL_VERDICT" in
+  reproducible) exit 0 ;;
+  *) exit 1 ;;
+esac
