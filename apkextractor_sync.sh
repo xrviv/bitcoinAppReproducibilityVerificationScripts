@@ -1,8 +1,16 @@
 #!/bin/bash
 # apkextractor_sync.sh - Extracts APKs from Android device and syncs to server
-# Version: v0.10.0
+# Version: v0.12.0
 # Usage: ./apkextractor_sync.sh <appID> [user@server] [OPTIONS]
-# Options: -b/--both, --no-extract, --remote-dir <path>, --ws, -h/--help
+# Options: --inspect, -b/--both, --no-extract, --remote-dir <path>, --ws, -h/--help
+#
+# Changelog v0.12.0:
+#   - Remote uploads go to <version>/splits or <version>/single; if that folder already
+#     holds files, the next free splits-N / single-N folder is used. No more abort.
+#
+# Changelog v0.11.0:
+#   - Added --inspect <appID> to report split APK status and package version metadata
+#     without pulling or extracting APKs
 #
 # Changelog v0.10.0:
 #   - Added --ws: upload the pulled split APKs to WalletScrutiny Blossom exactly
@@ -43,7 +51,8 @@
 # Directory structure:
 #   Local single APK: /var/shared/apk/{appID}/{versionName}/
 #   Local split APKs: /var/shared/apk/{appID}/{versionName}/splits/
-#   Remote (both types): /home/danny/apks/{appID}/{versionName}/
+#   Remote split APKs:  /home/danny/apks/{appID}/{versionName}/splits[-N]/
+#   Remote single APK:  /home/danny/apks/{appID}/{versionName}/single[-N]/
 #   Apps using versionCode: app.zeusln.zeus (hardcoded exceptions)
 #
 # Naming conventions:
@@ -60,6 +69,7 @@ saveBoth=false
 remoteBaseDir="/home/danny/apks"
 remoteDirProvided=false
 wsUpload=false
+inspectOnly=false
 
 # ---- WalletScrutiny Blossom/Nostr upload config (used by --ws) ----
 # Mirrors the WS Android app: each split is uploaded to Blossom individually (no tar/zip),
@@ -79,6 +89,7 @@ show_help() {
   echo ""
   echo "Usage:"
   echo "  ./apkextractor_sync.sh <appID> [user@server] [OPTIONS]"
+  echo "  ./apkextractor_sync.sh --inspect <appID>"
   echo ""
   echo "Arguments:"
   echo "  <appID>         Package name of the app (required)"
@@ -87,6 +98,7 @@ show_help() {
   echo "                  If omitted, saves locally to /var/shared/apk/"
   echo ""
   echo "Options:"
+  echo "  --inspect       Inspect installed package split status and version; do not pull APKs"
   echo "  -b, --both      Save both locally AND to server (requires server argument)"
   echo "  --no-extract    Do not extract APK contents (default: extracts to 'base/' folder)"
   echo "  --remote-dir    Remote base directory (default: ~/apks)."
@@ -99,13 +111,14 @@ show_help() {
   echo "Examples:"
   echo "  ./apkextractor_sync.sh app.zeusln.zeus"
   echo "  ./apkextractor_sync.sh app.zeusln.zeus --no-extract"
+  echo "  ./apkextractor_sync.sh --inspect com.example.app"
   echo "  ./apkextractor_sync.sh com.example.app user@server"
   echo "  ./apkextractor_sync.sh com.example.app user@server -b"
   echo "  ./apkextractor_sync.sh com.example.app user@server --both --no-extract"
   echo "  ./apkextractor_sync.sh com.example.app user@server --remote-dir /data/shared/apks"
   echo "  ./apkextractor_sync.sh com.example.app --ws"
   echo ""
-  echo "Version: v0.10.0"
+  echo "Version: v0.11.0"
   exit 0
 }
 
@@ -127,6 +140,43 @@ is_app_installed() {
   else
     return 1 # App is not installed
   fi
+}
+
+inspect_app() {
+  local package_name="$1"
+  local paths path_count version_code version_name package_details
+
+  command -v adb >/dev/null 2>&1 || { echo "Error: adb is not installed or not in PATH." >&2; return 1; }
+  if ! adb get-state >/dev/null 2>&1; then
+    echo "Error: No Android device is connected and authorized." >&2
+    return 1
+  fi
+  if ! is_app_installed "$package_name"; then
+    echo "Error: The app '$package_name' is not installed on the connected device." >&2
+    return 1
+  fi
+
+  paths="$(adb shell pm path "$package_name" | tr -d '\r')"
+  if [ -z "$paths" ]; then
+    echo "Error: Could not retrieve APK paths for $package_name." >&2
+    return 1
+  fi
+  path_count="$(printf '%s\n' "$paths" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
+
+  package_details="$(adb shell dumpsys package "$package_name" 2>/dev/null | tr -d '\r')"
+  version_code="$(printf '%s\n' "$package_details" | sed -nE 's/.*versionCode=([^ ]+).*/\1/p' | head -n 1)"
+  version_name="$(printf '%s\n' "$package_details" | sed -nE 's/.*versionName=([^ ]+).*/\1/p' | head -n 1)"
+
+  echo "Package: $package_name"
+  if [ "$path_count" -gt 1 ]; then
+    echo "APK layout: split APKs ($path_count APK files)"
+  else
+    echo "APK layout: single APK"
+  fi
+  echo "versionName: ${version_name:-unknown}"
+  echo "versionCode: ${version_code:-unknown}"
+  echo "APK paths:"
+  printf '%s\n' "$paths" | sed 's/^package://' | sed 's/^/  /'
 }
 
 get_version_code() {
@@ -247,6 +297,10 @@ while [[ $# -gt 0 ]]; do
       extractApk=false
       shift
       ;;
+    --inspect)
+      inspectOnly=true
+      shift
+      ;;
     -b|--both)
       saveBoth=true
       shift
@@ -282,6 +336,13 @@ if [ -z "$bundleId" ]; then
   echo -e "\033[1;31mError: No bundle ID provided.\033[0m"
   echo "Run './apkextractor_sync.sh --help' for usage information."
   exit 1
+fi
+
+# Inspection is read-only: query package metadata and installed APK paths, then exit
+# before any staging directory, adb pull, extraction, upload, or save is attempted.
+if [ "$inspectOnly" = true ]; then
+  inspect_app "$bundleId"
+  exit $?
 fi
 
 # Validate -b flag requires server argument
@@ -515,54 +576,24 @@ if [ ! -z "$sshCredentials" ]; then
   # Determine naming convention
   namingConvention=$(determine_naming_convention "$remoteBundleDir" "$bundleId" true)
 
-  # Determine target directory (no splits subdirectory for remote)
-  uploadDir="$remoteBundleDir/$version"
-
-  # Check for existing files and detect mismatches
-  existingFiles=$(ssh $sshCredentials "ls -1 $remoteBundleDir/$version/ 2>/dev/null" || echo "")
-
-  if [ ! -z "$existingFiles" ]; then
-    echo -e "\033[1;33m⚠️  Existing files detected in $remoteBundleDir/$version/\033[0m"
-
-    # Check for type mismatch (split vs single APK)
-    if [ "$isSplitApk" = true ]; then
-      # New upload is split APKs, check if single APK exists
-      if echo "$existingFiles" | grep -qE "^${bundleId}_v.*\.apk$|^${bundleId}-.*\.apk$"; then
-        echo -e "\033[1;31m❌ MISMATCH DETECTED:\033[0m"
-        echo "  Current upload: Split APKs"
-        echo "  Existing files: Single APK"
-        echo ""
-        echo "Existing files in $remoteBundleDir/$version/:"
-        echo "$existingFiles" | sed 's/^/    /'
-        echo ""
-        echo -e "\033[1;33mPlease manually clean the directory before proceeding:\033[0m"
-        echo "  ssh $sshCredentials \"rm -rf $remoteBundleDir/$version/*\""
-        exit 1
-      fi
-    else
-      # New upload is single APK, check if split APK files exist
-      if echo "$existingFiles" | grep -qE "^base\.apk$|^split_.*\.apk$|^split_config\..*\.apk$|-split-set\.tar\.gz$"; then
-        echo -e "\033[1;31m❌ MISMATCH DETECTED:\033[0m"
-        echo "  Current upload: Single APK"
-        echo "  Existing files: Split APKs (base.apk or split_*.apk found)"
-        echo ""
-        echo "Existing files in $remoteBundleDir/$version/:"
-        echo "$existingFiles" | sed 's/^/    /'
-        echo ""
-        echo -e "\033[1;33mPlease manually clean the directory before proceeding:\033[0m"
-        echo "  ssh $sshCredentials \"rm -rf $remoteBundleDir/$version/*\""
-        exit 1
-      fi
-    fi
-
-    echo ""
-    echo -e "\033[1;31m❌ Aborting to prevent accidental overwrite.\033[0m"
-    echo ""
-    echo -e "\033[1;33mTo proceed, manually clean the directory first:\033[0m"
-    echo "  ssh $sshCredentials \"rm -rf $remoteBundleDir/$version/*\""
-    echo ""
-    exit 1
+  # Target directory: <version>/splits for split APKs, <version>/single for a single APK.
+  # Never overwrite and never stop: if that folder already holds files, use the next free
+  # numbered one (splits-2, splits-3, ...).
+  if [ "$isSplitApk" = true ]; then
+    layoutName="splits"
+  else
+    layoutName="single"
   fi
+  uploadDir="$remoteBundleDir/$version/$layoutName"
+  suffixNum=1
+  while [ -n "$(ssh $sshCredentials "ls -A $uploadDir 2>/dev/null")" ]; do
+    suffixNum=$((suffixNum + 1))
+    uploadDir="$remoteBundleDir/$version/${layoutName}-${suffixNum}"
+  done
+  if [ "$suffixNum" -gt 1 ]; then
+    echo -e "\033[1;33m⚠️  $remoteBundleDir/$version/$layoutName already holds files; using a new folder instead.\033[0m"
+  fi
+  echo "Upload folder: $uploadDir"
 
   # Create the version-specific directory
   ssh $sshCredentials "mkdir -p $uploadDir"
