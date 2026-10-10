@@ -1,28 +1,29 @@
 #!/usr/bin/env bash
-# bluewallet_build.sh - BlueWallet (Google Play) reproducible build verification
-# Version:          v0.1.2
+# bluewallet_build.sh - BlueWallet reproducible build verification (Android fat APK)
+# Version:          v0.1.4
 # Organization:     WalletScrutiny.com
-# Last Modified:    2026-09-25
+# Last modified by: Bob (WalletScrutiny agent)
+# Last modified on: 2026-10-09
 # App ID:           io.bluewallet.bluewallet
 # Project:          https://github.com/BlueWallet/BlueWallet
 # Play Store:       https://play.google.com/store/apps/details?id=io.bluewallet.bluewallet
 #
-# Play ships the single universal APK that upstream's BuildReleaseApk workflow
-# produces (fastlane lane build_release_apk), re-signed by Play App Signing.
-# The same build is also shipped signed with BlueWallet's own key (no SourceStamp, no Play
-# meta-data); v0.1.2 verifies that artifact too.
+# Play ships the single fat APK (assembleRelease, four ABIs) that upstream's
+# BuildReleaseApk workflow produces (fastlane lane build_release_apk), re-signed by
+# Play App Signing. The same build is also shipped as a GitHub release asset signed
+# with BlueWallet's own key (no SourceStamp, no Play meta-data); both are verified.
 # Design notes, history and rationale: ws-notes script-notes/android/io.bluewallet.bluewallet/changelog.md
 #
 # Provided for technical analysis and reproducible build verification only, with
 # no warranty of any kind. Review before running.
 # Exit codes: 0 = identical, 1 = difference or build failure, 2 = bad parameters.
 
-SCRIPT_VERSION="v0.1.2"
+SCRIPT_VERSION="v0.1.4"
 
 SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
 SCRIPT_HASH="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
 echo "bluewallet_build.sh $SCRIPT_VERSION sha256:${SCRIPT_HASH:-unknown}"
-echo "Starting bluewallet_build.sh $SCRIPT_VERSION (Google Play universal APK)"
+echo "Starting bluewallet_build.sh $SCRIPT_VERSION (BlueWallet fat APK: Play or GitHub release)"
 
 # No -e: diff and cmp return 1 on legitimate differences.
 set -uo pipefail
@@ -35,6 +36,14 @@ REPO_URL="https://github.com/BlueWallet/BlueWallet"
 CI_PATH="/home/runner/work/BlueWallet/BlueWallet"
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
+# ABS reads the YAML next to the script; nothing is written to the caller's directory.
+RESULTS_FILE="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
+# Hand-back helper for docker / rootful podman (digest-pinned alpine 3.22; runs chown only).
+CHOWN_IMAGE="docker.io/library/alpine@sha256:3e9b4b680bfc9fb5269227cffbd6d42be39fbf7c0b908123913864aa4447e764"
+
+# Per-run state: empty until created, so the EXIT trap only touches what this run made.
+RESULTS_WRITTEN=0; CONTAINER_CMD=""; ROOTLESS=0; CTR_PID=""
+RUN_ID=""; RUN_LABEL=""; IMG=""; workspace=""; CMP_DIR=""; BUILD_DIR=""
 
 NC="\033[0m"; GREEN="\033[1;32m"; YELLOW="\033[1;33m"; RED="\033[1;31m"; BLUE="\033[1;34m"
 log_info()    { echo -e "${BLUE}[INFO]${NC} $*"; }
@@ -46,34 +55,111 @@ section() { printf -- '\n-- %s --\n' "$*"; }
 phase() { banner "$*"; echo "  $(date)"; }
 sha256of() { sha256sum "$1" | awk '{print $1}'; }
 
-# The YAML must land in the SCRIPT's directory (ABS reads it there); $PWD copy is convenience.
-execution_dir="$SCRIPT_DIR"
-invocation_dir="$(pwd -P)"
+# A verdict left by an earlier run must never be mistaken for this run's.
+rm -f "$RESULTS_FILE"
 
 # Only these three keys, ever: script_version, verdict, notes.
 generate_yaml() {
   local verdict="$1" notes="$2"
-  cat > "${execution_dir}/COMPARISON_RESULTS.yaml" <<EOF
+  cat > "$RESULTS_FILE" <<EOF
 script_version: $SCRIPT_VERSION
 verdict: ${verdict}
 notes: |
  ${notes}
 EOF
-  if [[ "$invocation_dir" != "$execution_dir" ]]; then
-    cp -f "${execution_dir}/COMPARISON_RESULTS.yaml" \
-       "${invocation_dir}/COMPARISON_RESULTS.yaml" 2>/dev/null || true
-  fi
+  RESULTS_WRITTEN=1
   log_info "COMPARISON_RESULTS.yaml written with verdict: ${verdict}"
 }
 
 fail() {
   local code="$1" note="$2"
   generate_yaml "ftbfs" "$note"
-  echo ""; echo "Exit code: ${code}"
   exit "$code"
 }
 
 die_invalid() { log_error "$1"; fail 2 "Invalid invocation: $1"; }
+
+# Long container steps run in the background and are waited for, so INT/TERM reach
+# the traps at once instead of after the container finishes; ctr_wait_tee also tees
+# the step's output to a log (a foreground pipeline would hold the signal).
+ctr_wait() {
+  local rc=0
+  "$@" &
+  CTR_PID=$!
+  wait "$CTR_PID" || rc=$?
+  CTR_PID=""
+  return "$rc"
+}
+ctr_wait_tee() {
+  local log="$1" rc=0; shift
+  { "$@" 2>&1 | tee "$log"; exit "${PIPESTATUS[0]}"; } &
+  CTR_PID=$!
+  wait "$CTR_PID" || rc=$?
+  CTR_PID=""
+  return "$rc"
+}
+
+# Removes only what this run created: containers and images carrying its run label.
+cleanup() {
+  [[ -n "$CONTAINER_CMD" && -n "$RUN_LABEL" ]] || return 0
+  local ids
+  ids="$($CONTAINER_CMD ps -aq --filter "label=${RUN_LABEL}" 2>/dev/null || true)"
+  if [[ -n "$ids" ]]; then
+    echo "$ids" | xargs -r $CONTAINER_CMD kill >/dev/null 2>&1 || true
+    echo "$ids" | xargs -r $CONTAINER_CMD rm -f >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$CTR_PID" ]] && kill -0 "$CTR_PID" 2>/dev/null; then
+    kill "$CTR_PID" 2>/dev/null || true
+    wait "$CTR_PID" 2>/dev/null || true
+  fi
+  ids="$($CONTAINER_CMD images -q --filter "label=${RUN_LABEL}" 2>/dev/null || true)"
+  [[ -n "$ids" ]] && { echo "$ids" | xargs -r $CONTAINER_CMD rmi -f >/dev/null 2>&1 || true; }
+  [[ -n "$IMG" ]] && { $CONTAINER_CMD rmi -f "$IMG" >/dev/null 2>&1 || true; }
+  return 0
+}
+
+# Hands the workspace back to the caller on every exit; never fails the script.
+# Rootless runtime: container root == caller, so chown 0:0 (a host uid would map
+# into the subuid range); rootful docker/podman: chown to the caller's uid:gid.
+hand_back_workspace() {
+  [[ -n "$workspace" && -d "$workspace" ]] || return 0
+  local own="${HOST_UID}:${HOST_GID}" stray
+  [[ "$ROOTLESS" -eq 1 ]] && own="0:0"
+  if [[ "$CONTAINER_CMD" == podman && "$ROOTLESS" -eq 1 ]]; then
+    podman unshare chown -R 0:0 "$workspace" >/dev/null 2>&1 || true
+  elif [[ -n "$CONTAINER_CMD" ]]; then
+    $CONTAINER_CMD run --rm --name "ws-bluewallet-chown-${RUN_ID}" --user root \
+      --volume "${workspace}:/w" "$CHOWN_IMAGE" chown -R "$own" /w >/dev/null 2>&1 || true
+  fi
+  stray="$(find "$workspace" ! -uid "$HOST_UID" -print -quit 2>/dev/null || true)"
+  if [[ -n "$stray" ]]; then
+    log_warn "Not caller-owned after hand-back: ${stray}"
+  else
+    echo "Workspace ownership: all files owned by uid ${HOST_UID} (${workspace})"
+  fi
+  return 0
+}
+
+# Runs on every exit (success, failure, interrupt): stops this run's containers,
+# removes its image, hands the workspace back and guarantees a verdict.
+on_exit() {
+  local rc=$?
+  trap - INT TERM
+  set +e
+  cleanup
+  hand_back_workspace
+  if [[ "$RESULTS_WRITTEN" -eq 0 ]]; then
+    generate_yaml "ftbfs" "Run ended before a verdict was written (exit code ${rc}: build failure, invalid input or interruption). See the terminal log for the failing step."
+  fi
+  echo "Results YAML: ${RESULTS_FILE}"
+  [[ -n "$workspace" ]] && echo "Workspace (logs, diffs): ${workspace}"
+  case "$rc" in 0|1|2) ;; *) rc=1 ;; esac
+  echo "Exit code: ${rc}"
+  exit "$rc"
+}
+trap on_exit EXIT
+trap 'echo; echo "Interrupted (SIGINT)."; exit 130' INT
+trap 'echo; echo "Terminated (SIGTERM)."; exit 143' TERM
 
 [[ "$EUID" -eq 0 ]] && die_invalid "Do not run this script as root."
 
@@ -89,7 +175,7 @@ usage() {
   cat <<USAGE
 Usage: ${SCRIPT_NAME} --binary <official.apk> [--git-revision <sha>] [--version <v>] [--arch <a>] [--type <t>]
 
- --binary        REQUIRED. The official Play APK (single universal APK), or a
+ --binary        REQUIRED. The official APK (Play or GitHub release; one fat APK), or a
                  directory holding exactly one .apk.
  --git-revision  Commit to build (7-40 hex). Default: the newest first-parent
                  master commit committed before the artifact's versionCode read
@@ -109,20 +195,20 @@ while [[ $# -gt 0 ]]; do
     --arch)         require_arg --arch    "${2:-}"; arch_arg="$2";    shift 2 ;;
     --type)         require_arg --type    "${2:-}"; type_arg="$2";    shift 2 ;;
     --git-revision) require_arg --git-revision "${2:-}"; rev_arg="$2"; shift 2 ;;
-    -h|--help)      usage; echo "Exit code: 0"; exit 0 ;;
+    -h|--help)      trap - EXIT; usage; echo "Exit code: 0"; exit 0 ;;
     *)              log_warn "Unknown argument: $1 (ignored)"; shift; continue ;;
   esac
 done
 
 if [[ -z "$binary_arg" ]]; then
-  log_error "--binary is required: pass the official Play APK."
-  fail 2 "--binary not provided. Pass the official Google Play APK of ${APP_ID}."
+  log_error "--binary is required: pass the official APK."
+  fail 2 "--binary not provided. Pass the official APK of ${APP_ID}."
 fi
 [[ -e "$binary_arg" ]] || die_invalid "--binary path does not exist: ${binary_arg}"
 if [[ -d "$binary_arg" ]]; then
   n_apk="$(find "$binary_arg" -maxdepth 1 -name '*.apk' | wc -l)"
   [[ "$n_apk" -eq 1 ]] || \
-    die_invalid "--binary directory must hold exactly one .apk (found ${n_apk}); Play ships BlueWallet as a single universal APK"
+    die_invalid "--binary directory must hold exactly one .apk (found ${n_apk}); BlueWallet ships a single fat APK"
   binary_arg="$(find "$binary_arg" -maxdepth 1 -name '*.apk')"
 fi
 [[ -f "$binary_arg" ]] || die_invalid "--binary is not a regular file: ${binary_arg}"
@@ -131,24 +217,31 @@ fi
 
 apk_file="$(realpath "$binary_arg")"
 
-[[ -n "$arch_arg" ]]    && log_info "--arch ${arch_arg} accepted; the universal APK carries every ABI"
+[[ -n "$arch_arg" ]]    && log_info "--arch ${arch_arg} accepted; the fat APK carries every ABI"
 [[ -n "$type_arg" ]]    && log_info "--type ${type_arg} accepted but not used"
 [[ -n "$version_arg" ]] && log_info "--version ${version_arg} accepted; the authoritative version comes from the APK"
 [[ -n "$rev_arg" ]]     && log_info "--git-revision ${rev_arg}: overrides the versionCode-timestamp pin"
 
-if [[ -z "${CONTAINER_CMD:-}" ]]; then
-  if command -v docker &>/dev/null; then
-    CONTAINER_CMD=docker
-  elif command -v podman &>/dev/null; then
-    CONTAINER_CMD=podman
-  else
-    die_invalid "Neither docker nor podman found in PATH"
-  fi
+# A runtime that actually works (docker needs its daemon), docker first, then podman.
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  CONTAINER_CMD=docker
+  docker info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless && ROOTLESS=1
+elif command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
+  CONTAINER_CMD=podman
+  [[ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" == true ]] && ROOTLESS=1
+else
+  log_error "No working container runtime: docker info and podman info both failed."
+  fail 1 "No working container runtime: docker info and podman info both failed. Install or start docker or podman."
 fi
 
-# Container user = host user, so no root-owned leftovers. HOME=/home/runner as on CI.
+# Container user, so nothing is left that the caller does not own. Rootless podman:
+# keep-id maps the caller to the same uid inside. Rootless docker: container uid 0 IS
+# the caller (a host uid would map into the subuid range), so run as 0:0. Rootful
+# docker: the caller's uid:gid. HOME=/home/runner as on CI.
 if [[ "$CONTAINER_CMD" == "podman" ]]; then
   CONTAINER_RUN_USER_ARGS=(--userns=keep-id -e HOME=/home/runner)
+elif [[ "$ROOTLESS" -eq 1 ]]; then
+  CONTAINER_RUN_USER_ARGS=(--user 0:0 -e HOME=/home/runner)
 else
   CONTAINER_RUN_USER_ARGS=(--user "${HOST_UID}:${HOST_GID}" -e HOME=/home/runner)
 fi
@@ -157,53 +250,44 @@ MEM_LIMIT="${MEM_LIMIT:-24g}"
 MEM_ARGS=()
 [[ -n "$MEM_LIMIT" ]] && MEM_ARGS=(--memory="$MEM_LIMIT")
 
+# crun <step> <run args...>: per-run container name and label, so the EXIT trap can
+# stop exactly this run's containers.
 crun() {
-  $CONTAINER_CMD run --rm "${CONTAINER_RUN_USER_ARGS[@]}" "${MEM_ARGS[@]}" "$@"
+  local step="$1"; shift
+  $CONTAINER_CMD run --rm --name "ws-bluewallet-${step}-${RUN_ID}" --label "$RUN_LABEL" \
+    "${CONTAINER_RUN_USER_ARGS[@]}" "${MEM_ARGS[@]}" "$@"
 }
 
 section "PRE-FLIGHT: HOST TOOL CHECK"
-printf "  %-10s OK  (%s)\n" "$CONTAINER_CMD" "$(command -v "$CONTAINER_CMD")"
+printf "  %-10s OK  (%s, rootless=%s)\n" "$CONTAINER_CMD" "$(command -v "$CONTAINER_CMD")" "$ROOTLESS"
 echo "  No host JDK, node, Gradle, Android SDK or apktool is required or used."
 
-RUN_ID="bluewallet-$(date +%s)-$$"
+# Per-run workspace in the caller's directory, created exclusively; never reused,
+# renamed or deleted. The version part is the --version hint (ABS always passes it);
+# the APK's own versionName is read later, inside the build image.
+safe_version="$(printf '%s' "${version_arg:-unknown}" | tr -c '[:alnum:]._-' '-')"
+WORK_BASE="$(pwd -P)"
+for _try in 1 2 3; do
+  RUN_ID="$(date +%s)-$$"
+  candidate="${WORK_BASE}/bluewallet_verification_${safe_version}_${RUN_ID}"
+  if mkdir "$candidate" 2>/dev/null; then workspace="$candidate"; break; fi
+  log_warn "Workspace ${candidate} already exists; retrying with a new run id"; sleep 1
+done
+[[ -n "$workspace" ]] || fail 1 "Could not create a fresh workspace under ${WORK_BASE} (exists or not writable)."
+RUN_LABEL="walletscrutiny.run=${RUN_ID}"
 IMG="ws-bluewallet-${RUN_ID}"
-# Per-run workspace in the caller's directory (shared build host: never a fixed or shared path).
-workspace="${invocation_dir}/bluewallet_verification_${RUN_ID}"
 META_DIR="${workspace}/metadata"
 BUILD_DIR="${workspace}/source-build"
 CMP_DIR="${workspace}/comparison"
-img_ctx=""
+mkdir "$META_DIR" "$BUILD_DIR" "$CMP_DIR"
 
-mkdir -p "$META_DIR" "$BUILD_DIR" "$CMP_DIR"
-
-# Runs as root in the container on purpose: it must be able to chown. Under rootless
-# podman, container root IS the caller, so 0:0 hands the files back; docker needs the uid.
-ensure_user_ownership() {
-  local path="$1" owner="${HOST_UID}:${HOST_GID}"
-  [[ "$CONTAINER_CMD" == "podman" ]] && owner="0:0"
-  [[ -e "$path" ]] || return 0
-  $CONTAINER_CMD image inspect "$IMG" >/dev/null 2>&1 || return 0
-  $CONTAINER_CMD run --rm -v "${path}:/target" "$IMG" \
-    sh -c "chown -R ${owner} /target" >/dev/null 2>&1 || \
-    log_warn "Could not normalise ownership for ${path}"
-}
-
-cleanup() {
-  log_info "Cleaning up build image and temporary context..."
-  ensure_user_ownership "$workspace"
-  $CONTAINER_CMD rmi -f "$IMG" >/dev/null 2>&1 || true
-  [[ -n "$img_ctx" ]] && rm -rf "$img_ctx" 2>/dev/null
-  log_success "Cleanup complete."
-}
-trap cleanup EXIT
-
-banner "BLUEWALLET - GOOGLE PLAY VERIFICATION"
+banner "BLUEWALLET - REPRODUCIBLE BUILD VERIFICATION"
 cat <<EOF
  Script:    ${SCRIPT_NAME} $SCRIPT_VERSION
  App ID:    ${APP_ID}
  Repo:      ${REPO_URL}
  APK:       ${apk_file}
- Runtime:   ${CONTAINER_CMD} ($($CONTAINER_CMD --version 2>&1 | head -1))
+ Runtime:   ${CONTAINER_CMD} ($($CONTAINER_CMD --version 2>&1 | head -1), rootless=${ROOTLESS})
  Workspace: ${workspace}
  Date:      $(date)
 EOF
@@ -262,7 +346,7 @@ WORKDIR /home/runner/work
 DOCKERFILE_END
 
 section "Building image ${IMG}"
-if ! $CONTAINER_CMD build -t "$IMG" -f "${img_ctx}/Dockerfile" "$img_ctx"; then
+if ! ctr_wait $CONTAINER_CMD build --label "$RUN_LABEL" -t "$IMG" -f "${img_ctx}/Dockerfile" "$img_ctx"; then
   log_error "Container image build failed - see the build output above."
   fail 1 "Container image build failed; no comparison was performed."
 fi
@@ -330,7 +414,7 @@ META
 META_END
 chmod +x "${img_ctx}/meta.sh"
 
-if ! crun \
+if ! ctr_wait crun meta \
   --volume "${apk_file}:/input/official.apk:ro" \
   --volume "${META_DIR}:/output" \
   --volume "${img_ctx}/meta.sh:/meta.sh:ro" \
@@ -363,8 +447,8 @@ log_info    "APK SHA-256:      ${app_hash}"
 [[ -n "$version_arg" && "$version_arg" != "$wallet_version" ]] && \
   log_warn "--version was '${version_arg}' but the APK reports '$wallet_version'; using the binary's value"
 if [[ -n "$split_name" ]]; then
-  log_error "The APK declares split name '${split_name}'; BlueWallet ships a single universal APK, not splits."
-  fail 2 "The supplied APK is a config split ('${split_name}'), not the universal Play APK."
+  log_error "The APK declares split name '${split_name}'; BlueWallet ships a single fat APK, not splits."
+  fail 2 "The supplied APK is a config split ('${split_name}'), not the fat APK."
 fi
 
 section "Resolving source revision"
@@ -521,14 +605,14 @@ sed -i \
 chmod +x "${img_ctx}/build.sh"
 
 section "Source build (40-90 min cold) - $(date)"
-crun \
+ctr_wait_tee "${BUILD_DIR}/container-build.log" crun build \
   -e "WS_GIT_REVISION=${build_rev}" \
   --add-host upload.bugsnag.com:127.0.0.1 --add-host build.bugsnag.com:127.0.0.1 \
   --volume "${BUILD_DIR}:/output" \
   --volume "${img_ctx}/build.sh:/build.sh:ro" \
   --volume "${img_ctx}/no-upload.gradle:/no-upload.gradle:ro" \
-  "$IMG" bash /build.sh 2>&1 | tee "${BUILD_DIR}/container-build.log"
-BUILD_RC=${PIPESTATUS[0]}
+  "$IMG" bash /build.sh
+BUILD_RC=$?
 
 if [[ $BUILD_RC -ne 0 ]]; then
   # Container exit codes: 1 clone, 2 checkout, 3 npm/gradle, 4 revision not found.
@@ -659,14 +743,23 @@ n=$(printf '%s\n' "$raw" | grep -vc '^$')
 echo "  raw diffs: ${n}   (full list: diff-unzipped.txt)"
 [[ "$n" -gt 0 ]] && printf '%s\n' "$raw" | head -5 | sed 's/^/    /'
 
-read -r c_sign c_stamp c_mani c_arsc < <(printf '%s\n' "$raw" | awk '
-  /\.(SF|RSA|DSA|EC)( |$)|MANIFEST\.MF( |$)/{a++;next}
+# Signing: excluded only when the entry is OFFICIAL-ONLY, sits at the ZIP root META-INF/
+# and is named *.SF, *.RSA, *.DSA, *.EC or MANIFEST.MF. A signing-named entry that is
+# built-only, nested deeper or present on both sides is a real difference and is listed.
+SIGN_OK='^Only in /tmp/o/META-INF: ([^ /]+\.(SF|RSA|DSA|EC)|MANIFEST\.MF)$'
+read -r c_sign c_sbad c_stamp c_mani c_arsc < <(printf '%s\n' "$raw" | awk '
+  /^Only in \/tmp\/o\/META-INF: ([^ \/]+\.(SF|RSA|DSA|EC)|MANIFEST\.MF)$/{a++;next}
+  /\.(SF|RSA|DSA|EC)( |$)|MANIFEST\.MF( |$)/{e++;next}
   /stamp-cert-sha256/{b++} /AndroidManifest\.xml/{c++} /resources\.arsc/{d++}
-  END{print a+0, b+0, c+0, d+0}')
+  END{print a+0, e+0, b+0, c+0, d+0}')
 a_sign=0; a_stamp=0; a_mani=0; a_arsc=0
 echo "  accepted-class evidence"
 if [[ "$c_sign" -gt 0 ]]; then a_sign=$c_sign
-  echo "      signing: ${c_sign} META-INF entry(ies) - $(printf '%s\n' "$raw" | grep -oE '[A-Za-z0-9_.-]+\.(SF|RSA|DSA|EC)|MANIFEST\.MF' | sort -u | paste -sd' ' -); Play re-signs, local build unsigned"; fi
+  echo "      signing: ${c_sign} official-only root META-INF entry(ies) excluded - $(printf '%s\n' "$raw" | grep -E "$SIGN_OK" | sed 's/^[^:]*: //' | sort | paste -sd' ' -); official APK signed, local build unsigned"; fi
+if [[ "$c_sbad" -gt 0 ]]; then
+  echo "      signing: ${c_sbad} signing-named entry(ies) NOT excluded (built-only, nested or on both sides) -> material:"
+  printf '%s\n' "$raw" | grep -E '\.(SF|RSA|DSA|EC)( |$)|MANIFEST\.MF( |$)' | grep -vE "$SIGN_OK" | head -3 | sed 's/^/        /'
+fi
 if [[ "$c_stamp" -gt 0 ]]; then
   if stamp_ok; then a_stamp=$c_stamp; else echo "      stamp: NOT EARNED -> material"; fi
 fi
@@ -687,13 +780,13 @@ echo "=== comparison complete: raw ${n}, accepted ${acc}, unaccounted ${un} ==="
 CMP_END
 chmod +x "${img_ctx}/compare.sh"
 
-crun \
+ctr_wait_tee "${CMP_DIR}/comparison.log" crun compare \
   --volume "${apk_file}:/official.apk:ro" \
   --volume "${BUILD_DIR}/built.apk:/built.apk:ro" \
   --volume "${CMP_DIR}:/out" \
   --volume "${img_ctx}/compare.sh:/compare.sh:ro" \
-  "$IMG" bash /compare.sh 2>&1 | tee "${CMP_DIR}/comparison.log"
-CMP_RC=${PIPESTATUS[0]}
+  "$IMG" bash /compare.sh
+CMP_RC=$?
 
 if [[ $CMP_RC -ne 0 ]] || ! grep -q '^TOTALS' "${CMP_DIR}/summary.txt" 2>/dev/null; then
   log_error "Comparison stage failed (exit ${CMP_RC}) or wrote no TOTALS line"
@@ -746,6 +839,4 @@ scriptHash:      ${SCRIPT_HASH:-unknown}
 
 sourceRef:       ${built_ref:-unknown} (branch master, ${rev_source})
 EOF
-echo ""
-echo "Exit code: ${rc}"
 exit "$rc"
