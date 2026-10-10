@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # bluewallet_build.sh - BlueWallet reproducible build verification (Android fat APK)
-# Version:          v0.1.4
+# Version:          v0.1.5
 # Organization:     WalletScrutiny.com
-# Last modified by: Bob (WalletScrutiny agent)
-# Last modified on: 2026-10-09
+# Last modified by: Claude (WalletScrutiny agent)
+# Last modified on: 2026-10-10
 # App ID:           io.bluewallet.bluewallet
 # Project:          https://github.com/BlueWallet/BlueWallet
 # Play Store:       https://play.google.com/store/apps/details?id=io.bluewallet.bluewallet
@@ -18,7 +18,7 @@
 # no warranty of any kind. Review before running.
 # Exit codes: 0 = identical, 1 = difference or build failure, 2 = bad parameters.
 
-SCRIPT_VERSION="v0.1.4"
+SCRIPT_VERSION="v0.1.5"
 
 SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
 SCRIPT_HASH="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
@@ -338,8 +338,9 @@ RUN yes | sdkmanager --licenses >/dev/null && \
   sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools" \
     "ndk;28.2.13676358" "ndk;27.0.12077973" "cmake;3.22.1" >/dev/null && chmod -R a+rX ${ANDROID_HOME}
 
-ADD https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar /opt/apktool.jar
-RUN chmod 0644 /opt/apktool.jar
+RUN wget -q -O /opt/apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar && \
+  echo "dbf930b076c6b9be08d57c449cacefc3bdd6b71ebd59b3066fc0e1f5b14f9423  /opt/apktool.jar" | sha256sum -c - && \
+  chmod 0644 /opt/apktool.jar
 
 RUN mkdir -p /tmp/afw /home/runner/work && chmod 0777 /tmp /tmp/afw /home/runner /home/runner/work
 WORKDIR /home/runner/work
@@ -556,6 +557,12 @@ git rev-parse HEAD > /output/commit.txt
 if [[ -n "$BUILD_TS" ]]; then
   late="$(git for-each-ref --format='%(creatordate:unix) %(refname:short)' refs/tags | awk -v t="$BUILD_TS" '$1>t{print $2}')"
   [[ -n "$late" ]] && { echo "=== Tags created after the build, removed locally: $(echo $late)"; git tag -d $late >/dev/null; }
+  # A lightweight tag has no date of its own (creatordate = its commit's date), so the release's own
+  # tag, put on the built commit after CI ran (v8.0.2 on 2026-10-06 for a 2026-10-04 build), passes the
+  # date check above and empties release-notes.json. Drop lightweight tags on HEAD named after this version.
+  own="$(git for-each-ref --points-at HEAD --format='%(objecttype) %(refname:short)' refs/tags \
+    | awk -v v="$WANT_VNAME" '$1=="commit" && ($2==v || $2=="v"v){print $2}')"
+  [[ -n "$own" ]] && { echo "=== Release tag on the built commit (lightweight, made after the build), removed locally: $(echo $own)"; git tag -d $own >/dev/null; }
 fi
 echo "  newest tag by sort: $(git tag | sort | tail -1)"
 
