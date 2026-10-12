@@ -1,17 +1,13 @@
 #!/bin/bash
 # ==============================================================================
-# edge_build.sh - Edge Wallet Reproducible Build Verification
+# edge-v0.3.0_build.sh - Edge Wallet Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.4
-# Organization:  WalletScrutiny.com
-# Last Modified: 2026-09-24
-# Project:       https://github.com/EdgeApp/edge-react-gui
+# Version:          v0.3.0
+# Organization:     WalletScrutiny.com
+# Last modified on: 2026-10-05
+# Project:          https://github.com/EdgeApp/edge-react-gui
 # ==============================================================================
 # LICENSE: MIT License
-#
-# IMPORTANT: Changelog maintained separately at:
-# ~/work/ws-notes/script-notes/android/co.edgesecure.app/changelog.md
-# ==============================================================================
 #
 # TECHNICAL DISCLAIMER:
 # This script is provided for technical analysis and reproducible build
@@ -28,34 +24,39 @@
 #   split_config.*.apk). A single APK carrying ONE ABI under lib/ is Edge's per-ABI APK
 #   (gradlew assembleRelease -PabiSplits; versionCode = build number + 1 armeabi-v7a / + 2 arm64-v8a):
 #   rebuilt that way. A single APK carrying both ABIs is compared as a bundletool universal APK.
-#   Without --binary, downloads Edge.<ver>.apk from GitHub releases.
-# - Source revision: tag v<version>, or --commit <sha>. Edge does not tag every release
-#   (no tags after v4.50.3); a missing tag is an error, never a silent fallback.
+#   Without --binary, downloads Edge.<ver>.apk from GitHub releases (GITHUB_TOKEN honoured if set).
+# - Source revision: tag v<version> (Edge tags releases again since v4.51.0), or --commit <sha>
+#   as an explicit override. A missing tag is an error, never a silent fallback. The results block
+#   names the tag or commit that was built and whether the tag and commit carry a PGP signature.
 # - Builds in a container: JDK 17, Node 22, npm from package.json "packageManager",
 #   SDK platform 36, build-tools 35.0.0, NDK 27.1.12297006.
-#   npm ci + npm run prepare + versionCode/versionName from the official APK + gradlew bundleRelease,
-#   then bundletool: --mode=universal (single APK) or --device-spec (split set), as upstream's
+#   npm ci + npm run prepare + versionCode/versionName from the official APK, then
+#   gradlew assembleRelease -PabiSplits (per-ABI APK) or gradlew bundleRelease + bundletool
+#   (--mode=universal for a single two-ABI APK, --device-spec for a split set), as upstream's
 #   scripts/deploy.ts does.
 # - Compares unzipped APKs pair by pair. Only root META-INF signature files (by NAME) are excluded;
 #   every other difference is counted. Upstream's private env.json, google-services.json and
 #   Sentry values are not public, so their effects show up as differences.
-# - Generates COMPARISON_RESULTS.yaml in 3-field minimal format.
+# - Per-run workspace $(pwd -P)/edge_verification_<ver>_<mode>_<epoch>-<pid>, created with an
+#   exclusive mkdir, never reused, renamed or deleted; ownership is handed back to the caller in
+#   the EXIT trap. Nothing is written to the host's /tmp.
+# - COMPARISON_RESULTS.yaml (script_version, verdict, notes) next to the script on every exit path;
+#   the final verdict is never rewritten by a trap or cleanup.
 
 set -euo pipefail
 
 # ------------------------------------------------------------------------------
 # Constants
 # ------------------------------------------------------------------------------
-SCRIPT_VERSION="v0.2.4"
+SCRIPT_VERSION="v0.3.0"
 APP_ID="co.edgesecure.app"
 REPO_URL="https://github.com/EdgeApp/edge-react-gui.git"
 GITHUB_RELEASE_BASE="https://github.com/EdgeApp/edge-react-gui/releases/download"
 WS_CONTAINER="docker.io/walletscrutiny/android:5"
 BUILD_TOOLS="35.0.0"
 BUNDLETOOL_VERSION="1.18.3"
-# Gradle JVM heap. Upstream gradle.properties sets -Xmx4g, which ran out (OutOfMemoryError) on the
-# 4.51.0 build. Heap size changes memory headroom only, not compiler input or output. The command
-# line outranks gradle.properties.
+# Upstream gradle.properties sets -Xmx4g, which ran out of memory on the 4.51.0 build. Heap size
+# changes memory headroom only, not compiler input or output. The command line outranks the file.
 GRADLE_JVMARGS="-Xmx8g -XX:MaxMetaspaceSize=1g"
 BUNDLETOOL_SHA256="a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29"
 
@@ -63,16 +64,19 @@ EXIT_SUCCESS=0
 EXIT_FAILED=1
 EXIT_INVALID=2
 
-execution_dir="$(pwd)"
+RUN_ID="$(date +%s)-$$"
+execution_dir="$(pwd -P)"
 script_name="$(basename "$0")"
 
-# --- Self-identification (script-notes/script-version-and-hash.md, 2026-08-17) ---
+# --- Self-identification: the first action, before argument parsing and any network or container work.
 script_path="$(readlink -f "$0")"
-if [[ -f "${script_path}" ]]; then
-  script_sha256="$(sha256sum "${script_path}" | awk '{print $1}')"
-else
-  script_sha256="unknown"
-fi
+script_dir="$(dirname "${script_path}")"
+sha256_of() {
+  local h=""
+  [[ -f "$1" ]] && h="$(sha256sum "$1" 2>/dev/null | awk '{print $1}')"
+  echo "${h:-N/A}"
+}
+script_sha256="$(sha256_of "${script_path}")"
 printf '%s %s sha256:%s\n' "${script_name}" "${SCRIPT_VERSION}" "${script_sha256}"
 
 should_cleanup=false
@@ -86,6 +90,7 @@ mode=""              # universal | splits | abisplit
 split_abi=""         # abisplit: the one ABI in the official APK
 build_version_code="" # versionCode written into build.gradle (abisplit: official minus the ABI offset)
 official_dir=""      # directory holding the official APK(s)
+download_dir=""      # per-run directory of the downloaded GitHub asset (no --binary)
 main_apk=""          # official single APK, or base.apk of the split set
 version_name=""
 version_code=""
@@ -94,10 +99,14 @@ app_hash=""
 signer=""
 commit_hash=""
 git_ref=""
+tag_name=""
+tag_commit=""
+source_text=""
 additional_info=""
 
 work_dir=""
 build_image_tag=""
+yaml_final=false
 
 # ------------------------------------------------------------------------------
 # Logging helpers
@@ -115,43 +124,65 @@ append_info() {
 }
 
 # ------------------------------------------------------------------------------
-# YAML generators (3-field minimal format per Luis 2026-03-12)
+# YAML (3-field minimal format). Written next to the script; once the final verdict is written,
+# nothing (ERR trap, EXIT trap, cleanup) can replace it.
 # ------------------------------------------------------------------------------
-generate_error_yaml() {
-  cat > "${execution_dir}/COMPARISON_RESULTS.yaml" <<EOF
-script_version: ${SCRIPT_VERSION}
-verdict: ${1}
-EOF
-}
-
-generate_comparison_yaml() {
-  cat > "${execution_dir}/COMPARISON_RESULTS.yaml" <<EOF
-script_version: ${SCRIPT_VERSION}
-verdict: ${1}
-notes: |
-  ${2}
-EOF
+write_yaml() {
+  [[ "${yaml_final}" == true ]] && return 0
+  {
+    echo "script_version: ${SCRIPT_VERSION}"
+    echo "verdict: ${1}"
+    echo "notes: |"
+    printf '%s\n' "${2}" | sed 's/^/  /'
+  } > "${script_dir}/COMPARISON_RESULTS.yaml"
 }
 
 # ------------------------------------------------------------------------------
 # Exit helpers
 # ------------------------------------------------------------------------------
 remove_build_image() {
-  if [[ -n "${build_image_tag}" ]]; then
+  if [[ -n "${build_image_tag}" && -n "${CONTAINER_CMD:-}" ]]; then
     ${CONTAINER_CMD} rmi "${build_image_tag}" >/dev/null 2>&1 || true
   fi
 }
 
+# Hand every file the containers wrote back to the caller: rootless podman maps container root to
+# the caller already, but anything created under a subordinate UID would be undeletable without
+# `podman unshare`; under docker the build container runs as root.
+restore_ownership() {
+  local d foreign
+  for d in "${work_dir}" "${download_dir}"; do
+    [[ -n "${d}" && -d "${d}" ]] || continue
+    if [[ "${CONTAINER_CMD:-}" == "podman" && "${ROOTLESS}" == true ]]; then
+      podman unshare chown -R 0:0 "${d}" 2>/dev/null || true
+    elif [[ -n "${CONTAINER_CMD:-}" ]]; then
+      ${CONTAINER_CMD} run --rm --volume "${d}:/w${VOLUME_RW_SUFFIX}" "${WS_CONTAINER}" \
+        chown -R "$(id -u):$(id -g)" /w >/dev/null 2>&1 || true
+    fi
+    chmod -R u+rwX "${d}" 2>/dev/null || true
+    foreign="$(find "${d}" ! -uid "$(id -u)" 2>/dev/null | sed -n '1,3p')"
+    [[ -z "${foreign}" ]] || log_warn "Files not owned by $(id -un) remain under ${d}: $(echo "${foreign}" | tr '\n' ' ')"
+  done
+}
+
+on_exit() {
+  set +e
+  trap - ERR
+  restore_ownership
+  remove_build_image
+}
+trap on_exit EXIT
+
 die_invalid() {
   log_error "$*"
+  write_yaml "ftbfs" "Invalid parameters: $*"
   echo "Exit code: ${EXIT_INVALID}"
   exit "${EXIT_INVALID}"
 }
 
 die_failed() {
   log_error "$*"
-  generate_error_yaml "ftbfs"
-  remove_build_image
+  write_yaml "ftbfs" "$*"
   echo "Exit code: ${EXIT_FAILED}"
   exit "${EXIT_FAILED}"
 }
@@ -161,8 +192,7 @@ on_error() {
   local line_no=$1
   set +e
   log_error "Script failed at line ${line_no} (exit code ${exit_code})"
-  generate_error_yaml "ftbfs"
-  remove_build_image
+  write_yaml "ftbfs" "Script failed at line ${line_no} (exit code ${exit_code})."
   echo "Exit code: ${EXIT_FAILED}"
   exit "${EXIT_FAILED}"
 }
@@ -176,14 +206,20 @@ VOLUME_RO_SUFFIX=""
 VOLUME_RW_SUFFIX=""
 CONTAINER_USER_ARGS=""
 CHOWN_TO=""
+ROOTLESS=false
 
 if command -v podman >/dev/null 2>&1; then
   CONTAINER_CMD="podman"
   VOLUME_RO_SUFFIX=":ro,Z"
   VOLUME_RW_SUFFIX=":Z"
-  # rootless podman: UID 0 in the container maps to the invoking user, so files written as root
-  # are already the caller's. Never chown inside: that would hand them to a subordinate UID.
-  CHOWN_TO="0:0"
+  ROOTLESS="$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || echo true)"
+  if [[ "${ROOTLESS}" == true ]]; then
+    # UID 0 in the container maps to the invoking user. Never chown to the host UID inside: that
+    # would hand the files to a subordinate UID.
+    CHOWN_TO="0:0"
+  else
+    CHOWN_TO="$(id -u):$(id -g)"
+  fi
 elif command -v docker >/dev/null 2>&1; then
   CONTAINER_CMD="docker"
   VOLUME_RO_SUFFIX=":ro"
@@ -208,35 +244,38 @@ SYNOPSIS
 
 DESCRIPTION
        Builds Edge Wallet from source in a container the way upstream's
-       scripts/deploy.ts does (gradlew bundleRelease, then bundletool) and compares
-       the result with an official artifact:
-         - a single APK (e.g. GitHub release Edge.<ver>.apk): bundletool --mode=universal
-         - a directory of Play splits (base.apk + split_config.*.apk): bundletool
-           --device-spec built from the split names, compared split by split.
+       scripts/deploy.ts does and compares the result with an official artifact:
+         - a single APK with one ABI under lib/ (Play-installed per-ABI APK):
+           gradlew assembleRelease -PabiSplits, compared with app-<abi>-release.apk
+         - a single APK with both ABIs (e.g. GitHub release Edge.<ver>.apk):
+           gradlew bundleRelease, then bundletool --mode=universal
+         - a directory of Play splits (base.apk + split_config.*.apk): gradlew
+           bundleRelease, then bundletool --device-spec built from the split names,
+           compared split by split.
        Version, versionCode and minSdk are read from the official APK content.
+       The source is tag v<version>; --commit overrides it.
 
 OPTIONS
        --binary <path>         Official APK file, or directory of Play splits.
        --apk <path>            Alias for --binary.
-       --version <version>     Version to verify (e.g. 4.51.0). Optional with --binary.
+       --version <version>     Version to verify (e.g. 4.51.3). Optional with --binary.
                                Without --binary, Edge.<version>.apk is downloaded
                                from GitHub releases.
-       --commit <sha>          Build this commit (full 40-hex hash). Required when the release
-                               has no v<version> tag (Edge stopped tagging after v4.50.3).
+       --commit <sha>          Build this commit (full 40-hex hash) instead of tag v<version>.
        --arch <arch>           Accepted for build server compatibility (ignored).
        --type <type>           Accepted for build server compatibility (ignored).
-       --cleanup               Remove temporary files after completion.
+       --cleanup               Remove this run's workspace after completion.
        --script-version        Print script version and exit.
        --help                  Show this help and exit.
 
 EXIT CODES
        0    Reproducible (only root META-INF signature files differ)
-       1    Differences found or build failure
+       1    Not reproducible, or build failure
        2    Invalid parameters
 
 EXAMPLES
-       ${script_name} --binary ~/apks/co.edgesecure.app/4.51.0/ --commit 6166f1166cca8e042e9fa36e1181c57b00a59359
-       ${script_name} --version 4.50.3
+       ${script_name} --binary ~/apks/co.edgesecure.app/4.51.3/co.edgesecure.app_v4.51.3.apk
+       ${script_name} --version 4.51.3
 EOF
 }
 
@@ -322,19 +361,21 @@ container_badging() {
 if [[ -z "${official_arg}" ]]; then
   apk_filename="Edge.${requested_version}.apk"
   apk_url="${GITHUB_RELEASE_BASE}/v${requested_version}/${apk_filename}"
-  official_dir="${execution_dir}/download_${APP_ID}_${requested_version}"
-  mkdir -p "${official_dir}"
+  download_dir="${execution_dir}/edge_download_${requested_version}_${RUN_ID}"
+  mkdir "${download_dir}" || die_failed "Could not create ${download_dir}"
   log_info "No --binary provided. Downloading ${apk_url}"
-  if ! ${CONTAINER_CMD} run --rm ${CONTAINER_USER_ARGS} \
-    --volume "${official_dir}:/download${VOLUME_RW_SUFFIX}" \
+  # GITHUB_TOKEN, if set, is passed by name only and never appears in argv or logs.
+  # shellcheck disable=SC2086
+  if ! ${CONTAINER_CMD} run --rm ${CONTAINER_USER_ARGS} ${GITHUB_TOKEN:+--env GITHUB_TOKEN} \
+    --volume "${download_dir}:/download${VOLUME_RW_SUFFIX}" \
     "${WS_CONTAINER}" \
-    sh -c "curl -fsSL -o '/download/${apk_filename}' '${apk_url}'"; then
+    sh -c 'curl -fsSL ${GITHUB_TOKEN:+-H "Authorization: Bearer ${GITHUB_TOKEN}"} -o "/download/$1" "$2"' sh "${apk_filename}" "${apk_url}"; then
     die_failed "Download failed. Upstream may not have published a GitHub release for v${requested_version}: ${apk_url}"
   fi
-  official_arg="${official_dir}/${apk_filename}"
+  official_arg="${download_dir}/${apk_filename}"
 fi
 
-[[ "${official_arg}" == /* ]] || official_arg="${execution_dir}/${official_arg}"
+[[ "${official_arg}" == /* ]] || official_arg="${execution_dir}/${official_arg#./}"
 if [[ -d "${official_arg}" ]]; then
   mode="splits"
   official_dir="${official_arg%/}"
@@ -395,8 +436,14 @@ if [[ "${mode}" == "universal" ]]; then
   fi
 fi
 
+if [[ "${mode}" == "abisplit" ]]; then
+  build_desc="gradlew assembleRelease -PabiSplits (per-ABI APK, ${split_abi})"
+else
+  build_desc="gradlew bundleRelease + bundletool ${BUNDLETOOL_VERSION} (${mode})"
+fi
+
 # ------------------------------------------------------------------------------
-# Source revision: tag v<version>, or --commit. Never fall back silently.
+# Source revision: tag v<version>, or --commit as an explicit override. Never fall back silently.
 # ------------------------------------------------------------------------------
 tag_name="v${version_name}"
 tag_line="$(${CONTAINER_CMD} run --rm "${WS_CONTAINER}" \
@@ -407,31 +454,26 @@ tag_commit="$(echo "${tag_line}" | awk '/\^\{\}$/ {print $1}')"
 if [[ -n "${requested_commit}" ]]; then
   git_ref="${requested_commit}"
   if [[ -n "${tag_commit}" ]]; then
-    log_info "Tag ${tag_name} exists (${tag_commit}); building --commit ${requested_commit} as requested."
-    append_info "Tag ${tag_name} -> ${tag_commit}; built --commit ${requested_commit} instead."
+    source_text="--commit ${requested_commit} (override; tag ${tag_name} -> ${tag_commit})"
   else
-    log_info "No tag ${tag_name} upstream; building --commit ${requested_commit}."
-    append_info "No tag ${tag_name} upstream; built --commit ${requested_commit}."
+    source_text="--commit ${requested_commit} (no tag ${tag_name} upstream)"
   fi
 elif [[ -n "${tag_commit}" ]]; then
   git_ref="${tag_commit}"
-  log_info "Tag ${tag_name} -> ${tag_commit}"
+  source_text="tag ${tag_name} -> ${tag_commit}"
 else
-  die_invalid "No tag ${tag_name} in ${REPO_URL}. Edge does not tag every release; pass --commit <sha> (see the build notes for how the release commit was identified)."
+  die_invalid "No tag ${tag_name} in ${REPO_URL}. Pass --commit <sha> to build a specific commit."
 fi
+log_info "Source: ${source_text}"
 
 # ------------------------------------------------------------------------------
-# Workspace
+# Workspace: one new directory per run, never reused, renamed or deleted by another run.
 # ------------------------------------------------------------------------------
-work_dir="${execution_dir}/workdir_${APP_ID}_${version_name}_${mode}"
-if [[ -d "${work_dir}" ]]; then
-  log_info "Removing existing workspace: ${work_dir}"
-  ${CONTAINER_CMD} run --rm --volume "${work_dir}:/workspace${VOLUME_RW_SUFFIX}" "${WS_CONTAINER}" \
-    sh -c "find /workspace -mindepth 1 -delete" 2>/dev/null || true
-  rm -rf "${work_dir}"
-fi
+work_dir="${execution_dir}/edge_verification_${version_name}_${mode}_${RUN_ID}"
+mkdir "${work_dir}" || die_failed "Could not create workspace ${work_dir} (already exists or ${execution_dir} is not writable)."
 mkdir -p "${work_dir}/output" "${work_dir}/ctx"
-build_image_tag="edge_build_${version_name}_$$"
+log_info "Workspace: ${work_dir}"
+build_image_tag="edge_build_${version_name}_${mode}_${RUN_ID}"
 
 # Device spec for split sets: from the official split names (ABI, density, locale) and base.apk's
 # minSdkVersion (bundletool writes each variant's lower SDK bound into its APKs).
@@ -493,7 +535,7 @@ ${CONTAINER_CMD} build -t "${build_image_tag}" "${work_dir}/ctx" || die_failed "
 # ------------------------------------------------------------------------------
 # Clone + build + render, inside the container
 # ------------------------------------------------------------------------------
-log_info "Running fetch + npm ci + npm run prepare + gradlew bundleRelease + bundletool (${mode}) in the container..."
+log_info "Running fetch + npm ci + npm run prepare + ${build_desc} in the container..."
 log_info "This typically takes 20-60 minutes."
 
 if ! ${CONTAINER_CMD} run --rm \
@@ -501,6 +543,7 @@ if ! ${CONTAINER_CMD} run --rm \
   --env "EDGE_REPO_URL=${REPO_URL}" \
   --env "EDGE_REF=${git_ref}" \
   --env "EDGE_TAG=${tag_name}" \
+  --env "EDGE_TAG_COMMIT=${tag_commit}" \
   --env "EDGE_VERSION_NAME=${version_name}" \
   --env "EDGE_VERSION_CODE=${build_version_code}" \
   --env "EDGE_MODE=${mode}" \
@@ -524,7 +567,29 @@ if ! ${CONTAINER_CMD} run --rm \
       *) echo "FATAL: checked out $(cat /output/commit_hash.txt), wanted ${EDGE_REF}"; exit 4 ;;
     esac
     printf "%s\n" "$(git log -1 --format="%H %cI %s")" > /output/commit_info.txt
-    git verify-commit HEAD > /output/commit_verify.txt 2>&1 || true
+    # Signature facts from the objects themselves (the image has no gpg and no keyring, so a
+    # present signature is reported as present, not as valid).
+    if git cat-file -p HEAD | grep -qE "^gpgsig(-sha256)? "; then
+      echo "present, not verified (no keyring in the build container)"
+    else
+      echo "none"
+    fi > /output/commit_sig.txt
+    if [ -n "${EDGE_TAG_COMMIT}" ]; then
+      if ! git fetch -q --depth 1 origin "refs/tags/${EDGE_TAG}:refs/tags/${EDGE_TAG}"; then
+        echo "unknown (fetching refs/tags/${EDGE_TAG} failed)"
+      elif [ "$(git cat-file -t "refs/tags/${EDGE_TAG}")" = tag ]; then
+        if git cat-file -p "refs/tags/${EDGE_TAG}" | grep -q "BEGIN PGP SIGNATURE"; then
+          echo "annotated, PGP signature present, not verified (no keyring in the build container)"
+        else
+          echo "annotated, unsigned"
+        fi
+      else
+        echo "lightweight, unsigned (a lightweight tag cannot carry a signature)"
+      fi
+    else
+      echo "no tag ${EDGE_TAG} upstream"
+    fi > /output/tag_info.txt
+    echo "tag ${EDGE_TAG}: $(cat /output/tag_info.txt); commit signature: $(cat /output/commit_sig.txt)"
 
     pm="$(node -p "require(\"./package.json\").packageManager || \"\"")"
     echo "packageManager: ${pm:-<none>}  node $(node --version)"
@@ -552,6 +617,9 @@ if ! ${CONTAINER_CMD} run --rm \
     fi
 
     cd android
+    # Full Gradle output goes to /output/gradle.log. The console drops Java stack-frame lines only:
+    # D8 prints hundreds of thousands of Kotlin-metadata trace lines for the Zcash SDK that would
+    # swamp the recording. Warning headers and errors still show.
     if [ "${EDGE_MODE}" = "abisplit" ]; then
       # Edge scripts/deploy.ts: ./gradlew assembleRelease -PabiSplits -> app-<abi>-release.apk
       ./gradlew assembleRelease -PabiSplits --no-daemon "-Dorg.gradle.jvmargs=${GRADLE_JVMARGS}" 2>&1 \
@@ -559,9 +627,6 @@ if ! ${CONTAINER_CMD} run --rm \
       cp "app/build/outputs/apk/release/app-${EDGE_ABI}-release.apk" "/output/built-${EDGE_ABI}.apk"
       exit 0
     fi
-    # Full Gradle output goes to /output/gradle.log. The console drops Java stack-frame lines only:
-    # D8 prints ~820 Kotlin-metadata warnings with full traces for the Zcash SDK (Kotlin 2.3 vs
-    # R8 8.8), ~290k lines that swamp the recording. Warning headers and errors still show.
     ./gradlew bundleRelease --no-daemon "-Dorg.gradle.jvmargs=${GRADLE_JVMARGS}" 2>&1 \
       | tee /output/gradle.log | grep --line-buffered -vE "^[[:space:]]+at |^[[:space:]]*$"
     cp app/build/outputs/bundle/release/app-release.aab /output/app-release.aab
@@ -577,7 +642,7 @@ if ! ${CONTAINER_CMD} run --rm \
       (cd /output && rm -rf splits && unzip -q -o built.apks "splits/*.apk")
     fi
   '; then
-  die_failed "Build failed inside the container. See the output above."
+  die_failed "Build failed inside the container (${build_desc}). See the output above."
 fi
 
 commit_hash="$(cat "${work_dir}/output/commit_hash.txt" 2>/dev/null || echo "unknown")"
@@ -616,7 +681,7 @@ fi
 # ------------------------------------------------------------------------------
 # Only ROOT META-INF signature files are excluded, matched by NAME: "Only in" on the official side,
 # or "Files differ" on both sides. services/, version-control-info.textproto, *.version markers and
-# anything signing-named that exists only in OUR build are counted (ws-notes/script-notes/meta-inf-filter-scope.md).
+# anything signing-named that exists only in OUR build are counted.
 SIGN_NAME='[^/]*(\.(SF|RSA|DSA|EC)|MANIFEST\.MF)'
 diff_file="${work_dir}/diff_full.txt"
 : > "${diff_file}"
@@ -681,37 +746,27 @@ for p in "${PAIRS[@]}"; do
 done
 
 if [[ "${total_counted}" -eq 0 && "${#PAIRS[@]}" -gt 0 ]]; then
-  verdict="reproducible"; yaml_status="reproducible"; exit_code="${EXIT_SUCCESS}"
+  verdict="reproducible"; exit_code="${EXIT_SUCCESS}"
 else
-  verdict="differences found"; yaml_status="not_reproducible"; exit_code="${EXIT_FAILED}"
+  verdict="not_reproducible"; exit_code="${EXIT_FAILED}"
 fi
-
-if [[ "${mode}" == "abisplit" ]]; then
-  append_info "Build: gradlew assembleRelease -PabiSplits (upstream deploy.ts per-ABI APK), ${split_abi}, versionCode ${build_version_code} + ${abi_offset}; $(tr '\n' ' ' < "${work_dir}/output/toolchain.txt" 2>/dev/null)"
-else
-  append_info "Build: gradlew bundleRelease + bundletool ${BUNDLETOOL_VERSION} (${mode}); $(tr '\n' ' ' < "${work_dir}/output/toolchain.txt" 2>/dev/null)"
-  append_info "AAB SHA-256: ${aab_hash}"
-fi
-append_info "Gradle JVM args: ${GRADLE_JVMARGS} (upstream gradle.properties: -Xmx4g -XX:MaxMetaspaceSize=512m). Full Gradle log: workdir output/gradle.log."
-append_info "Not public, so absent from this build: upstream env.json (API keys; Sentry DSN/slug that CI patches into build.gradle and MainApplication.kt), google-services.json (sample used)."
-generate_comparison_yaml "${yaml_status}" "${total_counted} counted differences (raw ${total_raw}) across ${#PAIRS[@]} APK pair(s); bundleRelease + bundletool ${mode}."
 
 # ------------------------------------------------------------------------------
 # Tag / commit signature information
 # ------------------------------------------------------------------------------
-if [[ -n "${tag_commit}" ]]; then
-  tag_text="Tag ${tag_name} -> ${tag_commit}"
+tag_info="$(cat "${work_dir}/output/tag_info.txt" 2>/dev/null || echo "unknown")"
+commit_sig="$(cat "${work_dir}/output/commit_sig.txt" 2>/dev/null || echo "unknown")"
+
+if [[ "${mode}" == "abisplit" ]]; then
+  append_info "Build: ${build_desc}, versionCode ${build_version_code} + ${abi_offset}; $(tr '\n' ' ' < "${work_dir}/output/toolchain.txt" 2>/dev/null)"
 else
-  tag_text="No tag ${tag_name} upstream"
+  append_info "Build: ${build_desc}; $(tr '\n' ' ' < "${work_dir}/output/toolchain.txt" 2>/dev/null)"
+  append_info "AAB SHA-256: ${aab_hash}"
 fi
-commit_verify="$(cat "${work_dir}/output/commit_verify.txt" 2>/dev/null || true)"
-if echo "${commit_verify}" | grep -q "Good signature"; then
-  commit_sig="[OK] Good signature on commit"
-elif echo "${commit_verify}" | grep -qiE "cannot run gpg|gpg: not found|No such file"; then
-  commit_sig="[INFO] Commit signature not checked (no gpg in the build container)"
-else
-  commit_sig="[WARNING] No valid signature found on commit"
-fi
+append_info "Gradle JVM args: ${GRADLE_JVMARGS} (upstream gradle.properties: -Xmx4g -XX:MaxMetaspaceSize=512m). Full Gradle log: output/gradle.log in the workspace."
+append_info "Not public, so absent from this build: upstream env.json (API keys; Sentry DSN/slug that CI patches into build.gradle and MainApplication.kt), google-services.json (sample used)."
+write_yaml "${verdict}" "${total_counted} counted differences (raw ${total_raw}) across ${#PAIRS[@]} APK pair(s); ${build_desc}; source ${source_text}; tag ${tag_name}: ${tag_info}; commit signature: ${commit_sig}."
+yaml_final=true
 
 # ------------------------------------------------------------------------------
 # Results
@@ -737,10 +792,11 @@ fi
 printf '%s\n' "${SUMMARY[@]}"
 echo "Totals: raw ${total_raw}, counted ${total_counted} (root META-INF signature files excluded)"
 echo ""
-echo "Revision, tag (and its signature):"
-echo "${tag_text}"
-echo "Built: $(cat "${work_dir}/output/commit_info.txt" 2>/dev/null || echo "${commit_hash}")"
-echo "${commit_sig}"
+echo "Revision:"
+echo "Source:           ${source_text}"
+echo "Tag ${tag_name}:      ${tag_info}"
+echo "Built:            $(cat "${work_dir}/output/commit_info.txt" 2>/dev/null || echo "${commit_hash}")"
+echo "Commit signature: ${commit_sig}"
 if [[ -n "${additional_info}" ]]; then
   echo ""
   echo "===== Also ====="
@@ -751,11 +807,11 @@ echo ""
 echo "Full diff list: ${diff_file}"
 
 # ------------------------------------------------------------------------------
-# Cleanup
+# Cleanup (the final verdict above is already written and cannot be replaced)
 # ------------------------------------------------------------------------------
-remove_build_image
 if [[ "${should_cleanup}" == true ]]; then
-  rm -rf "${work_dir}"
+  restore_ownership
+  rm -rf "${work_dir}" || log_warn "Could not remove ${work_dir}"
   log_info "Workspace cleaned up."
 else
   log_info "Workspace preserved: ${work_dir}"
