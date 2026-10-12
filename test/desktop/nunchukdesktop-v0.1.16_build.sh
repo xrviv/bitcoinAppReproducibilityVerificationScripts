@@ -1,20 +1,21 @@
 #!/bin/bash
 #
 # nunchukdesktop_build.sh - Nunchuk Desktop Reproducible Build Verifier
-# Version: v0.1.14
-# Last modified on: 2026-10-09
+# Version: v0.1.16
+# Last modified on: 2026-10-10
 # Organization: WalletScrutiny.com
 #
 # Rebuilds the Linux x86_64 AppImage ZIP with upstream's reproducible-builds/ recipe at the release
-# tag (2.6.6+) and compares the whole ZIP byte for byte with the official release. The build image
-# is pinned to release day: dated ubuntu:noble-* base + Ubuntu/PPA apt snapshot.
+# tag (2.6.6+) and compares the whole ZIP byte for byte with the official release. The build image is
+# pinned (dated ubuntu:noble-* base + Ubuntu/PPA apt snapshot) to the moment upstream's builder layer
+# was made, dated from the apt libraries bundled in the official AppImage; else to release day.
 #
 # Usage: nunchukdesktop_build.sh --version VERSION [--binary ZIP] [--arch x86_64-linux-gnu] [--type appimage]
 #
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.14"
+SCRIPT_VERSION="v0.1.16"
 APP_ID="nunchuk"
 APP_NAME="Nunchuk Desktop"
 GH_REPO="nunchuk-io/nunchuk-desktop"
@@ -28,6 +29,9 @@ APP_ARCH="x86_64-linux-gnu"
 APP_TYPE="appimage"
 BINARY_PATH=""
 CONTAINER_CMD=""
+# Extra `build` flags: podman's default OCI format drops Dockerfile SHELL instructions, which HWI's
+# build.Dockerfile relies on, so under podman every image is built in Docker format (same bytes).
+BUILD_FORMAT_ARGS=()
 # Digest-pinned git image: clones and resolves the tag inside a container.
 GIT_IMAGE="${GIT_IMAGE:-docker.io/alpine/git@sha256:6f8eae2205a85c51106a9650e574a37fb1d5e4f645e5f6ea57cb57b9462cd4cf}"
 WORK_DIR=""
@@ -41,6 +45,9 @@ UPSTREAM_DOCKERFILE_SHA256=""
 # Release-day pins; empty = derived. Override: UBUNTU_SNAPSHOT=YYYYMMDDTHHMMSSZ, UBUNTU_BASE=<image>.
 UBUNTU_SNAPSHOT="${UBUNTU_SNAPSHOT:-}"
 UBUNTU_BASE="${UBUNTU_BASE:-}"
+UBUNTU_SERIES="noble"
+SNAPSHOT_RULE=""
+UPLOAD=""
 VERDICT_WRITTEN=false
 NO_VERDICT_BY_DESIGN=false
 
@@ -122,7 +129,7 @@ check_build_inputs() {
 }
 
 comparison_context_note() {
-    printf '%s' "Built with upstream reproducible-builds/Dockerfile.linux and build_linux.sh at tag ${APP_VERSION} (Dockerfile sha256 ${UPSTREAM_DOCKERFILE_SHA256}), base image ${UBUNTU_BASE}, apt pinned to Ubuntu and PPA snapshot ${UBUNTU_SNAPSHOT}.${HWI_SHA256:+ Bundled hwi built from source, sha256 ${HWI_SHA256}.}"
+    printf '%s' "Built with upstream reproducible-builds/Dockerfile.linux and build_linux.sh at tag ${APP_VERSION} (Dockerfile sha256 ${UPSTREAM_DOCKERFILE_SHA256}), base image ${UBUNTU_BASE}, apt pinned to Ubuntu and PPA snapshot ${UBUNTU_SNAPSHOT}, ${SNAPSHOT_RULE}.${HWI_SHA256:+ Bundled hwi built from source, sha256 ${HWI_SHA256}.}"
 }
 
 
@@ -134,7 +141,10 @@ detect_container_cmd() {
     else
         die_invalid "Neither podman nor docker found in PATH. Install one and retry."
     fi
-    log_info "Container runtime: $CONTAINER_CMD"
+    if [[ "$CONTAINER_CMD" == *podman ]]; then
+        BUILD_FORMAT_ARGS=(--format docker)
+    fi
+    log_info "Container runtime: $CONTAINER_CMD${BUILD_FORMAT_ARGS[0]:+ (image builds in Docker format)}"
 }
 
 require_arg() {
@@ -220,7 +230,8 @@ OPTIONAL:
 
 OPTIONAL ENVIRONMENT:
   GITHUB_TOKEN          Used for GitHub downloads and API lookups, to avoid rate limiting
-  UBUNTU_SNAPSHOT       apt snapshot ID (YYYYMMDDTHHMMSSZ); default: release ZIP upload time
+  UBUNTU_SNAPSHOT       apt snapshot ID (YYYYMMDDTHHMMSSZ); default: derived from the apt libraries
+                        bundled in the official AppImage, else the release ZIP upload time
   UBUNTU_BASE           Base image; default: newest ubuntu:noble-* tag pushed before the snapshot
 
 EXAMPLES:
@@ -346,16 +357,16 @@ verify_official_signature() {
         return 0
     fi
 
-    # SHA256SUMS.asc is clearsigned; the detached form is also handled.
-    local gpg_out="" gpg_rc=0 sig_form="clearsigned"
+    # Clearsigned through 2.6.6, detached from 2.9.0: decide by the armor header, not by trying
+    # --decrypt first (on a detached .asc it verifies the neighbouring file and still says GOODSIG).
+    local gpg_out="" gpg_rc=0 sig_form="detached"
     local verified_manifest="${WORK_DIR}/SHA256SUMS.verified"
 
-    gpg_out="$(GNUPGHOME="$gnupg_home" gpg --batch --status-fd 1 --output "$verified_manifest" \
-                  --decrypt "$asc" 2>/dev/null)" || gpg_rc=$?
-    if ! grep -q "^\[GNUPG:\] \(GOODSIG\|BADSIG\|EXPKEYSIG\|REVKEYSIG\|ERRSIG\) " <<<"$gpg_out"; then
-        # Not clearsigned: retry as a detached signature over the separate manifest.
-        sig_form="detached"
-        gpg_rc=0
+    if grep -q "^-----BEGIN PGP SIGNED MESSAGE-----" "$asc"; then
+        sig_form="clearsigned"
+        gpg_out="$(GNUPGHOME="$gnupg_home" gpg --batch --status-fd 1 --output "$verified_manifest" \
+                      --decrypt "$asc" 2>/dev/null)" || gpg_rc=$?
+    else
         gpg_out="$(GNUPGHOME="$gnupg_home" gpg --batch --status-fd 1 \
                       --verify "$asc" "$sums" 2>/dev/null)" || gpg_rc=$?
         cp "$sums" "$verified_manifest" 2>/dev/null || true
@@ -385,6 +396,17 @@ verify_official_signature() {
         add_sig_warning "The manifest is signed by a key other than the pinned fingerprint. Treat the key as rotated or the artifact as suspect until upstream confirms which."
         log_warn "Manifest signed by an unexpected key: ${sig_key:-unknown}"
         check_digest_against_manifest "$verified_manifest" "unverified"
+    elif grep -q "^\[GNUPG:\] ERRSIG " <<<"$gpg_out"; then
+        # Signer not in the throwaway keyring: ERRSIG has the key id in field 3, fingerprint last.
+        local eline unk
+        eline="$(grep -m1 "^\[GNUPG:\] ERRSIG " <<<"$gpg_out")"
+        unk="$(awk '{print $NF}' <<<"$eline")"
+        [[ "$unk" =~ ^[0-9A-Fa-f]{40}$ ]] || unk="$(awk '{print $3}' <<<"$eline")"
+        SIG_MANIFEST_STATUS="[WARNING] SHA256SUMS ${sig_form} signature is from unknown key ${unk}, not the pinned ${NUNCHUK_RELEASE_KEY_FPR}"
+        SIG_KEY_USED="Manifest signed with: ${unk} (not in keyring; signature could not be verified)"
+        add_sig_warning "The manifest is signed by key ${unk}, which is not the pinned release key and could not be fetched. Treat the key as rotated or the artifact as suspect until upstream publishes the new key."
+        log_warn "SHA256SUMS signed by unknown key ${unk}; the pinned key did not sign it"
+        check_digest_against_manifest "$sums" "unverified"
     else
         SIG_MANIFEST_STATUS="[WARNING] No valid signature on SHA256SUMS"
         add_sig_warning "gpg reported no valid signature over the release manifest."
@@ -528,7 +550,7 @@ is_rootless() {
     [[ "$r" == "true" ]]
 }
 
-# /project must appear as the caller's UID, as under rootful Docker; UID 0 changes the output.
+# /project must appear as the caller's UID, as under rootful Docker.
 set_build_owner() {
     "$CONTAINER_CMD" run --rm -v "${1}:/w" --entrypoint chown "$GIT_IMAGE" \
         -R "$(id -u):$(id -g)" /w > /dev/null 2>&1 \
@@ -545,32 +567,150 @@ restore_host_owner() {
         || log_warn "Could not restore ownership of ${1}; deleting it may need 'podman unshare rm -rf'"
 }
 
-# apt snapshot = release ZIP upload time; base = newest noble-* tag pushed before it.
+# Newest ubuntu:noble-YYYYMMDD[.N] tag dated on or before snapshot ID $1 (empty if Docker Hub did not
+# answer). The tag's own date is used: Hub's last_updated is bumped weeks after the push (noble-20260917
+# shows 2026-10-04), which made the old rule pick one generation too old.
+base_tag_before() {
+    wget -qO- "https://hub.docker.com/v2/repositories/library/ubuntu/tags?name=noble-&page_size=100" 2>/dev/null \
+        | grep -oE '"name":"noble-[0-9]{8}(\.[0-9]+)?"' | cut -d'"' -f4 \
+        | awk -v d="${1:0:8}" 'substr($0,7,8) <= d' | sort -V | tail -1 || true
+}
+
+# GNU build-ID (first .note.gnu.build-id, 20-byte SHA1) of an ELF file; no readelf needed.
+elf_build_id() {
+    local off
+    off="$(LC_ALL=C grep -obUaP -m1 '\x04\x00\x00\x00\x14\x00\x00\x00\x03\x00\x00\x00GNU\x00' "$1" 2>/dev/null \
+           | head -1 | cut -d: -f1)"
+    [[ -n "$off" ]] || return 1
+    od -An -v -tx1 -j "$((off + 16))" -N 20 "$1" | tr -d ' \n'
+}
+
+# Package shipping SONAME in (/usr)/lib/x86_64-linux-gnu, from packages.ubuntu.com's Contents search.
+pkg_for_soname() {
+    local rows r='<td class="file">/(usr/)?lib/x86_64-linux-gnu/' s='<span[^>]*>[^<]*</span></td>.*href="/[^/]+/([^/"]+)".*'
+    rows="$({ wget -qO- -t 3 --waitretry=5 --timeout=60 "https://packages.ubuntu.com/search?suite=${UBUNTU_SERIES}&arch=amd64&mode=exactfilename&searchon=contents&keywords=${1}" 2>/dev/null || true; } \
+        | tr -d '\n' | sed 's/<tr>/\n/g' | sed 's#</tr>.*##')"
+    # The library directory itself first; one subdirectory (e.g. pulseaudio/) only as a fallback.
+    { sed -nE "s#.*${r}${s}#\\2#p" <<<"$rows"; sed -nE "s#.*${r}[^/<]+/${s}#\\2#p" <<<"$rows"; } | head -1
+}
+
+# Launchpad publishing history of PKG (noble/amd64, Release/Security/Updates): "VERSION\tPOCKET\tDATE", newest first.
+lp_history() {
+    { wget -qO- -t 3 --waitretry=5 --timeout=60 "https://api.launchpad.net/1.0/ubuntu/+archive/primary?ws.op=getPublishedBinaries&binary_name=${1}&exact_match=true&distro_arch_series=https://api.launchpad.net/1.0/ubuntu/${UBUNTU_SERIES}/amd64&order_by_date=true" 2>/dev/null || true; } \
+        | sed 's/}, {/}\n{/g' \
+        | sed -nE 's/.*"date_published": "([0-9T:-]{19})[^"]*".*"pocket": "(Release|Security|Updates)".*"binary_package_version": "([^"]+)".*/\3\t\2\t\1/p'
+}
+
+# True if the deb PKG=VER (from Launchpad) contains an ELF with build-ID BID.
+deb_has_build_id() {
+    local d="${WORK_DIR}/debs/${1}_${2#*:}" f hit=1
+    mkdir -p "$d"
+    if wget -q -t 3 --waitretry=5 --timeout=120 -O "$d/p.deb" "https://launchpad.net/ubuntu/+archive/primary/+files/${1}_${2#*:}_amd64.deb" 2>/dev/null \
+            && "$CONTAINER_CMD" run --rm --network none -v "${d}:/w" -w /w "$UBUNTU_BASE" dpkg-deb -x p.deb x >/dev/null 2>&1; then
+        while IFS= read -r f; do
+            [[ "$(elf_build_id "$f")" == "$3" ]] && { hit=0; break; }
+        done < <(find "$d/x" -type f -name '*.so*' 2>/dev/null)
+    fi
+    rm -rf "$d" 2>/dev/null
+    return "$hit"
+}
+
+# Version of PKG whose deb ships build-ID BID, walking newest-first (published before UPLOAD, at most
+# 6 debs). Prints "VERSION\tFIRST_PUBLISHED\tNEXT_VERSION_PUBLISHED"; rc 2 = never updated before UPLOAD.
+match_package_version() {
+    local pkg="$1" bid="$2" hist v pocket date tried=0 seen="|" ver="" first next
+    hist="$(lp_history "$pkg" || true)"
+    [[ -n "$hist" ]] || return 1
+    awk -F'\t' -v u="$UPLOAD" '$2!="Release" && $3<u{f=1} END{exit !f}' <<<"$hist" || return 2
+    while IFS=$'\t' read -r v pocket date; do
+        [[ "$date" < "$UPLOAD" && "$seen" != *"|$v|"* ]] || continue
+        seen="${seen}${v}|"
+        (( ++tried <= 6 )) || break
+        if deb_has_build_id "$pkg" "$v" "$bid"; then ver="$v"; break; fi
+    done <<<"$hist"
+    [[ -n "$ver" ]] || return 1
+    first="$(awk -F'\t' -v v="$ver" '$1==v{print $3}' <<<"$hist" | sort | head -1)"
+    next="$(awk -F'\t' -v v="$ver" -v f="$first" '$1!=v && $3>f{print $3}' <<<"$hist" | sort | head -1)"
+    printf '%s\t%s\t%s\n' "$ver" "$first" "$next"
+}
+
+# apt snapshot from the official AppImage: each bundled apt library is matched by build-ID to a published
+# version; the newest of those was in the archive when upstream's builder layer was made, the earliest
+# next version was not. Picks a point in that window, >= 4 h (snapshot.ubuntu.com mirror lag) after its
+# start. Sets UBUNTU_SNAPSHOT, or returns 1 and the caller falls back.
+derive_snapshot_from_bundle() {
+    local appdir="${WORK_DIR}/official_appdir" f soname bid pkg m ver first next seen="|" n=0 c=0 lo="" hi="$UPLOAD"
+    mkdir -p "$appdir"
+    cp "${WORK_DIR}/official.AppImage" "${appdir}/a.AppImage"
+    if ! "$CONTAINER_CMD" run --rm --network none -v "${appdir}:/w" -w /w --entrypoint /w/a.AppImage \
+            "$GIT_IMAGE" --appimage-extract >/dev/null 2>&1; then
+        log_warn "Could not extract the official AppImage in a container"; rm -rf "$appdir"; return 1
+    fi
+    log_info "Matching bundled libraries against Launchpad (${UBUNTU_SERIES}/amd64; Release, Security, Updates)..."
+    for f in "${appdir}"/squashfs-root/lib/* "${appdir}"/squashfs-root/usr/lib/*; do
+        [[ -f "$f" && ! -L "$f" ]] || continue
+        soname="$(basename "$f")"
+        [[ "$soname" == lib*.so* && "$soname" != libQt* ]] || continue
+        bid="$(elf_build_id "$f")" || continue
+        pkg="$(pkg_for_soname "$soname" || true)"
+        [[ -n "$pkg" && "$seen" != *"|$pkg|"* ]] || continue
+        seen="${seen}${pkg}|"; n=$((n + 1))
+        m="$(match_package_version "$pkg" "$bid")" || { [[ $? -eq 1 ]] && log_warn "  ${soname}: no ${pkg} deb published before the release has build-ID ${bid}"; continue; }
+        IFS=$'\t' read -r ver first next <<<"$m"
+        log_info "  ${soname}: ${pkg} ${ver}, in archive ${first}Z${next:+, next version ${next}Z}"
+        c=$((c + 1))
+        [[ "$first" > "$lo" ]] && lo="$first"
+        [[ -n "$next" && "$next" < "$hi" ]] && hi="$next"
+    done
+    rm -rf "$appdir" "${WORK_DIR}/debs" 2>/dev/null
+    log_info "Bundled apt libraries: ${n} packages checked, ${c} dated"
+    [[ -n "$lo" ]] || { log_warn "No bundled library dates upstream's builder layer"; return 1; }
+    [[ "$lo" < "$hi" ]] || { log_warn "Inconsistent window: after ${lo}Z but before ${hi}Z"; return 1; }
+    local ls hs snap half lag=14400
+    ls="$(date -u -d "${lo}Z" +%s)"; hs="$(date -u -d "${hi}Z" +%s)"
+    half=$(( (hs - ls) / 2 )); (( half > lag )) || half=$lag
+    snap=$((ls + half))
+    (( snap < hs )) || { snap=$((hs - 60)); log_warn "Window narrower than the mirror lag; snapshot set just before its end"; }
+    UBUNTU_SNAPSHOT="$(date -u -d "@${snap}" +%Y%m%dT%H%M%SZ)"
+    SNAPSHOT_RULE="derived from the official AppImage's bundled apt libraries (archive state after ${lo}Z and before ${hi}Z)"
+    log_ok "apt snapshot ${UBUNTU_SNAPSHOT}: ${SNAPSHOT_RULE}"
+}
+
+# apt snapshot: from the bundle (above), else the release ZIP upload time; base = newest noble-* tag before it.
 resolve_release_pins() {
-    local sde="$1" t
+    local sde="$1" t fallback
     local gh=(wget -qO- ${GITHUB_TOKEN:+--header="Authorization: token ${GITHUB_TOKEN}"})
-    if [[ -z "$UBUNTU_SNAPSHOT" ]]; then
-        t="$("${gh[@]}" "https://api.github.com/repos/${GH_REPO}/releases/tags/${APP_VERSION}" 2>/dev/null \
-            | grep -oE '"(name|created_at)": *"[^"]*"' \
-            | awk -F'"' -v n="$(zip_stem).zip" '$2=="name"{h=($4==n)} $2=="created_at"&&h{print $4; exit}' || true)"
-        if [[ "$t" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
-            UBUNTU_SNAPSHOT="$(tr -d ':-' <<<"$t")"
-            log_info "apt snapshot = release ZIP upload time: ${UBUNTU_SNAPSHOT}"
+    t="$("${gh[@]}" "https://api.github.com/repos/${GH_REPO}/releases/tags/${APP_VERSION}" 2>/dev/null \
+        | grep -oE '"(name|created_at)": *"[^"]*"' \
+        | awk -F'"' -v n="$(zip_stem).zip" '$2=="name"{h=($4==n)} $2=="created_at"&&h{print $4; exit}' || true)"
+    if [[ "$t" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+        fallback="$(tr -d ':-' <<<"$t")"; UPLOAD="${t%Z}"
+        log_info "Release ZIP upload time: ${t}"
+    else
+        fallback="$(date -u -d "@$((sde + 86400))" +%Y%m%dT%H%M%SZ)"
+        UPLOAD="$(date -u -d "@$((sde + 86400))" +%Y-%m-%dT%H:%M:%S)"
+        log_warn "Release upload time not available; using tag commit + 1 day: ${UPLOAD}Z"
+    fi
+    if [[ -n "$UBUNTU_SNAPSHOT" ]]; then
+        SNAPSHOT_RULE="set by UBUNTU_SNAPSHOT"
+    else
+        # The deb walk needs an Ubuntu image: the one the fallback rule would use.
+        local base_env="$UBUNTU_BASE"
+        [[ -n "$UBUNTU_BASE" ]] || { t="$(base_tag_before "$fallback")"; [[ -n "$t" ]] && UBUNTU_BASE="docker.io/library/ubuntu:${t}"; }
+        if [[ -z "$UBUNTU_BASE" ]] || ! derive_snapshot_from_bundle; then
+            UBUNTU_SNAPSHOT="$fallback"
+            SNAPSHOT_RULE="release ZIP upload time (bundled-library derivation not possible)"
+            log_warn "apt snapshot ${UBUNTU_SNAPSHOT}: ${SNAPSHOT_RULE}"
         else
-            UBUNTU_SNAPSHOT="$(date -u -d "@$((sde + 86400))" +%Y%m%dT%H%M%SZ)"
-            log_warn "Release upload time not available; apt snapshot = tag commit + 1 day: ${UBUNTU_SNAPSHOT}"
+            UBUNTU_BASE="$base_env"   # re-pick the base for the derived snapshot
         fi
     fi
     [[ "$UBUNTU_SNAPSHOT" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] \
         || die_invalid "UBUNTU_SNAPSHOT must look like 20260821T123445Z, got: ${UBUNTU_SNAPSHOT}"
     if [[ -z "$UBUNTU_BASE" ]]; then
-        local iso="${UBUNTU_SNAPSHOT:0:4}-${UBUNTU_SNAPSHOT:4:2}-${UBUNTU_SNAPSHOT:6:2}T${UBUNTU_SNAPSHOT:9:2}:${UBUNTU_SNAPSHOT:11:2}:${UBUNTU_SNAPSHOT:13:2}Z"
-        t="$(wget -qO- "https://hub.docker.com/v2/repositories/library/ubuntu/tags?name=noble-&page_size=100" 2>/dev/null \
-            | grep -oE '"(last_updated|name)":"[^"]*"' | paste - - \
-            | sed -nE 's/.*"last_updated":"([^"]+)".*"name":"(noble-[0-9]{8}(\.[0-9]+)?)".*/\1 \2/p' \
-            | awk -v s="$iso" '$1 <= s' | sort | tail -1 | awk '{print $2}' || true)"
-        # No silent fallback to the moving tag: that is the drift this version exists to remove.
-        [[ -n "$t" ]] || die_build "Could not pick a dated ubuntu:noble-* base image for ${iso}; set UBUNTU_BASE"
+        t="$(base_tag_before "$UBUNTU_SNAPSHOT")"
+        # No silent fallback to the moving tag: that is the drift this pinning exists to remove.
+        [[ -n "$t" ]] || die_build "Could not pick a dated ubuntu:noble-* base image for ${UBUNTU_SNAPSHOT}; set UBUNTU_BASE"
         UBUNTU_BASE="docker.io/library/ubuntu:${t}"
     fi
     log_info "Base image: ${UBUNTU_BASE}"
@@ -606,7 +746,7 @@ build_hwi() {
     head="$(git_c -C /w/hwi-src rev-parse HEAD | tr -dc '0-9a-f')" || head=""
     [[ "$head" == "$commit" ]] || die_build "HWI checkout ${head} is not the pinned commit ${commit}"
     HWI_IMAGE="nunchuk-hwi-${APP_VERSION}-$(date +%s)-$$"
-    "$CONTAINER_CMD" build --platform linux/amd64 -t "$HWI_IMAGE" \
+    "$CONTAINER_CMD" build ${BUILD_FORMAT_ARGS[@]+"${BUILD_FORMAT_ARGS[@]}"} --platform linux/amd64 -t "$HWI_IMAGE" \
         -f "${WORK_DIR}/hwi-src/contrib/build.Dockerfile" "${WORK_DIR}/hwi-src" \
         || die_build "HWI builder image failed"
     mkdir -p "${src}/hwi-prebuilt"
@@ -660,7 +800,7 @@ run_build() {
     local attempt image_built=false
     for attempt in 1 2 3; do
         # x86_64 build args as upstream's README/CI pass them (2.9.0+; unused before).
-        if "$CONTAINER_CMD" build --platform linux/amd64 \
+        if "$CONTAINER_CMD" build ${BUILD_FORMAT_ARGS[@]+"${BUILD_FORMAT_ARGS[@]}"} --platform linux/amd64 \
                 --build-arg APPIMAGE_ARCH=x86_64 --build-arg QT_HOST=linux \
                 --build-arg QT_ARCH=linux_gcc_64 --build-arg QT_DIR_NAME=gcc_64 \
                 -t "$image_name" -f "$dockerfile" "$src"; then
@@ -766,16 +906,12 @@ resolve_commit() {
 print_hash_legend() {
     echo ""
     echo "HASH LEGEND"
-    echo "  appHash          sha256 of ${OFFICIAL_ARTIFACT_NAME:-the official artifact} exactly as"
-    echo "                   distributed. THIS is the hash to publish — a user reproduces it with"
-    echo "                   sha256sum on the file they downloaded."
-    echo "  appImageHash     sha256 of the AppImage member inside that artifact. Reported to"
-    echo "                   localize a failure; NOT what the verdict is based on. Do not publish."
-    echo "  builtAppHash     sha256 of our rebuilt ZIP. From 2.6.6 upstream sets SOURCE_DATE_EPOCH"
-    echo "                   and normalizes the AppDir, so this IS expected to equal appHash; that"
-    echo "                   equality is the verdict. (Through 2.6.5 it could never match.)"
-    echo "  builtAppImageHash sha256 of the AppImage inside our rebuilt ZIP. Localizes a failure."
-    echo "  scriptHash       sha256 of this script, identifying which tooling produced these results."
+    echo "  appHash          sha256 of ${OFFICIAL_ARTIFACT_NAME:-the official artifact} as distributed."
+    echo "                   THIS is the hash to publish (sha256sum of the downloaded file)."
+    echo "  appImageHash     sha256 of the AppImage member inside it; localizes a failure. Do not publish."
+    echo "  builtAppHash     sha256 of our rebuilt ZIP; equality with appHash is the verdict (2.6.6+)."
+    echo "  builtAppImageHash sha256 of the AppImage inside our rebuilt ZIP; localizes a failure."
+    echo "  scriptHash       sha256 of this script, identifying the tooling behind these results."
 }
 
 # Results block (verification-result-summary-format.md); verdict also in COMPARISON_RESULTS.yaml.
