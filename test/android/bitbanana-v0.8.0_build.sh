@@ -1,71 +1,53 @@
 #!/bin/bash
-# bitbanana_build.sh v0.7.1 — BitBanana Android reproducible build verification
-# Organization: WalletScrutiny.com
-# Last modified by: Danny Garcia
-# Last modified on: 2026-09-25
-# Project: https://github.com/michaelWuensch/BitBanana
-# Scope: Google Play AAB / split-APK delivery. Builds the app bundle from source,
-#        materialises a device-specific APK set with bundletool, and compares it
-#        against the official Play split APKs supplied with --binary/--apk.
-#        The GitHub/F-Droid universal APK path is a separate variant script.
-# Steps: parse args -> read metadata from the official base.apk -> derive a device
-#        spec from the supplied splits -> build image (upstream recipe, inlined) ->
-#        gradle bundleRelease under disorderfs -> bundletool build-apks ->
-#        rename to Play naming -> unzip and diff per split -> decode
-#        resources.arsc for any split that differs -> verdict -> YAML.
-# No smartphone is required: the device spec is derived from the supplied splits,
-# never from `bundletool --connected-device`.
+# bitbanana-v0.8.0_build.sh — BitBanana (app.michaelwuensch.bitbanana) Android reproducible build verification
+# Version:          v0.8.0
+# Organization:     WalletScrutiny.com
+# Last modified by: Bob (WalletScrutiny agent)
+# Last modified on: 2026-10-05
+# Project:          https://github.com/michaelWuensch/BitBanana
+# Scope: one script for all four distribution channels; the input kind is read from the APK
+#        manifest, never from flags or file names (ABS stores uploads as base.apk or <hash>.bin).
+#        - Google Play split set (base.apk + split_config.*.apk): upstream docs/REPRODUCE_PLAYSTORE.md,
+#          gradle bundleRelease under disorderfs, bundletool build-apks against a device spec derived
+#          from the supplied splits, per-split comparison with evidence-earned exclusions.
+#        - GitHub / F-Droid / Obtainium fat APK (one file, all ABIs): upstream docs/REPRODUCE_GITHUB.md,
+#          gradle assembleRelease under disorderfs, unsigned output compared with the supplied file.
+#        - A lone Play base.apk or config split is refused: the full set is needed.
+#        Every tool runs in containers (podman or docker). No smartphone, no adb, no sudo.
 # License: MIT. No warranty. For security research only. Use at your own risk.
 set -euo pipefail
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.7.1"
-readonly SCRIPT_NAME="bitbanana_build.sh"
+readonly SCRIPT_VERSION="v0.8.0"
+readonly SCRIPT_NAME="bitbanana-v0.8.0_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 readonly SCRIPT_PATH
 SCRIPT_SHA256=""
 readonly APP_ID="app.michaelwuensch.bitbanana"
 readonly REPO_URL="https://github.com/michaelWuensch/BitBanana"
 readonly WS_CONTAINER="docker.io/walletscrutiny/android:5"
-# bundletool pin. 1.18.0 is the version used for our published v0.9.8 verification
-# (0-reports .../0.9.8/app.michaelwuensch.bitbanana.sh). bundletool decides split
-# naming and packaging, so it is a build input and is pinned by hash, not floated.
+# bundletool decides split naming and packaging, so it is a build input: pinned by hash.
 readonly BUNDLETOOL_VERSION="1.18.0"
 readonly BUNDLETOOL_SHA256="78343764d2e79c8f55710378b04981fcb1e46daebfc3b5dc577778082e6a98fd"
 
-VERSION=""
-ARCH=""
-TYPE=""
-BINARY=""
-WORK_DIR=""
-CONTAINER_RUNTIME=""
-IMAGE_NAME=""
-OFFICIAL_DIR=""
-OFFICIAL_BASE=""
-OFFICIAL_APP_HASH=""
-APP_ID_FROM_APK=""
-APK_VERSION_NAME=""
-APK_VERSION_CODE=""
-SIGNER_SHA256=""
-COMMIT_HASH=""
-SPEC_ABIS=""
-SPEC_DENSITY=""
-SPEC_LOCALES=""
-SPEC_SDK=""
-DIFF_COUNT=0
-MISSING_NOTE=""
-ARSC_SUMMARY=""
-ACCEPTED_SUMMARY=""
+VERSION=""; ARCH=""; TYPE=""; BINARY=""
+WORK_DIR=""; IMAGE_NAME=""; CONTAINER_RUNTIME=""
+OFFICIAL_DIR=""; OFFICIAL_FILE=""; OFFICIAL_BASE=""; OFFICIAL_NAME=""; OFFICIAL_APP_HASH=""
+INPUT_KIND=""
+APP_ID_FROM_APK=""; APK_VERSION_NAME=""; APK_VERSION_CODE=""; SIGNER_SHA256=""; COMMIT_HASH=""
+SPEC_ABIS=""; SPEC_DENSITY=""; SPEC_LOCALES=""; SPEC_SDK=""
+DIFF_COUNT=0; MISSING_NOTE=""; ARSC_SUMMARY=""; ACCEPTED_SUMMARY=""
 LOCALE_ALIGN=true
-# The only AndroidManifest.xml entries Google Play is allowed to add. An entry
-# outside this list, or ANY entry present only on the built side, fails the
-# manifest assessment and is counted as a real difference.
+# The only AndroidManifest.xml entries Google Play may add. Anything else, or ANY entry
+# present only on the built side, stays counted as a real difference.
 readonly PLAY_MANIFEST_KEYS='com\.android\.stamp\.source|com\.android\.stamp\.type|com\.android\.vending\.derived\.apk\.id'
 declare -A ARSC_STATE=()
 declare -A MF_STATE=()
 RESULT_DONE=false
 RESULT_EXIT_CODE=1
 declare -a OFFICIAL_SPLITS=()
+APKTOOL_MANIFEST=""
+APKTOOL_YML=""
 
 sha256_local() {
     [[ -f "$1" ]] || { echo "N/A"; return 0; }
@@ -83,23 +65,17 @@ sanitize_tag() {
 
 usage() {
     cat << EOF
-Usage: ${SCRIPT_NAME} --binary <dir> [--version <version>]
-  --binary <path>      Directory holding the official Play split APKs
-                       (base.apk plus split_config.*.apk). A path to base.apk
-                       itself is accepted; its directory is then used.
-                       Alias: --apk. Required — Play splits cannot be downloaded.
-  --version <version>  Release version to build (e.g. 1.0.1). Omitted: read from
-                       the official base.apk.
-  --arch <arch>        Accepted for ABS compatibility; the ABI is taken from the
-                       supplied splits, not from this flag.
-  --type <type>        Accepted for ABS compatibility; unused.
-  --no-locale-align    Turn OFF locale alignment of the bundletool step. By
-                       default bundletool runs with
-                       -Djava.locale.useOldISOCodes=true, which makes it emit the
-                       legacy language codes (iw/in/ji) that Google Play's own
-                       server-side split generator emits. The app build itself is
-                       never given this property. See the changelog for the
-                       measurement this is based on.
+Usage: ${SCRIPT_NAME} --binary <file|dir> [--version <version>]
+  --binary <path>      Official artifact. Either a directory holding the Google Play split set
+                       (base.apk plus split_config.*.apk; a path to that base.apk is accepted),
+                       or one file: the GitHub / F-Droid / Obtainium release APK under any name
+                       (base.apk, <hash>.bin). The kind is detected from the APK manifest.
+                       Alias: --apk. Required: Play splits cannot be downloaded.
+  --version <version>  Release tag to build (e.g. 1.1.0). Omitted: read from the APK.
+  --arch, --type       Accepted for ABS compatibility; the ABI set comes from the artifact.
+  --no-locale-align    Play split set only: run bundletool WITHOUT -Djava.locale.useOldISOCodes=true.
+                       Default ON because Google Play's split generator emits the legacy language
+                       codes (iw/in/ji). The app build itself never receives this property.
   --script-version     Print script version and exit.
   Requires: podman or docker. No smartphone, no adb, no sudo.
   Exit: 0=reproducible 1=not_reproducible/ftbfs 2=invalid parameters
@@ -130,46 +106,52 @@ require_non_root() {
     fi
 }
 
-# Utility container helpers. The WS image carries apktool, unzip and a JRE.
-
+# Utility container: apktool, apksigner, keytool, unzip. No aapt/aapt2 in that image.
 ws_run() {
     ${CONTAINER_RUNTIME} run --rm -v "${WORK_DIR}:/work" -w /work "${WS_CONTAINER}" bash -c "$1"
 }
 
-# The WS image has no aapt and no aapt2 (checked 2026-08-18: `command -v` found
-# neither). All metadata therefore comes from one apktool decode. apksigner IS
-# present and is tried first for the certificate; keytool is the fallback, and
-# the image has it because apktool needs a JRE.
-
-APKTOOL_MANIFEST=""
-APKTOOL_YML=""
-
-decode_official_base() {
-    APKTOOL_MANIFEST="${WORK_DIR}/comparison/meta/AndroidManifest.xml"
-    APKTOOL_YML="${WORK_DIR}/comparison/meta/apktool.yml"
-    if ! ws_run 'set -e
-        rm -rf comparison/meta
-        apktool d -f -s -o comparison/meta official/base.apk'; then
-        log_fail "apktool could not decode base.apk."
-        generate_yaml "ftbfs" "apktool failed to decode the supplied base.apk."
-        exit 2
+# COMPARISON_RESULTS.yaml: script_version, verdict, notes only. Every notes line is
+# indented, because the per-split summaries are multi-line block scalars.
+generate_yaml() {
+    local verdict="$1" notes="${2:-}"
+    if [[ -n "$INPUT_KIND" && -n "$notes" ]]; then notes="inputKind: ${INPUT_KIND}. ${notes}"; fi
+    local content="script_version: ${SCRIPT_VERSION}
+verdict: ${verdict}"
+    if [[ -n "$notes" ]]; then
+        content="${content}
+notes: |
+$(printf '%s\n' "$notes" | sed 's/^/  /')"
     fi
-    [[ -f "$APKTOOL_MANIFEST" ]] || { log_fail "apktool produced no AndroidManifest.xml."; exit 2; }
+    printf '%s\n' "$content" > "${EXEC_DIR}/COMPARISON_RESULTS.yaml"
+    if [[ -n "${WORK_DIR:-}" && -d "${WORK_DIR}" ]]; then
+        printf '%s\n' "$content" > "${WORK_DIR}/COMPARISON_RESULTS.yaml"
+    fi
 }
 
-# Anchored to the manifest's own package attribute. A greedy match on any
-# "name=" is wrong: an aapt badging line ends with compileSdkVersionCodename,
-# which such a pattern picks up instead of the package.
+# Log, write the ftbfs YAML and leave. $2 = exit code (default 2, invalid input).
+fail_ftbfs() {
+    log_fail "$1"
+    generate_yaml "ftbfs" "$1"
+    exit "${2:-2}"
+}
+
+decode_official() {
+    APKTOOL_MANIFEST="${WORK_DIR}/comparison/meta/AndroidManifest.xml"
+    APKTOOL_YML="${WORK_DIR}/comparison/meta/apktool.yml"
+    ws_run "set -e; rm -rf comparison/meta; apktool d -f -s -o comparison/meta $1" \
+        || fail_ftbfs "apktool could not decode the supplied APK (${OFFICIAL_NAME})."
+    [[ -f "$APKTOOL_MANIFEST" ]] || fail_ftbfs "apktool produced no AndroidManifest.xml."
+}
+
+# Anchored to the manifest's own package attribute (a greedy name= match picks up other attributes).
 manifest_package() {
     grep -o 'package="[^"]*"' "$APKTOOL_MANIFEST" | head -n1 | cut -d'"' -f2
 }
 
-# apktool.yml values are sometimes quoted and sometimes not; strip either.
 yml_field() {
-    local key="$1"
     [[ -f "$APKTOOL_YML" ]] || return 0
-    sed -n "s/^[[:space:]]*${key}:[[:space:]]*//p" "$APKTOOL_YML" \
-        | head -n1 | tr -d "'\"" | tr -d '\r'
+    sed -n "s/^[[:space:]]*$1:[[:space:]]*//p" "$APKTOOL_YML" | head -n1 | tr -d "'\"" | tr -d '\r'
 }
 
 apk_signer() {
@@ -191,8 +173,7 @@ apk_signer() {
 }
 
 sha256_of() {
-    local rel="$1"
-    ws_run "sha256sum \"${rel}\" | awk '{print \$1}'"
+    ws_run "sha256sum \"$1\" | awk '{print \$1}'"
 }
 
 parse_arguments() {
@@ -210,56 +191,31 @@ parse_arguments() {
     done
 
     if [[ -z "$BINARY" ]]; then
-        log_fail "Provide --binary <dir> with the official Play split APKs."
-        log_fail "Play splits are device-specific and cannot be downloaded; supply them."
+        log_fail "Provide --binary <file|dir>: the Play split set directory, or the GitHub/F-Droid/Obtainium APK."
         echo "Run '${SCRIPT_NAME} --help' for usage."
         exit 2
     fi
-
-    # A directory is the documented ABS form for multi-file artifacts. Accept a
-    # path to base.apk too and fall back to its directory.
     if [[ -d "$BINARY" ]]; then
         OFFICIAL_DIR="$(readlink -f "$BINARY")"
     elif [[ -f "$BINARY" ]]; then
-        OFFICIAL_DIR="$(dirname "$(readlink -f "$BINARY")")"
-        log_info "--binary is a file; using its directory: ${OFFICIAL_DIR}"
+        OFFICIAL_FILE="$(readlink -f "$BINARY")"
+        OFFICIAL_DIR="$(dirname "$OFFICIAL_FILE")"
     else
         log_fail "--binary not found: $BINARY"
         exit 2
     fi
 
-    local v_safe t_safe a_safe s_safe
+    local v_safe t_safe a_safe s_safe run_id
     v_safe=$(sanitize_tag "${VERSION:-provided}")
     t_safe=$(sanitize_tag "${TYPE:-default}")
-    a_safe=$(sanitize_tag "${ARCH:-splits}")
+    a_safe=$(sanitize_tag "${ARCH:-auto}")
     s_safe=$(sanitize_tag "$SCRIPT_VERSION")
-
+    run_id="$(date +%s)-$$"
     # Per run, in the caller's directory: a fixed /tmp path is shared by every user (ABS included).
-    local run_id; run_id="$(date +%s)-$$"
     WORK_DIR="$(pwd -P)/bitbanana_verification_${v_safe}_${a_safe}_${t_safe}_${run_id}"
-    IMAGE_NAME="bitbanana-aab-${v_safe}-${a_safe}-${t_safe}-${s_safe}-${run_id}"
+    IMAGE_NAME="bitbanana-${v_safe}-${a_safe}-${t_safe}-${s_safe}-${run_id}"
     log_info "Work directory: ${WORK_DIR}"
     log_info "Container image tag: ${IMAGE_NAME}"
-}
-
-# COMPARISON_RESULTS.yaml — script_version, verdict, notes only.
-
-generate_yaml() {
-    local verdict="$1" notes="${2:-}"
-    local content="script_version: ${SCRIPT_VERSION}
-verdict: ${verdict}"
-    # Every line is indented, not just the first: the per-split resources.arsc
-    # summary is multi-line, and an unindented continuation line silently breaks
-    # the block scalar.
-    if [[ -n "$notes" ]]; then
-        content="${content}
-notes: |
-$(printf '%s\n' "$notes" | sed 's/^/  /')"
-    fi
-    printf '%s\n' "$content" > "${EXEC_DIR}/COMPARISON_RESULTS.yaml"
-    if [[ -n "${WORK_DIR:-}" && -d "${WORK_DIR}" ]]; then
-        printf '%s\n' "$content" > "${WORK_DIR}/COMPARISON_RESULTS.yaml"
-    fi
 }
 
 # Leave nothing the invoking user cannot delete. The build server has no sudo.
@@ -273,6 +229,7 @@ normalize_ownership() {
             chown -R "$(id -u):$(id -g)" /work >/dev/null 2>&1 \
             || log_warn "Could not normalize ownership under ${WORK_DIR}"
     fi
+    chmod -R u+rwX "${WORK_DIR}" 2>/dev/null || true
     if find "${WORK_DIR}" ! -uid "$(id -u)" -print -quit 2>/dev/null | grep -q .; then
         log_warn "Files under ${WORK_DIR} are not owned by $(id -un); manual cleanup may need the container runtime."
     fi
@@ -283,21 +240,17 @@ on_exit() {
     if [[ $code -ne 0 && "${RESULT_DONE}" != "true" ]]; then
         log_warn "Script failed with exit code: ${code}"
         [[ -n "${WORK_DIR:-}" ]] && log_warn "Work directory preserved: ${WORK_DIR}"
-        generate_yaml "ftbfs" "Script aborted before a comparison was produced."
+        [[ -f "${EXEC_DIR}/COMPARISON_RESULTS.yaml" ]] || generate_yaml "ftbfs" "Script aborted before a comparison was produced (exit ${code})."
     fi
     normalize_ownership
-    [[ -n "${IMAGE_NAME:-}" && -n "${CONTAINER_RUNTIME:-}" ]] && ${CONTAINER_RUNTIME} rmi "${IMAGE_NAME}" >/dev/null 2>&1
+    if [[ -n "${IMAGE_NAME:-}" && -n "${CONTAINER_RUNTIME:-}" ]]; then ${CONTAINER_RUNTIME} rmi "${IMAGE_NAME}" >/dev/null 2>&1 || true; fi
     return 0
 }
 trap on_exit EXIT
 
+# Upstream reproducible-builds/Dockerfile (identical from v1.0.1 through v1.1.0), plus the clone
+# of the tag and the pinned bundletool. Re-check the version strings against the tag on every bump.
 create_dockerfile() {
-    # Inlined from upstream reproducible-builds/Dockerfile (read at v1.0.1;
-    # byte-identical on master at 14a4bb56, checked 2026-08-18). Upstream mounts
-    # the working tree from the host; we clone inside the image instead, per WS
-    # guidelines. Version strings below are upstream's own and must be re-checked
-    # against the tag on every bump. bundletool is added by us — upstream's
-    # docs/REPRODUCE_PLAYSTORE.md expects it on the host.
     cat > "$1" << 'DOCKERFILE_EOF'
 FROM docker.io/debian:bookworm-slim
 RUN set -ex; \
@@ -351,8 +304,6 @@ DOCKERFILE_EOF
     log_info "Created Dockerfile (upstream reproducible-builds recipe + pinned bundletool)"
 }
 
-# Screen-density bucket names as used in Play split filenames, mapped to the dpi
-# integers bundletool expects in a device spec.
 density_to_dpi() {
     case "$1" in
         ldpi) echo 120 ;;
@@ -366,16 +317,13 @@ density_to_dpi() {
     esac
 }
 
-# Derive the device spec from the split filenames Play actually delivered.
-# This replaces `bundletool --connected-device` from upstream's playbook, which
-# ABS rule 3 forbids (no smartphone may be required).
+# Device spec from the split names Play delivered (replaces `bundletool --connected-device`).
 derive_device_spec() {
     log_info "=== DEVICE SPEC ==="
     local abis="" locales="" density="" name suffix dpi
 
     for f in "${OFFICIAL_SPLITS[@]}"; do
         name="$(basename "$f")"
-        [[ "$name" == "base.apk" ]] && continue
         [[ "$name" == split_config.* ]] || continue
         suffix="${name#split_config.}"
         suffix="${suffix%.apk}"
@@ -388,8 +336,7 @@ derive_device_spec() {
         fi
         case "$suffix" in
             arm64_v8a|armeabi_v7a|x86_64|x86|mips|mips64)
-                # Play writes ABIs with underscores; bundletool wants hyphens,
-                # except x86_64 which keeps its underscore.
+                # Play writes ABIs with underscores; bundletool wants hyphens, except x86_64.
                 local abi="$suffix"
                 [[ "$abi" == "arm64_v8a" ]] && abi="arm64-v8a"
                 [[ "$abi" == "armeabi_v7a" ]] && abi="armeabi-v7a"
@@ -397,21 +344,15 @@ derive_device_spec() {
                 log_info "ABI split: ${suffix} -> ${abi}"
                 ;;
             *)
-                # Anything left over of the form xx or xx_YY is a language split.
                 locales="${locales:+${locales}, }\"${suffix//_/-}\""
                 log_info "Language split: ${suffix}"
                 ;;
         esac
     done
 
-    if [[ -z "$abis" ]]; then
-        log_fail "No ABI split found among the supplied APKs; cannot derive a device spec."
-        generate_yaml "ftbfs" "Supplied splits contain no split_config.<abi>.apk."
-        exit 2
-    fi
+    [[ -n "$abis" ]] || fail_ftbfs "Supplied splits contain no split_config.<abi>.apk; cannot derive a device spec."
     [[ -z "$density" ]] && { density=480; log_warn "No density split supplied; defaulting to 480 dpi (xxhdpi)."; }
-    # Upstream sets bundle { language.enableSplit = false }, so a language split
-    # is not expected. en-US keeps the spec valid when none is present.
+    # Upstream sets bundle { language.enableSplit = false }; en-US keeps the spec valid.
     [[ -z "$locales" ]] && locales='"en-US"'
 
     SPEC_ABIS="$abis"
@@ -431,74 +372,100 @@ SPEC_EOF
     cat "${WORK_DIR}/device-spec.json"
 }
 
+# Input kind of a single file, from its decoded manifest. Google Play marks every APK it serves
+# (isSplitRequired, com.android.vending.splits, SourceStamp / derived.apk.id meta-data; a config
+# split also carries split="config.*"). The Gradle fat APK has none of these markers.
+classify_single() {
+    if grep -qE ' split="config\.' "$APKTOOL_MANIFEST"; then
+        INPUT_KIND="play-config-split-only"
+    elif grep -qE "isSplitRequired=\"true\"|com\.android\.vending\.splits|${PLAY_MANIFEST_KEYS}" "$APKTOOL_MANIFEST"; then
+        INPUT_KIND="play-base-only"
+    else
+        INPUT_KIND="fat-apk"
+    fi
+}
+
 prepare() {
     log_info "=== PREPARATION PHASE ==="
-    mkdir -p "${WORK_DIR}"/{official,built,comparison}
-    chmod 777 "${WORK_DIR}" "${WORK_DIR}/built" "${WORK_DIR}/comparison"
-    rm -rf "${WORK_DIR}/official"/*.apk "${WORK_DIR}/built"/* "${WORK_DIR}/comparison"/*
+    mkdir "${WORK_DIR}" || fail_ftbfs "Workspace already exists: ${WORK_DIR}"
+    mkdir -p "${WORK_DIR}"/{official,built/splits,comparison}
+    chmod 777 "${WORK_DIR}" "${WORK_DIR}/built" "${WORK_DIR}/built/splits" "${WORK_DIR}/comparison"
 
     shopt -s nullglob
-    local supplied=("${OFFICIAL_DIR}"/*.apk)
-    shopt -u nullglob
-    if [[ ${#supplied[@]} -eq 0 ]]; then
-        log_fail "No .apk files in ${OFFICIAL_DIR}"
-        generate_yaml "ftbfs" "No APKs found in the supplied --binary directory."
-        exit 2
+    local sib=("${OFFICIAL_DIR}"/split_config.*.apk) supplied=()
+    if [[ -n "$OFFICIAL_FILE" && "$(basename "$OFFICIAL_FILE")" == "base.apk" && ${#sib[@]} -gt 0 ]]; then
+        log_info "--binary is the base.apk of a split set; using its directory ${OFFICIAL_DIR}"
+        OFFICIAL_FILE=""
     fi
-    cp "${supplied[@]}" "${WORK_DIR}/official/"
-
-    shopt -s nullglob
-    OFFICIAL_SPLITS=("${WORK_DIR}/official"/*.apk)
-    shopt -u nullglob
-    OFFICIAL_BASE="${WORK_DIR}/official/base.apk"
-    if [[ ! -f "$OFFICIAL_BASE" ]]; then
-        log_fail "base.apk not found in ${OFFICIAL_DIR}; a Play split set must include it."
-        generate_yaml "ftbfs" "Supplied split set has no base.apk."
-        exit 2
+    if [[ -n "$OFFICIAL_FILE" ]]; then
+        supplied=("$OFFICIAL_FILE")
+    else
+        supplied=("${OFFICIAL_DIR}"/*.apk "${OFFICIAL_DIR}"/*.bin)
     fi
-    log_info "Official splits supplied: ${#OFFICIAL_SPLITS[@]}"
-    local f
-    for f in "${OFFICIAL_SPLITS[@]}"; do log_info "  $(basename "$f")"; done
+    shopt -u nullglob
+    [[ ${#supplied[@]} -gt 0 ]] || fail_ftbfs "No .apk or .bin file found at ${BINARY}."
 
-    # appHash is the official artifact exactly as supplied. base.apk carries the
-    # manifest and the app identity, so it is the one published as appHash; the
-    # per-split hashes are printed alongside it, never in place of it.
-    OFFICIAL_APP_HASH="$(sha256_of official/base.apk)"
-    log_info "Official base.apk SHA256 (as supplied): ${OFFICIAL_APP_HASH}"
+    local single=false
+    if [[ ${#supplied[@]} -eq 1 ]]; then
+        single=true
+        OFFICIAL_NAME="$(basename "${supplied[0]}")"
+        cp "${supplied[0]}" "${WORK_DIR}/official/app.apk"
+        OFFICIAL_BASE="${WORK_DIR}/official/app.apk"
+        OFFICIAL_SPLITS=("$OFFICIAL_BASE")
+        log_info "One file supplied: ${OFFICIAL_NAME} (working copy official/app.apk)"
+    else
+        cp "${supplied[@]}" "${WORK_DIR}/official/"
+        shopt -s nullglob
+        OFFICIAL_SPLITS=("${WORK_DIR}/official"/*.apk)
+        shopt -u nullglob
+        OFFICIAL_BASE="${WORK_DIR}/official/base.apk"
+        OFFICIAL_NAME="base.apk"
+        [[ -f "$OFFICIAL_BASE" ]] || fail_ftbfs "Several APKs supplied but no base.apk; a Play split set must include it."
+        INPUT_KIND="play-split-set"
+        log_info "Official splits supplied: ${#OFFICIAL_SPLITS[@]}"
+        local f
+        for f in "${OFFICIAL_SPLITS[@]}"; do log_info "  $(basename "$f")"; done
+    fi
+    local rel
+    rel="official/$(basename "$OFFICIAL_BASE")"
 
-    decode_official_base
+    # appHash is the official artifact exactly as supplied: base.apk of a split set, or the one APK.
+    OFFICIAL_APP_HASH="$(sha256_of "$rel")"
+    log_info "Official ${OFFICIAL_NAME} SHA256 (as supplied): ${OFFICIAL_APP_HASH}"
+
+    decode_official "$rel"
     APP_ID_FROM_APK="$(manifest_package)"
     APK_VERSION_NAME="$(yml_field versionName)"
     APK_VERSION_CODE="$(yml_field versionCode)"
     SPEC_SDK="$(yml_field targetSdkVersion)"
-    SIGNER_SHA256="$(apk_signer official/base.apk)"
+    SIGNER_SHA256="$(apk_signer "$rel")"
 
-    if [[ -z "$APP_ID_FROM_APK" ]]; then
-        log_fail "Could not read the package name from base.apk."
-        generate_yaml "ftbfs" "Package name unreadable from the supplied base.apk."
-        exit 2
-    fi
+    [[ -n "$APP_ID_FROM_APK" ]] || fail_ftbfs "Package name unreadable from the supplied APK."
     log_info "versionName=${APK_VERSION_NAME:-unset} versionCode=${APK_VERSION_CODE:-unset} targetSdk=${SPEC_SDK:-unset}"
-    if [[ "$APP_ID_FROM_APK" != "$APP_ID" ]]; then
-        log_fail "Wrong APK: package is '${APP_ID_FROM_APK}', expected '${APP_ID}'."
-        generate_yaml "ftbfs" "Supplied APK is ${APP_ID_FROM_APK}, not ${APP_ID}."
-        exit 2
-    fi
+    [[ "$APP_ID_FROM_APK" == "$APP_ID" ]] || fail_ftbfs "Wrong APK: package is '${APP_ID_FROM_APK}', expected '${APP_ID}'."
     log_pass "Package ID verified: ${APP_ID_FROM_APK}"
+
+    if [[ "$single" == "true" ]]; then
+        classify_single
+        if [[ "$INPUT_KIND" != "fat-apk" ]]; then
+            log_fail "inputKind: ${INPUT_KIND}"
+            fail_ftbfs "The supplied file is one Google Play APK (${INPUT_KIND}), which cannot be verified alone. Upload the full split set: base.apk plus every split_config.*.apk."
+        fi
+    fi
+    log_info "inputKind: ${INPUT_KIND}"
 
     if [[ -z "$VERSION" ]]; then
         VERSION="${APK_VERSION_NAME}"
-        [[ -z "$VERSION" ]] && { log_fail "Cannot detect version; pass --version."; exit 2; }
-        log_info "Version detected from base.apk: ${VERSION}"
+        [[ -n "$VERSION" ]] || fail_ftbfs "Cannot detect the version from the APK; pass --version."
+        log_info "Version detected from the APK: ${VERSION}"
     elif [[ -n "$APK_VERSION_NAME" && "$APK_VERSION_NAME" != "$VERSION" ]]; then
-        log_warn "base.apk reports ${APK_VERSION_NAME}, --version says ${VERSION}. Building ${VERSION}."
+        log_warn "The APK reports ${APK_VERSION_NAME}, --version says ${VERSION}. Building ${VERSION}."
     fi
-
     APK_VERSION_NAME="${APK_VERSION_NAME:-$VERSION}"
     APK_VERSION_CODE="${APK_VERSION_CODE:-unknown}"
     SIGNER_SHA256="${SIGNER_SHA256:-unknown}"
 
-    derive_device_spec
+    if [[ "$INPUT_KIND" == "play-split-set" ]]; then derive_device_spec; fi
     log_pass "Preparation complete"
 }
 
@@ -512,100 +479,83 @@ build() {
         --build-arg REPO_URL="${REPO_URL}" \
         --build-arg BUNDLETOOL_VERSION="${BUNDLETOOL_VERSION}" \
         --build-arg BUNDLETOOL_SHA256="${BUNDLETOOL_SHA256}" \
-        -t "${IMAGE_NAME}" -f "${WORK_DIR}/Dockerfile" "${WORK_DIR}"
+        -t "${IMAGE_NAME}" -f "${WORK_DIR}/Dockerfile" "${WORK_DIR}" \
+        || fail_ftbfs "Container image build failed for v${VERSION} (clone of the tag, SDK or bundletool download)." 1
 
-    mkdir -p "${WORK_DIR}/built/splits"
-    chmod 777 "${WORK_DIR}/built/splits"
-
-    # Upstream docs/REPRODUCE_PLAYSTORE.md builds through disorderfs with sorted
-    # directory entries; that ordering is the reproducibility mechanism, so it is
-    # reproduced here rather than building the tree directly. Steps 5 and 7 of
-    # that playbook (bundletool, then MakeComparable.py's renaming) are inlined
-    # below rather than called, so the whole run stays in one container.
-    log_info "Running build in container (disorderfs + gradle bundleRelease + bundletool)"
-    # Locale alignment applies to the bundletool step ONLY, never to Gradle.
-    # res/xml/splits0.xml is created by bundletool's SplitsXmlInjector at
-    # build-apks time and is not present in the AAB at all, so the language code
-    # it carries is decided by the split generator, not by the app build. Google
-    # Play generates its splits server-side with tooling that emits the legacy
-    # codes; bundletool under JDK 17 emits the modern ones unless told otherwise.
-    # Measured 2026-08-18: one saved AAB, two bundletool runs differing only in
-    # this property, produced `iw` and `he` respectively. Passing it as a plain
-    # JVM argument to that one java command keeps `gradle bundleRelease` running
-    # exactly as docs/REPRODUCE_PLAYSTORE.md prescribes, with no added flags.
-    local -a runtime_env=()
-    if [[ "$LOCALE_ALIGN" == "true" ]]; then
-        runtime_env+=(-e "BT_LOCALE_OPTS=-Djava.locale.useOldISOCodes=true")
-        log_info "Locale alignment ON: bundletool runs with -Djava.locale.useOldISOCodes=true"
+    # Both upstream playbooks build through disorderfs with sorted directory entries; that
+    # ordering is the reproducibility mechanism and is reproduced here unchanged.
+    local -a run_args=()
+    local cmd='set -euo pipefail
+cp /commit.txt /out/commit.txt
+mkdir -p /app
+disorderfs --sort-dirents=yes --reverse-dirents=no /app-src/ /app/
+cd /app
+'
+    if [[ "$INPUT_KIND" == "fat-apk" ]]; then
+        log_info "Running build in container (disorderfs + gradle assembleRelease, per docs/REPRODUCE_GITHUB.md)"
+        cmd+='gradle clean assembleRelease --no-daemon
+apk="$(find app/build/outputs/apk/release -name "*-release-unsigned.apk" | head -n1)"
+[ -n "$apk" ] || { echo "No unsigned release APK produced"; exit 1; }
+echo "APK: $apk"
+cp "$apk" /out/splits/app.apk
+ls -la /out/splits/'
     else
-        runtime_env+=(-e "BT_LOCALE_OPTS=")
-        log_warn "Locale alignment OFF: bundletool may emit he/id/yi where Play emits iw/in/ji"
+        run_args+=(-v "${WORK_DIR}/device-spec.json:/device-spec.json:ro")
+        # Locale alignment applies to the bundletool step ONLY, never to Gradle: res/xml/splits0.xml
+        # is written by bundletool at build-apks time, and Play's generator writes iw/in/ji there.
+        if [[ "$LOCALE_ALIGN" == "true" ]]; then
+            run_args+=(-e "BT_LOCALE_OPTS=-Djava.locale.useOldISOCodes=true")
+            log_info "Locale alignment ON: bundletool runs with -Djava.locale.useOldISOCodes=true"
+        else
+            run_args+=(-e "BT_LOCALE_OPTS=")
+            log_warn "Locale alignment OFF: bundletool may emit he/id/yi where Play emits iw/in/ji"
+        fi
+        log_info "Running build in container (disorderfs + gradle bundleRelease + bundletool, per docs/REPRODUCE_PLAYSTORE.md)"
+        cmd+='gradle clean bundleRelease --no-daemon
+aab="$(find app/build/outputs/bundle/release -name "*.aab" | head -n1)"
+[ -n "$aab" ] || { echo "No AAB produced"; exit 1; }
+echo "AAB: $aab"
+cp "$aab" /out/
+java ${BT_LOCALE_OPTS:-} -jar /opt/bundletool.jar build-apks \
+    --bundle="$aab" --output-format=DIRECTORY --output=/tmp/built-apks --device-spec=/device-spec.json
+# MakeComparable.py naming: base-master.apk -> base.apk, base-<x>.apk -> split_config.<x>.apk.
+for f in /tmp/built-apks/splits/*.apk; do
+    b="$(basename "$f")"
+    case "$b" in
+        base-master.apk) n="base.apk" ;;
+        base-*.apk)      n="split_config.${b#base-}" ;;
+        *)               n="$b" ;;
+    esac
+    cp "$f" "/out/splits/$n"
+done
+ls -la /out/splits/'
     fi
 
-    if ! ${CONTAINER_RUNTIME} run --rm \
+    ${CONTAINER_RUNTIME} run --rm \
         --device /dev/fuse --cap-add SYS_ADMIN \
         -v "${WORK_DIR}/built:/out" \
-        -v "${WORK_DIR}/device-spec.json:/device-spec.json:ro" \
-        "${runtime_env[@]}" \
-        "${IMAGE_NAME}" \
-        bash -c 'set -euo pipefail
-            cp /commit.txt /out/commit.txt
-            mkdir -p /app
-            disorderfs --sort-dirents=yes --reverse-dirents=no /app-src/ /app/
-            cd /app
-            gradle clean bundleRelease --no-daemon
-            aab="$(find app/build/outputs/bundle/release -name "*.aab" | head -n1)"
-            [ -n "$aab" ] || { echo "No AAB produced"; exit 1; }
-            echo "AAB: $aab"
-            cp "$aab" /out/
-            java ${BT_LOCALE_OPTS:-} -jar /opt/bundletool.jar build-apks \
-                --bundle="$aab" \
-                --output-format=DIRECTORY \
-                --output=/tmp/built-apks \
-                --device-spec=/device-spec.json
-            # MakeComparable.py naming: base-master.apk -> base.apk, and every
-            # other base-<x>.apk -> split_config.<x>.apk.
-            for f in /tmp/built-apks/splits/*.apk; do
-                b="$(basename "$f")"
-                case "$b" in
-                    base-master.apk) n="base.apk" ;;
-                    base-*.apk)      n="split_config.${b#base-}" ;;
-                    *)               n="$b" ;;
-                esac
-                cp "$f" "/out/splits/$n"
-            done
-            ls -la /out/splits/'; then
-        log_fail "Build failed."
-        generate_yaml "ftbfs" "gradle bundleRelease or bundletool failed for v${VERSION}."
-        exit 1
-    fi
+        ${run_args[@]+"${run_args[@]}"} \
+        "${IMAGE_NAME}" bash -c "$cmd" \
+        || fail_ftbfs "Build failed for v${VERSION} (${INPUT_KIND})." 1
 
     shopt -s nullglob
     local built=("${WORK_DIR}/built/splits"/*.apk)
     shopt -u nullglob
-    if [[ ${#built[@]} -eq 0 ]]; then
-        log_fail "bundletool produced no split APKs."
-        generate_yaml "ftbfs" "No splits materialised from the AAB."
-        exit 1
-    fi
+    [[ ${#built[@]} -gt 0 ]] || fail_ftbfs "The build produced no APK." 1
 
     if [[ -f "${WORK_DIR}/built/commit.txt" ]]; then
         IFS= read -r COMMIT_HASH < "${WORK_DIR}/built/commit.txt"
     fi
     COMMIT_HASH="${COMMIT_HASH:-unknown}"
 
-    log_pass "Build complete: ${#built[@]} split APKs"
+    log_pass "Build complete: ${#built[@]} APK(s)"
     local f
     for f in "${built[@]}"; do log_info "  $(basename "$f")"; done
 }
 
-# resources.arsc evidence, per ws-notes/review-notes/resources.arsc.md and the
-# 2026-08-18 precedent survey. A binary arsc difference is not self-explanatory:
-# in 18 of 19 recorded cases the decoded res/ trees matched, but Tangem 5.39.1
-# proved a real semantic change can hide there — and proved it split by split,
-# with one split benign and another genuinely different in the same run. So this
-# runs per split and only produces evidence: it never changes DIFF_COUNT or the
-# verdict. The human categorises in the report.
+# resources.arsc evidence. A binary arsc difference is not self-explanatory: decoded res/ trees
+# usually match, but a real resource change can hide there (and did, per split, for Tangem 5.39.1).
+# Runs per APK and only produces evidence: it never changes DIFF_COUNT or the verdict by itself.
 assess_split_arsc() {
     local name="$1" tag="$2"
     log_info "${tag}: resources.arsc differs; decoding both APKs to compare resources"
@@ -647,11 +597,8 @@ assess_split_arsc() {
 "
 }
 
-# Normalise a decoded AndroidManifest.xml so that only substantive content
-# remains: drop the Play-injected meta-data entries, and neutralise the
-# self-closing <application/> form, which appears purely because those entries
-# were the element's only children. Both sides get identical treatment, so a
-# real difference cannot be normalised away.
+# Normalise a decoded AndroidManifest.xml: drop the Play-injected meta-data entries and the
+# self-closing <application/> form they leave behind. Both sides get identical treatment.
 normalise_manifest() {
     sed -E \
         -e "/<meta-data[^>]*android:name=\"(${PLAY_MANIFEST_KEYS})\"/d" \
@@ -664,9 +611,8 @@ normalise_manifest() {
         "$1"
 }
 
-# Decide whether a split's AndroidManifest.xml difference is nothing but Play
-# distribution metadata. Fail-closed: anything unexpected, any built-only line,
-# or a failed decode leaves the difference counted.
+# Is a split's AndroidManifest.xml difference nothing but Play distribution metadata? Fail-closed:
+# anything unexpected, any built-only entry, or a failed decode leaves the difference counted.
 assess_split_manifest() {
     local name="$1" tag="$2"
     local off="comparison/arsc_${tag}_official" bui="comparison/arsc_${tag}_built"
@@ -684,9 +630,8 @@ assess_split_manifest() {
         log_warn "${tag}: manifest decode failed; difference stays counted"
         return 0
     fi
-    # These entries are injected by Google Play. Our build must never produce one.
-    # Without this guard the normalisation would strip such an entry from both
-    # sides and quietly call the difference acceptable.
+    # Our build must never produce a Play entry; without this guard the normalisation would
+    # strip such an entry from both sides and quietly call the difference acceptable.
     if grep -qE "<meta-data[^>]*android:name=\"(${PLAY_MANIFEST_KEYS})\"" "$b"; then
         MF_STATE[$tag]="semantic"
         log_fail "${tag}: the BUILT manifest carries Play distribution metadata; that should never happen"
@@ -708,8 +653,7 @@ assess_split_manifest() {
     return 0
 }
 
-# Move one class of line from the counted set into the accepted set, recording
-# why. Nothing is ever dropped silently: everything excluded is printed.
+# Move one class of line from the counted set into the accepted set, recording why.
 accept_lines() {
     local counted="$1" pattern="$2" tag="$3" reason="$4"
     local hits
@@ -722,14 +666,20 @@ accept_lines() {
     return 0
 }
 
-# Per-split comparison. Leo's rule (2025-10-30): filter root-level META-INF only,
-# nothing else. Play's SourceStamp, manifest meta-data and resources.arsc all
-# count towards the mechanical verdict; a human categorises them in the report.
+# Per-APK comparison. Only root-level META-INF is filtered up front (Leo's 2025-10-30 rule); on the
+# fat APK path only its signature files. Every other exclusion must be earned by decode evidence.
 compare() {
     log_info "=== COMPARISON PHASE ==="
     local aggregate="${WORK_DIR}/comparison/diff_all.txt"
     : > "$aggregate"
     DIFF_COUNT=0
+    local fat=false metainf
+    if [[ "$INPUT_KIND" == "fat-apk" ]]; then
+        fat=true
+        metainf='^Only in [^:]+/official-unzipped/[^/:]+/META-INF: (MANIFEST\.MF|[^ /]+\.(SF|RSA|DSA|EC))$'
+    else
+        metainf='^Only in [^:]+/(official|built)-unzipped/[^/:]+: META-INF$|^Only in [^:]+/(official|built)-unzipped/[^/:]+/META-INF:|^Files [^ ]+/(official|built)-unzipped/[^/]+/META-INF/'
+    fi
 
     local f name built_apk
     for f in "${OFFICIAL_SPLITS[@]}"; do
@@ -756,30 +706,25 @@ compare() {
 
         local brief="${WORK_DIR}/comparison/diff_${tag}.txt"
         local filtered="${WORK_DIR}/comparison/filtered_${tag}.txt"
-        grep -vE '^Only in [^:]+/(official|built)-unzipped/[^/:]+: META-INF$|^Only in [^:]+/(official|built)-unzipped/[^/:]+/META-INF:|^Files [^ ]+/(official|built)-unzipped/[^/]+/META-INF/' \
-            "$brief" > "$filtered" 2>/dev/null || true
+        grep -vE "$metainf" "$brief" > "$filtered" 2>/dev/null || true
         sed -i '/^$/d' "$filtered" 2>/dev/null || true
 
         # Gather evidence before deciding what may be excluded.
         if grep -q 'resources\.arsc' "$filtered"; then
             assess_split_arsc "$name" "$tag"
         fi
-        if grep -q 'AndroidManifest\.xml' "$filtered"; then
+        if [[ "$fat" == "false" ]] && grep -q 'AndroidManifest\.xml' "$filtered"; then
             assess_split_manifest "$name" "$tag"
         fi
 
-        # Acceptable-diff exclusion, per review-notes/verification-reproducibility-guidelines.md
-        # and the resources.arsc policy. Precedent for excluding this class at all:
-        # bitkit_build.sh:327. Difference from that precedent: bitkit excludes
-        # AndroidManifest.xml and resources.arsc by FILENAME, unconditionally. Here each
-        # exclusion has to be earned by evidence from the decode, so a genuine manifest or
-        # resource change is still counted. Tangem 5.39.1 is why: its resources.arsc decoded
-        # to a real difference in one split while another split's was pure packing noise.
+        # Each exclusion is earned by evidence from the decode, never granted by file name.
+        # Play SourceStamp and Play manifest metadata are only ever accepted on a Play split set.
         local counted="${WORK_DIR}/comparison/counted_${tag}.txt"
         cp "$filtered" "$counted"
-
-        accept_lines "$counted" 'stamp-cert-sha256' "$tag" \
-            "stamp-cert-sha256 (Play SourceStamp, official only)"
+        if [[ "$fat" == "false" ]]; then
+            accept_lines "$counted" 'stamp-cert-sha256' "$tag" \
+                "stamp-cert-sha256 (Play SourceStamp, official only)"
+        fi
         if [[ "${ARSC_STATE[$tag]:-}" == "binary-only" ]]; then
             accept_lines "$counted" 'resources\.arsc' "$tag" \
                 "resources.arsc (binary only; decoded res/ identical)"
@@ -806,6 +751,7 @@ compare() {
             log_pass "${tag}: no differences beyond the accepted classes"
         else
             log_warn "${tag}: ${cnt} unaccounted differences"
+            head -n 5 "$counted"
         fi
     done
 
@@ -831,6 +777,7 @@ print_results_block() {
     echo ""
     echo "===== Begin Results ====="
     echo "appId:          ${APP_ID_FROM_APK:-$APP_ID}"
+    echo "inputKind:      ${INPUT_KIND:-unknown}"
     echo "signer:         ${SIGNER_SHA256}"
     echo "apkVersionName: ${APK_VERSION_NAME}"
     echo "apkVersionCode: ${APK_VERSION_CODE}"
@@ -839,19 +786,22 @@ print_results_block() {
     echo "commit:         ${COMMIT_HASH}"
     echo "scriptVersion:  ${SCRIPT_VERSION}"
     echo "scriptHash:     ${SCRIPT_SHA256}"
-    if [[ "$LOCALE_ALIGN" == "true" ]]; then
+    if [[ "$INPUT_KIND" == "fat-apk" ]]; then
+        echo "splitGenFlags:  n/a (fat APK: gradle assembleRelease, no bundletool)"
+    elif [[ "$LOCALE_ALIGN" == "true" ]]; then
         echo "splitGenFlags:  -Djava.locale.useOldISOCodes=true (bundletool only; Gradle build unmodified)"
     else
         echo "splitGenFlags:  none (locale alignment disabled)"
     fi
     echo ""
-    echo "Official split hashes (as supplied):"
-    local f
+    echo "Official APK hashes (as supplied):"
+    local f n
     for f in "${OFFICIAL_SPLITS[@]}"; do
-        echo "  $(basename "$f")  $(sha256_local "$f")"
+        n="$(basename "$f")"; [[ "$n" == "app.apk" ]] && n="${OFFICIAL_NAME} (copied to app.apk)"
+        echo "  ${n}  $(sha256_local "$f")"
     done
     echo ""
-    echo "Built split hashes:"
+    echo "Built APK hashes (unsigned):"
     shopt -s nullglob
     for f in "${WORK_DIR}/built/splits"/*.apk; do
         echo "  $(basename "$f")  $(sha256_local "$f")"
@@ -865,13 +815,17 @@ print_results_block() {
         echo "(no comparison performed)"
     fi
     if [[ -n "$ACCEPTED_SUMMARY" ]]; then
-        echo "Accepted differences (excluded from the verdict, per split):"
+        echo "Accepted differences (excluded from the verdict, per APK):"
         printf '%s' "$ACCEPTED_SUMMARY"
-        echo "  all splits: root META-INF/ (signing material; the built splits are unsigned)"
-        echo ""
     fi
+    if [[ "$INPUT_KIND" == "fat-apk" ]]; then
+        echo "  root META-INF signature files only (MANIFEST.MF, *.SF, *.RSA/DSA/EC); the built APK is unsigned"
+    else
+        echo "  all splits: root META-INF/ (signing material; the built splits are unsigned)"
+    fi
+    echo ""
     if [[ -n "$ARSC_SUMMARY" ]]; then
-        echo "resources.arsc (decoded, per split):"
+        echo "resources.arsc (decoded, per APK):"
         printf '%s' "$ARSC_SUMMARY"
         echo ""
     fi
@@ -886,12 +840,11 @@ print_results_block() {
     echo ""
     echo "===== End Results ====="
     echo ""
-    echo "Hash legend: appHash is base.apk exactly as supplied and is the value to"
-    echo "publish. The per-split hashes above are context and must never be published"
-    echo "as appHash. The built splits are unsigned; upstream declares no signingConfig."
+    echo "Hash legend: appHash is the official artifact exactly as supplied (base.apk of a split set, or"
+    echo "the single APK) and is the value to publish. Built APKs are unsigned: upstream declares no signingConfig."
     printf 'Run a full\ndiff --recursive %s/comparison/official-unzipped %s/comparison/built-unzipped\nmeld %s/comparison/official-unzipped %s/comparison/built-unzipped\nor\ndiffoscope "%s" "%s"\nfor more details.\n' \
         "${WORK_DIR}" "${WORK_DIR}" "${WORK_DIR}" "${WORK_DIR}" \
-        "${WORK_DIR}/official/base.apk" "${WORK_DIR}/built/splits/base.apk"
+        "${OFFICIAL_BASE}" "${WORK_DIR}/built/splits/$(basename "$OFFICIAL_BASE")"
 }
 
 result() {
@@ -909,13 +862,19 @@ result() {
         log_warn "VERDICT: NOT REPRODUCIBLE (${DIFF_COUNT} differences)"
     fi
 
-    local experiment_note=""
-    if [[ "$LOCALE_ALIGN" == "true" ]]; then
-        experiment_note="Split generation aligned to the distributor: bundletool run with -Djava.locale.useOldISOCodes=true so it emits the same legacy language codes Google Play's server-side generator emits. The Gradle build received no added flags and follows docs/REPRODUCE_PLAYSTORE.md unmodified. "
+    local env_note="Build environment inlined from upstream reproducible-builds/Dockerfile: debian:bookworm-slim, JDK 17, Gradle 8.14, Android SDK platform 35, build-tools 35.0.0, NDK 27.2.12479018, built through disorderfs with sorted directory entries. "
+    local notes
+    if [[ "$INPUT_KIND" == "fat-apk" ]]; then
+        notes="GitHub / F-Droid / Obtainium fat APK path per docs/REPRODUCE_GITHUB.md: gradle clean assembleRelease, the unsigned output compared with the supplied file. ${env_note}Excluded from the count: root META-INF signature files only (MANIFEST.MF, *.SF, *.RSA/DSA/EC), and resources.arsc only where the decoded res/ trees are identical. No Google Play metadata is accepted on this path. "
     else
-        experiment_note="Locale alignment disabled via --no-locale-align. "
+        if [[ "$LOCALE_ALIGN" == "true" ]]; then
+            notes="Split generation aligned to the distributor: bundletool run with -Djava.locale.useOldISOCodes=true so it emits the legacy language codes Google Play's server-side generator emits; the Gradle build received no added flags. "
+        else
+            notes="Locale alignment disabled via --no-locale-align. "
+        fi
+        notes="${notes}Google Play AAB path per docs/REPRODUCE_PLAYSTORE.md: gradle bundleRelease, splits materialised with bundletool ${BUNDLETOOL_VERSION} against a device spec derived from the supplied Play splits, not from a connected device. ${env_note}Only root-level META-INF/ is excluded up front (Leo's 2025-10-30 rule); Play SourceStamp (stamp-cert-sha256), the three com.android.stamp/vending manifest meta-data entries and resources.arsc are excluded only with decode evidence and listed below for the report. "
     fi
-    local notes="${experiment_note}Google Play AAB path. Build environment inlined from upstream reproducible-builds/Dockerfile: debian:bookworm-slim, JDK 17, Gradle 8.14, Android SDK 35, build-tools 35.0.0, NDK 27.2.12479018, built through disorderfs with sorted directory entries per docs/REPRODUCE_PLAYSTORE.md. Splits materialised with bundletool ${BUNDLETOOL_VERSION} against a device spec derived from the supplied Play splits, not from a connected device. Only root-level META-INF/ is excluded from the count, per Leo's 2025-10-30 rule; Play SourceStamp (stamp-cert-sha256), the three com.android.stamp/vending manifest meta-data entries and resources.arsc are expected on a Play comparison and are left for a human to categorise in the report. Built splits are unsigned because upstream declares no signingConfig. ${ACCEPTED_SUMMARY:+Accepted differences excluded from the verdict: ${ACCEPTED_SUMMARY}}${MISSING_NOTE}${ARSC_SUMMARY:+ resources.arsc decoded per split: ${ARSC_SUMMARY}}"
+    notes="${notes}Built APKs are unsigned because upstream declares no signingConfig. ${ACCEPTED_SUMMARY:+Accepted differences excluded from the verdict: ${ACCEPTED_SUMMARY}}${MISSING_NOTE}${ARSC_SUMMARY:+ resources.arsc decoded: ${ARSC_SUMMARY}}"
     generate_yaml "${yaml_verdict}" "${notes}"
     RESULT_DONE=true
     log_info "Generated COMPARISON_RESULTS.yaml"
