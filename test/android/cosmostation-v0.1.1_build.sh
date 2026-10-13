@@ -1,6 +1,6 @@
 #!/bin/bash
-# cosmostation-v0.1.0_build.sh - Cosmostation (wannabit.io.cosmostaion) Android reproducible build verification
-# Version:          v0.1.0
+# cosmostation-v0.1.1_build.sh - Cosmostation (wannabit.io.cosmostaion) Android reproducible build verification
+# Version:          v0.1.1
 # Organization:     WalletScrutiny.com
 # Last modified by: Claude Code (WalletScrutiny forensic agent) for Danny
 # Last modified on: 2026-10-13
@@ -21,8 +21,8 @@
 # LEGAL DISCLAIMER: for legitimate security research. Users are responsible for complying with all
 # applicable laws; by running it you accept full responsibility.
 set -euo pipefail
-readonly SCRIPT_VERSION="v0.1.0"
-readonly SCRIPT_NAME="cosmostation-v0.1.0_build.sh"
+readonly SCRIPT_VERSION="v0.1.1"
+readonly SCRIPT_NAME="cosmostation-v0.1.1_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 readonly SCRIPT_PATH
 readonly YAML_PATH="$(dirname "${SCRIPT_PATH}")/COMPARISON_RESULTS.yaml"
@@ -42,7 +42,7 @@ readonly APKTOOL_SHA256="56d59c524fc764263ba8d345754d8daf55b1887818b15cd3b594f55
 readonly PLAY_KEYS='com\.android\.stamp\.source|com\.android\.stamp\.type|com\.android\.vending\.derived\.apk\.id'
 
 VERSION=""; ARCH=""; BINARY=""; LOCALE_ALIGN=true
-WORK_DIR=""; IMAGE_NAME=""; RT=""; USER_ARGS=""; RUN_ID=""; CN_PREFIX=""
+WORK_DIR=""; IMAGE_NAME=""; RT=""; USER_ARGS=""; RUN_ID=""; CN_PREFIX=""; ROOTLESS=0
 OFFICIAL_DIR=""; OFFICIAL_FILE=""; OBASE=""; OFFICIAL_APP_HASH=""; INPUT_KIND=""
 APK_VERSION_NAME=""; APK_VERSION_CODE=""; SIGNER_SHA256=""; COMMIT_HASH=""; TARGET_SDK=""
 INPUTS_NOTE=""; ACCEPTED_SUMMARY=""; ARSC_SUMMARY=""; MISSING_NOTE=""; DIFF_COUNT=0
@@ -91,7 +91,9 @@ normalize_ownership() {
     if [[ "${RT}" == "podman" ]]; then
         podman unshare chown -R 0:0 "${WORK_DIR}" >/dev/null 2>&1 || true
     else
-        docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1 && docker run --rm --user 0:0 -v "${WORK_DIR}:/work" "${IMAGE_NAME}" chown -R "$(id -u):$(id -g)" /work >/dev/null 2>&1 || true
+        # Rootless docker: container root IS the caller, so 0:0; rootful: the caller's uid:gid.
+        local own="$(id -u):$(id -g)"; [[ "${ROOTLESS}" -eq 1 ]] && own="0:0"
+        docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1 && docker run --rm --user 0:0 -v "${WORK_DIR}:/work" "${IMAGE_NAME}" chown -R "${own}" /work >/dev/null 2>&1 || true
     fi
     chmod -R u+rwX "${WORK_DIR}" 2>/dev/null || true
     if find "${WORK_DIR}" ! -uid "$(id -u)" -print -quit 2>/dev/null | grep -q .; then
@@ -156,10 +158,14 @@ parse_arguments() {
 }
 
 detect_runtime() {
-    if command -v podman >/dev/null 2>&1; then RT="podman"; USER_ARGS="--userns=keep-id"
-    elif command -v docker >/dev/null 2>&1; then RT="docker"; USER_ARGS="--user $(id -u):$(id -g)"
-    else log_fail "Neither podman nor docker found."; exit 1; fi
-    log_info "Using ${RT} as container runtime"
+    # A runtime that actually works (info answers), podman first. Rootless podman: keep-id maps
+    # the caller in. Rootless docker: container uid 0 IS the caller, so run as 0:0.
+    if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then RT="podman"; USER_ARGS="--userns=keep-id"
+    elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        RT="docker"; USER_ARGS="--user $(id -u):$(id -g)"
+        if docker info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless; then ROOTLESS=1; USER_ARGS="--user 0:0"; fi
+    else log_fail "No working container runtime: podman info and docker info both failed."; exit 1; fi
+    log_info "Using ${RT} as container runtime$([[ ${ROOTLESS} -eq 1 ]] && echo ' (rootless docker)')"
 }
 
 write_files() {
@@ -569,9 +575,9 @@ main() {
     log_info "Script:  $(basename "$SCRIPT_PATH") ${SCRIPT_VERSION}"
     log_info "         sha256: ${SCRIPT_SHA256}"
     log_warn "Provided as-is for security research. Review before running."
+    if [[ "$(id -u)" -eq 0 ]]; then log_fail "Do not run this script as root."; RESULT_DONE=true; exit 2; fi
     parse_arguments "$@"
     rm -f "${YAML_PATH}"   # stale result from an earlier run
-    if [[ "$(id -u)" -eq 0 ]]; then log_fail "Do not run this script as root."; exit 2; fi
     detect_runtime
     prepare
     build
