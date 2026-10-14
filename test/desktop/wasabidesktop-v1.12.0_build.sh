@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# wasabidesktop_build.sh - Wasabi Wallet Desktop Reproducible Build Verification
+# wasabidesktop-v1.12.0_build.sh - Wasabi Wallet Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:          v1.11.0
+# Version:          v1.12.0
 # Organization:     WalletScrutiny.com
-# Last modified on: 2026-09-03
+# Last modified by: Claude Code for Danny
+# Last modified on: 2026-10-14
 # Project:          https://github.com/WalletWasabi/WalletWasabi
 # ==============================================================================
 # MIT License. Provided as-is for reproducible-build verification and security
@@ -21,7 +22,7 @@
 set -Eeuo pipefail
 
 # ---------- Script Metadata ----------
-SCRIPT_VERSION="v1.11.0"
+SCRIPT_VERSION="v1.12.0"
 APP_NAME="Wasabi Wallet"
 APP_ID="wasabi"
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
@@ -176,7 +177,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-ORIG_DIR="$(pwd)"
+ORIG_DIR="$(pwd -P)"
+rm -f -- "$ORIG_DIR/COMPARISON_RESULTS.yaml"
 
 # ---------- Validate Parameters (exit 2 = invalid params, mechanical policy) ----------
 if [ -z "$VERSION" ]; then
@@ -244,17 +246,17 @@ fi
 # see the --root-owner-group adaptation below.
 CONTAINER_CMD=""
 CONTAINER_RUN_USER_ARGS=""
-if command -v podman &> /dev/null; then
+if command -v podman &> /dev/null && podman info &> /dev/null; then
   CONTAINER_CMD="podman"
   CONTAINER_RUN_USER_ARGS="--userns=keep-id -e HOME=/tmp"
   log_info "Using Podman for containerization"
-elif command -v docker &> /dev/null; then
+elif command -v docker &> /dev/null && docker info &> /dev/null; then
   CONTAINER_CMD="docker"
   CONTAINER_RUN_USER_ARGS="--user $(id -u):$(id -g) -e HOME=/tmp"
   log_info "Using Docker for containerization"
 else
-  log_error "Neither Docker nor Podman found"
-  write_yaml "ftbfs" "  Neither Docker nor Podman found on host."
+  log_error "No working Docker or Podman (both must answer 'info')"
+  write_yaml "ftbfs" "  No working Docker or Podman found on host."
   exit 1
 fi
 
@@ -267,10 +269,12 @@ VERSION_NO_V="$VERSION"
 log_info "Building $APP_NAME version: $VERSION (tag: $GIT_TAG) for architecture: $ARCH, type: $TYPE"
 
 # ---------- Setup Workspace ----------
-WORKSPACE="$ORIG_DIR/wasabi_build_${VERSION_NO_V}_${ARCH}_${TYPE}"
+# Per-run workspace in the caller's directory: never reused, never deleted.
+RUN_ID="$(date +%s)-$$"
+WORKSPACE="$ORIG_DIR/wasabi_verification_${VERSION_NO_V}_${ARCH}_${TYPE}_${RUN_ID}"
 log_info "Creating workspace: $WORKSPACE"
-rm -rf "$WORKSPACE"
-mkdir -p "$WORKSPACE/output"
+mkdir -- "$WORKSPACE"
+mkdir -- "$WORKSPACE/output"
 cd "$WORKSPACE"
 
 OWNERSHIP_CHECK_RECORDED=false
@@ -283,8 +287,14 @@ cleanup_container() {
   $CONTAINER_CMD rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 }
 cleanup_run() {
-  local first_foreign=""
+  local rc=$? first_foreign=""
+  trap - ERR
   cleanup_container
+  $CONTAINER_CMD rmi -f "${IMAGE_NAME:-}" "${BOOTSTRAP_IMAGE:-}" >/dev/null 2>&1 || true
+  # Hand back anything a container mapped to another UID (rootless podman subuids).
+  [ "$CONTAINER_CMD" = podman ] && { podman unshare chown -R 0:0 "$WORKSPACE" >/dev/null 2>&1 || true; }
+  chmod -R u+rwX "$WORKSPACE" 2>/dev/null || true
+  [ -f "$ORIG_DIR/COMPARISON_RESULTS.yaml" ] || write_yaml "ftbfs" "  Run ended (exit ${rc}) before a verdict."
   first_foreign="$(find_foreign_owned_workspace_file)"
   if [ -n "$first_foreign" ]; then
     log_error "Workspace ownership check failed: $first_foreign is not owned by UID $(id -u)."
@@ -293,6 +303,7 @@ cleanup_run() {
   fi
 }
 trap cleanup_run EXIT
+trap 'log_error "Interrupted"; write_yaml "ftbfs" "  Run interrupted before a verdict."; exit 130' INT TERM
 
 # ---------- Determine Build Configuration ----------
 # BUILD_TARGET is what we pass to Contrib/release.sh; EXPECTED_FILE is what we hash.
@@ -339,11 +350,14 @@ fi
 # the pin going stale every time Microsoft ships a patch. v1.9.0 pinned SDK 10.0.301 (runtime
 # 10.0.9); Wasabi 2.8.2 shipped runtime 10.0.11, so 314 of 425 payload files differed for that
 # reason alone.
-BOOTSTRAP_IMAGE="wasabi-bootstrap-${VERSION_NO_V}-${ARCH}-${TYPE}"
+BOOTSTRAP_IMAGE="wasabi-bootstrap-${VERSION_NO_V}-${ARCH}-${TYPE}-${RUN_ID}"
 log_info "Building bootstrap helper image..."
-cat > "$WORKSPACE/Dockerfile.bootstrap" <<'BOOTSTRAP_EOF'
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Pinned base and a fixed Debian snapshot (http: no CA needed yet; apt checks signatures).
+APT_SNAPSHOT="20261014T000000Z"
+cat > "$WORKSPACE/Dockerfile.bootstrap" <<BOOTSTRAP_EOF
+FROM docker.io/library/debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
+RUN sed -i -E 's#http://deb.debian.org/(debian-security|debian)#http://snapshot.debian.org/archive/\1/${APT_SNAPSHOT}#' /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends \
     curl ca-certificates python3 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /workspace
@@ -466,16 +480,27 @@ fi
 # never root-owned -- but `apt-get install` needs root, so it cannot happen at
 # `run` time once user-mapping is in effect. One image build up front avoids
 # that conflict entirely instead of mixing root and mapped-user `run` calls.
+# The SDK tag is chosen per release above; pin it to its current digest and record it.
+SDK_DIGEST=$($CONTAINER_CMD run --rm $CONTAINER_RUN_USER_ARGS "$BOOTSTRAP_IMAGE" curl -fsSI \
+  -H "Accept: application/vnd.oci.image.index.v1+json" -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+  "https://mcr.microsoft.com/v2/dotnet/sdk/manifests/${SDK_VERSION}-noble" | tr -d '\r' \
+  | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p' || true)
+if ! [[ "$SDK_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  write_yaml "ftbfs" "  Could not resolve the digest of mcr.microsoft.com/dotnet/sdk:${SDK_VERSION}-noble."
+  exit 1
+fi
+log_info "SDK image: mcr.microsoft.com/dotnet/sdk:${SDK_VERSION}-noble@${SDK_DIGEST}"
 log_info "Generating embedded Dockerfile with .NET SDK ${SDK_VERSION}-noble..."
 DOCKERFILE_PATH="$WORKSPACE/Dockerfile"
 cat > "$DOCKERFILE_PATH" <<DOCKERFILE_EOF
-FROM mcr.microsoft.com/dotnet/sdk:${SDK_VERSION}-noble
+FROM mcr.microsoft.com/dotnet/sdk:${SDK_VERSION}-noble@${SDK_DIGEST}
 ENV DEBIAN_FRONTEND=noninteractive \
     DOTNET_CLI_TELEMETRY_OPTOUT=1 \
     DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 \
     LC_ALL=C.UTF-8 \
     LANG=C.UTF-8
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i -E 's#https?://(archive|security)\.ubuntu\.com/ubuntu/?#https://snapshot.ubuntu.com/ubuntu/${APT_SNAPSHOT}/#' /etc/apt/sources.list.d/ubuntu.sources \
+    && apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends \
     git wget ca-certificates zip unzip dpkg-dev gnupg dirmngr \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /workspace
@@ -483,7 +508,7 @@ CMD ["/bin/bash"]
 DOCKERFILE_EOF
 log_success "Dockerfile generated"
 
-IMAGE_NAME="wasabi-build:${VERSION_NO_V}-${ARCH}-${TYPE}-$$"
+IMAGE_NAME="wasabi-build:${VERSION_NO_V}-${ARCH}-${TYPE}-${RUN_ID}"
 log_info "Building container image (this may take a while on first run)..."
 if ! $CONTAINER_CMD build -t "$IMAGE_NAME" -f "$DOCKERFILE_PATH" "$WORKSPACE"; then
   log_error "Container build failed"
