@@ -1,42 +1,19 @@
 #!/bin/bash
-# ==============================================================================
-# greenfdroid_build.sh - Blockstream Green F-Droid Reproducible Build Verification
-# ==============================================================================
-# Version:       v0.2.6
-# Organization:  WalletScrutiny.com
-# Last modified by: Danny Garcia
-# Last modified on: 2026-09-01
-# Project:       https://github.com/Blockstream/green_android
-# F-Droid:       https://f-droid.org/packages/com.greenaddress.greenbits_android_wallet/
-# License:       MIT
-# Changelog + design rationale: ws-notes/script-notes/android/com.greenaddress.greenbits_android_wallet/changelog.md
-# ==============================================================================
-# Verifies the F-Droid distribution: compiles GDK from source (like F-Droid;
-# Play Store ships a prebuilt GDK), builds the APK, compares with apksigcopier.
-# The fdroiddata recipe is the source of truth: its commit: is built, its build
-# block must sha256-match the audited EXPECTED_RECIPE_SHA256 (any change =>
-# exit 2, re-audit), and the release tag is cross-checked for provenance.
-#
-# Env must match F-Droid's build servers (see changelog for the 5.4.0 Build ID
-# root cause): Debian Trixie; user vagrant; checkout path
-# /home/vagrant/build/com.greenaddress.greenbits_android_wallet/ (clone into
-# ".", no subdir); SDK/NDK at /opt/android-sdk (path feeds the Build ID);
-# NDK r26b; JDK 21; Rust from gdk Dockerfile; SOURCE_DATE_EPOCH from commit.
-# Deviations from literal fdroidserver: patch 5 +4d (recipe's +3d orphans a
-# brace); apt packages unpinned. GDK cloned full + tag checkout (srclib-equiv).
-# GDK compile ~30-60 min first run; Docker layers cached after.
-# ==============================================================================
+# greenfdroid_build.sh - Blockstream Green F-Droid reproducible build verification. License: MIT
+# Version: v0.2.7
+# Organization: WalletScrutiny.com | Project: https://github.com/Blockstream/green_android
+# Last modified by: Claude Code for Danny
+# Last modified on: 2026-10-14
+# Disclaimer: build verification only, not a security audit; as-is, no warranty. Use lawfully, at your own risk.
+# Builds fdroiddata's recipe commit in F-Droid's env (Trixie, vagrant, F-Droid paths); compares with apksigcopier.
 
 set -euo pipefail
 
-# ----------------------------------------
-# Constants
-# ----------------------------------------
-SCRIPT_VERSION="v0.2.6"
+# --- Constants ---
+SCRIPT_VERSION="v0.2.7"
 APP_ID="com.greenaddress.greenbits_android_wallet"
 REPO_URL="https://github.com/Blockstream/green_android.git"
 GDK_REPO_URL="https://github.com/Blockstream/gdk.git"
-WS_CONTAINER="docker.io/walletscrutiny/android:5"
 FDROID_RECIPE_URL="https://gitlab.com/fdroid/fdroiddata/-/raw/master/metadata/com.greenaddress.greenbits_android_wallet.yml"
 # sha256 of the recipe build block minus blank + versionName/versionCode/commit
 # lines; recompute with the guard pipeline below after re-auditing a change.
@@ -48,7 +25,7 @@ EXIT_SUCCESS=0
 EXIT_FAILED=1
 EXIT_INVALID=2
 
-execution_dir="$(pwd)"
+execution_dir="$(pwd -P)"
 script_name="$(basename "$0")"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256=""
@@ -70,9 +47,7 @@ built_apk=""
 _run_id=""
 _staging_tag=""
 
-# ----------------------------------------
-# Logging
-# ----------------------------------------
+# --- Logging ---
 log_info()  { echo "[INFO] $*"; }
 log_warn()  { echo "[WARN] $*"; }
 log_error() { echo "[ERROR] $*"; }
@@ -111,42 +86,54 @@ die_failed() {
 
 on_error() {
   local exit_code=$?
-  local line_no=$1
   set +e
-  log_error "Script failed at line ${line_no} (exit code ${exit_code})"
-  if [[ -n "${build_container_name}" ]]; then
-    ${CONTAINER_CMD} rm -f "${build_container_name}" 2>/dev/null || true
-  fi
-  [[ -n "${build_image_tag}" ]] && ${CONTAINER_CMD} rmi "${build_image_tag}" 2>/dev/null || true
-  [[ -n "${_staging_tag}" ]] && ${CONTAINER_CMD} rmi "${_staging_tag}" 2>/dev/null || true
+  log_error "Script failed at line $1 (exit code ${exit_code})"
   generate_error_yaml "ftbfs"
   echo "Exit code: ${EXIT_FAILED}"
   exit "${EXIT_FAILED}"
 }
+# EXIT (success, failure, signal): drop the run's container and image tags and
+# hand the workspace back to the caller (no sudo on the build server).
+on_exit() {
+  set +e
+  [[ -n "${build_container_name}" ]] && ${CONTAINER_CMD} rm -f "${build_container_name}" &>/dev/null
+  if [[ -d "${work_dir}" ]]; then
+    if [[ "${CONTAINER_CMD}" == podman ]]; then
+      podman unshare chown -R 0:0 "${work_dir}" &>/dev/null
+    else
+      own="$(id -u):$(id -g)"
+      docker info -f '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless && own=0:0
+      docker run --rm --user 0:0 -v "${work_dir}:/w" "${_staging_tag}" chown -R "${own}" /w &>/dev/null
+    fi
+    chmod -R u+rwX "${work_dir}" 2>/dev/null
+    find "${work_dir}" ! -uid "$(id -u)" -print -quit | grep -q . && log_warn "Files in ${work_dir} not owned by $(id -un)"
+    "${should_cleanup}" && [[ -n "${verdict:-}" ]] && rm -rf "${work_dir}" && log_info "Work directory removed."
+  fi
+  for t in "${build_image_tag}" "${_staging_tag}"; do [[ -n "$t" ]] && ${CONTAINER_CMD} rmi "$t" &>/dev/null; done
+  return 0
+}
+on_signal() { log_error "Interrupted ($1)"; generate_error_yaml "ftbfs"; echo "Exit code: $2"; exit "$2"; }
 trap 'on_error $LINENO' ERR
+trap on_exit EXIT
+trap 'on_signal INT 130' INT
+trap 'on_signal TERM 143' TERM
 
-# ----------------------------------------
-# Container runtime detection
-# ----------------------------------------
+# --- Container runtime detection ---
 CONTAINER_CMD=""
 VOLUME_RO_SUFFIX=""
-VOLUME_RW_SUFFIX=""
 
-if command -v podman >/dev/null 2>&1; then
+# A runtime must actually work (`info` answers), podman first.
+if command -v podman >/dev/null 2>&1 && podman info &>/dev/null; then
   CONTAINER_CMD="podman"
   VOLUME_RO_SUFFIX=":ro,Z"
-  VOLUME_RW_SUFFIX=":Z"
-elif command -v docker >/dev/null 2>&1; then
+elif command -v docker >/dev/null 2>&1 && docker info &>/dev/null; then
   CONTAINER_CMD="docker"
   VOLUME_RO_SUFFIX=":ro"
-  VOLUME_RW_SUFFIX=""
 else
-  die_invalid "Neither podman nor docker found. Install one to continue."
+  die_invalid "No working podman or docker (podman info / docker info failed)."
 fi
 
-# ----------------------------------------
-# Usage
-# ----------------------------------------
+# --- Usage ---
 usage() {
   cat <<EOF
 NAME
@@ -164,8 +151,7 @@ DESCRIPTION
 
        Compiles GDK from source, applies all F-Droid recipe patches, builds
        the unsigned APK, then compares against the official APK with
-       apksigcopier --unsigned. Captures linker commands, pre-strip .so and
-       .syms per ABI for Build ID diagnostics.
+       apksigcopier --unsigned.
 
        First run: 30-60 min (GDK C++/Rust compilation).
        Subsequent runs: ~5 min (Docker layer cache reused).
@@ -191,9 +177,7 @@ EXAMPLES
 EOF
 }
 
-# ----------------------------------------
-# Argument parsing
-# ----------------------------------------
+# --- Argument parsing ---
 while [[ "$#" -gt 0 ]]; do
   case $1 in
     --version)        [[ "$#" -lt 2 ]] && die_invalid "--version requires a value"; requested_version="$2"; shift ;;
@@ -216,9 +200,7 @@ done
 
 log_info "Starting ${script_name} ${SCRIPT_VERSION}"
 
-# ----------------------------------------
-# YAML output helpers
-# ----------------------------------------
+# --- YAML output helpers ---
 generate_error_yaml() {
   local status="$1"
   cat > "${execution_dir}/COMPARISON_RESULTS.yaml" <<EOF
@@ -241,7 +223,7 @@ generate_comparison_yaml() {
     echo "  SOURCE_DATE_EPOCH: derived from app git commit timestamp"
     echo "  Comparison method: apksigcopier compare --unsigned"
     echo "  Expected non-content differences: META-INF/F-Droid signature files (MANIFEST.MF, *.SF, *.RSA)"
-    echo "  Deviations from literal fdroidserver: patch5 +4d (recipe +3d orphans a brace); apt packages unpinned"
+    echo "  Deviations from literal fdroidserver: patch5 +4d (recipe +3d orphans a brace); debian:trixie by digest, apt from snapshot.debian.org 20261014T000000Z"
     if [[ -n "${additional_info}" ]]; then
       while IFS= read -r _ai_line; do
         echo "  ${_ai_line}"
@@ -250,11 +232,8 @@ generate_comparison_yaml() {
   } > "${execution_dir}/COMPARISON_RESULTS.yaml"
 }
 
-# ----------------------------------------
-# Build Trixie+vagrant Docker image (inline Dockerfile) — staging tag
-# ----------------------------------------
-# ----------------------------------------
-_run_id="$$-$(date +%s)"
+# --- Build Trixie+vagrant Docker image (inline Dockerfile) — staging tag ---
+_run_id="$(date +%s)-$$"
 _staging_tag="greenfdroid-build-${_run_id}:staging"
 
 log_info "Building Debian Trixie + vagrant Docker image (tag: ${_staging_tag}; cached after first run)..."
@@ -264,7 +243,9 @@ ${CONTAINER_CMD} build --tag "${_staging_tag}" - <<'DOCKERFILE'
 # SOURCE_DATE_EPOCH must be set at runtime (git log -1 --format=%ct) before
 # prepare_gdk_clang.sh — OpenSSL embeds it as "built on:".
 
-FROM debian:trixie
+FROM docker.io/library/debian:trixie@sha256:913f6706df59a68922d1dd08f78c2476560a8d367897200a6005b00e5f67c2d5
+# Pin apt to a snapshot.debian.org date (same packages on every run).
+ARG APT_SNAPSHOT=20261014T000000Z
 
 ARG ANDROID_COMMAND_LINE_TOOLS=commandlinetools-linux-9477386_latest.zip
 ARG ANDROID_COMMAND_LINE_TOOLS_SHA256=bd1aa17c7ef10066949c88dc6c9c8d536be27f992a1f3b5a584f9bd2ba5646a0
@@ -280,14 +261,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
     JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 \
     PATH=/usr/lib/jvm/java-21-openjdk-amd64/bin:/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:/opt/android-sdk/build-tools/34.0.0:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-RUN apt-get update \
+RUN sed -i -E "s#http://deb.debian.org/(debian(-security)?)\$#http://snapshot.debian.org/archive/\1/${APT_SNAPSHOT}#" \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Check-Valid-Until=false update \
     && apt-get install -y --no-install-recommends \
         autoconf automake bison build-essential ca-certificates clang cmake \
         curl file flex gettext git gperf jq libffi-dev libtool make \
         ninja-build openjdk-21-jdk patch perl pkg-config python3 python3-dev \
         python3-pip python3-virtualenv rsync rustup swig unzip wget xz-utils \
         zip zlib1g-dev \
-    && pip3 install --break-system-packages --no-cache-dir apksigcopier==1.1.1 setuptools \
+    && pip3 install --break-system-packages --no-cache-dir apksigcopier==1.1.1 setuptools==84.0.0 \
     && rm -rf /var/lib/apt/lists/* \
     && cmake --version \
     && cmake --version | awk 'NR==1{split($3,v,"."); if(v[1]<3||(v[1]==3&&v[2]<19)){print "cmake >= 3.19 required: "$3; exit 1}}'
@@ -333,10 +316,7 @@ DOCKERFILE
 
 log_info "Docker image ready: ${_staging_tag}"
 
-# ----------------------------------------
-# Validate APK and extract version using aapt from the build image
-# ----------------------------------------
-# ----------------------------------------
+# --- Validate APK and extract version using aapt from the build image ---
 apk_dir="$(dirname "${downloaded_apk}")"
 apk_file="$(basename "${downloaded_apk}")"
 filename_version_code="$(basename "${downloaded_apk}" .apk | grep -oE '[0-9]+$' || true)"
@@ -378,9 +358,7 @@ else
   log_info "Version: ${version_name} (versionCode: ${version_code})"
 fi
 
-# ----------------------------------------
-# F-Droid recipe: source of truth for the built commit + build-step guard
-# ----------------------------------------
+# --- F-Droid recipe: source of truth for the built commit + build-step guard ---
 # Ref -> commit; prefers the peeled ^{} line, falls back to the plain ref.
 resolve_ref() {
   ${CONTAINER_CMD} run --rm "${_staging_tag}" \
@@ -442,21 +420,17 @@ build_image_tag="greenfdroid-build-${_run_id}:${version_name}"
 ${CONTAINER_CMD} tag "${_staging_tag}" "${build_image_tag}"
 log_info "Image tagged: ${build_image_tag}"
 
-# ----------------------------------------
-# Work directory
-# ----------------------------------------
-work_dir="$(mktemp -d "/tmp/greenfdroid_${version_name}_XXXXXX")"
-mkdir -p "${work_dir}/artifacts"
+# --- Work directory ---
+# Per run, in the caller's directory; exclusive mkdir never reuses a workspace.
+work_dir="${execution_dir}/greenfdroid_verification_${version_name}_${_run_id}"
+mkdir "${work_dir}" "${work_dir}/artifacts"
 log_info "Work directory: ${work_dir}"
 
-# ----------------------------------------
-# Write inner build script (runs inside the container as vagrant)
-# ----------------------------------------
+# --- Write inner build script (runs inside the container as vagrant) ---
 # Inner script mounted read-only; output written to /output, docker cp'd after.
 # CRITICAL: green_android is cloned with "." directly into WORKDIR so the GDK
 # compile path matches fdroidserver's layout exactly — a subdirectory clone
 # adds "green_android/" to embedded paths, changing .rodata in the .so.
-# ----------------------------------------
 
 inner_script="${work_dir}/inner-build.sh"
 
@@ -568,119 +542,6 @@ JAVA_HOME=$(readlink -f /usr/bin/javac | sed "s:/bin/javac::") \
 
 echo "[BUILD] GDK compilation complete."
 
-echo "[BUILD] Capturing linker command for both ABIs..."
-# Makefile generator writes link.txt; Ninja stores commands in build.ninja.
-for abi in arm64-v8a armeabi-v7a; do
-  captured=false
-
-  # Method 1: link.txt anywhere under gdk/ for this ABI
-  linkfile=$(find "gdk" -path "*${abi}*" -name "link.txt" 2>/dev/null \
-             | xargs grep -l -- "--build-id" 2>/dev/null | head -1 || true)
-  if [[ -n "${linkfile}" ]]; then
-    cp "${linkfile}" "/output/link-${abi}.txt"
-    echo "[BUILD] Captured link.txt for ${abi}: ${linkfile}"
-    cat "${linkfile}"
-    captured=true
-  fi
-
-  # Method 2: Ninja — `ninja -t commands` prints fully-expanded commands
-  # (grepping build.ninja alone misses the template in rules.ninja).
-  if [[ "${captured}" == "false" ]]; then
-    ninja_file=$(find "gdk" -path "*${abi}*" -name "build.ninja" 2>/dev/null | head -1 || true)
-    if [[ -n "${ninja_file}" ]]; then
-      ninja -C "$(dirname "${ninja_file}")" -t commands 2>/dev/null \
-        | grep -- "libgreen_gdk_java" | head -5 > "/output/link-${abi}.txt" || true
-      if [[ ! -s "/output/link-${abi}.txt" ]]; then
-        # Fallback: raw grep of build.ninja (weaker — may show variables, not commands)
-        grep -n -- "--build-id\|libgreen_gdk_java" "${ninja_file}" 2>/dev/null \
-          | head -30 > "/output/link-${abi}.txt" || true
-      fi
-      if [[ -s "/output/link-${abi}.txt" ]]; then
-        echo "[BUILD] Captured linker command via ninja for ${abi}: ${ninja_file}"
-        cat "/output/link-${abi}.txt"
-        captured=true
-      fi
-    fi
-  fi
-
-  if [[ "${captured}" == "false" ]]; then
-    echo "[BUILD] WARNING: linker command not found for ${abi}"
-    echo "WARNING: linker command not captured (neither link.txt nor build.ninja found)" \
-      > "/output/link-${abi}.txt"
-  fi
-done
-
-echo "[BUILD] Capturing Build IDs from built .so files..."
-for abi in arm64-v8a armeabi-v7a; do
-  # The built .so may be in the cmake build dir or copied into the wrapper jniLibs
-  sofile=$(find "gdk" -name "libgreen_gdk_java.so" -path "*${abi}*" 2>/dev/null | head -1 || true)
-  if [[ -n "${sofile}" ]]; then
-    bid=$(readelf -n "${sofile}" 2>/dev/null | grep "Build ID" || true)
-    echo "${bid}" > "/output/buildid-built-${abi}.txt"
-    echo "[BUILD] Built ${abi} Build ID: ${bid}"
-  else
-    echo "[BUILD] WARNING: built libgreen_gdk_java.so not found for ${abi}"
-  fi
-done
-
-echo "[BUILD] Capturing .syms and pre-strip .so artifacts (before Gradle assembly)..."
-# GDK cmake runs objcopy --only-keep-debug on the linked lib, writing
-# libgreen_gdk_java.syms next to the linker output .so — anchor pre-strip
-# selection to the .syms location, size heuristic only as fallback.
-LLVM_OBJCOPY="${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objcopy"
-for abi in arm64-v8a armeabi-v7a; do
-  prestrip_so=""
-  select_method=""
-  syms=$(find "gdk" -path "*/build-android-${abi}/*" \
-    -name "libgreen_gdk_java.syms" 2>/dev/null | head -1 || true)
-  if [[ -z "${syms}" ]]; then
-    syms=$(find "gdk" -name "libgreen_gdk_java.syms" -path "*${abi}*" \
-      2>/dev/null | head -1 || true)
-  fi
-  if [[ -n "${syms}" ]]; then
-    cp "${syms}" "/output/syms-${abi}.syms"
-    sha256sum "${syms}" | awk '{print $1}' > "/output/hash-syms-${abi}.txt"
-    echo "[BUILD] Captured .syms for ${abi}: ${syms} ($(stat -c%s "${syms}") bytes)"
-    prestrip_so=$(find "$(dirname "${syms}")" -name "libgreen_gdk_java.so" 2>/dev/null \
-      | grep "swig_java" | head -1 || true)
-    [[ -z "${prestrip_so}" ]] && prestrip_so=$(find "$(dirname "${syms}")" \
-      -name "libgreen_gdk_java.so" 2>/dev/null | head -1 || true)
-    select_method="adjacent-to-syms"
-  else
-    echo "[BUILD] WARNING: libgreen_gdk_java.syms not found for ${abi}"
-  fi
-  if [[ -z "${prestrip_so}" ]]; then
-    prestrip_so=$(find "gdk" -name "libgreen_gdk_java.so" -path "*${abi}*" \
-      -printf '%s %p\n' 2>/dev/null | sort -rn | awk '{print $2}' | head -1 || true)
-    select_method="largest-size-heuristic"
-  fi
-  if [[ -n "${prestrip_so}" ]]; then
-    sz=$(stat -c%s "${prestrip_so}")
-    dbg_count=$(readelf -S "${prestrip_so}" 2>/dev/null | grep -c "\.debug_" || true)
-    echo "[BUILD] Pre-strip ${abi}: ${prestrip_so} (${sz} bytes, ${dbg_count} .debug_* sections, selected: ${select_method})"
-    if [[ "${dbg_count}" -eq 0 ]]; then
-      echo "[BUILD] WARNING: ${abi} pre-strip candidate has NO .debug_* sections — Build ID hash input difference must lie in symtab/strtab, or this file is not the linker output"
-    fi
-    cp "${prestrip_so}" "/output/prestrip-${abi}.so"
-    sha256sum "${prestrip_so}" | awk '{print $1}' > "/output/hash-prestrip-${abi}.txt"
-    readelf -S  "${prestrip_so}" 2>/dev/null > "/output/prestrip-sections-${abi}.txt" || true
-    readelf -n  "${prestrip_so}" 2>/dev/null >> "/output/prestrip-sections-${abi}.txt" || true
-    echo "[BUILD] Pre-strip section headers saved to prestrip-sections-${abi}.txt"
-    # Cross-check: regenerating .syms from the candidate proves it is the
-    # exact file objcopy ran on.
-    if [[ -n "${syms}" && -x "${LLVM_OBJCOPY}" ]]; then
-      "${LLVM_OBJCOPY}" --only-keep-debug "${prestrip_so}" "/tmp/recheck-${abi}.syms" 2>/dev/null || true
-      if cmp -s "/tmp/recheck-${abi}.syms" "${syms}" 2>/dev/null; then
-        echo "[BUILD] Cross-check ${abi}: --only-keep-debug of pre-strip .so == captured .syms (linker output confirmed)"
-      else
-        echo "[BUILD] Cross-check ${abi}: pre-strip candidate does NOT regenerate .syms (may not be the exact linker output)"
-      fi
-    fi
-  else
-    echo "[BUILD] WARNING: pre-strip .so not found for ${abi}"
-  fi
-done
-
 echo "[BUILD] Building F-Droid APK..."
 cd ..
 ./gradlew assembleProductionFDroidRelease
@@ -700,13 +561,6 @@ cp "${built_apk}" /output/green-fdroid-built-unsigned.apk
 cp /tmp/commit-hash.txt /output/commit-hash.txt
 sha256sum /output/green-fdroid-built-unsigned.apk | awk '{print $1}' \
   > /output/hash-built-apk.txt
-for abi in arm64-v8a armeabi-v7a; do
-  if ! unzip -p /output/green-fdroid-built-unsigned.apk \
-    "lib/${abi}/libgreen_gdk_java.so" 2>/dev/null \
-    | sha256sum | awk '{print $1}' > "/output/hash-built-so-${abi}.txt"; then
-    echo "not captured" > "/output/hash-built-so-${abi}.txt"
-  fi
-done
 
 echo "[BUILD] Artifacts in /output:"
 ls -lh /output/
@@ -714,9 +568,7 @@ INNER_BUILD
 
 chmod 644 "${inner_script}"
 
-# ----------------------------------------
-# Run build container (persistent — docker cp afterward)
-# ----------------------------------------
+# --- Run build container (persistent — docker cp afterward) ---
 build_container_name="greenfdroid-build-${_run_id}"
 
 log_info "Starting build container: ${build_container_name}"
@@ -751,6 +603,13 @@ official_sha256="$(${CONTAINER_CMD} run --rm \
   "${build_image_tag}" \
   sha256sum "/apk/${apk_file}" 2>/dev/null | awk '{print $1}' || echo "unknown")"
 log_info "Official APK SHA256: ${official_sha256}"
+official_signer="$(${CONTAINER_CMD} run --rm \
+  --volume "${apk_dir}:/apk${VOLUME_RO_SUFFIX}" \
+  "${build_image_tag}" \
+  apksigner verify --print-certs "/apk/${apk_file}" 2>/dev/null \
+  | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -1 || true)"
+official_signer="${official_signer:-N/A}"
+log_info "Official signer (cert SHA-256): ${official_signer}"
 read_hash_file() {
   local file="$1" fallback="$2"
   if [[ -f "${file}" ]]; then
@@ -764,82 +623,8 @@ log_info "Built APK SHA256:    ${built_sha256}"
 append_additional_info "Official APK SHA256: ${official_sha256}"
 append_additional_info "Built APK SHA256: ${built_sha256}"
 
-for abi in arm64-v8a armeabi-v7a; do
-  built_so_sha="$(read_hash_file "${work_dir}/artifacts/hash-built-so-${abi}.txt" "not captured")"
-  prestrip_sha="$(read_hash_file "${work_dir}/artifacts/hash-prestrip-${abi}.txt" "not captured")"
-  syms_sha="$(read_hash_file "${work_dir}/artifacts/hash-syms-${abi}.txt" "not captured")"
-  log_info "${abi} built APK .so SHA256: ${built_so_sha}"
-  log_info "${abi} pre-strip .so SHA256: ${prestrip_sha}"
-  log_info "${abi} .syms SHA256:         ${syms_sha}"
-  append_additional_info "${abi} hashes: built-so=${built_so_sha}, prestrip-so=${prestrip_sha}, syms=${syms_sha}"
-done
-
-# ----------------------------------------
-# Log linker-command contents and diagnose Build ID behavior
-# ----------------------------------------
-log_info "======================================================================"
-log_info "CMake linker command for libgreen_gdk_java.so"
-log_info "======================================================================"
-log_info "Examining --build-id and strip flags to explain Build ID non-determinism."
-
-for abi in arm64-v8a armeabi-v7a; do
-  linkfile="${work_dir}/artifacts/link-${abi}.txt"
-  log_info "--- ${abi} ---"
-  if [[ -f "${linkfile}" ]]; then
-    cat "${linkfile}"
-    echo ""
-    if grep -qE -- "--strip-all|-S " "${linkfile}" 2>/dev/null; then
-      log_info "[${abi}] linker command contains a strip flag"
-      append_additional_info "${abi} link: strips during link (--strip-all or -S found)"
-    else
-      log_info "[${abi}] No strip flag in captured linker command"
-      append_additional_info "${abi} link: no strip flag in link command (strip may occur in a separate post-link step)"
-    fi
-    build_id_flag=$(grep -oE -- "--build-id=[^ ]+" "${linkfile}" 2>/dev/null || echo "(not found)")
-    log_info "[${abi}] Build ID flag: ${build_id_flag}"
-    append_additional_info "${abi} --build-id flag: ${build_id_flag}"
-  else
-    log_warn "Linker command not found for ${abi}"
-    append_additional_info "${abi} linker command: not captured"
-  fi
-done
-
-# ----------------------------------------
-# Report Build IDs (official vs built)
-# ----------------------------------------
-log_info "======================================================================"
-log_info "GNU Build IDs"
-log_info "======================================================================"
-
-for abi in arm64-v8a armeabi-v7a; do
-  log_info "--- ${abi} ---"
-
-  official_buildid="$(${CONTAINER_CMD} run --rm \
-    --volume "$(dirname "${downloaded_apk}"):/official${VOLUME_RO_SUFFIX}" \
-    "${build_image_tag}" \
-    bash -c "
-      mkdir -p /tmp/so-extract
-      unzip -q /official/$(basename "${downloaded_apk}") lib/${abi}/libgreen_gdk_java.so \
-        -d /tmp/so-extract 2>/dev/null || true
-      readelf -n /tmp/so-extract/lib/${abi}/libgreen_gdk_java.so 2>/dev/null \
-        | grep 'Build ID' || echo '(not found)'
-    " )"
-
-  built_buildid_file="${work_dir}/artifacts/buildid-built-${abi}.txt"
-  built_buildid="$(cat "${built_buildid_file}" 2>/dev/null || echo "(not found)")"
-
-  log_info "Official: ${official_buildid}"
-  log_info "Built:    ${built_buildid}"
-  append_additional_info "Build ID official ${abi}: ${official_buildid}"
-  append_additional_info "Build ID built    ${abi}: ${built_buildid}"
-done
-
-# ----------------------------------------
-# Compare: apksigcopier --unsigned
-# ----------------------------------------
-log_info "======================================================================"
-log_info "apksigcopier compare --unsigned"
-log_info "======================================================================"
+# --- Compare: apksigcopier --unsigned ---
+log_info "== apksigcopier compare --unsigned =="
 
 apksig_raw="$(${CONTAINER_CMD} run --rm \
   --volume "$(dirname "${downloaded_apk}"):/official${VOLUME_RO_SUFFIX}" \
@@ -865,12 +650,8 @@ else
 fi
 append_additional_info "apksigcopier exit=${apksig_exit_code}: $(echo "${apksig_output}" | head -1)"
 
-# ----------------------------------------
-# Compare: full file diff (all files in APK)
-# ----------------------------------------
-log_info "======================================================================"
-log_info "Full APK file diff (diff -rq on unzipped contents)"
-log_info "======================================================================"
+# --- Compare: full file diff (all files in APK) ---
+log_info "== Full APK file diff (diff -rq on unzipped contents) =="
 
 diff_output="$(${CONTAINER_CMD} run --rm \
   --volume "$(dirname "${downloaded_apk}"):/official${VOLUME_RO_SUFFIX}" \
@@ -913,9 +694,7 @@ append_additional_info "diff: ${so_diff_count} .so file(s) differ, ${meta_only_c
 # (objcopy --remove-section rewrites layout and produces false mismatches).
 so_buildid_only=false
 if [[ "${so_diff_count}" -gt 0 ]]; then
-  log_info "======================================================================"
-  log_info "Verifying .so differences are confined to .note.gnu.build-id (cmp -l)"
-  log_info "======================================================================"
+  log_info "== Verifying .so differences are confined to .note.gnu.build-id (cmp -l) =="
   so_buildid_only=true
   for abi in arm64-v8a armeabi-v7a; do
     if ! echo "${diff_output}" | grep -q "lib/${abi}/libgreen_gdk_java.so"; then
@@ -1009,34 +788,19 @@ if [[ "${so_diff_count}" -gt 0 ]]; then
   fi
 fi
 
-# ----------------------------------------
-# Determine verdict
-# ----------------------------------------
+# --- Determine verdict ---
 verdict="not_reproducible"
 if "${apksig_ok}"; then
   verdict="reproducible"
 fi
 
-# Annotate if Build ID is the only non-signing difference (proven by objcopy)
-if [[ "${so_diff_count}" -gt 0 && "${only_meta_and_so}" == "true" && "${so_buildid_only}" == "true" && "${verdict}" == "not_reproducible" ]]; then
-  append_additional_info ""
-  append_additional_info "POLICY NOTE: The only content difference is .note.gnu.build-id in"
-  append_additional_info "libgreen_gdk_java.so (both ABIs), confirmed by cmp -l byte-range check."
-  append_additional_info "All executable code, data sections, resources, and assets are identical."
-  append_additional_info "See cmake link.txt above for lld flags (--build-id, strip behavior)."
-fi
+log_info "== Verdict: ${verdict} =="
 
-log_info "======================================================================"
-log_info "Verdict: ${verdict}"
-log_info "======================================================================"
-
-# ----------------------------------------
-# Results summary block (ABS compliance)
-# ----------------------------------------
+# --- Results summary block (ABS compliance) ---
 echo ""
 echo "===== Begin Results ====="
 echo "appId:          ${APP_ID}"
-echo "signer:         F-Droid"
+echo "signer:         ${official_signer}"
 echo "apkVersionName: ${version_name}"
 echo "apkVersionCode: ${version_code}"
 echo "verdict:        ${verdict}"
@@ -1044,43 +808,20 @@ echo "appHash:        ${official_sha256}"
 echo "commit:         ${commit_hash}"
 echo "scriptVersion:  ${SCRIPT_VERSION}"
 echo "scriptHash:     ${SCRIPT_SHA256}"
+echo "===== End Results ====="
 echo ""
 if [[ -n "${diff_output}" ]]; then
   echo "Diff (${diff_line_count} line(s); full diff in artifacts/apk-diff.txt):"
   echo "${diff_output}" | head -5
   [[ "${diff_line_count}" -gt 5 ]] && echo "... and $(( diff_line_count - 5 )) more line(s)"
-  echo ""
 else
   echo "Diff: (none)"
-  echo ""
 fi
-echo "===== End Results ====="
 echo ""
 
-# ----------------------------------------
-# Write COMPARISON_RESULTS.yaml
-# ----------------------------------------
+# --- Write COMPARISON_RESULTS.yaml ---
 generate_comparison_yaml "${verdict}"
 log_info "COMPARISON_RESULTS.yaml written."
-
-# ----------------------------------------
-# Cleanup run-specific image tags (always — layers remain cached; tags are useless after the run)
-# ----------------------------------------
-${CONTAINER_CMD} rmi "${build_image_tag}" 2>/dev/null || true
-${CONTAINER_CMD} rmi "${_staging_tag}" 2>/dev/null || true
-log_info "Run-specific image tags removed (layer cache preserved)."
-
-# ----------------------------------------
-# Cleanup work directory (optional — only with --cleanup)
-# ----------------------------------------
-if "${should_cleanup}"; then
-  log_info "Cleaning up work directory..."
-  ${CONTAINER_CMD} run --rm \
-    --volume "$(dirname "${work_dir}"):/parent${VOLUME_RW_SUFFIX}" \
-    "${WS_CONTAINER}" \
-    rm -rf "/parent/$(basename "${work_dir}")"
-  log_info "Work directory removed."
-fi
 
 if [[ "${verdict}" == "reproducible" ]]; then
   echo "Exit code: ${EXIT_SUCCESS}"
