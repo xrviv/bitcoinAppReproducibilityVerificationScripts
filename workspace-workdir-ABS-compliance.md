@@ -56,7 +56,7 @@ Leftovers removed on the host: `/tmp/test_world.bitkey.app_2026.11.2_auto` and
 
 ## Still to fix
 
-All rows re-verified against the newest script on disk and on the build host, 2026-10-08 (BitBox02 + Nova added the same day: 17; both fixed 2026-10-09: 15; Electrum Android fixed 2026-10-09: 14; Bitcoin Keeper fixed 2026-10-12: 13; 2026-10-14: greenfdroid v0.2.7 and keycardshell v0.2.0 fixed, cosmostationandroid replaced by `cosmostation-v0.1.1` (already per-run), trustless low priority: 10 left; later 2026-10-14: zeus v0.4.0 and wasabidesktop v1.12.0 fixed: **8 left** (7 + trustless), next `muun-v0.2.2`).
+All rows re-verified against the newest script on disk and on the build host, 2026-10-08 (BitBox02 + Nova added the same day: 17; both fixed 2026-10-09: 15; Electrum Android fixed 2026-10-09: 14; Bitcoin Keeper fixed 2026-10-12: 13; 2026-10-14: greenfdroid v0.2.7 and keycardshell v0.2.0 fixed, cosmostationandroid replaced by `cosmostation-v0.1.1` (already per-run), trustless low priority: 10 left; later 2026-10-14: zeus v0.4.0 and wasabidesktop v1.12.0 fixed: **8 left** (7 + trustless); muun v0.3.3 fixed: **7 left** (6 + trustless), next `airgapvault`).
 
 **Higher priority: in `/tmp`.** These are already unique per run, so they cannot block another run, but ABS
 leaves them behind in the shared `/tmp`.
@@ -73,7 +73,7 @@ the same version twice in the same folder. They need a run id added.
 | Script | Version | Current workspace | Deletes an existing workspace | Chown-back | Size (cap 48,235) |
 |---|---|---|---|---|---|
 | ~~`android/zeus-v0.3.2_build.sh`~~ **fixed in v0.4.0 (2026-10-14, `4002dbf`): `$(pwd -P)/zeus_verification_<v|apk>_<epoch>-<pid>`, downloads inside, EXIT hand-back; build host 13.2.3 Play `reproducible`, 17G, 0 foreign-owned** | v0.3.2 | `./workdir_<appId>_<v>_<arch>` | yes | not found | 38,795 |
-| `android/muun-v0.2.2_build.sh` | v0.2.2 | `./workdir_<appId>_<v>_<arch>` | yes | not found | 40,688 |
+| ~~`android/muun-v0.2.2_build.sh`~~ **fixed in v0.3.3 (2026-10-14, `e463bc9`): `$(pwd -P)/muun_verification_<v|apk>_<epoch>-<pid>`, decode dir inside, EXIT hand-back + own image cleanup; build host 55.11 Play `reproducible`, 0 foreign-owned** | v0.2.2 | `./workdir_<appId>_<v>_<arch>` | yes | not found | 40,688 |
 | `android/airgapvault_build.sh` | v0.2.0 | `./workdir_<appId>_<v>_<arch>` | yes | not found | 42,206 |
 | ~~`android/cosmostationandroid_build.sh`~~ **replaced by `cosmostation-v0.1.1_build.sh` (`ba4cfa6`): `$(pwd -P)/cosmostation_verification_<v>_<run id>`** | v0.3.2 | `./workdir_cosmostation_<v>_<arch>` | yes | yes | 34,089 |
 | `android/mycelium_build.sh` | v0.2.8 | `./mycelium_<label>_verification` + build context `mktemp -d` in `/tmp` | no | yes | 23,856 |
