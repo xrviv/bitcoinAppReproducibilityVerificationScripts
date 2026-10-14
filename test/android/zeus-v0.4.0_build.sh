@@ -1,10 +1,11 @@
 #!/bin/bash
 # ==============================================================================
-# zeus_build.sh - Zeus Lightning Wallet Reproducible Build Verification
+# zeus-v0.4.0_build.sh - Zeus Lightning Wallet Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.3.2
+# Version:       v0.4.0
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-09-24
+# Last modified by: Claude Code for Danny
+# Last modified on: 2026-10-14
 # Project:       https://github.com/ZeusLN/zeus
 # ==============================================================================
 # LICENSE: MIT License
@@ -45,10 +46,10 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 # Constants
 # ------------------------------------------------------------------------------
-SCRIPT_VERSION="v0.3.2"
+SCRIPT_VERSION="v0.4.0"
 APP_ID="app.zeusln.zeus"
 REPO_URL="https://github.com/ZeusLN/zeus.git"
-WS_CONTAINER="docker.io/walletscrutiny/android:5"
+WS_CONTAINER="docker.io/walletscrutiny/android:5@sha256:eabd60543f19831feef6db22e9a1ada0ef469eef723119f1c96bd836198614c3"
 
 # Zeus' official pinned Docker image for builds
 ZEUS_DOCKER_IMAGE="docker.io/reactnativecommunity/react-native-android@sha256:c390bfb35a15ffdf52538bdd0e6c5a926469cefa8c8c6da54bfd501c122de25d"
@@ -57,7 +58,7 @@ EXIT_SUCCESS=0
 EXIT_FAILED=1
 EXIT_INVALID=2
 
-execution_dir="$(pwd)"
+execution_dir="$(pwd -P)"
 script_name="$(basename "$0")"
 
 # --- Self-identification (script-notes/script-version-and-hash.md, 2026-08-17) ---
@@ -69,6 +70,7 @@ else
   script_sha256="unknown"
 fi
 printf '%s %s sha256:%s\n' "${script_name}" "${SCRIPT_VERSION}" "${script_sha256}"
+rm -f -- "${execution_dir}/COMPARISON_RESULTS.yaml"
 
 should_cleanup=false
 downloaded_apk=""
@@ -152,18 +154,18 @@ VOLUME_RO_SUFFIX=""
 VOLUME_RW_SUFFIX=""
 CONTAINER_RUN_USER_ARGS=""
 
-if command -v podman >/dev/null 2>&1; then
+if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
   CONTAINER_CMD="podman"
   VOLUME_RO_SUFFIX=":ro,Z"
   VOLUME_RW_SUFFIX=":Z"
   CONTAINER_RUN_USER_ARGS="--userns=keep-id"
-elif command -v docker >/dev/null 2>&1; then
+elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   CONTAINER_CMD="docker"
   VOLUME_RO_SUFFIX=":ro"
   VOLUME_RW_SUFFIX=""
   CONTAINER_RUN_USER_ARGS="--user $(id -u):$(id -g)"
 else
-  die_failed "Neither podman nor docker is available. Install one to continue."
+  die_invalid "No working podman or docker (both must answer 'info'). Install or start one."
 fi
 
 # ------------------------------------------------------------------------------
@@ -172,7 +174,7 @@ fi
 usage() {
   cat <<EOF
 NAME
-       zeus_build.sh - Zeus Lightning Wallet reproducible build verification
+       zeus-v0.4.0_build.sh - Zeus Lightning Wallet reproducible build verification
 
 SYNOPSIS
        ${script_name} --version <version> [OPTIONS]
@@ -393,13 +395,18 @@ generate_comparison_yaml() {
 script_version: ${SCRIPT_VERSION}
 verdict: ${yaml_status}
 notes: |
-  Uses Zeus upstream build.sh for reproducible builds.
-  Expected differences (do not affect reproducibility verdict):
-  - META-INF/*: Google Play signing files
-  - stamp-cert-sha256: Certificate stamp from Google Play
-  - AndroidManifest.xml: Modified by Google Play signing process
-  - index.android.bundle: React Native Metro bundler non-determinism
+  Built with Zeus' upstream build.sh in its pinned React Native image; unzipped entries compared.
+  Root META-INF signing files (*.SF, *.RSA, *.DSA, *.EC, MANIFEST.MF) excluded by file name only.
 EOF
+  if [[ "${play_accept}" == "true" ]]; then
+    cat >> "${yaml_file}" <<EOF
+  Google Play additions accepted: stamp-cert-sha256 and the com.android.vending.derived.apk.id
+  manifest attribute; decoded res/ trees identical.
+EOF
+  fi
+  if [[ -n "${dev_server_ip}" ]]; then
+    echo "  react_native_dev_server_ip pinned to the official APK's value (${dev_server_ip})." >> "${yaml_file}"
+  fi
 }
 
 
@@ -561,6 +568,44 @@ arch_from_versioncode() {
   esac
 }
 
+# ------------------------------------------------------------------------------
+# Per-run workspace in the caller's directory (never reused, never deleted by
+# another run); downloads, sources, build output and diffs all live inside it.
+# ------------------------------------------------------------------------------
+if [[ -n "${downloaded_apk}" && "${downloaded_apk}" != /* ]]; then
+  downloaded_apk="${execution_dir}/${downloaded_apk}"
+fi
+if [[ -n "${downloaded_apk}" && ! -f "${downloaded_apk}" ]]; then
+  die_invalid "APK file not found: ${downloaded_apk}"
+fi
+run_id="$(date +%s)-$$"
+work_dir="${execution_dir}/zeus_verification_${requested_version:-apk}_${run_id}"
+mkdir -- "${work_dir}" || die_failed "Cannot create workspace ${work_dir}"
+log_info "Workspace: ${work_dir}"
+
+# EXIT: hand the workspace back to the caller, whatever happened. Rootless
+# podman maps the containers' users to subuids; rootful docker writes as root.
+hand_back_workspace() {
+  local rc=$?
+  trap - ERR
+  set +e
+  if [[ -d "${work_dir}" ]]; then
+    if [[ "${CONTAINER_CMD}" == "podman" ]]; then
+      podman unshare chown -R 0:0 "${work_dir}" >/dev/null 2>&1
+    else
+      docker run --rm --volume "${work_dir}:/w" "${WS_CONTAINER}" chown -R "$(id -u):$(id -g)" /w >/dev/null 2>&1
+    fi
+    chmod -R u+rwX "${work_dir}" 2>/dev/null
+    local foreign
+    foreign="$(find "${work_dir}" ! -user "$(id -u)" 2>/dev/null | wc -l)"
+    [[ "${foreign}" == 0 ]] || log_warn "${foreign} workspace entries not owned by you: ${work_dir}"
+  fi
+  [[ -f "${execution_dir}/COMPARISON_RESULTS.yaml" ]] || generate_error_yaml "ftbfs"
+  exit "${rc}"
+}
+trap hand_back_workspace EXIT
+trap 'log_error "Interrupted"; generate_error_yaml "ftbfs"; exit 130' INT TERM
+
 if [[ -n "${downloaded_apk}" ]]; then
   # --------------------------------------------------------------------------
   # Path A: --apk provided — let the APK drive the arch
@@ -628,7 +673,7 @@ else
   # --------------------------------------------------------------------------
   # Path B: no --apk — download from GitHub releases using --version/--arch
   # --------------------------------------------------------------------------
-  download_dir="${execution_dir}/official_apk_${version_name}_${build_arch}"
+  download_dir="${work_dir}/official"
   downloaded_apk="${download_dir}/zeus-v${version_name}-${build_arch}.apk"
 
   download_url="https://github.com/ZeusLN/zeus/releases/download/v${version_name}/zeus-v${version_name}-${build_arch}.apk"
@@ -672,13 +717,7 @@ git_ref="${requested_tag:-v${version_name}}"
 # ------------------------------------------------------------------------------
 # Workspace setup
 # ------------------------------------------------------------------------------
-work_dir="${execution_dir}/workdir_${APP_ID}_${version_name}_${build_arch}"
-if [[ -d "${work_dir}" ]]; then
-  log_info "Removing existing workspace: ${work_dir}"
-  rm -rf "${work_dir}"
-fi
-
-mkdir -p "${work_dir}"
+# (per-run workspace created above, before any download)
 
 # ------------------------------------------------------------------------------
 # Source preparation (containerized git clone)
@@ -883,7 +922,7 @@ elif [[ "${play_accept}" == "true" ]]; then
   exit_code="${EXIT_SUCCESS}"
   append_additional_info "Play-only diffs accepted by default; verdict set to reproducible."
 else
-  verdict="differences found"
+  verdict="not_reproducible"
 fi
 
 built_hash="$(container_sha256 "${built_apk}")"
