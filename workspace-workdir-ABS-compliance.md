@@ -1,0 +1,90 @@
+# Workspace / workdir ABS compliance
+
+**Rule (Luis, 2026-09-25):** every `*_build.sh` creates a **new workspace per run under the caller's working
+directory** (e.g. `$(pwd -P)/<app>_verification_<version>_<epoch>-<pid>`), never a fixed `/tmp` path. It never
+reuses, deletes or renames a workspace another run or user may own, and it hands ownership back to the caller in the
+EXIT trap.
+
+**Why:** the build server is shared by `danny` and ABS (`build-server`), and neither has sudo. Bitkey v0.2.30 always
+used `/tmp/test_world.bitkey.app_<version>_auto`. A run by `danny` left that directory behind, and the next ABS run
+hit *Permission denied* deleting it and marked Bitkey 2026.11.2 as a permanent error.
+
+Full guideline: `~/work/ws-notes/script-notes/per-run-workspace-guideline.md`.
+
+Survey of `~/work/scripts/test/*/*_build.sh` on 2026-09-25 (BlueWallet, Stack Wallet, Green Android and Bitcoin Knots rows added 2026-09-28), by grepping each workspace assignment. Scripts that
+build their workspace under another variable name may be missing; check each script when you edit it.
+
+## Fixed
+
+| Script | Before | Workspace now | Build server | Attached to a published verification |
+|---|---|---|---|---|
+| `android/bitkey-v0.2.31_build.sh` | fixed `/tmp/test_world.bitkey.app_<version>_<arch>`, `rm -rf` + rename onto it; logs in a shared `build-logs/` next to the script; no chown-back | `$(pwd -P)/bitkey_verification_<version>_<epoch>-<pid>`, logs inside, chown-back at exit | yes (v0.2.31 only) | not yet: attach to the English 2026.11.2 verification after the test run (Luis) |
+| `android/bitbanana-v0.7.1_build.sh` | fixed `/tmp/test_<appId>_<v>_<arch>_<type>`, fixed image tag | `$(pwd -P)/bitbanana_verification_<v>_<arch>_<type>_<epoch>-<pid>`, per-run image removed at exit | no | no (next verification) |
+| `android/nunchukandroid-v0.5.4_build.sh` | v0.5.1: fixed `/tmp/test_<appId>_<version>_<arch>[_<ref>]`, `rm -rf` in prepare; v0.5.3: in-container `chown $(id -u):$(id -g)` under rootless podman left ~79k subuid-owned entries | `$(pwd -P)/nunchuk_verification_<version>_<arch>_<epoch>-<pid>`, per-run image removed at exit, hand-back via `podman unshare chown 0:0` (docker: uid:gid). Also detects split/universal/fat input (Bob, 33,268 B). Tested 2026-09-29 17:48/17:49: splits + GitHub `2.8.5.apk` both `reproducible`, 0 foreign-owned entries | yes (`c73ea614…`) | yes (2.8.5 Play splits `046f119d…` and GitHub universal `2.8.5.apk`, both `reproducible`, 2026-09-29) |
+| `android/coconut-v0.1.17_build.sh` | per run, but in `/tmp` (`/tmp/test_<appId>_<v>_<run id>`) | `$(pwd -P)/coconut_verification_<v>_<epoch>-<pid>` | pending: not found on the host on 2026-09-25 (only v0.1.15) | 0.17.0: script to be replaced by v0.1.17 |
+| `android/metamask-v0.3.1_build.sh` | v0.2.6: fixed `/tmp/test_io.metamask_<v>_<arch>_<type>` | `$(pwd -P)/metamask_verification_<run id>`, chown-back at exit | yes | yes (8.12.0) |
+| `android/bluewallet-v0.1.2_build.sh` | v0.1.1: per run, but in the script's directory; build context `mktemp -d` in `/tmp`; rootless-podman chown to a subuid | `$(pwd -P)/bluewallet_verification_bluewallet-<epoch>-<pid>`, build context inside it, per-run image removed at exit, chown-back `0:0` under podman | no (host has v0.1.1 `765bcd01…` only) | yes (8.0.1, `6ccf425c…`, published by 2026-09-29) |
+| `android/stackwallet-v0.1.13_build.sh` | v0.1.8 and earlier (never in git); from v0.1.9 already per run | `$(pwd)/workdir_stackwallet_<v>_<arch>_<utc time>_<pid>`, chown-back in the EXIT trap, `rm -rf` of its own dir only with `--cleanup`. Gaps: `$(pwd)` not `$(pwd -P)`; image tag `toolchain-<script version>` is shared per version and never removed (multi-GB each, filled the host's disk 2026-09-28) | yes | yes (2.7.3, `98c3fcac…`, 2026-09-28) |
+| `android/greenandroid-v0.4.4_build.sh` | v0.4.0: fixed `./workdir_<appId>_<v>_<arch>`, no chown-back; v0.4.3: `set -E` let a failed `rmi` in the EXIT trap rewrite the final YAML as `ftbfs` | `$(pwd)/greenandroid_verification_<v>_<arch>_<epoch>-<pid>`, exclusive `mkdir` with retry, chown + `chmod -R u+rwX` in the EXIT trap (ERR trap off there, `yaml_final` guard), per-run image names removed at exit, GDK diff file inside the workspace. Gap: `$(pwd)` not `$(pwd -P)`. 48,043 B (192 B left) | yes | yes (5.7.0, `c703aaf7…`, published by 2026-09-29) |
+
+Leftovers removed on the host: `/tmp/test_world.bitkey.app_2026.11.2_auto` and
+`/tmp/test_io.metamask_provided_arm64-v8a_default`. Owned by `build-server`, for Luis to remove:
+`/tmp/test_app.zeusln.zeus` (16 GB, not from our ZEUS scripts), `/tmp/test_world.bitkey.app_2025.15.0_auto`,
+`/tmp/test_world.bitkey.app_autoversion_auto`, `/tmp/test_onl.coconut.wallet_unset_1790328784-2524652`.
+
+## Fixed or already compliant since the last survey (checked 2026-10-07; Unstoppable added 2026-10-08; BitBox02 + Nova 2026-10-09)
+
+| Script | Workspace | Notes |
+|---|---|---|
+| `desktop/bitcoinknotsdesktop-v1.1.13_build.sh` | `$(pwd -P)/knots_verification_<v>_<arch>_<type>_<epoch>-<pid>`, `official/`, `built/` and imagefile inside, chown-back in the EXIT trap | Replaces v1.1.12 (was in "Still to fix"). Passed: arm-linux 29.4.2 `reproducible` 2026-10-02 (`3b6c7bc0…`, published), powerpc64 2026-10-06 (published). v1.1.12 deleted locally 2026-10-08 (`git mv` → v1.1.13, not committed). ⚠️ The powerpc64le verification published 2026-10-08 ran v1.1.12, so ABS (3 newest verifications' scripts, newest first) tries v1.1.12 first until a newer verification carries v1.1.13 |
+| `android/edge-v0.3.0_build.sh` | `$(pwd -P)/edge_verification_<v>_<mode>_<run id>`, chown-back with `podman unshare` | Replaces v0.2.3/v0.2.4 (both were in "Still to fix"). Used for the published Edge 4.51.3 verification |
+| `android/bitkey-v0.2.32_build.sh` | `$(pwd -P)/bitkey_verification_<v>_<epoch>-<pid>`, temp files `mktemp -p "$WORK_DIR"` | 48,161 B |
+| `android/bitcoinkeeper-v0.2.0_build.sh` | `$(pwd -P)/bitcoinkeeper_verification_<epoch>-<pid>`, named containers, EXIT/INT/TERM traps, rootless chown-back | Replaces v0.1.2 (fixed 2026-10-12, Bob; committed `eebf2a7`). v0.2.1 (`16ade272…`, uncommitted) keeps the same workspace |
+| `hardware/keystone3pro-v0.2.0_build.sh` | `$(pwd -P)/keystone3pro_verification_<v>_<type>_<epoch>-<pid>` (exclusive mkdir), per-run images/containers, EXIT trap chown-back | Replaces untracked v0.1.2 (`$(pwd)`, pid only, `mkdir -p`); committed `b102e24` 2026-10-12. Never was in this table |
+| `android/wsa-v0.3.1_build.sh` | per-run workspace in the caller's directory (`wsa_verification_<v>_<epoch>-<pid>`) | Replaces walletscrutinyandroid-v0.2.0; committed `1db1b78` 2026-10-12 |
+| `android/bitbanana-v0.8.0_build.sh` | `$(pwd -P)/bitbanana_verification_<v>_<arch>_<type>_<run id>`, `podman unshare` chown-back | |
+| `android/bullbitcoin-v0.8.2_build.sh` | `$(pwd -P)/bullbitcoin_verification_<v>_<arch>_<run id>`, `podman unshare` chown-back | |
+| `android/envoy-v0.4.0_build.sh` | `$(pwd -P)/envoy_verification_<v>_<run id>`, chown-back | ✅ **Verified on ABS 2026-10-07**: the 10-06 run's own check printed `331M, all owned by uid 996` (`build-server`); successful runs leave no workspace (pruned). Workspace is mode 0700, so only `build-server` can open or delete a kept (ftbfs) one. 48,227 B (8 B left) |
+| `android/unstoppablewallet-v0.6.4_build.sh` | `$(pwd -P)/unstoppable_verification_<v>_<epoch>-<pid>`, build contexts inside it (no `/tmp`), per-run container/image names, own image removed, chown-back in the EXIT trap (docker uid:gid, rootless podman `unshare chown 0:0`) | Replaces v0.5.2 (was in "Still to fix"). Bob's, reviewed 2026-10-08 (`811f4d0c…`, 48,210 B, 25 B left). ✅ Build host 2026-10-08: 0.51.2 GitHub fdroid APK `reproducible`, published; workspace 109 MB, all caller-owned; an interrupted run (Ctrl-C during the image build) left 24 KB, caller-owned. Workspace kept after success. Not committed yet (`git mv` from v0.5.2 when Danny asks) |
+| `desktop/nunchukdesktop-v0.1.16_build.sh` (from v0.1.13) | `$(pwd -P)/nunchuk_verification_<v>_<arch>_<type>_<epoch>-<pid>` (exclusive mkdir), EXIT trap `reclaim_workspace` (removes the run's image, chown-back, `chmod -R u+rwX`) | Workspace fix from v0.1.12 (other session, 10-08); v0.1.12 ran on the build host 10-08 with its workspace in the caller's dir, all `danny`-owned. v0.1.13 adds release-day apt/base pinning, stale-YAML removal and ftbfs-on-interrupt. 36,830 B. Not yet run |
+| `android/swissbitcoinpay-v0.2.2_build.sh`, `android/leather-v0.1.1_build.sh` | `$(pwd -P)/<app>_verification_<run id>` | |
+| `desktop/greendesktop-v0.3.5_build.sh`, `desktop/adamant-v0.2.1_build.sh` | `mktemp -d "$(pwd -P)/<app>_<v>_<arch>[_<type>]_XXXXXX"`, chown-back | |
+| `hardware/bitbox02-v3.15.0_build.sh` | `$(pwd -P)/bitbox02_verification_<v>_<type>_<epoch>-<pid>` (exclusive mkdir), per-run container/image, EXIT trap: image removed, chown-back, ftbfs if no verdict | Replaces v3.14.0 (was in "Still to fix"). Bob's, committed `eeb49f3`. ✅ Build host 2026-10-08: 9.27.1 btc-only + multi `reproducible`, both published; workspaces all caller-owned |
+| `hardware/bitbox2nova-v3.6.0_build.sh` | `$(pwd -P)/bitbox02nova_verification_<v>_<type>_<epoch>-<pid>` (exclusive mkdir), per-run container/image, EXIT trap: image removed, chown-back, ftbfs if no verdict | Replaces v3.4.0 (was in "Still to fix"); v3.5.0 Bob's, v3.6.0 ABS gaps closed (`7088fba`, pushed). ✅ Build host 2026-10-09: 9.27.1 btc-only + multi `reproducible` in parallel, workspaces caller-owned (1.9/2.0 GB); btc-only published. Known issue held for v3.6.1: per-run YAML copy taken from the shared file |
+| `android/electrumandroid-v2.4.0_build.sh` | `$(pwd -P)/electrum_verification_<v>_<arch>_<epoch>-<pid>` (exclusive mkdir), apktool/logs/diffs inside, no host `/tmp`; EXIT trap: label-scoped cleanup, hand-back, ftbfs | Replaces v2.3.0 (was in "Still to fix"). Bob's, committed `1062403`. ✅ Build host 2026-10-09: 4.8.2 arm64-v8a `reproducible`, workspace 17 GB all caller-owned, no containers/images left |
+| `hardware/trezort-v0.1.2_build.sh` | `$(pwd)/trezor-t-work_<v>_<type>_<pid>`, chown-back | Gap: `$(pwd)` not `$(pwd -P)`, pid only |
+
+## Still to fix
+
+All rows re-verified against the newest script on disk and on the build host, 2026-10-08 (BitBox02 + Nova added the same day: 17; both fixed 2026-10-09: 15; Electrum Android fixed 2026-10-09: 14; Bitcoin Keeper fixed 2026-10-12: 13; 2026-10-14: greenfdroid v0.2.7 and keycardshell v0.2.0 fixed, cosmostationandroid replaced by `cosmostation-v0.1.1` (already per-run), trustless low priority: 10 left, next `zeus-v0.3.2`).
+
+**Higher priority: in `/tmp`.** These are already unique per run, so they cannot block another run, but ABS
+leaves them behind in the shared `/tmp`.
+
+| Script | Version | Current workspace | Deletes an existing workspace | Chown-back | Size (cap 48,235) |
+|---|---|---|---|---|---|
+| ~~`android/greenfdroid-v0.2.6_build.sh`~~ | v0.2.6 | **fixed in v0.2.7 (2026-10-14, committed `0d8e6cb`; build host 5.7.0 `reproducible`, published; workspace 191M, 0 foreign-owned files)**: `$(pwd -P)/greenfdroid_verification_<v>_<epoch>-<pid>`, EXIT-trap hand-back | no | yes | 48,154 (81 B left) |
+| `android/trustless_build.sh` (**low priority**, Danny 2026-10-14: app is `custodial`) | v0.1.7 | `/tmp/trustless_build_<v>_<pid>` | yes (its own) | not found | 18,947 |
+| ~~`hardware/keycardshell-v0.1.1_build.sh`~~ **fixed in v0.2.0 (2026-10-14, `770fa47`): `$(pwd -P)/keycardshell_verification_<v>_<epoch>-<pid>`, EXIT-trap hand-back; build host 1.4.0 `reproducible`, 0 foreign-owned** | v0.1.1 | `/tmp/keycardshell_<v>_<pid>` | no | not found | 24,439 |
+
+**Lower priority: fixed name per version in the caller's directory.** These collide only when the same user runs
+the same version twice in the same folder. They need a run id added.
+
+| Script | Version | Current workspace | Deletes an existing workspace | Chown-back | Size (cap 48,235) |
+|---|---|---|---|---|---|
+| `android/zeus-v0.3.2_build.sh` | v0.3.2 | `./workdir_<appId>_<v>_<arch>` | yes | not found | 38,795 |
+| `android/muun-v0.2.2_build.sh` | v0.2.2 | `./workdir_<appId>_<v>_<arch>` | yes | not found | 40,688 |
+| `android/airgapvault_build.sh` | v0.2.0 | `./workdir_<appId>_<v>_<arch>` | yes | not found | 42,206 |
+| ~~`android/cosmostationandroid_build.sh`~~ **replaced by `cosmostation-v0.1.1_build.sh` (`ba4cfa6`): `$(pwd -P)/cosmostation_verification_<v>_<run id>`** | v0.3.2 | `./workdir_cosmostation_<v>_<arch>` | yes | yes | 34,089 |
+| `android/mycelium_build.sh` | v0.2.8 | `./mycelium_<label>_verification` + build context `mktemp -d` in `/tmp` | no | yes | 23,856 |
+| `desktop/wasabidesktop-v1.11.0_build.sh` | v1.11.0 | `./wasabi_build_<v>_<arch>_<type>` | yes | not found | 43,567 |
+| `desktop/bitcoinsafe-v0.9.3_build.sh` | v0.9.3 | `./bitcoinsafe_<v>_<arch>_<type>` | no | yes | 44,514 |
+| `desktop/freewalletdesktop_build.sh` | v0.5.2 | `./freewallet_<v>_<arch>` | no | not found | 10,875 |
+| `hardware/coldcard-v4.1.4_build.sh` | v4.1.4 | `./coldcard-work-<v>-<model>` | yes | not found | 41,116 |
+| `desktop/bisq1desktop-v0.10.1_build.sh` | v0.10.1 | `${SCRIPT_DIR}/bisq1_desktop_<v>_<arch>_<type>_<pid>` (script dir, not the caller's; pid only) + a `mktemp -d` in `/tmp` | no | not found | 47,559 (676 B left). Added 2026-10-07. Re-checked 2026-10-08: newest is v0.10.1 (`43e18938…`), on the build host only, NOT in this repo; same workspace code (L502) |
+
+"Chown-back: not found" means no `chown` in the script. That is harmless under rootless podman with `--userns=keep-id`,
+but files written as root under docker would stay undeletable. Check this per script when fixing.
+
+For each fix: bump the version and `git mv` the file, test-run it on the build server, then attach it to that app's
+next published verification so ABS picks it up.
