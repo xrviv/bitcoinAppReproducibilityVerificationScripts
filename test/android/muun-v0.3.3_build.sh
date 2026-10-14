@@ -1,10 +1,11 @@
 #!/bin/bash
 # ==============================================================================
-# apollo_build.sh - Muun Wallet Android Reproducible Build Verification
+# muun-v0.3.3_build.sh - Muun Wallet Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.2.2
+# Version:       v0.3.3
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-09-09
+# Last modified by: Claude Code for Danny
+# Last modified on: 2026-10-14
 # Project:       https://github.com/muun/apollo
 # ==============================================================================
 # LICENSE: MIT License
@@ -64,15 +65,12 @@
 # works against github.com/proxy.golang.org/static.rust-lang.org despite the
 # older ca-certificates bundle that comes with it.
 #
-# NOTE ON WORKSPACE REUSE (added v0.2.1, 2026-09-09):
-# A pre-existing workdir_<app>_<version>_<arch> from a prior run is now
-# removed automatically before a new run starts, rather than the run dying
-# with "Workspace already exists" and requiring --cleanup or a manual rm.
-# --cleanup still controls only whether the workspace is removed AFTER a run
-# completes; it never gated the stale-workspace-before-a-run case, and
-# nothing about the workspace is ever privileged (host user owns everything
-# under it), so there was no reason to require an extra flag or manual step
-# to re-run the same version/arch twice.
+# WORKSPACE (v0.3.0, 2026-10-14): every run gets its own workspace in the
+# caller's directory, muun_verification_<version|apk>_<epoch>-<pid>, created
+# before any work and never reused or deleted by another run. The APK decode
+# directory lives inside it. The EXIT trap hands it back to the caller.
+# --cleanup removes only this run's workspace, after the run. Under Podman the EXIT
+# trap also removes the untagged build images this run created (not older ones).
 #
 # NOTE ON BUILD TIME:
 # First run downloads Android SDK, Go 1.24.7, and Rust toolchains (~several GB).
@@ -97,16 +95,18 @@ fi
 # ==============================================================================
 # Script Metadata
 # ==============================================================================
-SCRIPT_VERSION="v0.2.2"
+SCRIPT_VERSION="v0.3.3"
 APP_ID="io.muun.apollo"
 REPO_URL="https://github.com/muun/apollo"
-WS_CONTAINER="docker.io/walletscrutiny/android:5"
+WS_CONTAINER="docker.io/walletscrutiny/android:5@sha256:eabd60543f19831feef6db22e9a1ada0ef469eef723119f1c96bd836198614c3"
 
 EXIT_SUCCESS=0
 EXIT_FAILED=1
 EXIT_INVALID=2
 
-execution_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+execution_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"   # COMPARISON_RESULTS.yaml goes here
+caller_dir="$(pwd -P)"                                               # per-run workspace goes here
+rm -f -- "${execution_dir}/COMPARISON_RESULTS.yaml"
 script_name="$(basename "$0")"
 
 # Script self-identification (script-version-and-hash.md, 2026-08-17): hash the
@@ -192,18 +192,18 @@ VOLUME_RO_SUFFIX=""
 VOLUME_RW_SUFFIX=""
 CONTAINER_RUN_USER_ARGS=""
 
-if command -v podman >/dev/null 2>&1; then
+if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
   CONTAINER_CMD="podman"
   VOLUME_RO_SUFFIX=":ro,Z"
   VOLUME_RW_SUFFIX=":Z"
   CONTAINER_RUN_USER_ARGS="--userns=keep-id"
-elif command -v docker >/dev/null 2>&1; then
+elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   CONTAINER_CMD="docker"
   VOLUME_RO_SUFFIX=":ro"
   VOLUME_RW_SUFFIX=""
   CONTAINER_RUN_USER_ARGS="--user $(id -u):$(id -g)"
 else
-  die_failed "Neither podman nor docker is available. Install one to continue."
+  die_invalid "No working podman or docker (both must answer 'info'). Install or start one."
 fi
 
 log_info "Container runtime: ${CONTAINER_CMD}"
@@ -233,7 +233,7 @@ OPTIONS
        --apk <file>            Alias for --binary (Android legacy flag)
        --version <version>     Version to verify (e.g. 55.6). Selects the build tag.
                                If omitted, version is derived from the --apk metadata.
-                               Without --apk, builds only (no comparison performed).
+                               Without --apk, builds only: no comparison, verdict ftbfs (exit 1).
        --arch <arch>           Architecture override (auto-detected from APK if omitted)
                                Supported: arm64-v8a, armeabi-v7a, x86, x86_64
        --type <type>           Accepted for build server compatibility (not used)
@@ -242,7 +242,7 @@ OPTIONS
 
 EXIT CODES
        0    Reproducible (no non-META-INF differences)
-       1    Differences found or build failure
+       1    not_reproducible, build failure, or no --apk (ftbfs)
        2    Invalid parameters or configuration
 
 EXAMPLES
@@ -284,6 +284,8 @@ if [[ -n "${requested_type}" ]]; then
   log_warn "--type '${requested_type}' accepted but not used (Muun prod release has a single build type per arch)."
   build_type="${requested_type}"
 fi
+
+[[ "$(id -u)" -ne 0 ]] || die_invalid "Do not run this script as root."
 
 # ==============================================================================
 # Containerized helper functions
@@ -383,9 +385,57 @@ EOF
 # Input preparation: resolve APK path and extract metadata
 # ==============================================================================
 if [[ -n "${apk_file}" ]]; then
-  # Resolve to absolute path.
-  [[ "${apk_file}" != /* ]] && apk_file="${execution_dir}/${apk_file}"
+  # Resolve to absolute path (relative to the caller's directory).
+  [[ "${apk_file}" != /* ]] && apk_file="${caller_dir}/${apk_file}"
   [[ ! -f "${apk_file}" ]] && die_invalid "APK file not found: ${apk_file}"
+fi
+
+# ==============================================================================
+# Per-run workspace in the caller's directory, created before any work.
+# ==============================================================================
+run_id="$(date +%s)-$$"
+work_dir="${caller_dir}/muun_verification_${requested_version:-apk}_${run_id}"
+mkdir -- "${work_dir}" || die_failed "Cannot create workspace ${work_dir}"
+log_info "Workspace: ${work_dir}"
+
+# EXIT: hand the workspace back to the caller whatever happened (rootless
+# podman maps container users to subuids; rootful docker writes as root).
+hand_back_workspace() {
+  local rc=$?
+  trap - ERR
+  set +e
+  remove_run_images
+  if [[ -d "${work_dir}" ]]; then
+    if [[ "${CONTAINER_CMD}" == "podman" ]]; then
+      podman unshare chown -R 0:0 "${work_dir}" >/dev/null 2>&1
+    else
+      docker run --rm --volume "${work_dir}:/w" "${WS_CONTAINER}" chown -R "$(id -u):$(id -g)" /w >/dev/null 2>&1
+    fi
+    chmod -R u+rwX "${work_dir}" 2>/dev/null
+    local foreign
+    foreign="$(find "${work_dir}" ! -user "$(id -u)" 2>/dev/null | wc -l)"
+    [[ "${foreign}" == 0 ]] || log_warn "${foreign} workspace entries not owned by you: ${work_dir}"
+  fi
+  [[ -f "${execution_dir}/COMPARISON_RESULTS.yaml" ]] || generate_error_yaml "ftbfs"
+  exit "${rc}"
+}
+# Podman keeps every stage of the --output build as untagged images (~17 GB per
+# run). Remove only images that did not exist before this run's build and carry
+# no tag; images still in use (e.g. by a parallel build) refuse removal and stay.
+images_before=""
+remove_run_images() {
+  [[ "${CONTAINER_CMD}" == "podman" && -n "${images_before}" ]] || return 0
+  local pass id
+  for pass in 1 2 3; do
+    for id in $(podman images -a --no-trunc --format '{{.ID}} {{.Repository}}' | awk '$2=="<none>"{print $1}'); do
+      grep -qxF "${id}" <<< "${images_before}" || podman rmi "${id}" >/dev/null 2>&1
+    done
+  done
+}
+trap hand_back_workspace EXIT
+trap 'log_error "Interrupted"; generate_error_yaml "ftbfs"; exit 130' INT TERM
+
+if [[ -n "${apk_file}" ]]; then
 
   log_info "Extracting metadata from official APK: $(basename "${apk_file}")..."
   app_hash="$(container_sha256 "${apk_file}")"
@@ -393,9 +443,8 @@ if [[ -n "${apk_file}" ]]; then
 
   # Decode APK with apktool; read versionName/versionCode from apktool.yml
   # and appId from AndroidManifest.xml. This is more reliable than aapt badging.
-  metadata_dir="${execution_dir}/apktool_meta_$(echo "${app_hash}" | head -c 12)"
-  rm -rf "${metadata_dir}"
-  mkdir -p "${metadata_dir}"
+  metadata_dir="${work_dir}/apktool_meta"
+  mkdir -- "${metadata_dir}"
   container_apktool "${apk_file}" "${metadata_dir}"
 
   apk_app_id="$(head -n 1 "${metadata_dir}/AndroidManifest.xml" \
@@ -443,25 +492,7 @@ if [[ -z "${apk_file}" ]]; then
   additional_info="${additional_info}No --apk provided. Build completed but no comparison performed."
 fi
 
-# ==============================================================================
-# Workspace setup
-# Workspace is named to be unique per app/version/arch, enabling parallel runs.
-# ==============================================================================
-work_dir="${execution_dir}/workdir_${APP_ID}_${version_name}_${build_arch}"
-
-# A leftover workspace from a prior run of this exact app/version/arch is
-# always safe to discard automatically: it is a script-owned scratch
-# directory scoped to this one combination, never anything the operator
-# needs preserved across invocations. --cleanup controls only whether the
-# workspace is removed AFTER this run completes (see below); it does not
-# gate whether a stale one is removed BEFORE a run starts.
-if [[ -d "${work_dir}" ]]; then
-  log_info "Removing stale workspace from a prior run: ${work_dir}"
-  rm -rf "${work_dir}"
-fi
-
-mkdir -p "${work_dir}"
-log_info "Workspace: ${work_dir}"
+# (per-run workspace created above, before any work)
 
 # ==============================================================================
 # Clone repository in WS container (avoids host git dependency).
@@ -513,15 +544,35 @@ mkdir -p "${built_apk_dir}"
 
 src_dir="${work_dir}/src"
 
+# Each Dockerfile patch only applies when its target text is present; a patch
+# whose text upstream changed is reported (warning + results "Also"), never
+# silently skipped. Applied/missing patch ids end up in the YAML notes.
+patches_applied=""
+patches_missing=""
+patch_dockerfile() {  # id, fixed string that must be present, sed expression
+  local df="${src_dir}/android/Dockerfile"
+  if grep -qF -- "$2" "${df}"; then
+    sed -i -e "$3" "${df}"
+    patches_applied="${patches_applied}${patches_applied:+, }$1"
+  else
+    log_warn "Patch $1: '$2' not found in android/Dockerfile; not applied."
+    patches_missing="${patches_missing}${patches_missing:+, }$1"
+  fi
+}
+
 # Patch 1 (Podman only): Qualify short image names.
 # Podman requires fully-qualified registry prefixes when no unqualified-search
 # registries are configured in /etc/containers/registries.conf.
 if [[ "${CONTAINER_CMD}" == "podman" ]]; then
   log_info "Patching android/Dockerfile for Podman (qualifying image names)..."
-  sed -i \
-    -e 's|FROM --platform=linux/amd64 openjdk:|FROM --platform=linux/amd64 docker.io/library/openjdk:|' \
-    -e 's|FROM rust:|FROM docker.io/library/rust:|' \
-    "${src_dir}/android/Dockerfile"
+  patch_dockerfile 1a 'FROM --platform=linux/amd64 openjdk:' \
+    's|FROM --platform=linux/amd64 openjdk:|FROM --platform=linux/amd64 docker.io/library/openjdk:|'
+  if grep -qF 'FROM --platform=linux/amd64 rust:' "${src_dir}/android/Dockerfile"; then
+    patch_dockerfile 1b 'FROM --platform=linux/amd64 rust:' \
+      's|FROM --platform=linux/amd64 rust:|FROM --platform=linux/amd64 docker.io/library/rust:|'
+  else
+    patch_dockerfile 1b 'FROM rust:' 's|FROM rust:|FROM docker.io/library/rust:|'
+  fi
 fi
 
 # Patch 2 (always): Fix ARG TARGETS scoping in librs_build stage.
@@ -533,9 +584,8 @@ fi
 # Fix: directly substitute the hardcoded TARGETS value (matching what rust_builder
 # installed via rustup) into the RUN command, bypassing ARG scoping entirely.
 log_info "Patching android/Dockerfile (fixing TARGETS in librs_build RUN command)..."
-sed -i \
-  's|TARGETS="$TARGETS"|TARGETS="aarch64-unknown-linux-musl x86_64-unknown-linux-musl aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android"|' \
-  "${src_dir}/android/Dockerfile"
+patch_dockerfile 2 'TARGETS="$TARGETS"' \
+  's|TARGETS="$TARGETS"|TARGETS="aarch64-unknown-linux-musl x86_64-unknown-linux-musl aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android"|'
 
 # Patch 3 (always, added v0.2.0, extended v0.2.2): bullseye-security is EOL in
 # two distinct ways, both hit live on 2026-09-09 and both fixed here.
@@ -562,11 +612,28 @@ sed -i \
 # same base image), so both patches bypass/redirect rather than substitute an
 # unverified base image — same pinned digest, same effective package set.
 log_info "Patching android/Dockerfile (bullseye-security is EOL: bypassing expired Valid-Until, redirecting to non-pruned main archive)..."
-sed -i \
-  -e 's|RUN apt-get update \\|RUN apt-get update -o Acquire::Check-Valid-Until=false \\|' \
-  -e 's|apt-get install --yes --no-install-recommends \\|apt-get install --yes --no-install-recommends -t bullseye \\|' \
-  "${src_dir}/android/Dockerfile"
+patch_dockerfile 3a 'RUN apt-get update \' \
+  's|RUN apt-get update \\|RUN apt-get update -o Acquire::Check-Valid-Until=false \\|'
+patch_dockerfile 3b 'apt-get install --yes --no-install-recommends \' \
+  's|apt-get install --yes --no-install-recommends \\|apt-get install --yes --no-install-recommends -t bullseye \\|'
 
+# Patch 4 (always, added v0.3.1, 2026-10-14): Google removed the obsolete
+# legacy "tools" package (SDK Tools 26.x) from its SDK repository, so
+# `sdkmanager "tools" "platform-tools"` fails with "Failed to find package
+# tools" (hit on 55.11). Nothing in the build uses it: sdkmanager comes from the
+# separately downloaded cmdline-tools, and Gradle uses build-tools/platforms.
+# Install platform-tools only; warn if upstream changes that line.
+log_info "Patching android/Dockerfile (dropping removed legacy SDK package \"tools\")..."
+patch_dockerfile 4 'RUN sdkmanager "tools" "platform-tools"' \
+  's|^RUN sdkmanager "tools" "platform-tools"$|RUN sdkmanager "platform-tools"|'
+
+if [[ -n "${additional_info}" ]]; then additional_info="${additional_info}\n"; fi
+additional_info="${additional_info}Dockerfile patches applied: ${patches_applied:-none}; not applied (text not found): ${patches_missing:-none}."
+
+if [[ "${CONTAINER_CMD}" == "podman" ]]; then
+  images_before="$(podman images -a --no-trunc -q 2>/dev/null | sort -u || true)"
+  [[ -n "${images_before}" ]] || images_before="none"
+fi
 log_info "Building Muun Wallet from source using android/Dockerfile..."
 log_info "First run will download Android SDK (~1.5 GB), Go (~70 MB), Rust toolchains (~2+ GB)."
 log_info "Estimated time: 30-90 minutes (first run). Docker layer cache speeds up reruns."
@@ -623,8 +690,8 @@ log_info "Built APK SHA-256: ${built_hash}"
 # The signing files above are therefore expected to be official-only and are
 # filtered; nothing else under META-INF/ gets a free pass.
 # ==============================================================================
-verdict="warning"
-yaml_status="warning"
+verdict="ftbfs"
+yaml_status="ftbfs"
 match_value="false"
 exit_code="${EXIT_FAILED}"
 diff_display=""
@@ -632,10 +699,11 @@ official_unzipped="${work_dir}/official-unzipped"
 built_unzipped="${work_dir}/built-unzipped"
 
 if [[ -z "${apk_file}" ]]; then
-  log_warn "Skipping comparison (no --apk provided)."
-  verdict="warning"
-  yaml_status="warning"
-  exit_code="${EXIT_SUCCESS}"
+  # No official APK means no comparison and no reportable verdict: ftbfs, exit 1.
+  log_warn "Skipping comparison (no --apk provided): verdict ftbfs."
+  verdict="ftbfs"
+  yaml_status="ftbfs"
+  exit_code="${EXIT_FAILED}"
 else
   log_info "Unzipping official APK for comparison..."
   container_unzip_apk "${apk_file}" "${official_unzipped}"
@@ -684,7 +752,7 @@ else
     match_value="true"
     exit_code="${EXIT_SUCCESS}"
   else
-    verdict="differences found"
+    verdict="not_reproducible"
     yaml_status="not_reproducible"
     match_value="false"
     exit_code="${EXIT_FAILED}"
@@ -782,10 +850,17 @@ fi
 # format per dannys-amendments.md 2026-02-05: nested files[] under each result.
 # ==============================================================================
 yaml_file="${execution_dir}/COMPARISON_RESULTS.yaml"
-cat > "${yaml_file}" <<EOF
-script_version: ${SCRIPT_VERSION}
-verdict: ${yaml_status}
-EOF
+{
+  echo "script_version: ${SCRIPT_VERSION}"
+  echo "verdict: ${yaml_status}"
+  echo "notes: |"
+  echo "  Built with the tag's android/Dockerfile (Muun's reproducible build) plus script patches"
+  echo "  applied: ${patches_applied:-none}; not applied (text not found): ${patches_missing:-none}."
+  echo "  Root META-INF signing files (*.SF, *.RSA, *.DSA, *.EC, MANIFEST.MF) excluded by file name only."
+  [[ -n "${resources_arsc_note}" ]] && echo "  ${resources_arsc_note#\[*\] }"
+  [[ -z "${apk_file}" ]] && echo "  No official APK supplied (--binary/--apk): no comparison was possible."
+  true
+} > "${yaml_file}"
 log_info "COMPARISON_RESULTS.yaml written to: ${yaml_file}"
 
 # ==============================================================================
@@ -918,10 +993,8 @@ echo "${diff_guide}"
 if [[ "${should_cleanup}" == true ]]; then
   log_info "Removing workspace: ${work_dir}"
   rm -rf "${work_dir}"
-  [[ -n "${metadata_dir:-}" && -d "${metadata_dir}" ]] && rm -rf "${metadata_dir}"
 else
   log_info "Workspace preserved: ${work_dir}"
-  [[ -n "${metadata_dir:-}" ]] && log_info "APK decode dir: ${metadata_dir}"
 fi
 
 echo "Exit code: ${exit_code}"
