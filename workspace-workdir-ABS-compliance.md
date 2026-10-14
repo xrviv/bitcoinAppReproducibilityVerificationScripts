@@ -72,7 +72,7 @@ the same version twice in the same folder. They need a run id added.
 
 | Script | Version | Current workspace | Deletes an existing workspace | Chown-back | Size (cap 48,235) |
 |---|---|---|---|---|---|
-| ~~`android/zeus-v0.3.2_build.sh`~~ **fixed in v0.4.0 (2026-10-14, not yet committed): `$(pwd -P)/zeus_verification_<v|apk>_<epoch>-<pid>`, downloads inside, EXIT hand-back; build host 13.2.3 Play `reproducible`, 17G, 0 foreign-owned** | v0.3.2 | `./workdir_<appId>_<v>_<arch>` | yes | not found | 38,795 |
+| ~~`android/zeus-v0.3.2_build.sh`~~ **fixed in v0.4.0 (2026-10-14, `4002dbf`): `$(pwd -P)/zeus_verification_<v|apk>_<epoch>-<pid>`, downloads inside, EXIT hand-back; build host 13.2.3 Play `reproducible`, 17G, 0 foreign-owned** | v0.3.2 | `./workdir_<appId>_<v>_<arch>` | yes | not found | 38,795 |
 | `android/muun-v0.2.2_build.sh` | v0.2.2 | `./workdir_<appId>_<v>_<arch>` | yes | not found | 40,688 |
 | `android/airgapvault_build.sh` | v0.2.0 | `./workdir_<appId>_<v>_<arch>` | yes | not found | 42,206 |
 | ~~`android/cosmostationandroid_build.sh`~~ **replaced by `cosmostation-v0.1.1_build.sh` (`ba4cfa6`): `$(pwd -P)/cosmostation_verification_<v>_<run id>`** | v0.3.2 | `./workdir_cosmostation_<v>_<arch>` | yes | yes | 34,089 |
