@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# mycelium-v0.3.0_build.sh - Mycelium Bitcoin Wallet (Android) reproducible build verification. License: MIT
-# Version: v0.3.0
+# mycelium-v0.3.1_build.sh - Mycelium Bitcoin Wallet (Android) reproducible build verification. License: MIT
+# Version: v0.3.1
 # Organization: WalletScrutiny.com | Project: https://github.com/mycelium-com/wallet-android
 # Last modified by: Claude Code for Danny
 # Last modified on: 2026-10-15
@@ -16,7 +16,7 @@ set -euo pipefail
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256="$(sha256sum "${SCRIPT_PATH}" 2>/dev/null | awk '{print $1}' || true)"
 SCRIPT_SHA256="${SCRIPT_SHA256:-N/A}"
-SCRIPT_VERSION="v0.3.0"
+SCRIPT_VERSION="v0.3.1"
 SCRIPT_NAME="$(basename "${SCRIPT_PATH}")"
 echo "[INFO] Script: ${SCRIPT_NAME} ${SCRIPT_VERSION} sha256: ${SCRIPT_SHA256}"
 
@@ -190,14 +190,15 @@ cleanup() {
   else
     ${container_cmd} rmi -f "${IMAGE_NAME}" >/dev/null 2>&1
   fi
-  # Invalid input (exit 2) writes no verdict; any other early stop is ftbfs.
-  if [[ "${rc}" != 2 && ! -f "${YAML_FILE}" ]]; then
+  # No verdict on invalid input (2) or a stop (130): ABS publishes any YAML
+  # verdict, and a stopped run did not fail to build. Other failures are ftbfs.
+  if [[ "${rc}" != 2 && "${rc}" != 130 && ! -f "${YAML_FILE}" ]]; then
     generate_yaml "ftbfs" "Script stopped before writing a verdict."
   fi
   exit "${rc}"
 }
 trap cleanup EXIT
-trap 'log_error "Interrupted"; generate_yaml "ftbfs" "Run interrupted."; exit 130' INT TERM
+trap 'log_error "Interrupted; no verdict written"; exit 130' INT TERM
 
 # ==============================================================================
 # Check the official APK before any build: app ID, version, signer, hash.

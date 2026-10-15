@@ -1,25 +1,16 @@
 #!/usr/bin/env bash
 # ======================================================================================
-# bitcoinsafe_build.sh - Bitcoin Safe Desktop Reproducible Build Verification
+# bitcoinsafe-v0.9.4_build.sh - Bitcoin Safe Desktop Reproducible Build Verification
 # ======================================================================================
-# Version:       v0.9.3
+# Version:       v0.9.4
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-08-11
+# Last Modified: 2026-10-15
 # Project:       https://github.com/andreasgriffin/bitcoin-safe
-# ==============================================================================
 # LICENSE: MIT License
 #
-# TECHNICAL DISCLAIMER:
-# This script is provided for technical analysis and reproducible build verification purposes only.
-# No warranty is provided regarding the security, functionality, or fitness for any particular purpose.
-# Users assume all risks associated with running this script and analyzing the software.
-# This script performs automated builds and binary comparisons - review all operations before execution.
-#
-# LEGAL DISCLAIMER:
-# This script is designed for legitimate security research and reproducible build verification.
-# Users are responsible for ensuring compliance with all applicable laws and regulations.
-# The developers assume no liability for any misuse or legal consequences arising from use.
-# By using this script, you acknowledge these disclaimers and accept full responsibility.
+# DISCLAIMER: Please examine this script yourself prior to running it. It is provided
+# as-is without warranty and may contain bugs or security vulnerabilities. It runs Docker
+# containers, downloads source code and builds, using significant CPU, memory and disk.
 #
 # SCRIPT SUMMARY:
 # - Downloads official Bitcoin Safe release artifacts from GitHub releases
@@ -38,7 +29,7 @@ set -euo pipefail
 # ======================================================================================
 
 APP_ID="bitcoin.safe"
-SCRIPT_VERSION="v0.9.3"
+SCRIPT_VERSION="v0.9.4"
 REPO_URL="https://github.com/andreasgriffin/bitcoin-safe.git"
 RELEASE_BASE="https://github.com/andreasgriffin/bitcoin-safe/releases/download"
 
@@ -49,11 +40,17 @@ SIGNING_KEY_FPR="2759AA7148568ECCB03B76301D82124B440F612D"
 SIGNING_KEY_URL="https://keys.openpgp.org/vks/v1/by-fingerprint/${SIGNING_KEY_FPR}"
 SIG_STATUS="not checked"
 
+# Bootstrap image, pinned by digest; apt uses the Debian snapshot it was built from.
+BASE_IMAGE="docker.io/library/python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1"
+SCRIPT_HASH="$(sha256sum "$(readlink -f "$0")" | cut -d' ' -f1)"
+
 # Build configuration variables
 NEEDS_SIGNATURE_STRIP=false
 BINARY_FILE=""
 CHECKED_OUT_TAG=""
 SOURCE_COMMIT=""
+APP_HASH=""; OFFICIAL_HASH=""; BUILT_HASH=""; COMPARE_BASIS="file as downloaded"
+MATCH_STATUS="false"; VERDICT_STATUS="not_reproducible"
 
 # Resolve script directory (for COMPARISON_RESULTS.yaml output)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -80,91 +77,41 @@ log_success() { echo -e "${GREEN}[$(timestamp)] SUCCESS${NC} $*"; }
 # ======================================================================================
 
 show_help() {
-  cat <<'EOF'
+  local n="${0##*/}"
+  cat <<EOF
 Bitcoin Safe Desktop Reproducible Build Verification Script
 
-DESCRIPTION:
-  Performs reproducible build verification of Bitcoin Safe desktop application.
-  Downloads official releases, builds from source using Docker, and compares
-  artifacts to assess reproducibility.
+Builds Bitcoin Safe from its release tag with upstream's Docker-based build
+(tools/build.py) and compares the result with the official release artifact.
 
 USAGE:
-  ./bitcoinsafe_build.sh [--version <version>] [--arch <arch>] [--type <type>] [--binary <file>]
+  ./$n --version <version> [--arch <arch>] [--type <type>] [--binary <file>]
 
-VERSION BEHAVIOR:
-  --version <version>    Release version to verify (e.g., 1.6.0)
-                         If omitted, the script tries to infer it from --binary.
-
-OPTIONAL PARAMETERS:
-  --arch <architecture>  Target architecture:
-                         - x86_64-linux    Linux x86_64
-                         - x86_64-windows  Windows x86_64
-                         Default: x86_64-linux
-
-  --type <type>          Build type:
-                         Linux:
-                           - appimage      AppImage (default)
-                           - deb           Debian package
-                           - flatpak       Flatpak bundle (new in v2.0.0)
-                         Windows:
-                           - portable      Portable executable
-                           - setup         Setup installer
-                         Default: appimage (Linux) / portable (Windows)
-
-  Note: Builds use Bitcoin Safe's official Docker-based build system.
-        Podman can be used as a drop-in replacement for Docker.
-
-  --binary <file>        Path to official binary to use instead of downloading.
-                         When provided, the download step is skipped and this
-                         file is used as the official artifact for comparison.
-
-  --help, -h             Show this help text
+  --version <version>    Release version (e.g. 2.1.3); inferred from --binary if omitted
+  --arch <arch>          x86_64-linux (default) | x86_64-windows
+  --type <type>          Linux: appimage (default) | deb | flatpak
+                         Windows: portable (default) | setup
+  --binary <file>        Official artifact to compare (skips the download)
+  --help, -h             Show this help
 
 OUTPUT:
-  - Exit code 0: Build is reproducible
-  - Exit code 1: Build failed or is not reproducible
-  - COMPARISON_RESULTS.yaml: Machine-readable comparison results
-  - Standardized results format between ===== Begin/End Results =====
+  Exit code 0 reproducible, 1 not reproducible or failed, 2 invalid parameters.
+  COMPARISON_RESULTS.yaml next to the script; results between ===== Begin/End Results =====.
+  Each run gets a new workspace in the current directory (kept afterwards):
+  ./bitcoinsafe_verification_<version>_<arch>_<type>_<epoch>-<pid>/{official,source,built}
 
 EXAMPLES:
-  # Verify Linux AppImage (default)
-  ./bitcoinsafe_build.sh --version 1.6.0
-
-  # Verify Linux AppImage (explicit)
-  ./bitcoinsafe_build.sh --version 1.6.0 --arch x86_64-linux --type appimage
-
-  # Use a pre-downloaded official binary (skip download)
-  ./bitcoinsafe_build.sh --version 1.6.0 --arch x86_64-linux --type appimage --binary ~/Downloads/Bitcoin-Safe-1.6.0-x86_64.AppImage.tar.gz
-
-  # Verify Debian package
-  ./bitcoinsafe_build.sh --version 1.6.0 --arch x86_64-linux --type deb
-
-  # Verify Windows portable executable
-  ./bitcoinsafe_build.sh --version 1.6.0 --arch x86_64-windows --type portable
-
-  # Verify Windows setup installer
-  ./bitcoinsafe_build.sh --version 1.6.0 --arch x86_64-windows --type setup
-
-  # Verify Flatpak bundle (v2.0.0+)
-  ./bitcoinsafe_build.sh --version 2.0.0 --arch x86_64-linux --type flatpak
+  ./$n --version 2.1.3
+  ./$n --version 2.1.3 --arch x86_64-windows --type setup
+  ./$n --binary ~/Downloads/Bitcoin-Safe-2.1.3-x86_64.AppImage.tar.gz
 
 REQUIREMENTS:
-  - docker or podman    Container runtime (the ONLY host dependency)
-
-  Note: The script auto-launches a python:3.12-slim container with all build tools
-        (git, curl, python3, poetry, etc.). No other host dependencies are needed.
-        Windows signature stripping uses containerized osslsigncode (no host install needed).
-
-DIRECTORY STRUCTURE:
-  All operations are performed in the execution directory:
-  ./bitcoinsafe_<version>_<arch>_<type>/
-  ├── official/         Downloaded official artifacts
-  ├── source/           Cloned repository
-  └── built/            Build outputs
-
-For more information, visit: https://walletscrutiny.com
+  docker or podman (the only host dependency). Everything else runs in
+  $BASE_IMAGE.
 EOF
 }
+
+invalid() { log_error "$1"; exit 2; }
 
 # ======================================================================================
 # UTILITY FUNCTIONS
@@ -255,27 +202,49 @@ bootstrap_container() {
     exit 1
   fi
 
-  local HOST_UID HOST_GID DOCKER_SOCK_GID
+  local HOST_UID HOST_GID DOCKER_SOCK_GID OWNER
   HOST_UID=$(id -u)
   HOST_GID=$(id -g)
   DOCKER_SOCK_GID=$(stat -c '%g' "$BUILD_SOCKET" 2>/dev/null || echo "0")
+  # Hand-back owner: under a rootless runtime, container root is the caller.
+  OWNER="$HOST_UID:$HOST_GID"
+  local rl
+  if [[ "$CONTAINER_CMD" == podman ]]; then
+    rl="$(podman info --format 'rootless={{.Host.Security.Rootless}}' 2>/dev/null || true)"
+  else
+    rl="$(docker info --format '{{.SecurityOptions}}' 2>/dev/null || true)"
+  fi
+  [[ "$rl" == *rootless=true* || "$rl" == *name=rootless* ]] && OWNER="0:0"
 
   local SCRIPT_PATH
   SCRIPT_PATH="$(readlink -f "$0")"
 
+  # Per-run workspace in the caller's directory; never reused or deleted.
+  local RUN_ID CNAME
+  RUN_ID="$(date +%s)-$$"
+  CNAME="ws-bitcoinsafe-${RUN_ID}"
+  WORKDIR="$(pwd -P)/bitcoinsafe_verification_${VERSION}_${ARCH}_${BUILD_TYPE}_${RUN_ID}"
+  mkdir "$WORKDIR" || { log_error "Cannot create workspace $WORKDIR"; exit 1; }
+
   log_info "Launching container for build environment..."
-  log_info "Container image: python:3.12-slim"
+  log_info "Container image: $BASE_IMAGE"
   log_info "Container runtime: $CONTAINER_CMD"
+  log_info "Workspace: $WORKDIR"
 
   # Build run args as array so we can conditionally add --binary mount
   local run_args=(
-    --rm
-    -v "$PWD:$PWD"
+    --rm --name "$CNAME"
+    -v "$WORKDIR:$WORKDIR"
     -v "$BUILD_SOCKET:/var/run/docker.sock"
     -v "$SCRIPT_PATH:$SCRIPT_PATH:ro"
     -v "$SCRIPT_DIR:$SCRIPT_DIR"
-    -w "$PWD"
+    -w "$WORKDIR"
     -e "_INSIDE_CONTAINER=1"
+    -e "BS_WORKDIR=$WORKDIR"
+    -e "BS_OWNER=$OWNER"
+    -e "BS_YAML_DIR=$SCRIPT_DIR"
+    -e "BS_SV=$SCRIPT_VERSION"
+    -e "BS_CNAME=$CNAME"
     -e "BS_VERSION=$VERSION"
     -e "BS_ARCH=$ARCH"
     -e "BS_TYPE=$BUILD_TYPE"
@@ -294,11 +263,36 @@ bootstrap_container() {
     run_args+=( -e "BS_BINARY=$abs_binary" )
   fi
 
-  $CONTAINER_CMD run "${run_args[@]}" \
-    python:3.12-slim \
+  $CONTAINER_CMD run "${run_args[@]}" "$BASE_IMAGE" \
     bash -c '
-      # Install dependencies (as root)
-      apt-get update -qq && apt-get install -y -qq \
+      # On every exit (also stop/interrupt): end the build, remove upstream build
+      # containers that mount this workspace, publish the YAML (ftbfs if none; none
+      # on exit 2 or a stop, since ABS publishes any verdict), and hand the workspace back.
+      W="$BS_WORKDIR"; Y="$W/COMPARISON_RESULTS.yaml"
+      finish() {
+        local s=$?
+        trap - EXIT INT TERM
+        kill -TERM -1 2>/dev/null; wait; sleep 2
+        for c in $(docker ps -aq 2>/dev/null); do
+          m=$(docker inspect -f "{{.Name}} {{range .Mounts}}{{.Source}}/ {{end}}" "$c" 2>/dev/null) || continue
+          [[ "${m%% *}" != *"$BS_CNAME" && "$m" == *" $W/"* ]] && docker rm -f "$c" >/dev/null 2>&1
+        done
+        [[ -f "$Y" || "$s" -eq 2 || "$s" -eq 130 ]] || printf "script_version: %s\nverdict: ftbfs\nnotes: |\n  Stopped or failed before a verdict (exit %s).\n" "$BS_SV" "$s" > "$Y"
+        [[ ! -f "$Y" ]] || { cp "$Y" "$BS_YAML_DIR/" && chown "$BS_OWNER" "$BS_YAML_DIR/COMPARISON_RESULTS.yaml"; } || s=1
+        if ! chown -R "$BS_OWNER" "$W"; then
+          echo "ERROR: Failed to restore workspace ownership: $W" >&2
+          [[ "$s" -ne 0 ]] || s=1
+        fi
+        exit "$s"
+      }
+      trap finish EXIT
+      trap "exit 130" INT TERM
+
+      # Install dependencies (as root) from the Debian snapshot the image was built
+      # from (its debian.sources carries the snapshot URL as a comment).
+      sed -i -E "s|^# (http://snapshot\.debian\.org/\S+)$|URIs: \1|; /^URIs: http:\/\/deb\.debian\.org/d" /etc/apt/sources.list.d/debian.sources
+      grep "^URIs:" /etc/apt/sources.list.d/debian.sources
+      { apt-get -o Acquire::Check-Valid-Until=false update -qq && apt-get install -y -qq \
         git curl ca-certificates docker.io coreutils gnupg \
         build-essential \
         osslsigncode \
@@ -308,32 +302,29 @@ bootstrap_container() {
         libxcb-shm0 libxcb-shape0 libxcb-sync1 libxcb-xfixes0 \
         libxcb-xkb1 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
         libxcb-cursor0 libxcb-util1 libxcb-render-util0 \
-        libx11-xcb1 libdbus-1-3 >/dev/null 2>&1
+        libx11-xcb1 libdbus-1-3 >/dev/null 2>&1; } &
+      # Background + wait: bash defers traps until a foreground command ends.
+      wait $! || { echo "ERROR: apt-get failed" >&2; exit 1; }
 
       # Create builder user matching host UID/GID
       groupadd -g "$HOST_GID" hostgrp 2>/dev/null || true
       groupadd -g "$DOCKER_SOCK_GID" dockerhost 2>/dev/null || true
       useradd -m -u "$HOST_UID" -g "$HOST_GID" builder 2>/dev/null || true
       usermod -aG dockerhost builder 2>/dev/null || true
-
-      # Nested build containers can write root-owned files into the bind-mounted
-      # workspace. Restore ownership from this outer root context on every exit.
-      WORKSPACE_PATH="$PWD/bitcoinsafe_${BS_VERSION}_${BS_ARCH}_${BS_TYPE}"
-      restore_workspace_ownership() {
-        local exit_status=$?
-        trap - EXIT
-        if [[ -e "$WORKSPACE_PATH" ]] && ! chown -R "$HOST_UID:$HOST_GID" "$WORKSPACE_PATH"; then
-          echo "ERROR: Failed to restore workspace ownership: $WORKSPACE_PATH" >&2
-          [[ "$exit_status" -ne 0 ]] || exit_status=1
-        fi
-        exit "$exit_status"
-      }
-      trap restore_workspace_ownership EXIT
+      chown "$HOST_UID:$HOST_GID" "$W"
 
       # Re-invoke script as builder user (pass --binary if provided)
-      su -p builder -c "export HOME=/home/builder && export PATH=\"/home/builder/.local/bin:\$PATH\" && cd \"$PWD\" && bash \"$BS_SCRIPT_PATH\" --version \"$BS_VERSION\" --arch \"$BS_ARCH\" --type \"$BS_TYPE\"${BS_BINARY:+ --binary \"$BS_BINARY\"}"
-    '
-  exit $?
+      su -p builder -c "export HOME=/home/builder && export PATH=\"/home/builder/.local/bin:\$PATH\" && cd \"$W\" && bash \"$BS_SCRIPT_PATH\" --version \"$BS_VERSION\" --arch \"$BS_ARCH\" --type \"$BS_TYPE\"${BS_BINARY:+ --binary \"$BS_BINARY\"}" &
+      wait $!
+    ' &
+  local cpid=$! rc=0
+  # Background + wait so INT/TERM reach this trap; docker stop gives the
+  # container time to run its cleanup.
+  trap "$CONTAINER_CMD stop -t 300 $CNAME >/dev/null 2>&1; wait $cpid || true; log_info 'Workspace kept: $WORKDIR'; exit 130" INT TERM
+  wait "$cpid" || rc=$?
+  trap - INT TERM
+  log_info "Workspace kept: $WORKDIR"
+  exit "$rc"
 }
 
 # ======================================================================================
@@ -381,29 +372,29 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --version)
-        [[ $# -ge 2 ]] || { log_error "--version requires a value"; exit 1; }
+        [[ $# -ge 2 ]] || invalid "--version requires a value"
         VERSION="$2"
         shift 2
         ;;
       --arch)
-        [[ $# -ge 2 ]] || { log_error "--arch requires a value"; exit 1; }
+        [[ $# -ge 2 ]] || invalid "--arch requires a value"
         ARCH="$2"
         shift 2
         ;;
       --type)
-        [[ $# -ge 2 ]] || { log_error "--type requires a value"; exit 1; }
+        [[ $# -ge 2 ]] || invalid "--type requires a value"
         BUILD_TYPE="$2"
         shift 2
         ;;
       --binary)
-        [[ $# -ge 2 ]] || { log_error "--binary requires a value"; exit 1; }
+        [[ $# -ge 2 ]] || invalid "--binary requires a value"
         BINARY_FILE="$2"
         shift 2
         ;;
       --apk)
         # Accepted but unused (desktop app - no APK). Required by build server
         # which may pass --apk to all scripts. Must not fail per Rule 11.
-        [[ $# -ge 2 ]] || { log_error "--apk requires a value"; exit 1; }
+        [[ $# -ge 2 ]] || invalid "--apk requires a value"
         log_info "Ignoring --apk parameter: Bitcoin Safe is a desktop app, not an Android app"
         shift 2
         ;;
@@ -424,9 +415,7 @@ parse_args() {
   fi
 
   if [[ -z "$VERSION" ]]; then
-    log_error "Missing version. Pass --version or provide a recognizable Bitcoin Safe file with --binary."
-    show_help
-    exit 1
+    invalid "Missing version. Pass --version or provide a recognizable Bitcoin Safe file with --binary."
   fi
 
   if [[ -z "$ARCH" ]]; then
@@ -487,7 +476,7 @@ map_build_config() {
       log_error "  - x86_64-linux / flatpak"
       log_error "  - x86_64-windows / portable"
       log_error "  - x86_64-windows / setup"
-      exit 1
+      exit 2
       ;;
   esac
 }
@@ -497,8 +486,8 @@ map_build_config() {
 # ======================================================================================
 
 setup_workspace() {
-  execution_dir="$(pwd)"
-  WORKDIR="${execution_dir}/bitcoinsafe_${VERSION}_${ARCH}_${BUILD_TYPE}"
+  # Created on the host by bootstrap_container (per run, caller's directory).
+  WORKDIR="${BS_WORKDIR:?run this script on the host, not inside a container}"
   OFFICIAL_DIR="$WORKDIR/official"
   SOURCE_DIR="$WORKDIR/source"
   REPO_DIR="$SOURCE_DIR/bitcoin-safe"
@@ -517,37 +506,21 @@ setup_workspace() {
 # ======================================================================================
 
 prepare_repository() {
-  if [[ ! -d "$REPO_DIR/.git" ]]; then
-    log_info "Cloning repository..."
-    git clone "$REPO_URL" "$REPO_DIR"
-  else
-    log_info "Updating repository..."
-    (cd "$REPO_DIR" && git fetch --all --tags --prune)
-  fi
+  log_info "Cloning repository..."
+  git clone "$REPO_URL" "$REPO_DIR" || return 1
 
   local ref="v${VERSION}"
   if (cd "$REPO_DIR" && git rev-parse "$ref" >/dev/null 2>&1); then
     log_info "Checking out tag $ref"
-    (cd "$REPO_DIR" && git checkout "$ref")
+    (cd "$REPO_DIR" && git checkout "$ref") || return 1
     CHECKED_OUT_TAG="$ref"
   else
     log_warn "Tag $ref not found, trying ${VERSION}"
-    (cd "$REPO_DIR" && git checkout "$VERSION")
+    (cd "$REPO_DIR" && git checkout "$VERSION") || return 1
     CHECKED_OUT_TAG="$VERSION"
   fi
 
-  if [[ -z "$CHECKED_OUT_TAG" ]]; then
-    CHECKED_OUT_TAG="$ref"
-  fi
-
-  # Clean untracked files and build artifacts to ensure a pristine source tree.
-  # Without this, reused workspaces can produce different builds due to stale
-  # venvs, leftover dist/ files, or cached Poetry state.
-  log_info "Cleaning source tree..."
-  (cd "$REPO_DIR" && git clean -fdx)
-  (cd "$REPO_DIR" && git checkout -- .)
-
-  (cd "$REPO_DIR" && git submodule update --init --recursive)
+  (cd "$REPO_DIR" && git submodule update --init --recursive) || return 1
 
   SOURCE_COMMIT=$(cd "$REPO_DIR" && git rev-parse HEAD)
   export SOURCE_COMMIT
@@ -604,10 +577,6 @@ run_build() {
   local start_ts end_ts build_rc
   start_ts=$(date +%s)
 
-  # Remove any artifact from a prior run so a stale binary can never be mistaken
-  # for a fresh build (the source tree is reused across runs).
-  rm -rf "$REPO_DIR/dist"
-
   (
     cd "$REPO_DIR"
     export SOURCE_DATE_EPOCH
@@ -616,8 +585,12 @@ run_build() {
     export DOCKER_BUILDKIT=1
 
     # Install Poetry (python:3.12-slim base provides pip3)
-    log_info "Installing Poetry..."
-    pip3 install --user poetry >/dev/null 2>&1
+    # Poetry version from upstream's own poetry.lock (dev dependency) at this tag
+    local pv
+    pv=$(grep -A1 '^name = "poetry"$' poetry.lock 2>/dev/null | sed -n 's/^version = "\(.*\)"$/\1/p')
+    [[ -n "$pv" ]] || { log_error "Poetry version not found in poetry.lock"; exit 1; }
+    log_info "Installing Poetry ${pv} (from poetry.lock)..."
+    pip3 install --user "poetry==${pv}" >/dev/null 2>&1 || { log_error "pip install poetry==${pv} failed"; exit 1; }
     export PATH="$HOME/.local/bin:$PATH"
     log_info "Poetry version: $(poetry --version)"
 
@@ -696,20 +669,16 @@ download_official() {
     OFFICIAL_FILE="$BINARY_FILE"
     OFFICIAL_FILENAME="$(basename "$BINARY_FILE")"
     log_info "Using provided binary as official artifact: $BINARY_FILE"
+    APP_HASH=$(sha256sum "$OFFICIAL_FILE" | cut -d' ' -f1)
     return 0
   fi
 
   log_info "Downloading official artifact: $OFFICIAL_FILENAME"
 
   local dest="$OFFICIAL_DIR/$OFFICIAL_FILENAME"
-  if [[ -f "$dest" ]]; then
-    log_info "Using cached official artifact"
-    OFFICIAL_FILE="$dest"
-    return 0
-  fi
-
   if fetch_release_file "$VERSION" "$OFFICIAL_FILENAME" "$dest"; then
     OFFICIAL_FILE="$dest"
+    APP_HASH=$(sha256sum "$OFFICIAL_FILE" | cut -d' ' -f1)
     return 0
   else
     log_error "Failed to download official artifact"
@@ -821,12 +790,6 @@ print_diff_preview() {
 }
 
 compare_artifacts() {
-  # Remove stale side files from previous runs in the same workdir so they
-  # cannot bleed into the summary of a successful re-run.
-  rm -f "$WORKDIR/flatpak-hash-mismatch-note.txt"
-  rm -f "$WORKDIR/diff-appimage-contents.txt"
-  rm -f "$WORKDIR/diff-deb-contents.txt"
-
   if [[ ! -f "$BUILT_FILE" ]]; then
     log_error "Built file not found: $BUILT_FILE"
     return 1
@@ -855,6 +818,7 @@ compare_artifacts() {
 
     strip_windows_signature "$BUILT_FILE" "$built_compare" || return 1
     strip_windows_signature "$OFFICIAL_FILE" "$official_compare" || return 1
+    COMPARE_BASIS="signature-stripped executables"
   fi
 
   BUILT_HASH=$(sha256sum "$built_compare" | awk '{print $1}')
@@ -906,6 +870,7 @@ compare_artifacts() {
     if [[ "$built_ai_hash" == "$official_ai_hash" ]]; then
       BUILT_HASH="$built_ai_hash"
       OFFICIAL_HASH="$official_ai_hash"
+      COMPARE_BASIS="raw AppImage inside the .tar.gz"
       MATCH_STATUS="true"
       VERDICT_STATUS="reproducible"
       log_success "Raw AppImage hashes match - Build is reproducible (tar.gz wrapper differs only)"
@@ -939,6 +904,7 @@ compare_artifacts() {
       log_success "AppImage contents are identical (squashfs packaging differs)"
       BUILT_HASH="$built_ai_hash"
       OFFICIAL_HASH="$official_ai_hash"
+      COMPARE_BASIS="raw AppImages differ; extracted contents identical"
       MATCH_STATUS="true"
       VERDICT_STATUS="reproducible"
       return 0
@@ -949,6 +915,7 @@ compare_artifacts() {
 
     BUILT_HASH="$built_ai_hash"
     OFFICIAL_HASH="$official_ai_hash"
+    COMPARE_BASIS="raw AppImage inside the .tar.gz; extracted contents differ"
     MATCH_STATUS="false"
     VERDICT_STATUS="not_reproducible"
     return 1
@@ -1001,7 +968,7 @@ compare_artifacts() {
         log_success "DEB installed files are identical (control metadata differs only)"
         print_diff_preview "$control_diff" "DEB control diff preview"
       fi
-      BUILT_HASH="$OFFICIAL_HASH"
+      COMPARE_BASIS=".deb files differ; installed files identical"
       MATCH_STATUS="true"
       VERDICT_STATUS="reproducible"
       return 0
@@ -1058,7 +1025,7 @@ compare_artifacts() {
 # ======================================================================================
 
 generate_comparison_yaml() {
-  local yaml_file="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
+  local yaml_file="${WORKDIR}/COMPARISON_RESULTS.yaml"  # copied next to the script at exit
 
   log_info "Generating COMPARISON_RESULTS.yaml..."
 
@@ -1085,7 +1052,7 @@ EOF
 generate_error_yaml() {
   local error_status="$1"
   local error_msg="$2"
-  local yaml_file="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
+  local yaml_file="${WORKDIR}/COMPARISON_RESULTS.yaml"  # copied next to the script at exit
 
   log_info "Generating error COMPARISON_RESULTS.yaml..."
 
@@ -1109,57 +1076,45 @@ EOF
 # ======================================================================================
 
 print_summary() {
-  local summary_verdict=""
-  local match_indicator="0 (DOESN'T MATCH)"
-  if [[ "${MATCH_STATUS}" == "true" ]]; then
-    summary_verdict="reproducible"
-    match_indicator="1 (MATCHES)"
-  fi
-
   echo
   echo "===== Begin Results ====="
   echo "appId:          ${APP_ID}"
   echo "signer:         N/A"
-  echo "versionName:    ${VERSION}"
-  echo "versionCode:    N/A"
-  echo "verdict:        ${summary_verdict}"
-  echo "appHash:        ${OFFICIAL_HASH:-N/A}"
+  echo "apkVersionName: ${VERSION}"
+  echo "apkVersionCode: N/A"
+  echo "verdict:        ${VERDICT_STATUS}"
+  echo "appHash:        ${APP_HASH:-N/A}"
   echo "commit:         ${SOURCE_COMMIT:-N/A}"
-  echo
-  echo "Diff:"
-  if [[ "${MATCH_STATUS}" == "true" ]]; then
-    echo "BUILDS MATCH BINARIES"
-  else
-    echo "BUILDS DO NOT MATCH BINARIES"
-  fi
-  echo "$(basename "${OFFICIAL_FILE:-unknown}") - ${ARCH} - ${BUILT_HASH:-N/A} - ${match_indicator}"
-  if [[ "$NEEDS_SIGNATURE_STRIP" == "true" ]]; then
-    echo "Note: Hashes are of signature-stripped executables"
-  fi
-  echo
-  echo "Revision, tag (and its signature):"
-  echo "Tag: ${CHECKED_OUT_TAG:-unknown} (checked out from git)"
-  echo "Note: Git tag/commit signature verification not implemented"
-  echo "Release signature (${OFFICIAL_FILENAME:-artifact}.asc): ${SIG_STATUS}"
-  echo
-  local diff_file="$WORKDIR/diff-appimage-contents.txt"
-  if [[ -f "$diff_file" ]]; then
-    print_diff_preview "$diff_file" "AppImage content diff"
-    echo
-  fi
-  local deb_diff_file="$WORKDIR/diff-deb-contents.txt"
-  if [[ -f "$deb_diff_file" ]]; then
-    print_diff_preview "$deb_diff_file" "DEB content diff"
-    echo
-  fi
-  local flatpak_note_file="$WORKDIR/flatpak-hash-mismatch-note.txt"
-  if [[ -f "$flatpak_note_file" ]]; then
-    echo "Flatpak hash mismatch note (full details in ${flatpak_note_file}):"
-    head -4 "$flatpak_note_file"
-    echo
-  fi
+  echo "scriptVersion:  ${SCRIPT_VERSION}"
+  echo "scriptHash:     ${SCRIPT_HASH}"
   echo "===== End Results ====="
   echo
+  # Everything below is outside the results block.
+  [[ -z "$APP_HASH" ]] || echo "appHash: sha256 of ${OFFICIAL_FILENAME} exactly as downloaded/supplied"
+  if [[ -n "$BUILT_HASH" ]]; then
+    echo "Compared (${COMPARE_BASIS}): official ${OFFICIAL_HASH} / built ${BUILT_HASH}"
+  fi
+  echo "Tag: ${CHECKED_OUT_TAG:-unknown} (git tag signature not checked)"
+  echo "Release signature (${OFFICIAL_FILENAME:-artifact}.asc): ${SIG_STATUS}"
+  local f
+  for f in diff-appimage-contents diff-deb-contents; do
+    [[ ! -f "$WORKDIR/$f.txt" ]] || print_diff_preview "$WORKDIR/$f.txt" "${f#diff-}"
+  done
+  [[ ! -f "$WORKDIR/flatpak-hash-mismatch-note.txt" ]] || head -4 "$WORKDIR/flatpak-hash-mismatch-note.txt"
+  local c="$WORKDIR/appimage_compare"
+  [[ ! -d "$c/built-squashfs" ]] || echo "More detail: diff -r $c/official-squashfs $c/built-squashfs"
+  c="$WORKDIR/deb_compare"
+  [[ ! -d "$c" ]] || echo "More detail: diff -r $c/official-data $c/built-data"
+  echo "Workspace: $WORKDIR"
+  echo
+}
+
+fail_ftbfs() {
+  log_error "$1"
+  generate_error_yaml "ftbfs" "$1"
+  VERDICT_STATUS="ftbfs"
+  print_summary
+  exit 1
 }
 
 print_finding() {
@@ -1172,84 +1127,37 @@ print_finding() {
 # ======================================================================================
 
 main() {
-  # Parse arguments first (needed for container bootstrap env vars)
+  # No stale YAML from an earlier run, also when parameters are invalid (exit 2)
+  [[ "${_INSIDE_CONTAINER:-}" == "1" ]] || rm -f "$SCRIPT_DIR/COMPARISON_RESULTS.yaml"
   parse_args "$@"
+  map_build_config "$ARCH" "$BUILD_TYPE"
 
   # If not inside container, bootstrap and re-invoke
   if [[ "${_INSIDE_CONTAINER:-}" != "1" ]]; then
+    [[ "$(id -u)" -ne 0 ]] || invalid "Run as a normal user, not root."
+    log_info "Script: ${0##*/} ${SCRIPT_VERSION} sha256: ${SCRIPT_HASH}"
     bootstrap_container
-    # bootstrap_container calls exit, never reaches here
   fi
 
-  # Inside container - proceed with normal flow
-  log_info "Starting bitcoinsafe_build.sh script version ${SCRIPT_VERSION}"
-  log_info "Bitcoin Safe Desktop Build Verification Script"
-  log_info "========================================================"
-
-  # Map architecture and type to build configuration
-  map_build_config "$ARCH" "$BUILD_TYPE"
-
-  # Setup workspace
   setup_workspace
-
-  # Prepare repository
-  prepare_repository
-
-  # Download official artifact
-  if ! download_official; then
-    log_error "Failed to download official artifact"
-    generate_error_yaml "ftbfs" "Failed to obtain official release artifact"
-    exit 1
-  fi
-
+  prepare_repository || fail_ftbfs "Could not clone or check out ${VERSION}"
+  download_official || fail_ftbfs "Failed to obtain official release artifact"
   verify_official_signature
+  run_build || fail_ftbfs "Build process failed - see logs above"
+  find_built_artifact || fail_ftbfs "Build completed but artifact not found in dist/"
 
-  # Run build
-  if ! run_build; then
-    log_error "Build failed"
-    generate_error_yaml "ftbfs" "Build process failed - see logs above"
-    exit 1
-  fi
-
-  # Find built artifact
-  if ! find_built_artifact; then
-    log_error "Failed to find built artifact"
-    generate_error_yaml "ftbfs" "Build completed but artifact not found in dist/"
-    exit 1
-  fi
-
-  # Compare artifacts
-  BUILT_HASH=""
-  OFFICIAL_HASH=""
-  MATCH_STATUS="false"
-  VERDICT_STATUS="not_reproducible"
   local comparison_result=0
   compare_artifacts || comparison_result=$?
-
-  # If comparison failed before any hashes were computed (e.g. signature strip error),
-  # emit ftbfs rather than a misleading not_reproducible with empty hashes.
+  # Comparison failed before any hash was computed (e.g. signature strip error)
   if [[ "$comparison_result" -ne 0 && -z "$BUILT_HASH" ]]; then
-    log_error "Comparison aborted before hash computation - see errors above"
-    generate_error_yaml "ftbfs" "Artifact comparison failed before hash computation - see logs above"
-    exit 1
+    fail_ftbfs "Artifact comparison failed before hash computation - see logs above"
   fi
 
-  # Generate YAML output
   generate_comparison_yaml
-
-  # Print summary
   print_summary
-
-  # Exit with appropriate code
-  if [[ "$comparison_result" -eq 0 ]]; then
-    print_finding "reproducible"
-    log_success "Verification complete: Build is REPRODUCIBLE (exit code: 0)"
-    exit 0
-  else
-    print_finding "${VERDICT_STATUS}"
-    log_warn "Verification complete: Build is NOT REPRODUCIBLE (exit code: 1)"
-    exit 1
-  fi
+  print_finding "${VERDICT_STATUS}"
+  [[ "$comparison_result" -eq 0 ]] && exit 0
+  exit 1
 }
 
 # Run main function
