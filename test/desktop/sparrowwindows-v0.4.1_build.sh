@@ -1,37 +1,17 @@
 #!/bin/bash
-#
 # sparrowwindows_build.sh - Sparrow Wallet Windows (MSI/ZIP) Reproducible Build Verifier
-# Version: v0.4.0
-# Last modified on: 2026-10-16 (v0.4.0)
-#
-# Builds Sparrow for Windows inside a Windows Server 2022 VM (dockur/windows, QEMU/KVM)
-# and compares the built installer to the official release artifact. Each run boots a
-# throw-away copy-on-write copy of a read-only golden image; see GitLab #984 for the
-# image runbook. Needs /dev/kvm, the golden image and its VM key (--windows-dir).
-#
-# MSI: every named stream and decoded table is compared; five classes are normalized
-# away and each is printed - Authenticode signature, PackageCode, build timestamps (two
-# summary FILETIMEs and the cabinet per-file date/time fields), table row order,
-# string-pool order. The cabinet is byte-compared after zeroing only those fields.
-# The container is accounted for, not byte-compared: bytes past the final sector, data
-# in unallocated sectors, dated directory entries and one-sided streams are checked;
-# metadata sectors (header, FAT/DIFAT, directory) are structural, not authored.
-#
-# Comparator exit codes: 0 equivalent, 1 real differences, 2+ a tool error as ftbfs.
-# The official artifact is downloaded when --binary is omitted and always checked first:
-# manifest signature verified under a PINNED fingerprint, then sha256 matched.
-# The build runs in D:\a\sparrow\sparrow, the path GitHub's runner used for the official
-# release: that path is an MSI build input.
-#
-# Linux artifacts (tarball/deb/rpm) are handled by sparrowdesktop_build.sh.
-#
+# Version: v0.4.1
+# Last modified on: 2026-10-16 (v0.4.1)
+# Builds Sparrow in a throw-away copy of a Windows Server 2022 VM (dockur/windows, KVM) at
+# D:\a\sparrow\sparrow and compares the MSI/ZIP with the signed official release. Needs /dev/kvm,
+# the golden image and VM key (--windows-dir; runbook: GitLab #984). Linux: sparrowdesktop_build.sh.
+# The MSI comparator prints everything it sets aside, and its scope.
 # Organization: WalletScrutiny.com
 # Repository: https://gitlab.com/walletscrutiny/walletScrutinyCom
 #
-
 set -euo pipefail
 
-SCRIPT_VERSION="v0.4.0"
+SCRIPT_VERSION="v0.4.1"
 APP_ID="sparrow"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256=""
@@ -362,6 +342,14 @@ def compare_pools(a, b, raw_differs):
     norm('string pool storage order (same entries, same individual reference counts)')
 
 # -- tables
+def catalog(d, p, who):
+  """!_Tables: one string reference per table name."""
+  raw, w = rd(d, '!_Tables'), p[2]
+  if raw is None or len(raw) % w: raise Bad(f'{who}: !_Tables missing or malformed')
+  ids = [int.from_bytes(raw[i:i + w], 'little') for i in range(0, len(raw), w)]
+  if not all(0 < i < len(p[0]) for i in ids): raise Bad(f'{who}: !_Tables string out of range')
+  return [p[0][i] for i in ids]
+
 def schema(d, strings, who):
   raw = rd(d, '!_Columns')
   if raw is None: raise Bad(f'{who}: !_Columns missing')
@@ -492,6 +480,11 @@ def run(A, B):
   for t in sorted(set(sa) & set(sb)):
     if sa[t] != sb[t]:
       diff(f'schema differs for table {t.decode("ascii", "replace")}')
+  ca, cb = catalog(A, pa, 'official'), catalog(B, pb, 'built')
+  if Counter(ca) != Counter(cb): diff(f'table catalog (!_Tables) differs: {sorted(set(ca) ^ set(cb))!r}')
+  elif ca != cb: norm('row storage order in table _Tables')
+  for who, c, s in (('official', ca, sa), ('built', cb, sb)):
+    if set(c) != set(s): diff(f'{who}: !_Tables and !_Columns list different tables')
 
   # every ! stream must be explicitly accounted for; nothing is skipped by pattern
   accounted = {'!_StringPool', '!_StringData', '!_Columns', '!_Tables'}
