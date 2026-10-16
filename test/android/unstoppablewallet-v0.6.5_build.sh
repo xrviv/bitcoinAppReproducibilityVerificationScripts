@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # unstoppablewallet_build.sh - Unstoppable Wallet Reproducible Build Verification
-# Version:       v0.6.4
+# Version:       v0.6.5
 # Organization:  WalletScrutiny.com
 # License:       MIT
-# Last modified by: Bob (WalletScrutiny agent)
-# Last modified on: 2026-10-07
+# Last modified by: Claude (WalletScrutiny agent)
+# Last modified on: 2026-10-16
 # Project:       https://github.com/horizontalsystems/unstoppable-wallet-android
 # Host deps:     docker or podman only
 # Disclaimer:    Provided as-is, without warranty. It checks whether the published APK matches a build
@@ -14,9 +14,9 @@
 #                whole-APK compare. Flavor by GitHub asset digest (google_play => assembleBaseRelease,
 #                github => assembleFdroidRelease), else by the flavor's BuildConfig key in the DEX.
 #                Lone Play base.apk, config split, non-upstream signer (F-Droid store build): exit 2.
-#                zano-kit built, ~290 MB prebuilt .a trusted; thorchain-kit built and published locally.
+#                zano-kit built, ~290 MB prebuilt .a trusted; thorchain/xrp kits built and published locally.
 
-SCRIPT_VERSION="v0.6.4"
+SCRIPT_VERSION="v0.6.5"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_NAME="$(basename "$SCRIPT_PATH")"
 if [[ -f "$SCRIPT_PATH" ]]; then
@@ -175,7 +175,6 @@ ctx="${workspace}/ctx"
 ensure_user_ownership() {
     local path="$1" image="$2" own="${HOST_UID}:${HOST_GID}"
     [[ -e "$path" ]] || return 0
-    # Rootless runtime: container root == caller, so chown 0:0 (a host uid would land in the subuid range).
     [[ "$ROOTLESS" -eq 1 ]] && own="0:0"
     if [[ "$CRUN" == podman && "$ROOTLESS" -eq 1 ]]; then
         podman unshare chown -R 0:0 "$path" >/dev/null 2>&1 || log_warn "Could not fix ownership for ${path}"
@@ -276,9 +275,7 @@ split_name=$(echo "$apk_info" | sed -n "s/.*split='\([^']*\)'.*/\1/p" | head -1)
 abis=$(echo "$apk_info" | sed -n "s/^native-code: //p" | tr -d "'" | head -1)
 echo "${split_name}" > /output/split_name.txt
 echo "${abis}"       > /output/abis.txt
-# bundletool output has splits0.xml or a SourceStamp; Gradle fat APKs do not.
 unzip -l /input/official.apk 2>/dev/null | grep -qE ' (res/xml/splits0\.xml|stamp-cert-sha256)$' && echo 1 > /output/universal.txt || echo 0 > /output/universal.txt
-# Release asset digests (sha256 name) for flavor detection; GITHUB_TOKEN optional.
 hdr=(); [[ -n "${GITHUB_TOKEN:-}" ]] && hdr=(--header="Authorization: Bearer ${GITHUB_TOKEN}")
 wget -qO- --timeout=30 "${hdr[@]}" "https://api.github.com/repos/horizontalsystems/unstoppable-wallet-android/releases/tags/${version_name}" 2>/dev/null \
   | grep -oE '"(name|digest)": *"[^"]*"' | awk -F'"' '$2=="name"{n=$4} $2=="digest"{sub(/^sha256:/,"",$4); print $4, n}' > /output/gh_assets.txt || true
@@ -326,7 +323,6 @@ if [[ "$INPUT_MODE" == fat ]]; then
         log_error "Single APK has no native libraries: a lone Play base.apk cannot be verified alone."
         die 2 "Single APK is a lone Play base.apk (no native libs); pass the whole split directory (base.apk + split_config.*)"
     fi
-    # Kind by evidence, not file name: asset digest first, then the DEX key literal (in-container).
     gh_asset=$(awk -v h="$app_hash" '$1==h{print $2; exit}' "${P0_DIR}/gh_assets.txt" 2>/dev/null)
     case "$gh_asset" in
         *_google_play_*) FLAVOR=base;   KIND_RULE="sha256 = GitHub release asset ${gh_asset}" ;;
@@ -365,7 +361,6 @@ clone_at_commit() {
     git -C "$dir" submodule update --init --recursive
 }
 
-# Version catalog (gradle/libs.versions.toml, wallet >= 0.48.0): module -> version.ref -> version.
 extract_wallet_hs_version() {
     local toml="/build/wallet/gradle/libs.versions.toml" ref
     ref=$(grep -E "module\s*=\s*\"com\.github\.horizontalsystems:$1\"" "$toml" \
@@ -425,7 +420,6 @@ echo ""; echo "=== Step 1: Clone all repos === $(date)"
 git clone --depth 1 --branch __WALLET_VERSION__ "$GH/unstoppable-wallet-android.git" /build/wallet
 WS_FLAVOR="${WS_FLAVOR:-base}"
 if [[ "$WS_FLAVOR" == auto ]]; then
-    # base/fdroid differ only in BuildConfig literals; exactly one flavor's USWAP key sits in the official DEX.
     kb=$(sed -nE 's/.*uswapApiKeyAndroid *= *"([^"]+)".*/\1/p' /build/wallet/app/build.gradle.kts | head -1)
     kf=$(sed -nE 's/.*uswapApiKeyFdroid *= *"([^"]+)".*/\1/p' /build/wallet/app/build.gradle.kts | head -1)
     mkdir -p /tmp/dx && unzip -qo -j /official/official.apk 'classes*.dex' -d /tmp/dx
@@ -439,7 +433,6 @@ if [[ "$WS_FLAVOR" == auto ]]; then
 fi
 echo "$WS_FLAVOR" > /output/flavor.txt
 [[ -f /build/wallet/gradle/libs.versions.toml ]] || { echo "ERROR: no gradle/libs.versions.toml (wallet < 0.48.0 is not supported)"; exit 1; }
-# The tag must describe the APK: defaultConfig versionName/versionCode vs the official APK's.
 src_vn=$(sed -nE 's/^\s*versionName = "([^"]+)".*/\1/p' /build/wallet/app/build.gradle.kts | head -1)
 src_vc=$(sed -nE 's/^\s*versionCode = ([0-9]+).*/\1/p' /build/wallet/app/build.gradle.kts | head -1)
 echo "Tag __WALLET_VERSION__ source: versionName=$src_vn versionCode=$src_vc | official APK: ${WS_VERSION_NAME:-?} / ${WS_VERSION_CODE:-?}"
@@ -465,6 +458,7 @@ TRON_VER=$(extract_wallet_hs_version "tron-kit-android")
 ZANO_VER=$(extract_wallet_hs_version "zano-kit-android")
 HD_WALLET_VER=$(extract_wallet_hs_version "hd-wallet-kit-android" || true)
 THORCHAIN_VER=$(extract_wallet_hs_version "thorchain-kit-android" || true)
+XRP_VER=$(extract_wallet_hs_version "xrp-android" || true)   # wallet >= 0.52.0
 
 for kv in monero:$MONERO_VER stellar:$STELLAR_VER ton:$TON_VER bitcoin:$BITCOIN_VER ethereum:$ETHEREUM_VER \
           blockchain-fee-rate:$FEERATE_VER market:$MARKET_VER solana:$SOLANA_VER tron:$TRON_VER zano:$ZANO_VER; do
@@ -472,7 +466,7 @@ for kv in monero:$MONERO_VER stellar:$STELLAR_VER ton:$TON_VER bitcoin:$BITCOIN_
 done
 echo "Derived HS versions (wallet version catalog): monero=$MONERO_VER stellar=$STELLAR_VER ton=$TON_VER" \
      "bitcoin=$BITCOIN_VER ethereum=$ETHEREUM_VER feerate=$FEERATE_VER market=$MARKET_VER solana=$SOLANA_VER" \
-     "tron=$TRON_VER zano=$ZANO_VER hd-wallet=${HD_WALLET_VER:-<from deps>} thorchain=${THORCHAIN_VER:-<none>}"
+     "tron=$TRON_VER zano=$ZANO_VER hd-wallet=${HD_WALLET_VER:-<from deps>} thorchain=${THORCHAIN_VER:-<none>} xrp=${XRP_VER:-<none>}"
 
 clone_at_commit "$GH/ton-kit-android.git"                     "$TON_VER"      /build/deps/ton-kit-android
 clone_at_commit "$GH/stellar-kit-android.git"                 "$STELLAR_VER"  /build/deps/stellar-kit-android
@@ -488,6 +482,7 @@ clone_at_commit "$GH/monero-kit-android.git"                  "$MONERO_VER"   /b
 if [[ -n "$THORCHAIN_VER" ]]; then
     clone_at_commit "$GH/thorchain-kit-android.git"            "$THORCHAIN_VER" /build/deps/thorchain-kit-android
 fi
+[[ -z "$XRP_VER" ]] || clone_at_commit "$GH/xrp-kit-android.git" "$XRP_VER" /build/deps/xrp-kit-android
 
 for g in /home/jitpack/build/bitcoincore/build.gradle /build/deps/tron-kit-android/tronkit/build.gradle; do
     [[ -z "$HD_WALLET_VER" ]] || break
@@ -559,6 +554,15 @@ echo "  [BLOB CAVEAT] zano links prebuilt .a (Zano engine/Boost/OpenSSL), not re
 cd /build/deps/zano-kit-android
 ensure_pub zanokit/build.gradle zano-kit-android "$ZANO_VER" sv   # AGP 8.11.1
 ./gradlew :zanokit:publishToMavenLocal --no-daemon
+
+if [[ -n "$XRP_VER" ]]; then
+    echo ""; echo "=== Step 4h: xrp-kit-android === $(date)"
+    cd /build/deps/xrp-kit-android
+    sed -i '/maven.*jitpack/i\        mavenLocal()' settings.gradle
+    sed -i -E "s/(com\\.github\\.horizontalsystems:hd-wallet-kit-android:)[^\"']+/\\1$HD_WALLET_VER/g" xrpkit/build.gradle
+    ensure_pub xrpkit/build.gradle xrp-android "$XRP_VER"
+    ./gradlew :xrpkit:publishToMavenLocal --no-daemon
+fi
 
 echo ""; echo "=== Step 5a: bitcoin-kit-android === $(date)"
 cd /home/jitpack/build
@@ -737,7 +741,6 @@ cfg_of() { local s; s=$("$AAPT2" dump badging "$1" 2>/dev/null | sed -n "s/.*spl
 classify_manifest_diff() {
     local md="$1" cfg="$2" mch mnx
     mch=$(printf '%s\n' "$md" | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)')
-    # Only Play-injected metadata (and the self-closed <application> it leaves) passes.
     mnx=$(printf '%s\n' "$mch" | grep -vE \
         '^[+-][[:space:]]*<meta-data android:name="(com\.android\.vending\.derived\.apk\.id|com\.android\.stamp\.source|com\.android\.stamp\.type)"[^>]*/>$|^[+-][[:space:]]*<application android:extractNativeLibs="true" android:hasCode="false"(/>|>)$|^[+-][[:space:]]*</application>$' \
         | tr -d '\n\r')
