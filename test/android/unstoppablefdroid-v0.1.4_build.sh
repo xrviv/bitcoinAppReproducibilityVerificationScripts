@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # unstoppablefdroid_build.sh - Unstoppable Wallet (F-Droid variant) Verification
-# Version: v0.1.3 | WalletScrutiny.com | Danny Garcia | 2026-09-02
+# Version: v0.1.4 | WalletScrutiny.com | Danny Garcia | 2026-10-16
 # Project: https://github.com/horizontalsystems/unstoppable-wallet-android
 # Host deps: docker or podman; curl only when downloading the official APK.
 # Sibling of unstoppablewallet_build.sh (Play/split-only). Four things to know:
@@ -11,10 +11,10 @@
 #  3. F-Droid does not build the pristine tag. fdroiddata declares
 #     `rm: subscriptions-google-play` and a prebuild sed stripping marketKit.sendStats;
 #     both are reproduced and asserted below. Without them no match is possible.
-#  4. The twelve horizontalsystems kits are rebuilt from source; any horizontalsystems
+#  4. The horizontalsystems kits (xrp from wallet 0.52.0) are rebuilt from source; any horizontalsystems
 #     JitPack fetch aborts. F-Droid's own build consumes JitPack artifacts instead.
 
-SCRIPT_VERSION="v0.1.3"
+SCRIPT_VERSION="v0.1.4"
 SCRIPT_NAME="unstoppablefdroid_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 if [[ -f "$SCRIPT_PATH" ]]; then
@@ -542,8 +542,11 @@ for spec in $KITS; do
 done
 HD_WALLET_VER=$(extract_wallet_hs_version "hd-wallet-kit-android" "$wallet_gradle" || true)
 THORCHAIN_VER=$(extract_wallet_hs_version "thorchain-kit-android" "$wallet_gradle" || true)
+# xrp-kit-android (wallet >= 0.52.0) publishes under the old repo name: com.github.horizontalsystems:xrp-android
+XRP_VER=$(extract_wallet_hs_version "xrp-android" "$wallet_gradle" || true)
 [[ -n "$HD_WALLET_VER" ]] && echo "  hd-wallet-kit-android:            $HD_WALLET_VER"
 [[ -n "$THORCHAIN_VER" ]] && echo "  thorchain-kit-android:             $THORCHAIN_VER"
+[[ -n "$XRP_VER" ]] && echo "  xrp-kit-android (xrp-android):     $XRP_VER"
 
 # bitcoin-kit is cloned to /home/jitpack/build: its build.gradle hardcodes that path.
 for spec in $KITS; do
@@ -553,6 +556,9 @@ for spec in $KITS; do
 done
 if [[ -n "$THORCHAIN_VER" ]]; then
     clone_at_commit "$GH/thorchain-kit-android.git"            "$THORCHAIN_VER" /build/deps/thorchain-kit-android
+fi
+if [[ -n "$XRP_VER" ]]; then
+    clone_at_commit "$GH/xrp-kit-android.git"                  "$XRP_VER"       /build/deps/xrp-kit-android
 fi
 
 if [[ -z "$HD_WALLET_VER" ]]; then
@@ -633,6 +639,16 @@ sed -i "s/version = '1.0.0'/version = '$SOLANA_VER'/" solanakit/build.gradle
 echo ""; echo "=== Step 4g: zano-kit-android === $(date)"
 echo "  [BLOB CAVEAT] zano links prebuilt .a (Zano engine/Boost/OpenSSL) — not rebuilt from source"
 publish_kit zano-kit-android zanokit zano-kit-android "$ZANO_VER" 1
+
+if [[ -n "$XRP_VER" ]]; then
+    # Its publication version is 'local' and its hd-wallet pin (a74b51f) differs from the
+    # wallet's; both are rewritten so neither xrp nor hd-wallet is fetched from JitPack.
+    echo ""; echo "=== Step 4h: xrp-kit-android === $(date)"
+    cd /build/deps/xrp-kit-android
+    sed -i '/maven.*jitpack/i\        mavenLocal()' settings.gradle
+    sed -i -E "s/(com\\.github\\.horizontalsystems:hd-wallet-kit-android:)[^\"']+/\\1$HD_WALLET_VER/g" xrpkit/build.gradle
+    publish_kit xrp-kit-android xrpkit xrp-android "$XRP_VER" 0
+fi
 
 echo ""; echo "=== Step 5a: bitcoin-kit-android === $(date)"
 publish_multi /home/jitpack/build bitcoin-kit-android "$BITCOIN_VER" \
