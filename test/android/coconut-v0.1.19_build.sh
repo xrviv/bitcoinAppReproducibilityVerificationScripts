@@ -1,9 +1,9 @@
 #!/bin/bash
-# coconut_build.sh v0.1.17 — Coconut Wallet (onl.coconut.wallet) Android reproducible build
+# coconut_build.sh v0.1.19 — Coconut Wallet (onl.coconut.wallet) Android reproducible build
 # verification
 # Organization: WalletScrutiny.com
 # Last modified by: Daniel Garcia
-# Last modified on: 2026-09-25
+# Last modified on: 2026-10-20
 # Project: https://github.com/noncelab/coconut_wallet
 #
 # TECHNICAL DISCLAIMER:
@@ -32,7 +32,7 @@ set -euo pipefail
 
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.1.17"
+readonly SCRIPT_VERSION="v0.1.19"
 readonly SCRIPT_NAME="coconut_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 readonly SCRIPT_PATH
@@ -59,15 +59,19 @@ readonly AT_SHA="dbf930b076c6b9be08d57c449cacefc3bdd6b71ebd59b3066fc0e1f5b14f942
 readonly GO_VER="1.26.0"
 readonly GO_URL="https://go.dev/dl/go${GO_VER}.linux-amd64.tar.gz"
 readonly GO_SHA="aac1b08a0fb0c4e0a7c1555beb7b59180b05dfc5a3d62e40e9de90cd42f88235"
-readonly FLUTTER_TAG="3.29.1"
-# NDK: android/app/build.gradle uses `ndkVersion flutter.ndkVersion`, which Flutter 3.29.1 defines as
-# 26.3.11579264 (packages/flutter_tools/gradle/src/main/groovy/flutter.groovy at tag 3.29.1). AGP
-# 8.6 needs exactly that revision present to strip the release jniLibs (llvm-strip); if it is
-# missing it either auto-downloads it through sdkmanager at build time or packages the .so files
-# unstripped, both of which are diff sources. One NDK in the image, used by both cargo ndk (Trezor
+# FLUTTER_TAG and NDK_VER are no longer fixed here (v0.1.18): FLUTTER_TAG is read from the release
+# tag's .fvmrc, NDK_VER from that Flutter release's own ndkVersion default (see "SETUP: TOOLCHAIN
+# VERSIONS"). android/app/build.gradle uses `ndkVersion flutter.ndkVersion`; AGP needs exactly that
+# revision present to strip the release jniLibs (llvm-strip), else it auto-downloads it or packages
+# the .so files unstripped, both diff sources. One NDK in the image, used by both cargo ndk (Trezor
 # bridge, via ANDROID_NDK_HOME) and AGP (app), removes that variable. Which NDK the vendor's macOS
 # build used for the Trezor bridge is unknown.
-readonly NDK_VER="26.3.11579264"
+# pubspec.lock is gitignored upstream, so pub get resolves today's graph. For 0.20.0 that picks
+# url_launcher_android 6.3.29 (androidx.core 1.17.0, browser 1.9.0 -> needs AGP 8.9.1; upstream pins
+# 8.6.0): build fails. The official APK's META-INF/*.version say core 1.13.1, browser 1.8.0 =
+# url_launcher_android 6.3.14-6.3.25. 6.3.25 (newest of those) is pinned via dependency_overrides.
+# The vendor's exact version is unknown: a guess, reported in the results.
+readonly PUB_OVERRIDE="url_launcher_android: 6.3.25"
 
 readonly EXIT_SUCCESS=0
 readonly EXIT_FAILED=1
@@ -105,8 +109,8 @@ Usage: ${SCRIPT_NAME} --binary <dir-of-official-splits|base.apk> [--version <v>]
   --binary   REQUIRED. Directory holding the official Play split APKs (base.apk plus
              split_config.*.apk), or the path to base.apk itself, whose siblings in
              the same directory then form the split set. Alias: --apk.
-  --version  Optional. Logged and cross-checked; the authoritative versionName/Code
-             come from base.apk / the tag's pubspec.yaml app_versions.aos_mainnet.
+  --version  REQUIRED. Selects tag v<version>, whose .fvmrc sets the Flutter version;
+             cross-checked against base.apk's versionName inside the container.
   --arch     Optional. Logged; the device spec's ABI comes from the official splits.
   --type     Optional. Logged, unused (mainnet flavor only — see header SCOPE).
   --commit   Optional. Build this revision instead of the derived release tag.
@@ -188,6 +192,7 @@ done
 
 [[ "$(id -u)" -eq 0 ]] && die_invalid "Refusing to run as root. Run as a normal user; no sudo is needed."
 [[ -n "$binary_arg" ]] || { usage; die_invalid "--binary (alias --apk) is required — Play splits cannot be downloaded, they must be supplied."; }
+[[ "$version_arg" =~ ^[0-9]+(\.[0-9]+)*$ ]] || { usage; die_invalid "--version is required (e.g. 0.20.0): it selects the tag whose .fvmrc sets the Flutter version."; }
 
 OFFICIAL_DIR=""
 if [[ -f "$binary_arg" ]]; then
@@ -256,6 +261,23 @@ fetch_pinned() {
 fetch_pinned "$BT_URL" "$BT_SHA" "${WORK_DIR}/tools/bundletool.jar"
 fetch_pinned "$AT_URL" "$AT_SHA" "${WORK_DIR}/tools/apktool.jar"
 
+# Flutter comes from the tag's .fvmrc (upstream's FVM pin; 0.17.0 = 3.29.1, 0.20.0 = 3.35.7), NDK
+# from that Flutter tag's ndkVersion default (Kotlin file since 3.32, Groovy before). The driver
+# re-reads .fvmrc from the clone and stops if it differs.
+section "SETUP: TOOLCHAIN VERSIONS"
+FVMRC_URL="https://raw.githubusercontent.com/noncelab/coconut_wallet/v${version_arg}/.fvmrc"
+FLUTTER_TAG="$(curl -fsSL "$FVMRC_URL" | sed -n 's/.*"flutter"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)" || true
+[[ "$FLUTTER_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "ftbfs" "Could not read a Flutter version from ${FVMRC_URL}."
+NDK_VER=""
+for f in packages/flutter_tools/gradle/src/main/kotlin/FlutterExtension.kt packages/flutter_tools/gradle/src/main/groovy/flutter.groovy; do
+    NDK_VER="$(curl -fsSL "https://raw.githubusercontent.com/flutter/flutter/${FLUTTER_TAG}/${f}" 2>/dev/null \
+        | sed -n 's/.*ndkVersion[^=]*=[[:space:]]*"\([0-9.]*\)".*/\1/p' | head -1)" || true
+    [[ -n "$NDK_VER" ]] && break
+done
+[[ "$NDK_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "ftbfs" "Could not read Flutter ${FLUTTER_TAG}'s default ndkVersion."
+readonly FLUTTER_TAG NDK_VER
+log_ok "Flutter ${FLUTTER_TAG} (tag v${version_arg} .fvmrc), NDK ${NDK_VER} (Flutter ${FLUTTER_TAG} default)"
+
 # ------------------------------------------------------------------------------
 # Build the toolchain image. Everything below this point that touches the
 # network, Flutter, Go, Rust, the Android SDK/NDK or Gradle runs inside it.
@@ -315,7 +337,7 @@ ENV ANDROID_NDK_HOME=\$ANDROID_SDK_ROOT/ndk/${NDK_VER}
 # is exactly that (entries owned by jakobr/eng = 397546:5000). GNU tar reads TAR_OPTIONS from the
 # environment, so this applies to every tar the toolchain runs, at image build and at run time.
 ENV TAR_OPTIONS=--no-same-owner
-# Flutter, pinned to the exact tag .fvmrc declares — no FVM wrapper needed, this IS 3.29.1.
+# Flutter, pinned to the exact tag .fvmrc declares — no FVM wrapper needed, this IS ${FLUTTER_TAG}.
 ENV PATH=\$PATH:/opt/flutter/bin
 # Clone, configure, precache and open permissions in ONE layer. Two problems, both from the image
 # building as root while the container runs as the invoking user:
@@ -411,6 +433,13 @@ if ! git checkout --quiet "$TAG" 2>/dev/null; then
 fi
 COMMIT_HASH="$(git rev-parse HEAD)"
 echo "$COMMIT_HASH" > /work/commit.txt
+fvm_pin="$(sed -n 's/.*"flutter"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' .fvmrc 2>/dev/null | head -1)"
+if [[ "$fvm_pin" != "$FLUTTER_TAG" ]]; then
+    echo "FLUTTER MISMATCH: tag ${TAG} .fvmrc says '${fvm_pin}', image has ${FLUTTER_TAG} (check --version)" >&2
+    echo "ftbfs" > /work/verdict.txt
+    exit 1
+fi
+echo "Flutter ${FLUTTER_TAG} = .fvmrc at ${TAG}"
 pubcode="$(sed -n 's/^[[:space:]]*aos_mainnet:[[:space:]]*[0-9.]*+\([0-9]*\)[[:space:]]*$/\1/p' pubspec.yaml | head -1)"
 if [[ -n "$pubcode" && "$pubcode" != "$VERSION_CODE" ]]; then
     echo "WARNING: tag ${TAG} pubspec app_versions.aos_mainnet build number (${pubcode}) does not match official APK versionCode (${VERSION_CODE})." >&2
@@ -485,6 +514,9 @@ echo "exclusion (meta-inf-filter-scope.md), not a fabricated signature match."
 
 echo "== PHASE 6: fvm flutter build appbundle (REQUIRE_GOOGLE_SERVICES intentionally unset -- NOTE B) =="
 cd /build/coconut_wallet
+grep -q '^dependency_overrides:' pubspec.yaml && { echo "pubspec.yaml already has dependency_overrides" >&2; echo ftbfs > /work/verdict.txt; exit 1; }
+printf '\ndependency_overrides:\n  %s\n' "$PUB_OVERRIDE" >> pubspec.yaml
+echo "Pinned (not upstream, see script header): ${PUB_OVERRIDE}"
 flutter pub get 2>&1 | tee /work/pub-get.log
 # pubspec.lock is gitignored upstream (.gitignore: "*.lock", no exception), so pub get resolves the
 # dependency graph afresh at build time. Keep the resolved lockfile with the run for the record.
@@ -492,7 +524,7 @@ cp pubspec.lock /work/pubspec.lock.resolved
 # Generated Dart is gitignored upstream too (*.g.dart, *.realm.dart, and slang's
 # lib/localization/strings.g.dart, imported by 150+ files). README "Code generation" / Makefile
 # "ready" target: build_runner, realm generate, slang -- run here in that order, without the fvm
-# prefix (the image's flutter IS 3.29.1). The Fastlane lane does not run this; developers do.
+# prefix (the image's flutter IS the .fvmrc version). The Fastlane lane does not run this; developers do.
 { dart run build_runner clean \
     && dart run build_runner build --delete-conflicting-outputs \
     && dart run realm generate \
@@ -653,7 +685,7 @@ section "BUILD + COMPARE"
 # CARGO_HOME relocation, git safe.directory) are deliberately RETAINED: they are harmless here and
 # keep the docker path and any future non-root run model working.
 RUN_USER_ARGS="--user 0:0"
-"$CONTAINER_RUNTIME" run --rm ${RUN_USER_ARGS} --volume "${WORK_DIR}:/work" "$IMAGE_NAME" \
+"$CONTAINER_RUNTIME" run --rm ${RUN_USER_ARGS} --env "FLUTTER_TAG=${FLUTTER_TAG}" --env "PUB_OVERRIDE=${PUB_OVERRIDE}" --volume "${WORK_DIR}:/work" "$IMAGE_NAME" \
     bash /work/driver.sh 2>&1 | tee "${WORK_DIR}/container-run.log" \
     || true   # verdict/exit handling below reads /work/verdict.txt regardless of container rc
 
@@ -711,6 +743,7 @@ echo "buildEnv:       podman image with Flutter ${FLUTTER_TAG}, Go ${GO_VER}, Ru
 echo "buildCmd:       flutter build appbundle --flavor mainnet --release --dart-define=USE_FIREBASE=true --build-name=<versionName> --build-number=<versionCode>"
 echo "bundletool:     ${BT_VER} (reproduces Play's splits0.xml and split manifest attributes for this release; AGP 8.6.0 itself declares 1.16.0), sha256 ${BT_SHA}"
 echo "lockfile:       pubspec.lock is gitignored upstream; dependencies resolved at build time (saved as pubspec.lock.resolved in the workspace)"
+echo "pubOverride:    ${PUB_OVERRIDE} (NOT upstream; chosen to match the official APK's androidx versions; vendor's exact version unknown)"
 echo "envRecovery:    mainnet.env/regtest.env/testnet.env extracted from the official APK's Flutter assets (script NOTE A) -- review before trusting"
 echo "googleServices: REQUIRE_GOOGLE_SERVICES intentionally NOT set; official build sets it (script NOTE B) -- UNRESOLVED divergence"
 echo "makefileRepair: ${MAKEFILE_NOTE}"
@@ -728,7 +761,7 @@ echo "diff --recursive ${WORK_DIR}/unzipped/official/<split> ${WORK_DIR}/unzippe
 echo "or diffoscope \"${OFFICIAL_BASE}\" ${WORK_DIR}/built-renamed/base.apk"
 echo "for more details."
 
-NOTES="Coconut Wallet ${APP_ID} v${VERSION_NAME} (commit ${COMMIT_HASH}), Google Play split set built with the project's own Fastlane recipe reverse-engineered from android/fastlane/Fastfile (no upstream CI builds this artifact). ${RAW_TOTAL} raw difference(s) across splits; excluded only root META-INF signing filenames and a resources.arsc decode match (review-notes/resources.arsc.md) -- both sanctioned, evidence-backed exceptions, not general acceptable-diff filtering. ${UNACC_TOTAL} unaccounted difference(s) -- the verdict is judged on this alone. ${MISSING_TOTAL} split(s) unmatched. Known open items, NOT resolved by this script: (1) mainnet/regtest/testnet .env recovered from the official APK's bundled Flutter assets rather than from upstream (gitignored, obtainable only by emailing the vendor) -- review this design decision; (2) built WITHOUT REQUIRE_GOOGLE_SERVICES=true because google-services.json is unobtainable and unlike the .env files is not bundled into the APK, while the official mainnet build sets it -- any Firebase/google-services-shaped diff should be attributed to this; (3a) upstream's Makefile does not parse at this tag (line 23 space-indented instead of TAB, broken since 2025-10-08 commit 5579122b), which breaks every make target including the gomobile/trezor bridge targets its own README tells you to run; this run applied a whitespace-only make-syntax repair -- ${MAKEFILE_NOTE}; (3) the BitBox02 bridge is built against a non-upstream fork (${BITBOX_FORK_URL} @ ${BITBOX_FORK_BRANCH}, commit ${BITBOX_FORK_COMMIT}) the README requires in place of upstream BitBoxSwiss; (4) the NDK revision used to compile the Trezor bridge (${NDK_VER}) is pinned by this script, not confirmed against Flutter ${FLUTTER_TAG}'s own default. Official base.apk SHA-256 ${APP_HASH}."
+NOTES="Coconut Wallet ${APP_ID} v${VERSION_NAME} (commit ${COMMIT_HASH}), Google Play split set built with the project's own Fastlane recipe reverse-engineered from android/fastlane/Fastfile (no upstream CI builds this artifact). ${RAW_TOTAL} raw difference(s) across splits; excluded only root META-INF signing filenames and a resources.arsc decode match (review-notes/resources.arsc.md) -- both sanctioned, evidence-backed exceptions, not general acceptable-diff filtering. ${UNACC_TOTAL} unaccounted difference(s) -- the verdict is judged on this alone. ${MISSING_TOTAL} split(s) unmatched. Known open items, NOT resolved by this script: (1) mainnet/regtest/testnet .env recovered from the official APK's bundled Flutter assets rather than from upstream (gitignored, obtainable only by emailing the vendor) -- review this design decision; (2) built WITHOUT REQUIRE_GOOGLE_SERVICES=true because google-services.json is unobtainable and unlike the .env files is not bundled into the APK, while the official mainnet build sets it -- any Firebase/google-services-shaped diff should be attributed to this; (3a) upstream's Makefile does not parse at this tag (line 23 space-indented instead of TAB, broken since 2025-10-08 commit 5579122b), which breaks every make target including the gomobile/trezor bridge targets its own README tells you to run; this run applied a whitespace-only make-syntax repair -- ${MAKEFILE_NOTE}; (3) the BitBox02 bridge is built against a non-upstream fork (${BITBOX_FORK_URL} @ ${BITBOX_FORK_BRANCH}, commit ${BITBOX_FORK_COMMIT}) the README requires in place of upstream BitBoxSwiss; (4) the NDK revision used to compile the Trezor bridge (${NDK_VER}) is Flutter ${FLUTTER_TAG}'s ndkVersion default; the vendor's own NDK for that bridge is unknown; (5) pinned ${PUB_OVERRIDE} (guess). Official base.apk SHA-256 ${APP_HASH}."
 write_yaml "$VERDICT" "$NOTES"
 
 if [[ "$VERDICT" == "reproducible" ]]; then
