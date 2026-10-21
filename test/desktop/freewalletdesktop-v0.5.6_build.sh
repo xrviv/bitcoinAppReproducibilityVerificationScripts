@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# freewalletdesktop-v0.5.5_build.sh - FreeWallet Desktop Reproducible Build Verification
+# freewalletdesktop-v0.5.6_build.sh - FreeWallet Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.5.5
+# Version:       v0.5.6
 # Organization:  WalletScrutiny.com
 # Project:       https://github.com/jdogresorg/freewallet-desktop
 # Last modified by: Claude Code for Danny
@@ -33,7 +33,8 @@
 # - Downloads the official FreeWallet.<arch>.tgz and checksums.txt from the GitHub release
 #   (or uses the file given with --binary)
 # - Clones the release tag inside a container
-# - Builds the app with the NW.js SDK (checksum-verified) in node:20-bullseye
+# - Builds the app with the NW.js SDK and the nwjs-ffmpeg-prebuilt libffmpeg.so the
+#   upstream README asks for (both checksum-verified) in node:20-bullseye (digest-pinned)
 # - Packages FreeWallet/ as a tarball and compares its sha256 with the official one
 # - On a mismatch, lists every differing file (5-line preview, full list in diff_full.txt)
 # - Writes COMPARISON_RESULTS.yaml next to the script
@@ -51,12 +52,13 @@ INFO_ICON="[INFO]"
 
 APP_NAME="FreeWallet Desktop"
 APP_ID="freewallet"
-SCRIPT_VERSION="v0.5.5"
+SCRIPT_VERSION="v0.5.6"
 REPO_URL="https://github.com/jdogresorg/freewallet-desktop"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "${SCRIPT_PATH}")"
 YAML_FILE="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
-HELPER_IMAGE="debian:bookworm-slim"
+# debian:bookworm-slim, pinned by index digest
+HELPER_IMAGE="docker.io/library/debian@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587"
 
 EXIT_SUCCESS=0
 EXIT_FAILED=1
@@ -77,6 +79,10 @@ sha256_of() {
 SCRIPT_SHA256="$(sha256_of "${SCRIPT_PATH}")"
 log_info "Script:  $(basename "${SCRIPT_PATH}") ${SCRIPT_VERSION}"
 log_info "         sha256: ${SCRIPT_SHA256}"
+
+# A stale verdict from an earlier run must never be read as this run's,
+# including when this run stops early (help, invalid input, root).
+rm -f "${YAML_FILE}"
 
 # Parameter problems: exit 2 and no verdict (ABS publishes any YAML it finds).
 die_invalid() {
@@ -216,9 +222,6 @@ else die_invalid "Neither podman nor docker was found in PATH"
 fi
 
 # ---------- Setup ----------
-# A stale verdict from an earlier run must never be read as this run's.
-rm -f "${YAML_FILE}"
-
 # Per-run workspace in the caller's directory. A run only touches the
 # directory it created; earlier workspaces are never removed or reused.
 EXECUTION_DIR="$(pwd -P)"
@@ -262,6 +265,10 @@ nw_file="nwjs-sdk-v${nw_ver}-linux-${nw_arch}.tar.gz"
 nw_url="https://dl.nwjs.io/v${nw_ver}/${nw_file}"
 # SHA256 checksum for the NW.js SDK (from dl.nwjs.io/v0.92.0/SHASUMS256.txt)
 nw_sha256="77dffb987c4fcc7939bdde2a0ddceb58ff2ceb3529835d7fb2397f308cd53bf8"
+# Upstream README: replace lib/libffmpeg.so with the nwjs-ffmpeg-prebuilt build for the
+# same NW.js version. Its libffmpeg.so (46502c03...) is the one in the official v2.0.4 tarball.
+ff_url="https://github.com/nwjs-ffmpeg-prebuilt/nwjs-ffmpeg-prebuilt/releases/download/${nw_ver}/${nw_ver}-linux-${nw_arch}.zip"
+ff_sha256="d18d26f701991aa1fbf0b4cf496c3e3824efc5dea49888ee63349a7a9c2df7f2"
 
 # ---------- Fetch ----------
 OFFICIAL_DIR="${WORK_DIR}/official"
@@ -314,9 +321,10 @@ fi
 log_info "Creating Dockerfile..."
 printf '%s\n' official build-output logs > "${WORK_DIR}/.dockerignore"
 cat > "${WORK_DIR}/Dockerfile" <<'DOCKERFILE'
-FROM node:20-bullseye
+# node:20-bullseye, pinned by index digest (the image used for the published 2.0.4 run)
+FROM docker.io/library/node@sha256:c0122351f25f04facee976f9db7214789eabadb489f4e4aea9cd00a0d6af77c4
 
-# --no-upgrade: curl and xz-utils ship in the image; bullseye-security upgrades now 404
+# --no-upgrade: curl, xz-utils and unzip ship in the image; bullseye-security upgrades now 404
 RUN apt-get update && apt-get install -y --no-upgrade curl xz-utils zip && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -347,9 +355,17 @@ RUN mkdir -p builds/FreeWallet && \\
 #    a+rX = read for all files, execute for directories (allows traversal)
 RUN chmod -R a+rX builds/FreeWallet/
 
+# 3b. Replace libffmpeg.so with the nwjs-ffmpeg-prebuilt build (upstream README step)
+RUN curl -fSL "${ff_url}" -o /tmp/ffmpeg.zip && \\
+    echo "${ff_sha256}  /tmp/ffmpeg.zip" | sha256sum -c - && \\
+    unzip -o /tmp/ffmpeg.zip libffmpeg.so -d builds/FreeWallet/lib/ && \\
+    rm /tmp/ffmpeg.zip
+
 # 4. Create app.nw (ZIP of app files) - NW.js concatenation method
-#    The official build embeds app files INTO the binary, not alongside it
-RUN cd build && zip -r ../app.nw . && cd ..
+#    The official build embeds app files INTO the binary, not alongside it.
+#    Same selection as upstream's nw-builder glob ./build/**: no dot-named
+#    files or directories, no directory entries.
+RUN cd build && zip -r -D ../app.nw . -x '.*' '*/.*' && cd ..
 
 # 5. Concatenate app.nw to nw binary to create FreeWallet (matches official)
 #    This is how nw-builder creates the final executable
@@ -391,7 +407,7 @@ tar -czf "${RELEASE_FILE}" FreeWallet
 # ---------- Compare ----------
 log_info "Comparing hashes..."
 BUILT_HASH="$(sha256_of "${BUILD_OUT}/${RELEASE_FILE}")"
-NOTES="Rebuilt ${RELEASE_FILE} from tag v${version} (commit ${COMMIT}) with NW.js SDK ${nw_ver} (sha256-checked) in node:20-bullseye, then compared the tarball sha256 with the official release asset (${BINARY_SOURCE})."
+NOTES="Rebuilt ${RELEASE_FILE} from tag v${version} (commit ${COMMIT}) with NW.js SDK ${nw_ver} and nwjs-ffmpeg-prebuilt ${nw_ver} libffmpeg.so (both sha256-checked) in node:20-bullseye (digest-pinned), then compared the tarball sha256 with the official release asset (${BINARY_SOURCE})."
 diff_summary=""
 diff_preview=""
 
@@ -403,14 +419,23 @@ else
     log_warn "NOT REPRODUCIBLE - Hashes differ"
     cmp_dir="${WORK_DIR}/comparison"
     mkdir -- "${cmp_dir}" "${cmp_dir}/official" "${cmp_dir}/built"
-    tar -xzf "${OFFICIAL_DIR}/${RELEASE_FILE}" -C "${cmp_dir}/official" 2>"${WORK_DIR}/logs/tar-official.txt" || true
-    tar -xzf "${BUILD_OUT}/${RELEASE_FILE}" -C "${cmp_dir}/built" 2>"${WORK_DIR}/logs/tar-built.txt" || true
-    (cd "${cmp_dir}" && diff -rq official built > "${WORK_DIR}/diff_full.txt" 2>&1) || true
+    # Statuses are kept: a failed extraction or diff error means the list below is incomplete.
+    # (GNU tar exits 0 on the official tarball's LIBARCHIVE.xattr warnings.)
+    tar_official_rc=0; tar_built_rc=0; diff_rc=0
+    tar -xzf "${OFFICIAL_DIR}/${RELEASE_FILE}" -C "${cmp_dir}/official" 2>"${WORK_DIR}/logs/tar-official.txt" || tar_official_rc=$?
+    tar -xzf "${BUILD_OUT}/${RELEASE_FILE}" -C "${cmp_dir}/built" 2>"${WORK_DIR}/logs/tar-built.txt" || tar_built_rc=$?
+    (cd "${cmp_dir}" && diff -rq official built > "${WORK_DIR}/diff_full.txt" 2>&1) || diff_rc=$?
     only_official="$(grep -c '^Only in official' "${WORK_DIR}/diff_full.txt" || true)"
     only_built="$(grep -c '^Only in built' "${WORK_DIR}/diff_full.txt" || true)"
     differ="$(grep -c ' differ$' "${WORK_DIR}/diff_full.txt" || true)"
     total="$(wc -l < "${WORK_DIR}/diff_full.txt")"
     diff_summary="Differences: ${total} (files differ ${differ}, only in official ${only_official}, only in built ${only_built})"
+    if [[ ${tar_official_rc} -ne 0 || ${tar_built_rc} -ne 0 || ${diff_rc} -gt 1 ]]; then
+        log_warn "File comparison incomplete: tar official ${tar_official_rc}, tar built ${tar_built_rc}, diff ${diff_rc}"
+        diff_summary="${diff_summary}; INCOMPLETE (tar official exit ${tar_official_rc}, tar built exit ${tar_built_rc}, diff exit ${diff_rc})"
+    elif [[ ${diff_rc} -eq 0 ]]; then
+        diff_summary="${diff_summary}; all extracted files are identical, so the tarballs differ only in archive metadata (owners, modes, dates, order)"
+    fi
     diff_preview="$(head -5 "${WORK_DIR}/diff_full.txt")"
     NOTES="${NOTES}
 ${diff_summary}. Full list: diff_full.txt in the workspace."
