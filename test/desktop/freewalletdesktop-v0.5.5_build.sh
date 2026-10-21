@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# freewalletdesktop-v0.5.4_build.sh - FreeWallet Desktop Reproducible Build Verification
+# freewalletdesktop-v0.5.5_build.sh - FreeWallet Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.5.4
+# Version:       v0.5.5
 # Organization:  WalletScrutiny.com
 # Project:       https://github.com/jdogresorg/freewallet-desktop
 # Last modified by: Claude Code for Danny
@@ -51,7 +51,7 @@ INFO_ICON="[INFO]"
 
 APP_NAME="FreeWallet Desktop"
 APP_ID="freewallet"
-SCRIPT_VERSION="v0.5.4"
+SCRIPT_VERSION="v0.5.5"
 REPO_URL="https://github.com/jdogresorg/freewallet-desktop"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "${SCRIPT_PATH}")"
@@ -316,7 +316,8 @@ printf '%s\n' official build-output logs > "${WORK_DIR}/.dockerignore"
 cat > "${WORK_DIR}/Dockerfile" <<'DOCKERFILE'
 FROM node:20-bullseye
 
-RUN apt-get update && apt-get install -y curl xz-utils zip && rm -rf /var/lib/apt/lists/*
+# --no-upgrade: curl and xz-utils ship in the image; bullseye-security upgrades now 404
+RUN apt-get update && apt-get install -y --no-upgrade curl xz-utils zip && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY source/ /app/
