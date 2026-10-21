@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # nunchukwindows_build.sh - Nunchuk Desktop Windows Reproducible Build Verifier
-# Version: v0.1.6
+# Version: v0.1.7
 # Last modified by: Danny Garcia, Carol (Buzz), Claude Code
 # Last modified on: 2026-10-21
 # Organization: WalletScrutiny.com
@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.6"
+SCRIPT_VERSION="v0.1.7"
 APP_ID="nunchuk"
 APP_NAME="Nunchuk Desktop (Windows)"
 GH_REPO="nunchuk-io/nunchuk-desktop"
@@ -522,16 +522,17 @@ if ($Phase -eq 'build') {
         Expand-Archive (Get-Pinned 'https://strawberryperl.com/download/5.32.1.1/strawberry-perl-5.32.1.1-64bit-portable.zip' '692646105b0f5e058198a852dc52a48f1cebcaf676d63bbdeae12f4eaee9bf5c') 'C:\Strawberry'
     }
     $vsw = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-    function VsPath { if (Test-Path $vsw) { & $vsw -products * -version '[17.14.37710,17.14.37711)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 Microsoft.VisualStudio.Component.VC.CoreBuildTools -property installationPath | Select-Object -First 1 } }
+    function VsPath { if (Test-Path $vsw) { & $vsw -products * -version '[17.14.37710,17.14.37711)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 Microsoft.VisualStudio.Component.VC.CoreBuildTools Microsoft.VisualStudio.Component.VC.CMake.Project -property installationPath | Select-Object -First 1 } }
     if (!(VsPath)) {
         # Fixed-version bootstrapper for VS 17.14.41 (17.14.37710.0), the windows-2022 runner's VS.
         $p = Start-Process (Get-Pinned 'https://download.visualstudio.microsoft.com/download/pr/bc92e2cb-33de-4a0c-995d-efa817f16b16/37bb0fb429d163ecebd272a865d11a37b906d152bef960da2ddb29c2e2fd6eeb/vs_BuildTools.exe' '37bb0fb429d163ecebd272a865d11a37b906d152bef960da2ddb29c2e2fd6eeb') -Wait -PassThru `
             -ArgumentList '--quiet', '--wait', '--norestart', '--nocache', '--add', 'Microsoft.VisualStudio.Workload.VCTools', `
             '--add', 'Microsoft.VisualStudio.Component.VC.CoreBuildTools', '--add', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', `
+            '--add', 'Microsoft.VisualStudio.Component.VC.CMake.Project', `
             '--add', 'Microsoft.VisualStudio.Component.VC.Redist.14.Latest', '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.22621'
         Need ($p.ExitCode -in 0, 3010) "VS Build Tools installer exit code $($p.ExitCode)"
         # Ports built with MSBuild (sqlite3) need the C++ build targets, not only cl.exe.
-        Need (VsPath) "VS Build Tools installed without the VC.CoreBuildTools (MSBuild C++) component"
+        Need (VsPath) "VS Build Tools installed without the VC.CoreBuildTools / VC.CMake.Project components"
     }
     # Same layering as the runner: msvc-dev-cmd's vcvars, then Python and NASM, Strawberry Perl last.
     $env:Path = "$py;$py\Scripts;$T\nasm-3.02;$env:Path;C:\Strawberry\c\bin;C:\Strawberry\perl\site\bin;C:\Strawberry\perl\bin"
@@ -544,6 +545,9 @@ if ($Phase -eq 'build') {
     if ($add) { [Environment]::SetEnvironmentVariable('Path', (@($mp.TrimEnd(';')) + $add) -join ';', 'Machine') }
     $mp = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     foreach ($d in $need) { Need (($mp -split ';') -contains $d) "machine PATH lacks $d" }
+    # vcpkg sets up each port with vcvarsall, which adds VS's bundled Ninja (VC.CMake.Project). Without it
+    # vcpkg falls back to MSBuild and sqlite3 fails (RC2135 sqlite370.ico). The runner's full VS has it.
+    Need (Test-Path "$(VsPath)\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe") "VS bundled ninja.exe missing (VC.CMake.Project)"
     Set-Content C:\nw\env.cmd "@call `"$(VsPath)\VC\Auxiliary\Build\vcvarsall.bat`" x64 10.0.22621.0 -vcvars_ver=14.44.35207 >nul`r`n@set" -Encoding ascii
     cmd /c C:\nw\env.cmd | ForEach-Object { if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2]) } }
     $cl = (Get-Command cl.exe).Source
