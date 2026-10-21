@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # nunchukwindows_build.sh - Nunchuk Desktop Windows Reproducible Build Verifier
-# Version: v0.1.4
+# Version: v0.1.5
 # Last modified by: Danny Garcia, Carol (Buzz), Claude Code
 # Last modified on: 2026-10-21
 # Organization: WalletScrutiny.com
@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.4"
+SCRIPT_VERSION="v0.1.5"
 APP_ID="nunchuk"
 APP_NAME="Nunchuk Desktop (Windows)"
 GH_REPO="nunchuk-io/nunchuk-desktop"
@@ -522,13 +522,16 @@ if ($Phase -eq 'build') {
         Expand-Archive (Get-Pinned 'https://strawberryperl.com/download/5.32.1.1/strawberry-perl-5.32.1.1-64bit-portable.zip' '692646105b0f5e058198a852dc52a48f1cebcaf676d63bbdeae12f4eaee9bf5c') 'C:\Strawberry'
     }
     $vsw = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-    function VsPath { if (Test-Path $vsw) { & $vsw -products * -version '[17.14.37710,17.14.37711)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1 } }
+    function VsPath { if (Test-Path $vsw) { & $vsw -products * -version '[17.14.37710,17.14.37711)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 Microsoft.VisualStudio.Component.VC.CoreBuildTools -property installationPath | Select-Object -First 1 } }
     if (!(VsPath)) {
         # Fixed-version bootstrapper for VS 17.14.41 (17.14.37710.0), the windows-2022 runner's VS.
         $p = Start-Process (Get-Pinned 'https://download.visualstudio.microsoft.com/download/pr/bc92e2cb-33de-4a0c-995d-efa817f16b16/37bb0fb429d163ecebd272a865d11a37b906d152bef960da2ddb29c2e2fd6eeb/vs_BuildTools.exe' '37bb0fb429d163ecebd272a865d11a37b906d152bef960da2ddb29c2e2fd6eeb') -Wait -PassThru `
-            -ArgumentList '--quiet', '--wait', '--norestart', '--nocache', '--add', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', `
+            -ArgumentList '--quiet', '--wait', '--norestart', '--nocache', '--add', 'Microsoft.VisualStudio.Workload.VCTools', `
+            '--add', 'Microsoft.VisualStudio.Component.VC.CoreBuildTools', '--add', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', `
             '--add', 'Microsoft.VisualStudio.Component.VC.Redist.14.Latest', '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.22621'
         Need ($p.ExitCode -in 0, 3010) "VS Build Tools installer exit code $($p.ExitCode)"
+        # Ports built with MSBuild (sqlite3) need the C++ build targets, not only cl.exe.
+        Need (VsPath) "VS Build Tools installed without the VC.CoreBuildTools (MSBuild C++) component"
     }
     # Same layering as the runner: msvc-dev-cmd's vcvars, then Python and NASM, Strawberry Perl last.
     $env:Path = "$py;$py\Scripts;$T\nasm-3.02;$env:Path;C:\Strawberry\c\bin;C:\Strawberry\perl\site\bin;C:\Strawberry\perl\bin"
@@ -559,11 +562,21 @@ if ($Phase -eq 'build') {
     $epoch = [long](git -C $src show -s --format=%ct HEAD).Trim()
     # $env:ImageOS/$env:ImageVersion stay unset: only GitHub's runner has them (see Warnings).
     Set-Location $src
-    & .\reproducible-builds\build_windows.ps1 -Replica a -ExpectedCommit $Commit -ReleaseVersion $Tag -SourceDateEpoch $epoch
+    # On failure, print the newest vcpkg/CMake logs: the VM (and every log in it) is deleted at exit.
+    function FailLogs($what) {
+        Write-Host "NW-FAIL ${what}: $_"
+        Get-ChildItem C:\nunchuk-repro -Recurse -File -Include *-out.log, *-err.log, CMakeError.log, CMakeConfigureLog.yaml -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 6 | ForEach-Object {
+                Write-Host "===== NW-FAILLOG $($_.FullName) (last 60 lines)"; Get-Content $_.FullName -Tail 60 }
+    }
+    try { & .\reproducible-builds\build_windows.ps1 -Replica a -ExpectedCommit $Commit -ReleaseVersion $Tag -SourceDateEpoch $epoch }
+    catch { FailLogs 'build_windows.ps1'; throw }
     Lap 'build'
-    & .\reproducible-builds\package_windows.ps1 -ExpectedCommit $Commit -ReleaseVersion $Tag -SourceDateEpoch $epoch `
-        -ArtifactFlavor unsigned -ApplicationExe C:\nunchuk-repro\build-output\nunchuk-qt.exe `
-        -BuildInfoFile C:\nunchuk-repro\build-output\build-info.json -TlsProbeExe C:\nunchuk-repro\build-output\qt-tls-probe.exe -SmokeTest
+    try {
+        & .\reproducible-builds\package_windows.ps1 -ExpectedCommit $Commit -ReleaseVersion $Tag -SourceDateEpoch $epoch `
+            -ArtifactFlavor unsigned -ApplicationExe C:\nunchuk-repro\build-output\nunchuk-qt.exe `
+            -BuildInfoFile C:\nunchuk-repro\build-output\build-info.json -TlsProbeExe C:\nunchuk-repro\build-output\qt-tls-probe.exe -SmokeTest
+    } catch { FailLogs 'package_windows.ps1'; throw }
     Lap 'package'
     Write-Host "NW-BUILD-DONE epoch=$epoch"
 }
@@ -597,7 +610,7 @@ run_build() {
     grep -q '^NW-BUILD-DONE' "${WORK_DIR}/build.log" || {
         grep -q 'Toolchain check failed' "${WORK_DIR}/build.log" \
             && die_build "Windows toolchain does not match the release's: $(grep -m1 -o 'Toolchain check failed.*' "${WORK_DIR}/build.log")"
-        die_build "Upstream Windows build failed (log: ${WORK_DIR}/build.log)"
+        die_build "Upstream Windows build failed: $(grep -m1 -o 'NW-FAIL .*' "${WORK_DIR}/build.log" | cut -c1-200) (log with vcpkg/CMake tails: build.log in the workspace)"
     }
     SOURCE_EPOCH="$(sed -nE 's/^NW-BUILD-DONE epoch=([0-9]+).*/\1/p' "${WORK_DIR}/build.log")"
     # A skipped upstream step can invalidate a verdict: surface such lines, don't judge them.
