@@ -2,10 +2,10 @@
 # ==============================================================================
 # coldcard_build.sh - Coldcard (Mk4 / Mk5 / Q) Reproducible Build Verifier
 # ==============================================================================
-# Version: v4.1.4
+# Version: v4.1.5
 # Organization: WalletScrutiny.com
 # Last modified by: Daniel Garcia
-# Last modified on: 2026-08-06
+# Last modified on: 2026-10-21
 # Project: https://github.com/Coldcard/firmware
 # ==============================================================================
 #
@@ -63,7 +63,7 @@
 
 set -eEuo pipefail
 
-SCRIPT_VERSION="v4.1.4"
+SCRIPT_VERSION="v4.1.5"
 APP_ID="coldcard"
 REPO_URL="https://github.com/Coldcard/firmware.git"
 DOWNLOAD_BASE="https://coldcard.com/downloads"
@@ -72,10 +72,13 @@ DOWNLOAD_BASE="https://coldcard.com/downloads"
 # from the rolling alpine edge/testing repository, so the compiler version is not
 # pinned by anything. Reproduced faithfully - changing it would mean verifying a
 # build Coinkite does not perform. Recorded as a known hazard in the changelog.
-BASE_IMAGE="alpine:3.16.0"
+# The tag is pinned to the digest it resolved to (index digest, 2026-10-21).
+BASE_IMAGE="docker.io/library/alpine:3.16.0@sha256:686d8c9dfa6f3ccfc8230bc3178d23f84eeaf7e457f36f271ab1acc53015037c"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 RESULTS_FILE="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
+SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_SHA256="N/A"
 
 EXIT_OK=0
 EXIT_FAIL=1
@@ -91,6 +94,9 @@ TOOLS_IMAGE=""
 BUILD_IMAGE=""
 
 TAG=""
+TAG_TYPE=""
+TAG_SIG=""
+COMMIT_SIG=""
 COMMIT=""
 SHORT_VERSION=""
 TAG_PREFIX=""
@@ -135,19 +141,31 @@ write_results() {
   echo -e "${GREEN}Results written to: ${RESULTS_FILE}${NC}"
 }
 
-invalid_input() {
-  local message="$1"
-  log_fail "${message}"
-  write_results "ftbfs" \
-    "Coldcard verification could not start because the invocation was invalid: ${message} No firmware was built or compared."
-  exit "${EXIT_INVALID}"
+# ABS publishes any verdict found in the YAML, whatever the exit code. So a
+# failure that says nothing about the source (bad invocation, missing runtime,
+# network, a stop) writes NO YAML: ABS then logs an error and publishes nothing.
+no_verdict() {
+  log_fail "$1 No verdict written."
+  exit "${2:-${EXIT_FAIL}}"
 }
 
-# Any unexpected failure still leaves a results file behind: a run that dies
-# without one is indistinguishable from a crashed runner.
+invalid_input() {
+  no_verdict "$1" "${EXIT_INVALID}"
+}
+
+on_stop() {
+  trap - ERR
+  no_verdict "Interrupted." 130
+}
+trap on_stop INT TERM
+
+# Any other unexpected failure still leaves a results file behind: a run that
+# dies without one is indistinguishable from a crashed runner.
 handle_err() {
   local rc=$?
   trap - ERR
+  # A child killed by INT/TERM can surface here before on_stop runs.
+  (( rc == 130 || rc == 143 )) && no_verdict "Interrupted." 130
   log_fail "Unexpected error (exit ${rc})."
   write_results "ftbfs" \
     "Coldcard ${MODEL:-unknown} v${VERSION:-unknown}: script failed before a verdict could be computed (exit ${rc}). Work dir: ${WORK_DIR:-unset}"
@@ -192,7 +210,9 @@ EXAMPLES
   coldcard_build.sh --version 1.5.0Q --type q1
   coldcard_build.sh --version 6.5.0X --type mk4 --binary ./official.dfu
 
-Exit codes: 0 = reproducible, 1 = not reproducible / ftbfs, 2 = invalid parameters.
+Exit codes: 0 = reproducible, 1 = not reproducible / ftbfs, 2 = invalid
+parameters or run as root, 130 = stopped. Invalid input, a stop, a missing
+container runtime or a network failure writes no COMPARISON_RESULTS.yaml.
 USAGE
 }
 
@@ -228,7 +248,7 @@ validate_inputs() {
   if [[ -z "${VERSION}" ]]; then
     invalid_input "--version is required."
   fi
-  # Constrains what reaches the workdir path (and therefore `rm -rf`) and the
+  # Constrains what reaches the workdir path, the image tags and the
   # tag/filename matching below. Coldcard versions are digits, dots and the
   # Q / X track suffixes only.
   if [[ ! "${VERSION}" =~ ^[0-9]+(\.[0-9]+)*[A-Za-z]*$ ]]; then
@@ -263,7 +283,7 @@ validate_inputs() {
   fi
 
   if [[ "$(id -u)" -eq 0 ]]; then
-    log_warn "Running as root. This script needs no privileges; artifacts will be root-owned."
+    invalid_input "Do not run as root. This script needs no privileges, and root-owned files could not be removed by the caller."
   fi
 }
 
@@ -277,9 +297,7 @@ detect_container_cmd() {
     CONTAINER_CMD="docker"
     CONTAINER_RUN_USER_ARGS=(--user "$(id -u):$(id -g)" -e HOME=/tmp)
   else
-    log_fail "Neither podman nor docker found. One of them is the only requirement."
-    write_results "ftbfs" "No container runtime available; nothing was built."
-    exit "${EXIT_FAIL}"
+    no_verdict "Neither podman nor docker found. One of them is the only requirement."
   fi
   log_info "Container runtime: ${CONTAINER_CMD}"
 }
@@ -287,16 +305,24 @@ detect_container_cmd() {
 # ── Workspace ─────────────────────────────────────────────────────────────────
 
 setup_workspace() {
-  # Namespaced by version+model so parallel arch/type runs never collide.
-  WORK_DIR="${PWD}/coldcard-work-${VERSION}-${MODEL}"
-  # Image names must be lowercase; versions carry Q/X suffixes.
-  local tag_suffix="${VERSION,,}-${MODEL,,}"
+  # Per-run workspace in the caller's dir; never reused or deleted, so
+  # concurrent runs (same or other users) cannot touch each other's files.
+  local run_id wd
+  run_id="$(date +%s)-$$"
+  wd="$(pwd -P)/coldcard_verification_${VERSION}_${MODEL}_${run_id}"
+  if ! mkdir -- "${wd}"; then
+    log_fail "Work directory already exists or cannot be created: ${wd}"
+    exit "${EXIT_INVALID}"
+  fi
+  WORK_DIR="${wd}"
+  # Image names must be lowercase; versions carry Q/X suffixes. The run id
+  # keeps cleanup() from removing another run's images.
+  local tag_suffix="${VERSION,,}-${MODEL,,}-${run_id}"
   TOOLS_IMAGE="coldcard-tools-${tag_suffix}"
   BUILD_IMAGE="coldcard-build-${tag_suffix}"
   DIFF_FILE="${WORK_DIR}/out/diff_firmware.txt"
 
   log_info "Work directory: ${WORK_DIR}"
-  rm -rf "${WORK_DIR}"
   mkdir -p "${WORK_DIR}/out" "${WORK_DIR}/built"
 }
 
@@ -306,7 +332,7 @@ build_tools_image() {
   log_info "Building tools image ${TOOLS_IMAGE} (git + busybox utilities)..."
   # Everything except the container runtime runs inside a container; the host
   # needs no git, wget or coreutils.
-  ${CONTAINER_CMD} build -t "${TOOLS_IMAGE}" - <<DOCKERFILE
+  ${CONTAINER_CMD} build -t "${TOOLS_IMAGE}" - <<DOCKERFILE || no_verdict "Tools image build failed (registry or Alpine mirror unreachable?). Nothing was built from source."
 FROM ${BASE_IMAGE}
 RUN apk add --no-cache git openssl ca-certificates
 WORKDIR /work
@@ -319,7 +345,9 @@ build_toolchain_image() {
   # edge/testing toolchain repository, because deviating would mean verifying a
   # build Coinkite does not perform.
   log_info "Building toolchain image ${BUILD_IMAGE} from inlined stm32/dockerfile.build..."
-  ${CONTAINER_CMD} build -t "${BUILD_IMAGE}" - <<DOCKERFILE
+  # A failure here is usually the network or the rolling edge repository; a
+  # human decides whether it is a real ftbfs, so no verdict is written.
+  ${CONTAINER_CMD} build -t "${BUILD_IMAGE}" - <<DOCKERFILE || no_verdict "Toolchain image build failed (network, or the edge/testing toolchain packages changed). Firmware was not built."
 FROM ${BASE_IMAGE}
 WORKDIR /work
 RUN apk add --no-cache git python3 py-pip musl-dev make rsync autoconf automake libtool && \
@@ -338,9 +366,7 @@ clone_repo() {
         sh -c "git config --global --add safe.directory '*'; \
                git clone --quiet '${REPO_URL}' /work/repo && \
                git -C /work/repo tag > /work/out/tags.txt"; then
-    log_fail "Clone failed."
-    write_results "ftbfs" "Coldcard ${MODEL} v${VERSION}: could not clone ${REPO_URL}."
-    exit "${EXIT_FAIL}"
+    no_verdict "Clone of ${REPO_URL} failed (network?)."
   fi
 }
 
@@ -386,10 +412,16 @@ checkout_and_probe() {
     sh -c "git config --global --add safe.directory '*'; \
            git -C /work/repo checkout --quiet '${TAG}' && \
            git -C /work/repo rev-parse HEAD > /work/out/commit.txt && \
-           ( [ -f /work/repo/stm32/MK4-Makefile ] && echo yes || echo no ) > /work/out/has_mk4_makefile.txt"
+           ( [ -f /work/repo/stm32/MK4-Makefile ] && echo yes || echo no ) > /work/out/has_mk4_makefile.txt && \
+           tt=\$(git -C /work/repo cat-file -t 'refs/tags/${TAG}') && echo \$tt > /work/out/tag_type.txt && \
+           { [ \"\$tt\" = tag ] && git -C /work/repo cat-file -p 'refs/tags/${TAG}' | grep -q 'BEGIN .*SIGNATURE' && echo yes || echo no; } > /work/out/tag_sig.txt && \
+           { git -C /work/repo cat-file -p HEAD | grep -q '^gpgsig' && echo yes || echo no; } > /work/out/commit_sig.txt"
 
   COMMIT="$(<"${WORK_DIR}/out/commit.txt")"
   COMMIT="${COMMIT//[$'\t\r\n ']/}"
+  TAG_TYPE="$(<"${WORK_DIR}/out/tag_type.txt")"
+  TAG_SIG="$(<"${WORK_DIR}/out/tag_sig.txt")"
+  COMMIT_SIG="$(<"${WORK_DIR}/out/commit_sig.txt")"
 
   # Coldcard renamed the Mk4 model id mk4 -> mk and MK4-Makefile -> MK-Makefile
   # in v5.5.0. Probe the checked-out tree rather than comparing version numbers,
@@ -472,9 +504,7 @@ stage_official_artifact() {
     if ! ${CONTAINER_CMD} run --rm "${CONTAINER_RUN_USER_ARGS[@]}" \
           --volume "${WORK_DIR}:/work:rw" "${TOOLS_IMAGE}" \
           sh -c "wget -q -O '${dest}' '${DOWNLOAD_BASE}/${DFU_FILENAME}'"; then
-      log_fail "Download failed."
-      write_results "ftbfs" "Coldcard ${MODEL} v${VERSION}: could not download ${DFU_FILENAME} from ${DOWNLOAD_BASE}. Not a hash mismatch; no comparison was performed. Supply the file with --binary to retry offline."
-      exit "${EXIT_FAIL}"
+      no_verdict "Download of ${DOWNLOAD_BASE}/${DFU_FILENAME} failed. Retry, or supply the file with --binary."
     fi
   fi
 
@@ -489,9 +519,9 @@ stage_official_artifact() {
     log_fail "Official artifact does not match the hash Coinkite records in signatures.txt."
     echo "  signatures.txt: ${OFFICIAL_DFU_HASH}"
     echo "  actual:         ${actual}"
-    write_results "ftbfs" \
-      "Coldcard ${MODEL} v${VERSION}: the ${DFU_FILENAME} obtained does not match the SHA-256 recorded for it in releases/signatures.txt at tag ${TAG} (expected ${OFFICIAL_DFU_HASH}, got ${actual}). No build comparison was performed. Investigate before publishing anything."
-    exit "${EXIT_FAIL}"
+    # Not a build result: the file under test is wrong or corrupt. A human
+    # investigates; ABS must not publish anything for it.
+    no_verdict "The ${DFU_FILENAME} obtained does not match releases/signatures.txt at tag ${TAG}. No build comparison was performed. Investigate before publishing anything."
   fi
   log_ok "Official artifact matches signatures.txt: ${actual}"
   OFFICIAL_DFU_HASH="${actual}"
@@ -783,42 +813,14 @@ print_results() {
   echo
   echo "===== Begin Results ====="
   echo "appId:          ${APP_ID}"
-  echo "script_version: ${SCRIPT_VERSION}"
+  echo "signer:         N/A"
   echo "apkVersionName: ${VERSION}"
   echo "apkVersionCode: ${SHORT_VERSION}"
-  echo "type:           ${MODEL}"
-  echo "hwModel:        ${HW_MODEL}"
-  echo "signer:         N/A (firmware signed by Coinkite; private signing key not public)"
   echo "verdict:        ${verdict}"
   echo "appHash:        ${OFFICIAL_DFU_HASH}"
-  echo "                  hash of the .dfu as downloaded - the publishable value"
-  echo "officialFirmwareHash: ${OFFICIAL_FW_HASH:-unavailable}"
-  echo "                  official firmware section, Coinkite signature attached"
-  echo "builtFirmwareHash:    ${BUILT_FW_HASH:-unavailable}"
-  echo "                  our build; on a reproducible result, only the signature differs"
-  echo "officialComparisonHash: ${OFFICIAL_CMP_HASH:-unavailable}"
-  echo "                  hexdump text, signature masked - never publish"
-  echo "builtComparisonHash:   ${BUILT_CMP_HASH:-unavailable}"
-  echo "                  hexdump text, signature masked - never publish"
-  echo "builtSignedDfuHash:    ${BUILT_DFU_HASH:-unavailable}"
-  echo "                  our .dfu, development signing key"
-  echo "repository:     ${REPO_URL}"
-  echo "tag:            ${TAG}"
   echo "commit:         ${COMMIT}"
-  echo "officialFile:   ${DFU_FILENAME}"
-  # Informational, never part of the verdict: a version can be perfectly
-  # reproducible and still carry the weak-seed defect.
-  case "${RNG_SOURCE:-unknown}" in
-    hardware-TRNG)
-      echo "rngSource:      hardware-TRNG" ;;
-    micropython-PRNG)
-      echo -e "rngSource:      micropython-PRNG  ${RED}*** WEAK SEED - see advisory 2026-07-30 ***${NC}" ;;
-    *)
-      echo "rngSource:      ${RNG_SOURCE:-unknown}" ;;
-  esac
-  echo "                  ${RNG_DETAIL:-no RNG linkage evidence collected}"
-  echo "rngCheck:       ${RNG_UPSTREAM_CHECK:-unknown}"
-  echo "                  whether upstream's own rng-code-check exists in this source tree"
+  echo "scriptVersion:  ${SCRIPT_VERSION}"
+  echo "scriptHash:     ${SCRIPT_SHA256}"
   echo
   echo "Diff:"
   if [[ -s "${DIFF_FILE}" ]]; then
@@ -834,7 +836,50 @@ print_results() {
   else
     echo "(none - masked hexdumps are identical)"
   fi
+  echo
+  # Presence only: no Coinkite signing key is pinned here, so nothing is
+  # cryptographically verified.
+  echo "Revision, tag (and its signature):"
+  echo "Signature Summary:"
+  case "${TAG_TYPE}" in
+    tag)    echo "Tag type: annotated"
+            if [[ "${TAG_SIG}" == yes ]]; then echo "[INFO] Tag carries a signature (not verified: no Coinkite key pinned)"
+            else echo "[WARNING] Tag is not signed"; fi ;;
+    commit) echo "Tag type: lightweight"
+            echo "[INFO] Tag is lightweight (cannot contain a signature)" ;;
+    *)      echo "Tag type: unknown (${TAG_TYPE:-not probed})" ;;
+  esac
+  if [[ "${COMMIT_SIG}" == yes ]]; then echo "[INFO] Commit carries a signature (not verified)"
+  else echo "[WARNING] Commit is not signed"; fi
+  echo
+  echo "Warnings:"
+  if [[ "${RNG_SOURCE:-}" == micropython-PRNG ]]; then echo "weak-seed RNG linkage (see rngSource below)"; else echo "none"; fi
   echo "===== End Results ====="
+  echo
+  echo "type:           ${MODEL}"
+  echo "hwModel:        ${HW_MODEL}"
+  echo "signerNote:     firmware signed by Coinkite; private signing key not public"
+  echo "officialFirmwareHash:   ${OFFICIAL_FW_HASH:-unavailable}"
+  echo "builtFirmwareHash:      ${BUILT_FW_HASH:-unavailable}"
+  echo "officialComparisonHash: ${OFFICIAL_CMP_HASH:-unavailable}  (hexdump text - never publish)"
+  echo "builtComparisonHash:    ${BUILT_CMP_HASH:-unavailable}  (hexdump text - never publish)"
+  echo "builtSignedDfuHash:     ${BUILT_DFU_HASH:-unavailable}  (development signing key)"
+  echo "repository:     ${REPO_URL}"
+  echo "tag:            ${TAG}"
+  echo "officialFile:   ${DFU_FILENAME}"
+  # Informational, never part of the verdict: a version can be perfectly
+  # reproducible and still carry the weak-seed defect.
+  case "${RNG_SOURCE:-unknown}" in
+    hardware-TRNG)
+      echo "rngSource:      hardware-TRNG" ;;
+    micropython-PRNG)
+      echo -e "rngSource:      micropython-PRNG  ${RED}*** WEAK SEED - see advisory 2026-07-30 ***${NC}" ;;
+    *)
+      echo "rngSource:      ${RNG_SOURCE:-unknown}" ;;
+  esac
+  echo "                  ${RNG_DETAIL:-no RNG linkage evidence collected}"
+  echo "rngCheck:       ${RNG_UPSTREAM_CHECK:-unknown}"
+  echo "                  whether upstream's own rng-code-check exists in this source tree"
   echo
   echo "Artifacts:"
   echo "  Official firmware:      ${WORK_DIR}/repo/releases/${DFU_FILENAME}"
@@ -879,8 +924,13 @@ Differences were found outside the masked signature block. Full diff: built/diff
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 main() {
-  # Remove any prior verdict before this invocation can fail. Every invalid or
-  # failed verification path below writes a fresh result.
+  # Self-identify first, so even a run that fails at parse time records
+  # which script bytes ran. Never aborts: a hashing problem gives N/A.
+  [[ -f "${SCRIPT_PATH}" ]] && SCRIPT_SHA256="$(sha256sum "${SCRIPT_PATH}" | cut -d' ' -f1)" || true
+  log_info "Script: $(basename "${SCRIPT_PATH}") ${SCRIPT_VERSION} sha256 ${SCRIPT_SHA256}"
+
+  # Remove any prior verdict before this invocation can fail. A failed
+  # verification writes a fresh ftbfs; no_verdict paths write none.
   rm -f "${RESULTS_FILE}"
 
   echo -e "${YELLOW}"
