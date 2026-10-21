@@ -1,10 +1,17 @@
 #!/bin/bash
 #
 # nunchukwindows_build.sh - Nunchuk Desktop Windows Reproducible Build Verifier
-# Version: v0.1.1
+# Version: v0.1.2
 # Last modified by: Danny Garcia, Carol (Buzz), Claude Code
 # Last modified on: 2026-10-21
 # Organization: WalletScrutiny.com
+# Project: https://github.com/nunchuk-io/nunchuk-desktop
+# LICENSE: MIT License
+#
+# TECHNICAL DISCLAIMER: provided for reproducible build verification only, without warranty of
+# security, functionality or fitness for any purpose. Users assume all risks of running it.
+# LEGAL DISCLAIMER: an independent verification tool, not affiliated with or endorsed by Nunchuk.
+# All trademarks belong to their respective owners.
 #
 # Rebuilds the Windows x64 installer (Inno Setup) and portable ZIP with upstream's
 # reproducible-builds/build_windows.ps1 + package_windows.ps1 at the release tag, inside a Windows
@@ -12,13 +19,13 @@
 # image), and compares the selected file (--type) byte for byte with the release. Upstream marks Windows
 # verification "standby": expect differences.
 #
-# Usage: nunchukwindows_build.sh --version VERSION [--binary FILE] [--arch x86_64-windows] [--type setup|portable] [--golden DIR]
+# Usage: nunchukwindows_build.sh --version VERSION [--binary FILE|DIR] [--arch x86_64-windows] [--type setup|portable] [--golden DIR]
 # One verdict per run, for the file --type selects. Host needs podman (or docker), /dev/kvm, and read access to the golden image and VM key.
 #
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.1"
+SCRIPT_VERSION="v0.1.2"
 APP_ID="nunchuk"
 APP_NAME="Nunchuk Desktop (Windows)"
 GH_REPO="nunchuk-io/nunchuk-desktop"
@@ -151,7 +158,7 @@ require_arg() {
 
 parse_args() {
     if [[ $# -eq 0 ]]; then
-        echo "Usage: $0 --version VERSION [--binary FILE] [--arch ARCH] [--type setup|portable] [--golden DIR]"
+        echo "Usage: $0 --version VERSION [--binary FILE|DIR] [--arch ARCH] [--type setup|portable] [--golden DIR]"
         exit "${EXIT_INVALID}"
     fi
     while [[ $# -gt 0 ]]; do
@@ -182,8 +189,22 @@ parse_args() {
         die_invalid "Version ${APP_VERSION} predates ${MIN_VERSION}, the first release with build_windows.ps1"
     fi
     if [[ -n "$BINARY_PATH" ]]; then
-        [[ -f "$BINARY_PATH" ]] || die_invalid "--binary path does not exist: $BINARY_PATH"
+        [[ -e "$BINARY_PATH" ]] || die_invalid "--binary path does not exist: $BINARY_PATH"
         BINARY_PATH="$(realpath "$BINARY_PATH")"
+        local pat m=() magic want
+        [[ "$APP_TYPE" == setup ]] && { pat='*-x64-setup.exe'; want=4d5a; } || { pat='*-x64-portable.zip'; want=504b0304; }
+        # ABS passes a directory when a submission has several files: take the one for --type.
+        if [[ -d "$BINARY_PATH" ]]; then
+            shopt -s nullglob
+            # shellcheck disable=SC2206 # $pat is a glob on purpose
+            m=("$BINARY_PATH"/$pat)
+            shopt -u nullglob
+            [[ ${#m[@]} -eq 1 ]] || die_invalid "--binary directory needs exactly one ${pat} file (found ${#m[@]})"
+            BINARY_PATH="${m[0]}"
+        fi
+        # The installer is a PE file (MZ), the portable build a ZIP (PK\3\4).
+        magic="$(head -c 4 "$BINARY_PATH" | od -An -tx1 | tr -d ' \n')"
+        [[ "$magic" == "$want"* ]] || die_invalid "--binary is not a ${APP_TYPE} file (starts with ${magic:-nothing})"
     fi
 }
 
@@ -198,7 +219,7 @@ REQUIRED:
   --version VERSION    Release version without v prefix, 2.9.1 or later
 
 OPTIONAL:
-  --binary FILE        Official file of the selected --type (skip its GitHub download)
+  --binary FILE|DIR    Official file of the selected --type, or a folder holding it (skip its download)
   --arch ARCH          x86_64-windows (default, only supported value)
   --type TYPE          setup (default, the Inno Setup installer) or portable (the ZIP)
   --golden DIR         Golden image folder (default: $WS_WINDOWS_GOLDEN or
@@ -381,6 +402,10 @@ vm_ssh() {
     "$CONTAINER_CMD" run --rm -i --network host -v "${WORK_DIR}/vm/key:/k:ro" --entrypoint ssh \
         "$GIT_IMAGE" "${SSH_OPTS[@]}" -p "$VM_PORT" Docker@127.0.0.1 "$@"
 }
+# A failed copy is an ftbfs, except while diffing a known mismatch (COPY_SOFT=true):
+# then it only warns, so the verdict stays not_reproducible.
+COPY_SOFT=false
+copy_fail() { [[ "$COPY_SOFT" == true ]] && { log_warn "$1"; return 1; }; die_build "$1"; }
 # Copy a host file into the VM, then check its sha256 inside Windows.
 vm_push() {
     local src="$1" dst="$2" got
@@ -388,17 +413,17 @@ vm_push() {
         "$GIT_IMAGE" "${SSH_OPTS[@]}" -P "$VM_PORT" /f "Docker@127.0.0.1:${dst//\\//}" > /dev/null 2>&1 \
         || "$CONTAINER_CMD" run --rm --network host -v "${WORK_DIR}/vm/key:/k:ro" -v "${src}:/f:ro" --entrypoint scp \
             "$GIT_IMAGE" -O "${SSH_OPTS[@]}" -P "$VM_PORT" /f "Docker@127.0.0.1:${dst//\\//}" > /dev/null \
-        || die_build "Could not copy $(basename "$src") into the VM"
+        || { copy_fail "Could not copy $(basename "$src") into the VM"; return 1; }
     got="$(vm_ssh "powershell -NoProfile -Command (Get-FileHash '${dst}').Hash" | tr -d '\r\n' | tr 'A-F' 'a-f')"
-    [[ "$got" == "$(sha256_of "$src")" ]] || die_build "Copy of $(basename "$src") into the VM is corrupt"
+    [[ "$got" == "$(sha256_of "$src")" ]] || { copy_fail "Copy of $(basename "$src") into the VM is corrupt"; return 1; }
 }
 # Stream a VM file out over SSH, then check it against Get-FileHash inside Windows.
 vm_pull() {
     local src="$1" dst="$2" want
     vm_ssh "powershell -NoProfile -Command \"\$f=[IO.File]::OpenRead('${src}');\$f.CopyTo([Console]::OpenStandardOutput());\$f.Close()\"" > "$dst" \
-        || die_build "Could not copy ${src} out of the VM"
+        || { copy_fail "Could not copy ${src} out of the VM"; return 1; }
     want="$(vm_ssh "powershell -NoProfile -Command (Get-FileHash '${src}').Hash" | tr -d '\r\n' | tr 'A-F' 'a-f')"
-    [[ "$want" == "$(sha256_of "$dst")" ]] || die_build "Copy of ${src} out of the VM is corrupt"
+    [[ "$want" == "$(sha256_of "$dst")" ]] || { copy_fail "Copy of ${src} out of the VM is corrupt"; return 1; }
 }
 
 start_vm() {
@@ -546,7 +571,7 @@ PS1
 }
 
 run_build() {
-    local a
+    local a n
     log_info "Copying the build driver into the VM..."
     vm_ssh "mkdir C:\\nw" > /dev/null 2>&1 || true
     vm_push "${WORK_DIR}/nw.ps1" 'C:\nw\nw.ps1'
@@ -563,6 +588,14 @@ run_build() {
         die_build "Upstream Windows build failed (log: ${WORK_DIR}/build.log)"
     }
     SOURCE_EPOCH="$(sed -nE 's/^NW-BUILD-DONE epoch=([0-9]+).*/\1/p' "${WORK_DIR}/build.log")"
+    # A skipped upstream step can invalidate a verdict: surface such lines, don't judge them.
+    grep -nE 'SKIP|Skipping' "${WORK_DIR}/build.log" > "${WORK_DIR}/skip_lines.txt" || true
+    if [[ -s "${WORK_DIR}/skip_lines.txt" ]]; then
+        n="$(wc -l < "${WORK_DIR}/skip_lines.txt")"
+        log_warn "${n} build log lines mention SKIP/Skipping (first 5; all in skip_lines.txt):"
+        head -n 5 "${WORK_DIR}/skip_lines.txt"
+        SIG_WARNINGS+=$'\n'"- ${n} build log lines mention SKIP/Skipping; review skip_lines.txt in the workspace."
+    fi
     # Phases inside Windows, timed there (one SSH session runs them all).
     PHASE_TIMES+="$(sed -nE 's/^NW-TIME (.*)$/\1/p' "${WORK_DIR}/build.log")"$'\n'
     PHASE_T0=$SECONDS
@@ -585,7 +618,7 @@ diff_manifests() {
         || return 1
     n="$(wc -l < "${WORK_DIR}/${d}/differing.txt")"
     DIFF_NOTE[$2]="${n} of $(wc -l < "${WORK_DIR}/${d}/m-official") files differ (path, official sha256, rebuilt sha256 in ${d}/differing.txt)"
-    log_warn "${DIFF_NOTE[$2]}"; head -n 10 "${WORK_DIR}/${d}/differing.txt"
+    log_warn "${DIFF_NOTE[$2]}"; head -n 5 "${WORK_DIR}/${d}/differing.txt"
 }
 
 compare_artifacts() {
@@ -607,16 +640,21 @@ compare_artifacts() {
                 done' sh "diff-${a}" "${OFF_NAME[$a]}" && diff_manifests "diff-${a}" "$a" \
                 || DIFF_NOTE[$a]="the ZIPs could not be unpacked"
         else
-            vm_push "${WORK_DIR}/official/${OFF_NAME[$a]}" 'C:\nw\official-setup.exe'
-            if vm_ssh "C:\\tools\\pwsh\\pwsh.exe -NoProfile -File C:\\nw\\nw.ps1 -Phase unpack -Arg1 C:\\nw\\official-setup.exe -Arg2 C:\\nw\\m-official.txt" \
+            COPY_SOFT=true
+            if vm_push "${WORK_DIR}/official/${OFF_NAME[$a]}" 'C:\nw\official-setup.exe' \
+                && vm_ssh "C:\\tools\\pwsh\\pwsh.exe -NoProfile -File C:\\nw\\nw.ps1 -Phase unpack -Arg1 C:\\nw\\official-setup.exe -Arg2 C:\\nw\\m-official.txt" \
                 && vm_ssh "C:\\tools\\pwsh\\pwsh.exe -NoProfile -File C:\\nw\\nw.ps1 -Phase unpack -Arg1 C:\\nunchuk-repro\\artifacts\\$(built_name "$a") -Arg2 C:\\nw\\m-built.txt"; then
-                vm_pull 'C:\nw\m-official.txt' "${WORK_DIR}/diff-${a}/m-official"
-                vm_pull 'C:\nw\m-built.txt' "${WORK_DIR}/diff-${a}/m-built"
-                sed -i 's/\r$//' "${WORK_DIR}/diff-${a}"/m-*
-                diff_manifests "diff-${a}" "$a" || DIFF_NOTE[$a]="the installed trees could not be compared"
+                if vm_pull 'C:\nw\m-official.txt' "${WORK_DIR}/diff-${a}/m-official" \
+                    && vm_pull 'C:\nw\m-built.txt' "${WORK_DIR}/diff-${a}/m-built"; then
+                    sed -i 's/\r$//' "${WORK_DIR}/diff-${a}"/m-*
+                    diff_manifests "diff-${a}" "$a" || DIFF_NOTE[$a]="the installed trees could not be compared"
+                else
+                    DIFF_NOTE[$a]="the installed file lists could not be copied out of the VM"
+                fi
             else
-                DIFF_NOTE[$a]="the installers could not be installed in the VM to diff their contents"
+                DIFF_NOTE[$a]="the installers could not be copied into or installed in the VM to diff their contents"
             fi
+            COPY_SOFT=false
         fi
     done
     phase_done "compare"
@@ -664,6 +702,23 @@ emit_verification_summary() {
         fi
     done
     echo ""
+    echo "Revision, tag (and its signature):"
+    echo "tag:            ${APP_VERSION}"
+    echo "commit:         ${RESOLVED_COMMIT}"
+    echo ""
+    echo "Signature Summary:"
+    echo "${SIG_MANIFEST_STATUS}"
+    echo "${SIG_DIGEST_STATUS}"
+    echo "[WARNING] Tag signature not checked by this script"
+    echo "[WARNING] Commit signature not checked by this script"
+    echo ""
+    echo "Keys used:"
+    if [[ "$SIG_MANIFEST_STATUS" == "[OK]"* ]]; then echo "Manifest signed with: ${NUNCHUK_RELEASE_KEY_FPR}"; else echo "None established"; fi
+    echo ""
+    printf 'Warnings:%s\n' "${SIG_WARNINGS:-}"
+    echo ""
+    echo "===== End Results ====="
+    echo ""
     echo "Build environment:"
     echo "VM image:       ${WIN_IMAGE}"
     echo "golden image:   ${GOLDEN_DIR}"
@@ -684,23 +739,8 @@ emit_verification_summary() {
     echo "  the script checks the bootstrapper's sha256 and asserts the resulting cl/CRT/SDK versions."
     echo "- Qt (aqt from download.qt.io) and vcpkg sources are verified by those tools, not by this script."
     echo "- Built under user Docker, time zone set to UTC; the release was built as runneradmin on GitHub's runner."
+    echo "- The bundled hwi.exe is a prebuilt download pinned by sha256 in windows-dependencies.lock.json, not built from source."
     echo ""
-    echo "Revision, tag (and its signature):"
-    echo "tag:            ${APP_VERSION}"
-    echo "commit:         ${RESOLVED_COMMIT}"
-    echo ""
-    echo "Signature Summary:"
-    echo "${SIG_MANIFEST_STATUS}"
-    echo "${SIG_DIGEST_STATUS}"
-    echo "[WARNING] Tag signature not checked by this script"
-    echo "[WARNING] Commit signature not checked by this script"
-    echo ""
-    echo "Keys used:"
-    if [[ "$SIG_MANIFEST_STATUS" == "[OK]"* ]]; then echo "Manifest signed with: ${NUNCHUK_RELEASE_KEY_FPR}"; else echo "None established"; fi
-    echo ""
-    printf 'Warnings:%s\n' "${SIG_WARNINGS:-}"
-    echo ""
-    echo "===== End Results ====="
 }
 
 main() {
