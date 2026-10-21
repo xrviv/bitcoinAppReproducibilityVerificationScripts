@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # nunchukwindows_build.sh - Nunchuk Desktop Windows Reproducible Build Verifier
-# Version: v0.1.5
+# Version: v0.1.6
 # Last modified by: Danny Garcia, Carol (Buzz), Claude Code
 # Last modified on: 2026-10-21
 # Organization: WalletScrutiny.com
@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.5"
+SCRIPT_VERSION="v0.1.6"
 APP_ID="nunchuk"
 APP_NAME="Nunchuk Desktop (Windows)"
 GH_REPO="nunchuk-io/nunchuk-desktop"
@@ -535,6 +535,15 @@ if ($Phase -eq 'build') {
     }
     # Same layering as the runner: msvc-dev-cmd's vcvars, then Python and NASM, Strawberry Perl last.
     $env:Path = "$py;$py\Scripts;$T\nasm-3.02;$env:Path;C:\Strawberry\c\bin;C:\Strawberry\perl\site\bin;C:\Strawberry\perl\bin"
+    # vcpkg builds ports in a clean environment that takes PATH from the registry, not from this
+    # session. With VCPKG_FORCE_SYSTEM_BINARIES it must find pip's ninja there, or it falls back to
+    # MSBuild (sqlite3 then fails: RC2135 sqlite370.ico). The runner has these on the machine PATH.
+    $need = @($py, "$py\Scripts", "$T\nasm-3.02", 'C:\Strawberry\c\bin', 'C:\Strawberry\perl\site\bin', 'C:\Strawberry\perl\bin')
+    $mp = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $add = $need | Where-Object { ($mp -split ';') -notcontains $_ }
+    if ($add) { [Environment]::SetEnvironmentVariable('Path', (@($mp.TrimEnd(';')) + $add) -join ';', 'Machine') }
+    $mp = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    foreach ($d in $need) { Need (($mp -split ';') -contains $d) "machine PATH lacks $d" }
     Set-Content C:\nw\env.cmd "@call `"$(VsPath)\VC\Auxiliary\Build\vcvarsall.bat`" x64 10.0.22621.0 -vcvars_ver=14.44.35207 >nul`r`n@set" -Encoding ascii
     cmd /c C:\nw\env.cmd | ForEach-Object { if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2]) } }
     $cl = (Get-Command cl.exe).Source
