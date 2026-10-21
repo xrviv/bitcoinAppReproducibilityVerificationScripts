@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # nunchukwindows_build.sh - Nunchuk Desktop Windows Reproducible Build Verifier
-# Version: v0.1.0
+# Version: v0.1.1
 # Last modified by: Danny Garcia, Carol (Buzz), Claude Code
 # Last modified on: 2026-10-21
 # Organization: WalletScrutiny.com
@@ -9,16 +9,16 @@
 # Rebuilds the Windows x64 installer (Inno Setup) and portable ZIP with upstream's
 # reproducible-builds/build_windows.ps1 + package_windows.ps1 at the release tag, inside a Windows
 # Server 2022 VM (dockurr/windows under QEMU/KVM, booted from a per-run overlay of a read-only golden
-# image), and compares both byte for byte with the released files. Upstream marks Windows
+# image), and compares the selected file (--type) byte for byte with the release. Upstream marks Windows
 # verification "standby": expect differences.
 #
-# Usage: nunchukwindows_build.sh --version VERSION [--binary FILE] [--arch x86_64-windows] [--type both|setup|portable]
-# Host needs podman (or docker), /dev/kvm, and read access to the golden image and VM key.
+# Usage: nunchukwindows_build.sh --version VERSION [--binary FILE] [--arch x86_64-windows] [--type setup|portable] [--golden DIR]
+# One verdict per run, for the file --type selects. Host needs podman (or docker), /dev/kvm, and read access to the golden image and VM key.
 #
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.0"
+SCRIPT_VERSION="v0.1.1"
 APP_ID="nunchuk"
 APP_NAME="Nunchuk Desktop (Windows)"
 GH_REPO="nunchuk-io/nunchuk-desktop"
@@ -30,7 +30,7 @@ EXIT_INVALID=2
 
 APP_VERSION=""
 APP_ARCH="x86_64-windows"
-APP_TYPE="both"
+APP_TYPE="setup"
 BINARY_PATH=""
 CONTAINER_CMD=""
 GIT_IMAGE="${GIT_IMAGE:-docker.io/alpine/git@sha256:6f8eae2205a85c51106a9650e574a37fb1d5e4f645e5f6ea57cb57b9462cd4cf}"
@@ -49,6 +49,10 @@ VERDICT_WRITTEN=false
 NO_VERDICT_BY_DESIGN=false
 RESOLVED_COMMIT="unknown"
 SOURCE_EPOCH=""
+PHASE_TIMES=""
+# Elapsed time of a phase, for the results block.
+phase_done() { PHASE_TIMES+="${1}: $(( (SECONDS - PHASE_T0) / 60 )) min $(( (SECONDS - PHASE_T0) % 60 )) s"$'\n'; PHASE_T0=$SECONDS; }
+PHASE_T0=0
 
 # Runner identity and compiler of the release, read from build-info.json in the official ZIP.
 # build-info.json ships in both artifacts and records $env:ImageOS/$env:ImageVersion verbatim.
@@ -147,7 +151,7 @@ require_arg() {
 
 parse_args() {
     if [[ $# -eq 0 ]]; then
-        echo "Usage: $0 --version VERSION [--binary FILE] [--arch ARCH] [--type both|setup|portable]"
+        echo "Usage: $0 --version VERSION [--binary FILE] [--arch ARCH] [--type setup|portable] [--golden DIR]"
         exit "${EXIT_INVALID}"
     fi
     while [[ $# -gt 0 ]]; do
@@ -156,6 +160,7 @@ parse_args() {
             --binary)  require_arg "$1" "${2:-}"; BINARY_PATH="$2"; shift 2 ;;
             --arch)    require_arg "$1" "${2:-}"; APP_ARCH="$2"; shift 2 ;;
             --type)    require_arg "$1" "${2:-}"; APP_TYPE="$2"; shift 2 ;;
+            --golden)  require_arg "$1" "${2:-}"; GOLDEN_DIR="$2"; shift 2 ;;
             --apk)
                 if [[ $# -ge 2 && "${2:-}" != --* ]]; then shift 2; else shift; fi
                 log_warn "--apk is not applicable for desktop builds (ignored)" ;;
@@ -170,16 +175,14 @@ parse_args() {
     [[ "$APP_ARCH" == "x86_64-windows" ]] \
         || die_invalid "Unsupported --arch '${APP_ARCH}'; only x86_64-windows is implemented"
     case "$APP_TYPE" in
-        both) ARTIFACTS=(setup portable) ;;
         setup|portable) ARTIFACTS=("$APP_TYPE") ;;
-        *) die_invalid "Unsupported --type '${APP_TYPE}'; use both, setup or portable" ;;
+        *) die_invalid "Unsupported --type '${APP_TYPE}'; use setup or portable" ;;
     esac
     if [[ "$(printf '%s\n' "$MIN_VERSION" "$APP_VERSION" | sort -V | head -1)" != "$MIN_VERSION" ]]; then
         die_invalid "Version ${APP_VERSION} predates ${MIN_VERSION}, the first release with build_windows.ps1"
     fi
     if [[ -n "$BINARY_PATH" ]]; then
         [[ -f "$BINARY_PATH" ]] || die_invalid "--binary path does not exist: $BINARY_PATH"
-        [[ "$APP_TYPE" != both ]] || die_invalid "--binary needs --type setup or --type portable"
         BINARY_PATH="$(realpath "$BINARY_PATH")"
     fi
 }
@@ -195,9 +198,11 @@ REQUIRED:
   --version VERSION    Release version without v prefix, 2.9.1 or later
 
 OPTIONAL:
-  --binary FILE        Official file for --type setup or portable (skip its GitHub download)
+  --binary FILE        Official file of the selected --type (skip its GitHub download)
   --arch ARCH          x86_64-windows (default, only supported value)
-  --type TYPE          both (default): setup.exe and portable ZIP; or setup, or portable
+  --type TYPE          setup (default, the Inno Setup installer) or portable (the ZIP)
+  --golden DIR         Golden image folder (default: $WS_WINDOWS_GOLDEN or
+                       /var/lib/walletscrutiny-windows/golden-2022)
 
 OPTIONAL ENVIRONMENT:
   GITHUB_TOKEN         Used for GitHub downloads, to avoid rate limiting
@@ -212,7 +217,7 @@ REQUIREMENTS:
   hash-checked; their versions are asserted either way.
 
 EXIT CODES:
-  0  Identical (every compared file byte-for-byte equal)
+  0  Identical (the selected file is byte-for-byte equal)
   1  Differences found, or build failed
   2  Invalid parameters or missing prerequisites (no verdict for missing prerequisites)
   130  Interrupted (no verdict)
@@ -397,7 +402,7 @@ vm_pull() {
 }
 
 start_vm() {
-    local s i
+    local s
     VM_NAME="nunchukwin-$(date +%s)-$$"
     install -m 600 "$VM_KEY" "${WORK_DIR}/vm/key"
     mkdir -p "${WORK_DIR}/vm/storage" "${WORK_DIR}/vm/storage2"
@@ -422,7 +427,7 @@ start_vm() {
     VM_PORT="$("$CONTAINER_CMD" port "$VM_NAME" 22/tcp | head -1)"; VM_PORT="${VM_PORT##*:}"
     [[ "$VM_PORT" =~ ^[0-9]+$ ]] || die_build "Could not read the VM's SSH port"
     for _ in $(seq 1 90); do
-        vm_ssh "type C:\\OEM\\done.txt" > /dev/null 2>&1 && { log_ok "Windows is up (SSH on 127.0.0.1:${VM_PORT})"; return 0; }
+        vm_ssh "type C:\\OEM\\done.txt" > /dev/null 2>&1 && { log_ok "Windows is up (SSH on 127.0.0.1:${VM_PORT})"; phase_done "VM boot"; return 0; }
         "$CONTAINER_CMD" ps -q --filter "name=${VM_NAME}" | grep -q . || die_build "The VM container exited during boot"
         sleep 10
     done
@@ -455,25 +460,32 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 }
 function Run($exe) { & $exe @args; if ($LASTEXITCODE) { throw "$exe failed with exit code $LASTEXITCODE" } }
 
+function Lap($name) { Write-Host ("NW-TIME {0}: {1} min {2} s" -f $name, [int][math]::Floor($sw.Elapsed.TotalMinutes), $sw.Elapsed.Seconds); $sw.Restart() }
+# A tool already present (e.g. baked into a later golden image) is used only at the exact version.
+function Present($exe, $want, [scriptblock]$ver) {
+    if (!(Test-Path $exe)) { return $false }
+    $got = & $ver; Need ($got -eq $want) "$exe is $got, want $want"; $true
+}
 if ($Phase -eq 'build') {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
     tzutil /s UTC
     try { Add-MpPreference -ExclusionPath 'C:\nunchuk-repro', 'D:\a'; Set-MpPreference -DisableRealtimeMonitoring $true }
     catch { Write-Warning "Defender not configured (continuing): $_" }
     # Missing tools: install per run (option a); present (option b image): only asserted below.
     $py = "$T\Python312"
-    if (!(Test-Path "$py\python.exe")) {
+    if (!(Present "$py\python.exe" 'Python 3.12.10' { & "$py\python.exe" --version })) {
         $p = Start-Process (Get-Pinned 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe' '67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb') -Wait -PassThru `
             -ArgumentList '/quiet', 'InstallAllUsers=1', "TargetDir=$py", 'PrependPath=0', 'Include_test=0', 'Include_launcher=0', 'Shortcuts=0'
         Need ($p.ExitCode -eq 0) "Python installer exit code $($p.ExitCode)"
     }
-    if (!(Test-Path "$T\nasm-3.02\nasm.exe")) {
+    if (!(Present "$T\nasm-3.02\nasm.exe" 'NASM version 3.02' { (& "$T\nasm-3.02\nasm.exe" -v) -replace ' compiled.*' })) {
         Expand-Archive (Get-Pinned 'https://www.nasm.us/pub/nasm/releasebuilds/3.02/win64/nasm-3.02-win64.zip' '161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7') $T
     }
-    if (!(Test-Path 'C:\Strawberry\perl\bin\perl.exe')) {
+    if (!(Present 'C:\Strawberry\perl\bin\perl.exe' 'v5.32.1' { & C:\Strawberry\perl\bin\perl.exe -e 'print $^V' })) {
         Expand-Archive (Get-Pinned 'https://strawberryperl.com/download/5.32.1.1/strawberry-perl-5.32.1.1-64bit-portable.zip' '692646105b0f5e058198a852dc52a48f1cebcaf676d63bbdeae12f4eaee9bf5c') 'C:\Strawberry'
     }
     $vsw = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-    function VsPath { if (Test-Path $vsw) { & $vsw -products * -version '[17.14,17.15)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1 } }
+    function VsPath { if (Test-Path $vsw) { & $vsw -products * -version '[17.14.37710,17.14.37711)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1 } }
     if (!(VsPath)) {
         # Fixed-version bootstrapper for VS 17.14.41 (17.14.37710.0), the windows-2022 runner's VS.
         $p = Start-Process (Get-Pinned 'https://download.visualstudio.microsoft.com/download/pr/bc92e2cb-33de-4a0c-995d-efa817f16b16/37bb0fb429d163ecebd272a865d11a37b906d152bef960da2ddb29c2e2fd6eeb/vs_BuildTools.exe' '37bb0fb429d163ecebd272a865d11a37b906d152bef960da2ddb29c2e2fd6eeb') -Wait -PassThru `
@@ -495,6 +507,7 @@ if ($Phase -eq 'build') {
     Need ((& python --version) -eq 'Python 3.12.10') "python $(& python --version), want 3.12.10"
     Need ((& nasm -v) -match '^NASM version 3\.02 ') "nasm $(& nasm -v), want 3.02"
     Need ((& perl -e 'print $^V') -eq 'v5.32.1') "perl $(& perl -e 'print $^V'), want v5.32.1"
+    Lap 'tool install'
     Write-Host "Toolchain: PASS (cl $Arg3, VCTools 14.44.35207, SDK 10.0.22621.0, CRT 14.44.35211.0, pwsh 7.6.6, Python 3.12.10, NASM 3.02, Perl 5.32.1)"
 
     # Checkout as in build-windows.yml, at the runner's workspace path.
@@ -511,9 +524,11 @@ if ($Phase -eq 'build') {
     $env:ImageOS = $Arg1; $env:ImageVersion = $Arg2
     Set-Location $src
     & .\reproducible-builds\build_windows.ps1 -Replica a -ExpectedCommit $Commit -ReleaseVersion $Tag -SourceDateEpoch $epoch
+    Lap 'build'
     & .\reproducible-builds\package_windows.ps1 -ExpectedCommit $Commit -ReleaseVersion $Tag -SourceDateEpoch $epoch `
         -ArtifactFlavor unsigned -ApplicationExe C:\nunchuk-repro\build-output\nunchuk-qt.exe `
         -BuildInfoFile C:\nunchuk-repro\build-output\build-info.json -TlsProbeExe C:\nunchuk-repro\build-output\qt-tls-probe.exe -SmokeTest
+    Lap 'package'
     Write-Host "NW-BUILD-DONE epoch=$epoch"
 }
 elseif ($Phase -eq 'unpack') {
@@ -548,12 +563,16 @@ run_build() {
         die_build "Upstream Windows build failed (log: ${WORK_DIR}/build.log)"
     }
     SOURCE_EPOCH="$(sed -nE 's/^NW-BUILD-DONE epoch=([0-9]+).*/\1/p' "${WORK_DIR}/build.log")"
+    # Phases inside Windows, timed there (one SSH session runs them all).
+    PHASE_TIMES+="$(sed -nE 's/^NW-TIME (.*)$/\1/p' "${WORK_DIR}/build.log")"$'\n'
+    PHASE_T0=$SECONDS
     for a in "${ARTIFACTS[@]}"; do
         log_info "Copying $(built_name "$a") out of the VM..."
         vm_pull "C:\\nunchuk-repro\\artifacts\\$(built_name "$a")" "${WORK_DIR}/built/${OFF_NAME[$a]}"
         BUILT_SHA[$a]="$(sha256_of "${WORK_DIR}/built/${OFF_NAME[$a]}")"
         log_ok "Rebuilt ${OFF_NAME[$a]} sha256 ${BUILT_SHA[$a]}"
     done
+    phase_done "copy-out"
 }
 
 # Differing entries between two "sha256  path" manifests (written by the caller as m-official / m-built).
@@ -600,6 +619,7 @@ compare_artifacts() {
             fi
         fi
     done
+    phase_done "compare"
     local ctx="Built in a Windows Server 2022 VM (${WIN_IMAGE##*@}) with upstream build_windows.ps1 and package_windows.ps1 at tag ${APP_VERSION}, commit ${RESOLVED_COMMIT}, SOURCE_DATE_EPOCH ${SOURCE_EPOCH}; MSVC 14.44.35207 (cl ${REL_MSVC}), SDK 10.0.22621.0, VS 17.14.41; ImageOS/ImageVersion set to the release's ${REL_IMAGE_OS}/${REL_IMAGE_VERSION} (they only feed build-info.json)."
     local sums="" a2
     for a2 in "${ARTIFACTS[@]}"; do sums+="${OFF_NAME[$a2]}: official ${OFF_SHA[$a2]}, rebuilt ${BUILT_SHA[$a2]}${DIFF_NOTE[$a2]:+ (${DIFF_NOTE[$a2]})}; "; done
@@ -649,6 +669,21 @@ emit_verification_summary() {
     echo "golden image:   ${GOLDEN_DIR}"
     echo "release runner: ${REL_IMAGE_OS} ${REL_IMAGE_VERSION}, cl.exe ${REL_MSVC}"
     echo "toolchain:      VS Build Tools 17.14.41, MSVC 14.44.35207, SDK 10.0.22621.0, pwsh 7.6.6, Python 3.12.10, NASM 3.02, Strawberry Perl 5.32.1.1"
+    echo "                cl.exe is checked against the release's build-info.json. build-info.json does not record"
+    echo "                Python, NASM or Perl: those are from upstream's 2.9.1 CI job log (run 38044363978:"
+    echo "                'Successfully set up CPython (3.12.10)', 'nasm v3.2.0', 'NASM version 3.02', C:\\Strawberry perl)"
+    echo "                and the runner toolset (strawberryperl 5.32.1.1)."
+    [[ "$APP_VERSION" == 2.9.1 ]] || echo "[WARNING] Toolchain versions were confirmed for 2.9.1 only; check them against this release's CI run"
+    echo ""
+    echo "Elapsed time per phase:"
+    printf '%s' "$PHASE_TIMES"
+    echo ""
+    echo "Limitations:"
+    echo "- pip resolves aqtinstall's and py7zr's dependencies at run time (upstream pins only aqtinstall, py7zr, ninja)."
+    echo "- VS Build Tools payloads are checked only by the VS installer against Microsoft's signed manifest;"
+    echo "  the script checks the bootstrapper's sha256 and asserts the resulting cl/CRT/SDK versions."
+    echo "- Qt (aqt from download.qt.io) and vcpkg sources are verified by those tools, not by this script."
+    echo "- Built under user Docker, time zone set to UTC; the release was built as runneradmin on GitHub's runner."
     echo ""
     echo "Revision, tag (and its signature):"
     echo "tag:            ${APP_VERSION}"
