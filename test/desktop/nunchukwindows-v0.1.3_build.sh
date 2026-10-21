@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # nunchukwindows_build.sh - Nunchuk Desktop Windows Reproducible Build Verifier
-# Version: v0.1.2
+# Version: v0.1.3
 # Last modified by: Danny Garcia, Carol (Buzz), Claude Code
 # Last modified on: 2026-10-21
 # Organization: WalletScrutiny.com
@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.2"
+SCRIPT_VERSION="v0.1.3"
 APP_ID="nunchuk"
 APP_NAME="Nunchuk Desktop (Windows)"
 GH_REPO="nunchuk-io/nunchuk-desktop"
@@ -63,6 +63,8 @@ PHASE_T0=0
 
 # Runner identity and compiler of the release, read from build-info.json in the official ZIP.
 # build-info.json ships in both artifacts and records $env:ImageOS/$env:ImageVersion verbatim.
+# Only GitHub's runner sets those two; this script does not fake them (Danny, 2026-10-21), so a
+# release that records them cannot match. The run says so under Warnings.
 REL_IMAGE_OS=""
 REL_IMAGE_VERSION=""
 REL_MSVC=""
@@ -342,9 +344,12 @@ prepare_official() {
     REL_IMAGE_OS="$(sed -nE 's/.*"runnerImage": *"([^"]*)".*/\1/p' "${WORK_DIR}/official/build-info.json")"
     REL_IMAGE_VERSION="$(sed -nE 's/.*"runnerImageVersion": *"([^"]*)".*/\1/p' "${WORK_DIR}/official/build-info.json")"
     REL_MSVC="$(sed -nE 's/.*"msvcFileVersion": *"([^"]*)".*/\1/p' "${WORK_DIR}/official/build-info.json")"
-    [[ "$REL_IMAGE_OS$REL_IMAGE_VERSION" =~ ^[A-Za-z0-9._-]+$ && "$REL_MSVC" =~ ^[0-9.]+$ ]] \
-        || die_build "Could not read runnerImage/runnerImageVersion/msvcFileVersion from the official build-info.json"
-    log_info "Release built on runner ${REL_IMAGE_OS} ${REL_IMAGE_VERSION} with cl.exe ${REL_MSVC}"
+    [[ "$REL_MSVC" =~ ^[0-9.]+$ ]] || die_build "Could not read msvcFileVersion from the official build-info.json"
+    log_info "Release built on runner ${REL_IMAGE_OS:-?} ${REL_IMAGE_VERSION:-?} with cl.exe ${REL_MSVC}"
+    if [[ -n "$REL_IMAGE_OS$REL_IMAGE_VERSION" ]]; then
+        log_warn "build-info.json records GitHub's runner image; this build cannot reproduce that (see Warnings)"
+        SIG_WARNINGS+=$'\n'"- UPSTREAM LEAK: build-info.json, inside both Windows files, records GitHub's runner image (runnerImage ${REL_IMAGE_OS}, runnerImageVersion ${REL_IMAGE_VERSION}) from \$env:ImageOS/\$env:ImageVersion. Only GitHub's runner sets them and this script does not fake them, so no build elsewhere can match that file. Upstream should drop these fields or make them settable."
+    fi
 }
 
 # SHA256SUMS signed by the pinned key; a signed manifest that disagrees is fatal (no verdict).
@@ -545,8 +550,7 @@ if ($Phase -eq 'build') {
     $head = (git -C $src rev-parse HEAD).Trim()
     Need ($head -eq $Commit) "checkout HEAD $head is not tag commit $Commit"
     $epoch = [long](git -C $src show -s --format=%ct HEAD).Trim()
-    # build_windows.ps1 copies these into build-info.json, which ships in both artifacts.
-    $env:ImageOS = $Arg1; $env:ImageVersion = $Arg2
+    # $env:ImageOS/$env:ImageVersion stay unset: only GitHub's runner has them (see Warnings).
     Set-Location $src
     & .\reproducible-builds\build_windows.ps1 -Replica a -ExpectedCommit $Commit -ReleaseVersion $Tag -SourceDateEpoch $epoch
     Lap 'build'
@@ -578,7 +582,7 @@ run_build() {
     log_info "Building inside Windows (toolchain, then upstream build_windows.ps1 + package_windows.ps1): about 2-3 h..."
     # In the background so INT/TERM run the trap now (it removes the VM), not after the build.
     set +e
-    { vm_ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\nw\\nw.ps1 -Phase build -Tag ${APP_VERSION} -Commit ${RESOLVED_COMMIT} -Arg1 ${REL_IMAGE_OS} -Arg2 ${REL_IMAGE_VERSION} -Arg3 ${REL_MSVC}" < /dev/null 2>&1 \
+    { vm_ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\nw\\nw.ps1 -Phase build -Tag ${APP_VERSION} -Commit ${RESOLVED_COMMIT} -Arg3 ${REL_MSVC}" < /dev/null 2>&1 \
         | tr -d '\r' | tee "${WORK_DIR}/build.log"; } &
     wait $!
     set -e
@@ -658,7 +662,7 @@ compare_artifacts() {
         fi
     done
     phase_done "compare"
-    local ctx="Built in a Windows Server 2022 VM (${WIN_IMAGE##*@}) with upstream build_windows.ps1 and package_windows.ps1 at tag ${APP_VERSION}, commit ${RESOLVED_COMMIT}, SOURCE_DATE_EPOCH ${SOURCE_EPOCH}; MSVC 14.44.35207 (cl ${REL_MSVC}), SDK 10.0.22621.0, VS 17.14.41; ImageOS/ImageVersion set to the release's ${REL_IMAGE_OS}/${REL_IMAGE_VERSION} (they only feed build-info.json)."
+    local ctx="Built in a Windows Server 2022 VM (${WIN_IMAGE##*@}) with upstream build_windows.ps1 and package_windows.ps1 at tag ${APP_VERSION}, commit ${RESOLVED_COMMIT}, SOURCE_DATE_EPOCH ${SOURCE_EPOCH}; MSVC 14.44.35207 (cl ${REL_MSVC}), SDK 10.0.22621.0, VS 17.14.41; ImageOS/ImageVersion not set: build-info.json records GitHub's runner image (${REL_IMAGE_OS:-none}/${REL_IMAGE_VERSION:-none} in the release), which no build outside GitHub can match (upstream leak)."
     local sums="" a2
     for a2 in "${ARTIFACTS[@]}"; do sums+="${OFF_NAME[$a2]}: official ${OFF_SHA[$a2]}, rebuilt ${BUILT_SHA[$a2]}${DIFF_NOTE[$a2]:+ (${DIFF_NOTE[$a2]})}; "; done
     if [[ "$all" == true ]]; then
@@ -722,7 +726,7 @@ emit_verification_summary() {
     echo "Build environment:"
     echo "VM image:       ${WIN_IMAGE}"
     echo "golden image:   ${GOLDEN_DIR}"
-    echo "release runner: ${REL_IMAGE_OS} ${REL_IMAGE_VERSION}, cl.exe ${REL_MSVC}"
+    echo "release runner: ${REL_IMAGE_OS:-?} ${REL_IMAGE_VERSION:-?}, cl.exe ${REL_MSVC} (runner fields not reproduced, see Warnings)"
     echo "toolchain:      VS Build Tools 17.14.41, MSVC 14.44.35207, SDK 10.0.22621.0, pwsh 7.6.6, Python 3.12.10, NASM 3.02, Strawberry Perl 5.32.1.1"
     echo "                cl.exe is checked against the release's build-info.json. build-info.json does not record"
     echo "                Python, NASM or Perl: those are from upstream's 2.9.1 CI job log (run 38044363978:"
