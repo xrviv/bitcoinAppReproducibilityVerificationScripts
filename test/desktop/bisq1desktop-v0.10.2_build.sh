@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# bisq1desktop_build.sh - Bisq 1 Desktop Reproducible Build Verification
+# bisq1desktop-v0.10.2_build.sh - Bisq 1 Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.10.0
+# Version:       v0.10.2
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-09-12
+# Last Modified: 2026-10-21
 # Project:       https://github.com/bisq-network/bisq
 # ==============================================================================
 # LICENSE: MIT License
@@ -43,8 +43,8 @@ set -euo pipefail
 # Ubuntu host with umask 002 gives 0664 and 5 jars differ for that reason alone (found at 1.10.7). Pin it.
 umask 022
 
-SCRIPT_VERSION="v0.10.0"
-SCRIPT_NAME="bisq1desktop_build.sh"
+SCRIPT_VERSION="v0.10.2"
+SCRIPT_NAME="bisq1desktop-v0.10.2_build.sh"
 APP_NAME="Bisq 1"
 APP_ID="bisq"
 REPO_URL="https://github.com/bisq-network/bisq"
@@ -62,8 +62,9 @@ BUILT_DIR=""
 NO_CACHE=false
 KEEP_CONTAINER=false
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 WORK_DIR=""
+rm -f "${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"   # no stale verdict
 
 IMAGE_NAME=""
 CONTAINER_A=""; CONTAINER_B=""; CONTAINER_CMP=""
@@ -85,6 +86,12 @@ cleanup_on_exit() {
         done
     fi
     [[ -n "${VERIFY_SCRIPT:-}" ]] && rm -f "$VERIFY_SCRIPT" 2>/dev/null || true
+    [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]] || return 0
+    # Hand the workspace back; verdict also next to the script.
+    [[ -n "${DOCKER_RUN_EXTRA:-}" ]] && docker unshare chown -R 0:0 "$WORK_DIR" >/dev/null 2>&1
+    chmod -R u+rwX "$WORK_DIR" 2>/dev/null || true
+    [[ -f "$WORK_DIR/COMPARISON_RESULTS.yaml" ]] && cp -f "$WORK_DIR/COMPARISON_RESULTS.yaml" "$SCRIPT_DIR/"
+    return 0
 }
 trap cleanup_on_exit EXIT INT TERM
 
@@ -258,7 +265,7 @@ diag_extract_diff() {
         || { echo "DIAGNOSTIC UNAVAILABLE: helper image unavailable; $(basename "$outfile") skipped." >> "$detail"; return 0; }
 
     # Extract both files + diff inside the container; write full diff + a meta line to the mounted work dir.
-    local wd; wd="$(mktemp -d)"
+    local wd; wd="$(mktemp -d "${PWD}/diag.XXXXXX")"
     local rc=0
     docker run --rm --user "$(id -u):$(id -g)" \
         -v "$f1":/in/f1:ro -v "$f2":/in/f2:ro -v "$wd":/work -w /work \
@@ -423,7 +430,7 @@ while [[ $# -gt 0 ]]; do
         --arch)    [[ -z "${2:-}" ]] && die "--arch requires an argument" "$EXIT_INVALID_PARAMS"; BISQ_ARCH="$2"; shift 2 ;;
         --type)    [[ -z "${2:-}" ]] && die "--type requires an argument" "$EXIT_INVALID_PARAMS"; BISQ_TYPE="$2"; shift 2 ;;
         --binary|--apk) [[ -z "${2:-}" ]] && die "$1 requires a file/dir argument" "$EXIT_INVALID_PARAMS"; OFFICIAL_BINARY="$2"; shift 2 ;;
-        --built) [[ -z "${2:-}" ]] && die "--built requires a dir argument" "$EXIT_INVALID_PARAMS"; BUILT_DIR="$2"; shift 2 ;;
+        --built) [[ -z "${2:-}" ]] && die "--built requires a dir argument" "$EXIT_INVALID_PARAMS"; BUILT_DIR="$(realpath -m "$2")"; shift 2 ;;
         --no-cache) NO_CACHE=true; shift ;;
         --keep-container) KEEP_CONTAINER=true; shift ;;
         *) log_warn "ignoring unknown argument: $1"; shift ;;
@@ -480,21 +487,24 @@ Use at your own risk and ensure you understand what the script does before
 execution.${NC}"
 sleep 3
 
+VC=$(sanitize_component "$BISQ_VERSION"); AC=$(sanitize_component "$BISQ_ARCH"); TC=$(sanitize_component "$BISQ_TYPE")
+SUFFIX=$(sanitize_component "$(date +%s)-$$")
+# Per-run workspace in the caller's dir (deb/rpm and exe); never reused.
+wd="$(pwd -P)/bisq1_verification_${VC}_${AC}_${TC}_${SUFFIX}"
+mkdir "$wd" || die "Work dir exists: $wd" "$EXIT_INVALID_PARAMS"
+WORK_DIR="$wd"; cd "$WORK_DIR"; chmod 777 "$WORK_DIR" >/dev/null 2>&1 || true
+
 # ---- ISOLATION BOUNDARY: Windows EXE path returns here, before any docker/release-builder logic. ----
 if [[ "$BISQ_TYPE" == "exe" ]]; then
     verify_windows_exe
     exit $?
 fi
 
-VC=$(sanitize_component "$BISQ_VERSION"); AC=$(sanitize_component "$BISQ_ARCH"); TC=$(sanitize_component "$BISQ_TYPE")
-SUFFIX=$(sanitize_component "$(date +%s)-$$")
 IMAGE_NAME="bisq-release-builder-linux:java-21.0.6"
 CONTAINER_A="bisq1-build-a-${VC}-${TC}-${SUFFIX}"
 CONTAINER_B="bisq1-build-b-${VC}-${TC}-${SUFFIX}"
 CONTAINER_CMP="bisq1-cmp-${VC}-${TC}-${SUFFIX}"
 
-WORK_DIR="${SCRIPT_DIR}/bisq1_desktop_${VC}_${AC}_${TC}_$$"
-mkdir -p "$WORK_DIR"; cd "$WORK_DIR"; chmod 777 "$WORK_DIR" >/dev/null 2>&1 || true
 execution_dir="$(pwd)"; YAML_OUT="${execution_dir}/COMPARISON_RESULTS.yaml"
 SRC_A="${WORK_DIR}/src-a"
 SRC_B="${WORK_DIR}/src-b"
