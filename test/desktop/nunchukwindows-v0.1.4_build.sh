@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # nunchukwindows_build.sh - Nunchuk Desktop Windows Reproducible Build Verifier
-# Version: v0.1.3
+# Version: v0.1.4
 # Last modified by: Danny Garcia, Carol (Buzz), Claude Code
 # Last modified on: 2026-10-21
 # Organization: WalletScrutiny.com
@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.3"
+SCRIPT_VERSION="v0.1.4"
 APP_ID="nunchuk"
 APP_NAME="Nunchuk Desktop (Windows)"
 GH_REPO="nunchuk-io/nunchuk-desktop"
@@ -48,6 +48,7 @@ VM_RAM="${WS_WINDOWS_RAM:-8G}"
 WORK_DIR=""
 VM_NAME=""
 VM_PORT=""
+SSH_HELPER=""
 TOOLS_USER=()
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 SCRIPT_PATH="$(readlink -f "$0")"
@@ -276,6 +277,7 @@ reclaim_workspace() {
         write_yaml "ftbfs" "Run ended before a verdict was written (internal error)"
     fi
     [[ -n "$VM_NAME" ]] && "$CONTAINER_CMD" rm -f "$VM_NAME" > /dev/null 2>&1
+    [[ -n "$SSH_HELPER" ]] && "$CONTAINER_CMD" rm -f "$SSH_HELPER" > /dev/null 2>&1
     [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]] || return 0
     if [[ -n "$(find "$WORK_DIR" ! -uid "$(id -u)" -print -quit 2>/dev/null)" ]]; then
         local uid gid; uid="$(id -u)"; gid="$(id -g)"
@@ -403,8 +405,10 @@ resolve_commit() {
 # The VM is per-run and local, so its host key is not pinned.
 SSH_OPTS=(-i /k -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
           -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=15)
+# SSH_NAME (optional) names the helper container, so the EXIT trap can remove it.
 vm_ssh() {
-    "$CONTAINER_CMD" run --rm -i --network host -v "${WORK_DIR}/vm/key:/k:ro" --entrypoint ssh \
+    local n=(); [[ -n "${SSH_NAME:-}" ]] && n=(--name "$SSH_NAME")
+    "$CONTAINER_CMD" run --rm -i "${n[@]}" --network host -v "${WORK_DIR}/vm/key:/k:ro" --entrypoint ssh \
         "$GIT_IMAGE" "${SSH_OPTS[@]}" -p "$VM_PORT" Docker@127.0.0.1 "$@"
 }
 # A failed copy is an ftbfs, except while diffing a known mismatch (COPY_SOFT=true):
@@ -439,14 +443,15 @@ start_vm() {
     # dockur state files (windows.boot = already installed; windows.vars must be writable).
     cp "${GOLDEN_DIR}"/storage/windows.* "${WORK_DIR}/vm/storage/"
     chmod u+w "${WORK_DIR}"/vm/storage/windows.*
+    local extra=(); [[ "$CONTAINER_CMD" == podman ]] && extra=(--group-add keep-groups)
     # Copy-on-write overlays; the golden disks are only ever opened read-only.
     for s in "storage/data.qcow2:/golden" "storage2/data2.qcow2:/golden2"; do
-        "$CONTAINER_CMD" run --rm --entrypoint qemu-img \
+        local disk="${s%%:*}" mnt="${s#*:}"
+        "$CONTAINER_CMD" run --rm "${extra[@]}" --entrypoint qemu-img \
             -v "${GOLDEN_DIR}/storage:/golden:ro" -v "${GOLDEN_DIR}/storage2:/golden2:ro" -v "${WORK_DIR}/vm:/vm" \
-            "$WIN_IMAGE" create -q -f qcow2 -F qcow2 -b "${s#*:}/${s##*/}" "/vm/${s%%:*}" \
-            || die_build "Could not create the qcow2 overlay for ${s%%:*}"
+            "$WIN_IMAGE" create -q -f qcow2 -F qcow2 -b "${mnt}/${disk##*/}" "/vm/${disk}" \
+            || die_build "Could not create the qcow2 overlay for ${disk}"
     done
-    local extra=(); [[ "$CONTAINER_CMD" == podman ]] && extra=(--group-add keep-groups)
     log_info "Starting Windows VM ${VM_NAME} (RAM ${VM_RAM}, 4 cores)..."
     "$CONTAINER_CMD" run -d --name "$VM_NAME" "${extra[@]}" \
         -e VERSION=2022 -e RAM_SIZE="$VM_RAM" -e CPU_CORES=4 -e DISK_SIZE=64G -e DISK2_SIZE=32G -e DISK_FMT=qcow2 \
@@ -499,6 +504,8 @@ function Present($exe, $want, [scriptblock]$ver) {
 if ($Phase -eq 'build') {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     tzutil /s UTC
+    # GitHub's runner enables long paths; vcpkg buildtrees can pass 260 chars (overlay only).
+    Set-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem LongPathsEnabled 1
     try { Add-MpPreference -ExclusionPath 'C:\nunchuk-repro', 'D:\a'; Set-MpPreference -DisableRealtimeMonitoring $true }
     catch { Write-Warning "Defender not configured (continuing): $_" }
     # Missing tools: install per run (option a); present (option b image): only asserted below.
@@ -582,7 +589,8 @@ run_build() {
     log_info "Building inside Windows (toolchain, then upstream build_windows.ps1 + package_windows.ps1): about 2-3 h..."
     # In the background so INT/TERM run the trap now (it removes the VM), not after the build.
     set +e
-    { vm_ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\nw\\nw.ps1 -Phase build -Tag ${APP_VERSION} -Commit ${RESOLVED_COMMIT} -Arg3 ${REL_MSVC}" < /dev/null 2>&1 \
+    SSH_HELPER="nunchukwin-ssh-$(date +%s)-$$"
+    { SSH_NAME="$SSH_HELPER" vm_ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\nw\\nw.ps1 -Phase build -Tag ${APP_VERSION} -Commit ${RESOLVED_COMMIT} -Arg3 ${REL_MSVC}" < /dev/null 2>&1 \
         | tr -d '\r' | tee "${WORK_DIR}/build.log"; } &
     wait $!
     set -e
@@ -767,6 +775,7 @@ main() {
     verify_official_signature
     resolve_commit
     write_vm_script
+    PHASE_T0=$SECONDS
     start_vm
     run_build
 
