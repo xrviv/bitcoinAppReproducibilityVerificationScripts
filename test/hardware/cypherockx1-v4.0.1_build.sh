@@ -1,9 +1,9 @@
 #!/bin/bash
-# cypherockx1_build.sh v4.0.0 - WalletScrutiny verification script for Cypherock X1 firmware
+# cypherockx1-v4.0.1_build.sh v4.0.1 - WalletScrutiny verification script for Cypherock X1 firmware
 # Organization: WalletScrutiny.com
-# Last modified by: Daniel Garcia
-# Last modified on: 2026-09-11
-# Usage: cypherockx1_build.sh --version VERSION [--type TYPE] [--binary PATH] [--arch ARCH]
+# Last modified by: Claude Code for Danny
+# Last modified on: 2026-10-21
+# Usage: cypherockx1-v4.0.1_build.sh --version VERSION [--type TYPE] [--binary PATH] [--arch ARCH]
 # Project: https://github.com/Cypherock/x1_wallet_firmware
 #
 # TECHNICAL DISCLAIMER: This script is provided for reproducible-build verification only, with no
@@ -26,7 +26,7 @@
 set -Eeo pipefail
 
 # ---- Globals ------------------------------------------------------------------
-SCRIPT_VERSION="v4.0.0"
+SCRIPT_VERSION="v4.0.1"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 SCRIPT_SHA256=""
@@ -294,8 +294,9 @@ hash_in_container() {
 }
 
 # ---- Work area (fresh per run; nothing outside it is ever deleted) ----------------------
-runTag="${version}-${firmwareType}-${archLabel}-$$"
-workDir="${PWD}/cypherockx1-work_${version}_${firmwareType}_${archLabel}_$$"
+runId="$(date +%s)-$$"
+runTag="${version}-${firmwareType}-${archLabel}-${runId}"
+workDir="$(pwd -P)/cypherockx1_verification_${version}_${firmwareType}_${archLabel}_${runId}"
 SRC_IMAGE="ws-cypherockx1-src:${runTag}"
 BUILD_IMAGE="ws-cypherockx1-build:${runTag}"
 officialFile="${workDir}/output/official-${ARTIFACT}"
@@ -311,7 +312,11 @@ NOTES=(
   "Comparison: SHA-256 of the whole built file against the whole official file. The release .bin is unsigned, so nothing is stripped."
 )
 
-mkdir -- "$workDir"
+# Exclusive create: an existing directory belongs to another run, so stop without a verdict.
+if ! mkdir -- "$workDir"; then
+  log_error "Work directory already exists or cannot be created: ${workDir}"
+  exit "$EXIT_INVALID"
+fi
 mkdir -- "${workDir}/output" "${workDir}/ctx-source" "${workDir}/ctx-build"
 log_info "Work directory: ${workDir}"
 
