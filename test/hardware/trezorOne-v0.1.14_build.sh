@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # trezorOne_build.sh - Trezor One (T1B1) firmware reproducible build verification
-# Version: v0.1.13 · Organization: WalletScrutiny.com · License: MIT
+# Version: v0.1.14 · Organization: WalletScrutiny.com · License: MIT
 # Last modified by: Claude Code for Danny
 # Last modified on: 2026-10-22
 # Disclaimer: for reproducible-build verification only; no warranty; runs containers and
@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.13"
+SCRIPT_VERSION="v0.1.14"
 APP_ID="trezorOne"
 RESULTS_WRITTEN=false
 ENV_IMAGE=""
@@ -984,9 +984,9 @@ echo "builtBootloaderSha256d: ${BUILT_BL_SHA256D:-N/A}"
 echo "firmwareVerdict:        ${FIRMWARE_VERDICT}"
 echo "bootloaderVerdict:      ${BOOTLOADER_VERDICT}"
 echo "bootloaderCheck:        ${BL_NOTES}"
-[[ -n "$BL_TAG" ]] && echo "bootloaderRebuild:      ${BL_TAG} (commit ${BL_TAG_COMMIT:-unknown}); committed bootloader.dat sha256 ${BL_DAT_SHA256:-N/A}"
 echo "                        SHA256d (double-SHA256) vs bl_check.txt entry for v${BOOTLOADER_VERSION:-N/A}"
 [[ "${BL_HASH_IN_C}" == "yes" ]] && echo "                        cross-verified against bl_check.c (compiled into firmware)"
+[[ -n "$BL_TAG" ]] && echo "bootloaderRebuild:      ${BL_TAG} (commit ${BL_TAG_COMMIT:-unknown}); committed bootloader.dat sha256 ${BL_DAT_SHA256:-N/A}"
 echo "signerNote:             firmware signed by Trezor (SatoshiLabs s.r.o.); see"
 echo "                        https://github.com/trezor/trezor-firmware/blob/legacy/v${version}/legacy/bootloader/firmware_sign.py"
 echo ""
