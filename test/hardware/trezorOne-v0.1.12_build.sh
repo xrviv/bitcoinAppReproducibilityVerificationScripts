@@ -2,7 +2,7 @@
 # ==============================================================================
 # trezorOne_build.sh - Trezor One (T1B1) Firmware Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.1.11
+# Version:       v0.1.12
 # Organization:  WalletScrutiny.com
 # Last modified by: Claude Code for Danny
 # Last modified on: 2026-10-22
@@ -38,15 +38,6 @@
 #   writes COMPARISON_RESULTS.yaml next to this script and prints the results block
 # - Only host dependency: Docker or Podman
 #
-# BACKGROUND:
-# The Trezor One ("legacy", T1B1) firmware uses:
-#   - Alpine Linux 3.15.0 as the container base (SHA256-pinned)
-#   - Nix 2.31.4 with pinned nixpkgs for deterministic toolchain
-#   - gcc-arm-embedded-13 for STM32F2 cross-compilation
-#   - Build entry point: uv run script/cibuild (from legacy/ directory)
-# Signature region: TRZF bytes 544-738 (195 bytes) zeroed before comparison.
-# Bootloader hashes in bl_check.txt are SHA256d (double-SHA256).
-#
 # EXIT CODES: 0 reproducible · 1 not reproducible, ftbfs or failure ·
 #             2 invalid parameters · 130 stopped
 # A COMPARISON_RESULTS.yaml is written only for a real verdict: never on invalid
@@ -55,7 +46,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.11"
+SCRIPT_VERSION="v0.1.12"
 APP_ID="trezorOne"
 RESULTS_WRITTEN=false
 ENV_IMAGE=""
@@ -130,6 +121,21 @@ if [[ -n "$CONTAINER_CMD" && -f "$SCRIPT_PATH" ]]; then
   [[ "$_hash" =~ ^[0-9a-f]{64}$ ]] && SCRIPT_SHA256="$_hash"
 fi
 log_info "Script: ${SCRIPT_NAME} ${SCRIPT_VERSION} sha256 ${SCRIPT_SHA256}"
+
+# One run at a time per script directory: every run writes the same COMPARISON_RESULTS.yaml
+# next to the script (where ABS reads it), so parallel runs from one folder would overwrite each
+# other's verdict. flock releases on any exit; ABS gives each job its own directory, so this never
+# triggers there. Refusing writes no verdict. (flock is optional: without it, only a warning.)
+if command -v flock &>/dev/null; then
+  exec 9>"${SCRIPT_DIR}/.comparison_results.lock"
+  if ! flock -n 9; then
+    log_error "Another verification is already running from ${SCRIPT_DIR} (it shares COMPARISON_RESULTS.yaml). Run this one after it, or from a copy of the script in another folder."
+    log_error "No verdict written."
+    exit "$EXIT_FAIL"
+  fi
+else
+  log_warn "flock not found; parallel runs from this folder would share COMPARISON_RESULTS.yaml."
+fi
 
 # Remove a previous verdict before this invocation can fail, so ABS can never
 # pick up a stale COMPARISON_RESULTS.yaml from an earlier run.
@@ -302,6 +308,11 @@ write_results_yaml() {
     fi
   } > "${CANONICAL_RESULTS}"
   RESULTS_WRITTEN=true
+  # Per-run copy in this run's workspace. Deliberately NOT named COMPARISON_RESULTS.yaml:
+  # ABS searches its build directory recursively for that name.
+  if [[ -n "${WORK_DIR:-}" && -d "$WORK_DIR" ]]; then
+    printf '%s\n' "$(<"${CANONICAL_RESULTS}")" > "${WORK_DIR}/results_${RUN_ID}.yaml" || true
+  fi
   log_info "COMPARISON_RESULTS.yaml written (verdict: ${v})"
 }
 
@@ -356,15 +367,8 @@ trap 'exit 130' INT TERM
 # parse_releases.py — parses releases.json, writes one-value-per-file outputs
 emit > "${WORK_DIR}/parse_releases.py" << 'PYEOF'
 #!/usr/bin/env python3
-"""
-Parses releases.json and writes metadata files for the requested version.
-Usage: parse_releases.py <releases.json> <version> <build_type>
-Outputs (to /work/):
-  firmware_url.txt          — download URL for the firmware binary
-  bootloader_version.txt    — bootloader version bundled with this firmware (e.g. "1.12.1")
-  releases_fingerprint.txt  — SHA256 of first 1024-byte TRZF header with sig/index region zeroed
-Exit 3 when the version is not listed.
-"""
+"""Writes firmware_url.txt, bootloader_version.txt, releases_fingerprint.txt to /work/
+for <version> <build_type> from releases.json. Exit 3 when the version is not listed."""
 import json, sys
 
 releases_path = sys.argv[1]
@@ -415,14 +419,8 @@ PYEOF
 # parse_bl_check.py — extracts expected bootloader SHA256d and cross-checks bl_check.c
 emit > "${WORK_DIR}/parse_bl_check.py" << 'PYEOF2'
 #!/usr/bin/env python3
-"""
-Parses bl_check.txt for the expected SHA256d of a bootloader version,
-then verifies the same hash appears in bl_check.c (compiled into firmware at runtime).
-Usage: parse_bl_check.py <bl_check.txt> <bl_check.c> <bootloader_version>
-Outputs (to /work/):
-  expected_bl_hash.txt   — expected SHA256d (hex), or empty if not found
-  bl_hash_in_c.txt       — "yes" or "no"
-"""
+"""Writes expected_bl_hash.txt (SHA256d for <bootloader_version> from bl_check.txt) and
+bl_hash_in_c.txt ("yes" if the same hash is compiled into bl_check.c) to /work/."""
 import sys, re
 
 bl_txt_path = sys.argv[1]
@@ -457,7 +455,8 @@ hash_in_c = "no"
 try:
     with open(bl_c_path) as f:
         content = f.read().lower()
-    hex_bytes = re.findall(r'0x([0-9a-f]{2})', content)
+    # bl_check.c stores the hashes as "\\xNN" string literals (0xNN accepted too).
+    hex_bytes = re.findall(r'(?:0x|\\x)([0-9a-f]{2})', content)
     hex_str   = "".join(hex_bytes)
     for i in range(len(hex_str) - 63):
         if hex_str[i:i+64] == expected_hash:
@@ -517,9 +516,7 @@ fi
 sha256sum /work/official_firmware_raw.bin | cut -d' ' -f1 > /work/official_raw_sha256.txt
 
 # Detect TRZR prefix before stripping.
-# Older releases (firmware/1/ URL) prepend a 256-byte TRZR header before the TRZF payload.
-# Newer releases (firmware/t1b1/ URL) serve the TRZF payload directly — no prefix.
-# Magic: TRZR = 54525a52, TRZF = 54525a46. Unconditionally stripping would corrupt newer files.
+# Old releases prepend a 256-byte TRZR (54525a52) header; t1b1/ files start with TRZF (54525a46).
 MAGIC=$(dd if=/work/official_firmware_raw.bin bs=1 count=4 2>/dev/null | xxd -p | tr -d '\n')
 echo "[Phase1] Firmware magic bytes: ${MAGIC}"
 if [ "${MAGIC}" = "54525a52" ]; then
@@ -533,7 +530,7 @@ TRZF_SIZE=$(wc -c < /work/official_firmware_trzf.bin)
 echo "[Phase1] TRZF size: ${TRZF_SIZE} bytes"
 
 # Zero 195-byte signature region in TRZF copy (bytes 544-738).
-# Constants from legacy/firmware/firmware_sign.py:
+# Constants from legacy/bootloader/firmware_sign.py:
 #   SIGNATURES_START = 6*4 + 8 + 512 = 544
 #   INDEXES_START    = 544 + 3*64    = 736
 # Region: 3x64 ECDSA sigs + 3 signer index bytes = 195 bytes total.
@@ -651,6 +648,14 @@ RUN git -C /home/builder/trezor-firmware cat-file -t "\${GIT_TAG}" \\
 # Trezor's signing key is not imported — informational only, not a build blocker.
 RUN git -C /home/builder/trezor-firmware -c gpg.format=openpgp tag -v "\${GIT_TAG}" \\
       > /home/builder/trezor-firmware/BUILD_TAG_VERIFY.txt 2>&1 || true
+# Which signature the tag and the commit carry (presence only; no Trezor key is pinned here, so
+# nothing is cryptographically verified). Recent legacy tags are SSH-signed, which git tag -v
+# cannot check without an allowed-signers file.
+RUN t=\$(git -C /home/builder/trezor-firmware cat-file tag "\${GIT_TAG}" 2>/dev/null || true); \\
+    case "\$t" in *"BEGIN SSH SIGNATURE"*) echo ssh ;; *"BEGIN PGP SIGNATURE"*) echo pgp ;; *) echo none ;; esac \\
+      > /home/builder/trezor-firmware/BUILD_TAG_SIG.txt; \\
+    c=\$(git -C /home/builder/trezor-firmware cat-file commit HEAD); \\
+    case "\$c" in *"gpgsig"*) echo yes ;; *) echo no ;; esac > /home/builder/trezor-firmware/BUILD_COMMIT_SIG.txt
 
 WORKDIR /home/builder/trezor-firmware
 
@@ -744,6 +749,10 @@ ${CONTAINER_CMD} cp "${TEMP_CONTAINER}:/home/builder/trezor-firmware/BUILD_TAG_T
   "${WORK_DIR}/tag_type.txt"        2>/dev/null || true
 ${CONTAINER_CMD} cp "${TEMP_CONTAINER}:/home/builder/trezor-firmware/BUILD_TAG_VERIFY.txt" \
   "${WORK_DIR}/tag_verify.txt"      2>/dev/null || true
+${CONTAINER_CMD} cp "${TEMP_CONTAINER}:/home/builder/trezor-firmware/BUILD_TAG_SIG.txt" \
+  "${WORK_DIR}/tag_sig.txt"         2>/dev/null || true
+${CONTAINER_CMD} cp "${TEMP_CONTAINER}:/home/builder/trezor-firmware/BUILD_COMMIT_SIG.txt" \
+  "${WORK_DIR}/commit_sig.txt"      2>/dev/null || true
 
 # Clean up container and images — no longer needed
 ${CONTAINER_CMD} rm -f "$TEMP_CONTAINER" >/dev/null 2>&1 || true; TEMP_CONTAINER=""
@@ -814,10 +823,8 @@ fi
 
 # ---------------------------------------------------------------------------
 # Bootloader comparison
-# Use bootloader.dat (pre-committed binary) when available — this is the bootloader
-# that actually ships embedded in official firmware.  The freshly-built bootloader.bin
-# may be a different source version (e.g., source says 1.12.2 at tag legacy/v1.14.1
-# while the committed dat and releases.json both record 1.12.1).
+# Use the committed bootloader.dat when present: it is the bootloader the official firmware
+# embeds; the freshly built bootloader.bin can be a newer source version.
 # ---------------------------------------------------------------------------
 if [ -f /work/build_output/bootloader/bootloader.dat ]; then
   BL_FILE=/work/build_output/bootloader/bootloader.dat
@@ -931,11 +938,24 @@ MATCH_COUNT=$(( FW_MATCH_INT + BL_MATCH_INT ))
 MISMATCH_COUNT=$(( TOTAL_ARTIFACTS - MATCH_COUNT ))
 
 # Git tag and signature info
-TAG_TYPE_LABEL="unknown"
+TAG_TYPE_LABEL="unknown"; TAG_SIG_KIND="unknown"; COMMIT_SIG="unknown"
+[[ -f "${WORK_DIR}/tag_sig.txt" ]]    && read -r TAG_SIG_KIND < "${WORK_DIR}/tag_sig.txt"
+[[ -f "${WORK_DIR}/commit_sig.txt" ]] && read -r COMMIT_SIG   < "${WORK_DIR}/commit_sig.txt"
 TAG_SIG_LINE="[WARNING] Tag signature status unknown"
 case "${BUILD_TAG_TYPE}" in
-  tag)    TAG_TYPE_LABEL="annotated"; TAG_SIG_LINE="[INFO] Annotated tag — GPG keys not imported, signature not verified" ;;
-  commit) TAG_TYPE_LABEL="lightweight"; TAG_SIG_LINE="[INFO] Lightweight tag (cannot contain a GPG signature)" ;;
+  tag)
+    TAG_TYPE_LABEL="annotated"
+    case "$TAG_SIG_KIND" in
+      ssh)  TAG_SIG_LINE="[INFO] Tag carries an SSH signature (not verified: no Trezor key pinned)" ;;
+      pgp)  TAG_SIG_LINE="[INFO] Tag carries a PGP signature (not verified: no Trezor key pinned)" ;;
+      none) TAG_SIG_LINE="[WARNING] Tag is not signed" ;;
+    esac ;;
+  commit) TAG_TYPE_LABEL="lightweight"; TAG_SIG_LINE="[INFO] Lightweight tag (cannot contain a signature)" ;;
+esac
+case "$COMMIT_SIG" in
+  yes) COMMIT_SIG_LINE="[INFO] Commit carries a signature (not verified)" ;;
+  no)  COMMIT_SIG_LINE="[WARNING] Commit is not signed" ;;
+  *)   COMMIT_SIG_LINE="[WARNING] Commit signature status unknown" ;;
 esac
 
 # Tag verification output without git's SSH-signer config noise (bash loop; no host grep)
@@ -988,11 +1008,13 @@ if (( ${#DIFF_PREVIEW[@]} > 0 )); then
 fi
 echo ""
 echo "Revision, tag (and its signature):"
+echo "${GIT_TAG} -> ${BUILD_COMMIT}"
 if (( ${#TAG_VERIFY_LINES[@]} > 0 )); then printf '%s\n' "${TAG_VERIFY_LINES[@]}"; fi
 echo ""
 echo "Signature Summary:"
 echo "Tag type: ${TAG_TYPE_LABEL}"
 echo "${TAG_SIG_LINE}"
+echo "${COMMIT_SIG_LINE}"
 echo "===== End Results ====="
 echo ""
 echo "type:                   ${build_type}"
@@ -1007,7 +1029,7 @@ echo "bootloaderCheck:        ${BL_NOTES}"
 echo "                        SHA256d (double-SHA256) vs bl_check.txt entry for v${BOOTLOADER_VERSION:-N/A}"
 [[ "${BL_HASH_IN_C}" == "yes" ]] && echo "                        cross-verified against bl_check.c (compiled into firmware)"
 echo "signerNote:             firmware signed by Trezor (SatoshiLabs s.r.o.); see"
-echo "                        https://github.com/trezor/trezor-firmware/blob/legacy/v${version}/legacy/firmware/firmware_sign.py"
+echo "                        https://github.com/trezor/trezor-firmware/blob/legacy/v${version}/legacy/bootloader/firmware_sign.py"
 echo ""
 echo "Run a full"
 echo "diffoscope \"${WORK_DIR}/official_firmware_nosig.bin\" \"${WORK_DIR}/built_firmware_nosig.bin\""
