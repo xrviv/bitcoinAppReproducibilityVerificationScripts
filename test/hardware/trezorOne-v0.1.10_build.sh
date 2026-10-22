@@ -2,9 +2,10 @@
 # ==============================================================================
 # trezorOne_build.sh - Trezor One (T1B1) Firmware Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.1.9
+# Version:       v0.1.10
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-04-22
+# Last modified by: Claude Code for Danny
+# Last modified on: 2026-10-22
 # Project:       https://github.com/trezor/trezor-firmware
 # ==============================================================================
 # LICENSE: MIT License
@@ -44,7 +45,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.9"
+SCRIPT_VERSION="v0.1.10"
 RESULTS_WRITTEN=false
 IMAGE_NAME=""
 TEMP_CONTAINER=""
@@ -211,16 +212,19 @@ RELEASE_FILENAME="$( [[ "$build_type" == "btc-only" ]] && echo "trezor-t1b1-${ve
 # ---------------------------------------------------------------------------
 # Workspace setup
 # ---------------------------------------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORK_DIR="${SCRIPT_DIR}/trezorOne-work-${build_type}-${version}-$$"
+# Per-run workspace in the caller's directory, never reused or deleted, so
+# concurrent runs (same or other users, e.g. ABS) cannot touch each other's files.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+RUN_ID="$(date +%s)-$$"
+WORK_DIR="$(pwd -P)/trezorOne_verification_${version}_${build_type}_${RUN_ID}"
 BUILD_OUTPUT_DIR="${WORK_DIR}/build_output"
 CANONICAL_RESULTS="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
 
-if [[ -d "$WORK_DIR" ]]; then
-  log_warn "Removing stale work directory: ${WORK_DIR}"
-  rm -rf "$WORK_DIR"
+if ! mkdir -- "$WORK_DIR"; then
+  log_error "Work directory already exists or cannot be created: ${WORK_DIR}"
+  exit 2
 fi
-mkdir -p "$WORK_DIR" "$BUILD_OUTPUT_DIR"
+mkdir -p "$BUILD_OUTPUT_DIR"
 
 log_info "=============================================="
 log_info "Trezor One (T1B1) Firmware Verification"
@@ -248,12 +252,31 @@ write_results_yaml() {
 }
 
 # ---------------------------------------------------------------------------
-# Cleanup trap — removes container/image on any exit; writes ftbfs if needed
+# hand_back_workspace — Phase 1/3 containers run as root and write into WORK_DIR.
+# Under docker those files are root-owned on the host; chown them back to the
+# caller (no host privileges needed) so a plain rm -rf removes the workspace.
+# Under rootless podman, container root is the caller; unshare normalises any
+# subuid-owned files to the caller.
+# ---------------------------------------------------------------------------
+hand_back_workspace() {
+  [[ -n "${WORK_DIR:-}" && -d "$WORK_DIR" ]] || return 0
+  if [[ "$CONTAINER_CMD" == "podman" ]]; then
+    podman unshare chown -R 0:0 "$WORK_DIR" >/dev/null 2>&1 || true
+  else
+    ${CONTAINER_CMD} run --rm -v "${WORK_DIR}:/work" "${ALPINE_IMAGE}" \
+      sh -c "chown -R $(id -u):$(id -g) /work && chmod -R u+rwX /work" >/dev/null 2>&1 || true
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Cleanup trap — removes container/image on any exit, hands the workspace
+# back to the caller; writes ftbfs if needed
 # ---------------------------------------------------------------------------
 cleanup() {
   local ec=$?
   [[ -n "$TEMP_CONTAINER" ]] && ${CONTAINER_CMD} rm -f "$TEMP_CONTAINER" 2>/dev/null || true
   [[ -n "$IMAGE_NAME" ]]    && ${CONTAINER_CMD} rmi -f "$IMAGE_NAME"    2>/dev/null || true
+  hand_back_workspace
   if [[ "$RESULTS_WRITTEN" != "true" ]]; then
     write_results_yaml "ftbfs" "Script exited unexpectedly (exit code: ${ec})"
   fi
@@ -506,7 +529,7 @@ log_success "Phase 1 complete. Bootloader version: ${BOOTLOADER_VERSION:-unknown
 log_info ""
 log_info "--- Phase 2: Building firmware (30-60 min on first run) ---"
 
-IMAGE_NAME="trezor-one-build-${build_type}-${version//./_}-$$"
+IMAGE_NAME="trezor-one-build-${build_type}-${version//./_}-${RUN_ID}"
 DOCKERFILE_PATH="${WORK_DIR}/Dockerfile.trezorOne"
 
 cat > "$DOCKERFILE_PATH" << DOCKERFILE_EOF
@@ -602,7 +625,7 @@ fi
 log_success "Build image created: ${IMAGE_NAME}"
 
 # Extract build artifacts from image to host via a temporary container
-TEMP_CONTAINER="${IMAGE_NAME}-extract-$$"
+TEMP_CONTAINER="${IMAGE_NAME}-extract"
 ${CONTAINER_CMD} create --name "$TEMP_CONTAINER" "$IMAGE_NAME" >/dev/null
 
 if ! ${CONTAINER_CMD} cp \
