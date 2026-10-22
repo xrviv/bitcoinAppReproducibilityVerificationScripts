@@ -2,7 +2,7 @@
 # ==============================================================================
 # trezorsafe3_build.sh - Trezor Safe 3 (T2B1 rev.A / T3B1 rev.B) Firmware Reproducible Build Verification
 # ==============================================================================
-# Version:           v0.1.1
+# Version:           v0.1.2
 # Organization:      WalletScrutiny.com
 # Last modified by:  Claude Code for Danny
 # Last modified on:  2026-10-22
@@ -45,6 +45,13 @@
 #   if the TRZV / 512-byte / TRZF / hw_model header shape does not match
 # - Compares SHA-256 of each zeroed official file with the unsigned local build of the same
 #   revision; the verdict is reproducible only if every compared revision matches
+# - Bootloader: each firmware embeds a prebuilt, signed bootloader committed to the repository
+#   (core/embed/models/<MODEL>/bootloaders/bootloader_<MODEL>.bin). The script reads its version,
+#   clones the matching release tag core/bl<VERSION>, builds the bootloader there with that tag's
+#   own build-docker.sh (--targets bootloader), then fills in the two fields Trezor's signing
+#   adds: the 65-byte signature (0x3BF) is zeroed on both sides, and the code hash at 0x20 in
+#   the committed file must equal the SHA-256 or BLAKE2s of our built code. The revision is
+#   reproducible only if both the firmware and its bootloader match (as in the Trezor One script).
 # - Prints one results block per revision (appHash = that revision's official file as
 #   downloaded) and writes COMPARISON_RESULTS.yaml next to this script
 # - Exit codes: 0 reproducible; 1 not reproducible, ftbfs or a failure with no verdict;
@@ -54,7 +61,7 @@
 set -eE
 
 # ---- Globals (paths captured before any cd) ---------------------------------
-SCRIPT_VERSION="v0.1.1"
+SCRIPT_VERSION="v0.1.2"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 SCRIPT_SHA256=""
@@ -66,6 +73,7 @@ workDir=""
 CONTAINER_CMD=""
 CONTAINER_NAME=""
 SNAPSHOT_NAME=""
+EXTRA_IMAGES=()   # bootloader build images of this run, removed at exit
 repo="https://github.com/trezor/trezor-firmware.git"
 firmwareType="standard"
 version=""
@@ -161,6 +169,11 @@ cleanup() {
     "$CONTAINER_CMD" rm -f "$SNAPSHOT_NAME" &>/dev/null || true
     "$CONTAINER_CMD" rmi -f "$SNAPSHOT_NAME" "$CONTAINER_NAME" &>/dev/null || true
   fi
+  local img
+  for img in "${EXTRA_IMAGES[@]}"; do
+    "$CONTAINER_CMD" rm -f "$img" &>/dev/null || true
+    "$CONTAINER_CMD" rmi -f "$img" &>/dev/null || true
+  done
   [[ "$RESULTS_WRITTEN" == "1" ]] || echo -e "${YELLOW}[WARN] No COMPARISON_RESULTS.yaml written for this run.${NC}"
   echo "Exit code: ${rc}"
 }
@@ -370,7 +383,7 @@ if [[ ${#MODELS[@]} -eq 1 ]]; then revTag="${MODELS[0],,}"; else revTag="safe3";
 # fetches and checks the Alpine tarball itself), so these are required on the host in
 # addition to docker/podman. Fail early and clearly instead of part-way through.
 missingTools=()
-for tool in git wget sha256sum od dd awk; do
+for tool in git wget sha256sum od dd awk openssl; do
   command -v "$tool" &>/dev/null || missingTools+=("$tool")
 done
 if [[ ${#missingTools[@]} -gt 0 ]]; then
@@ -547,15 +560,101 @@ compare_firmware() {
   done
 }
 
+# ---- Bootloader -------------------------------------------------------------
+# The firmware build does not compile the bootloader: it embeds the committed, signed
+# bootloader_<MODEL>.bin. Rebuild that bootloader from its own release tag (core/bl<VERSION>)
+# with that tag's build-docker.sh, so the bootloader the firmware installs is checked too.
+# Signing adds two things a local build cannot have: the 65-byte signature (sigmask 0x3BF +
+# signature 0x3C0) and the code hash at 0x20 (docs/core/misc/boot.md). The signature is zeroed on
+# both sides; the committed code hash must equal a hash of OUR built code (T3B1: SHA-256,
+# T2B1: BLAKE2s, measured at core/bl2.1.16), so it is recomputed rather than ignored.
+declare -A BL_VER=() BL_TAG=() BL_COMMIT=() BL_SIGNED_HASH=() BL_BUILT_HASH=() BL_HASHALG=() BL_MATCH=() BL_NOTE=()
+
+check_bootloader() {
+  local m="$1" committed="$2" built="$3" size codelen want got alg
+  BL_SIGNED_HASH[$m]=$(sha256_of "$committed")
+  BL_BUILT_HASH[$m]=$(sha256_of "$built")
+  BL_MATCH[$m]=0
+  if [[ ! -f "$built" ]]; then BL_NOTE[$m]="no built bootloader"; return 0; fi
+  size=$(wc -c < "$committed")
+  codelen=$(od -An -tu4 -j12 -N4 "$committed" | tr -d '[:space:]')
+  # One code chunk only (header 1 KiB + code <= 127 KiB); otherwise more hash slots are used.
+  if [[ "$size" != "$(wc -c < "$built")" || $(( 1024 + codelen )) -ne "$size" || "$codelen" -gt 130048 ]]; then
+    BL_NOTE[$m]="size/codelen mismatch (committed ${size} B, codelen ${codelen}, built $(wc -c < "$built") B)"
+    return 0
+  fi
+  cp "$committed" "bl_${m}.committed.cmp"; cp "$built" "bl_${m}.built.cmp"
+  for f in "bl_${m}.committed.cmp" "bl_${m}.built.cmp"; do
+    dd if=/dev/zero of="$f" bs=1 seek=959 count=65 conv=notrunc 2>/dev/null   # sigmask + signature
+    dd if=/dev/zero of="$f" bs=1 seek=32 count=32 conv=notrunc 2>/dev/null    # code hash (checked below)
+  done
+  if ! cmp -s "bl_${m}.committed.cmp" "bl_${m}.built.cmp"; then
+    cmp -l "bl_${m}.committed.cmp" "bl_${m}.built.cmp" > "diff_bootloader_${m}.txt" 2>&1 || true
+    BL_NOTE[$m]="$(wc -l < "diff_bootloader_${m}.txt") bytes differ outside the signature and code hash"
+    return 0
+  fi
+  want=$(od -An -tx1 -j32 -N32 "$committed" | tr -d ' \n')
+  for alg in sha256 blake2s256; do
+    got=$(tail -c +1025 "$built" | openssl dgst "-${alg}" -r | cut -c1-64)
+    if [[ "$got" == "$want" ]]; then BL_HASHALG[$m]="$alg"; BL_MATCH[$m]=1; BL_NOTE[$m]="match"; return 0; fi
+  done
+  BL_NOTE[$m]="code hash at 0x20 (${want}) is neither SHA-256 nor BLAKE2s of the built code"
+}
+
+build_bootloaders() {
+  cd "$workDir"
+  local m committed magic hdr v tag dir cn sn
+  local -A cloned=()
+  for m in "${MODELS[@]}"; do
+    committed="trezor-firmware/core/embed/models/${m}/bootloaders/bootloader_${m}.bin"
+    if [[ ! -f "$committed" ]]; then
+      BL_MATCH[$m]=0; BL_NOTE[$m]="no committed bootloader_${m}.bin at core/v${normalizedVersion}"; continue
+    fi
+    magic=$(head -c4 "$committed"); hdr=$(od -An -tu4 -j4 -N4 "$committed" | tr -d '[:space:]')
+    v=$(od -An -tu1 -j16 -N3 "$committed" | awk '{print $1"."$2"."$3}')
+    if [[ "$magic" != "TRZB" || "$hdr" != "1024" ]]; then
+      BL_MATCH[$m]=0; BL_NOTE[$m]="unexpected bootloader header (magic ${magic}, ${hdr} B)"; continue
+    fi
+    BL_VER[$m]="$v"; tag="core/bl${v}"; BL_TAG[$m]="$tag"
+    if ! git -C trezor-firmware rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+      BL_MATCH[$m]=0; BL_NOTE[$m]="no release tag ${tag} for bootloader ${v}"; continue
+    fi
+    BL_COMMIT[$m]=$(git -C trezor-firmware rev-parse "${tag}^{commit}")
+    dir="bl-${v}"
+    if [[ -z "${cloned[$v]:-}" ]]; then
+      echo "Building bootloader ${v} from ${tag} (${BL_COMMIT[$m]})..."
+      git clone -q --depth 1 --branch "$tag" "$repo" "$dir" || no_verdict "failed to clone ${tag}"
+      cn="trezor-bl-env-${v//./_}-${RUN_ID}.nix"; sn="${cn}__${tag//[^a-zA-Z0-9]/_}"
+      EXTRA_IMAGES+=("$sn" "$cn")
+      local blModels; blModels=$(IFS=,; echo "${MODELS[*]}")
+      ( cd "$dir" && for x in "${MODELS[@]}"; do mkdir -p "build/core-${x}" "build/core-${x}-bitcoinonly"; done \
+        && CONTAINER_NAME="$cn" ./build-docker.sh --models "$blModels" --targets bootloader --skip-bitcoinonly "$tag" ) \
+        || no_verdict "bootloader build at ${tag} failed (this tag's build-docker.sh has no download-only step, so network and source failures cannot be told apart; check the log)"
+      cloned[$v]=1
+    fi
+    check_bootloader "$m" "$committed" "${dir}/build/core-${m}/bootloader/bootloader.bin"
+    if [[ "${BL_MATCH[$m]}" == "1" ]]; then
+      echo -e "${GREEN}Bootloader ${v} (${m}) matches (code hash: ${BL_HASHALG[$m]})${NC}"
+    else
+      echo -e "${RED}Bootloader ${v} (${m}) does not match: ${BL_NOTE[$m]}${NC}"
+    fi
+  done
+  # A revision is reproducible only if its firmware AND its bootloader match.
+  for m in "${MODELS[@]}"; do
+    [[ "${BL_MATCH[$m]:-0}" == "1" ]] || verdict="not_reproducible"
+  done
+}
+
 # ---- Main -------------------------------------------------------------------
 echo "Starting ${PRODUCT} verification..."
-echo "This may take 15-30 minutes."
+echo "This may take 45-60 minutes (firmware, then its bootloader)."
 echo
 
 prepare
 download_official
 build_firmware
 compare_firmware
+build_bootloaders
 
 print_hash_legend() {
   echo
@@ -572,19 +671,26 @@ print_hash_legend() {
   echo "              signatures cleared), the value a Trezor shows during a firmware update."
   echo
   echo "MATCH means builtHash == zeroedHash. It does NOT verify Trezor's signature."
+  echo "bootloader    (in Diff) SHA-256 of the bootloader built from its core/bl tag, before"
+  echo "              signing. The signed committed file's hash is after End; never publish it."
   echo "----------------------------------"
 }
 
 # One standard 9-field results block per revision: each revision is a separate official file.
 print_results_block() {
-  local m="$1" flag n lines=()
+  local m="$1" flag blflag n lines=()
   if [[ "${MATCH[$m]}" == "1" ]]; then flag="1 (MATCHES)"; else flag="0 (DOESN'T MATCH)"; fi
+  if [[ "${BL_MATCH[$m]:-0}" == "1" ]]; then blflag="1 (MATCHES)"; else blflag="0 (DOESN'T MATCH)"; fi
   echo "===== Begin Results ====="
   echo "appId:          ${APP_ID}"
   echo "signer:         N/A"
   echo "apkVersionName: ${normalizedVersion}"
   echo "apkVersionCode: N/A"
-  if [[ "${MATCH[$m]}" == "1" ]]; then echo "verdict:        reproducible"; else echo "verdict:        not_reproducible"; fi
+  if [[ "${MATCH[$m]}" == "1" && "${BL_MATCH[$m]:-0}" == "1" ]]; then
+    echo "verdict:        reproducible"
+  else
+    echo "verdict:        not_reproducible"
+  fi
   echo "appHash:        ${OFFICIAL_HASH[$m]}"
   echo "commit:         ${commit}"
   echo "scriptVersion:  ${SCRIPT_VERSION}"
@@ -593,6 +699,7 @@ print_results_block() {
   echo "Diff:"
   echo "BUILDS MATCH BINARIES"
   echo "trezor-${m,,}-${normalizedVersion}${editionSuffix}.bin - ${m}-${firmwareType} - ${BUILT_HASH[$m]} - ${flag}"
+  echo "bootloader_${m}.bin ${BL_VER[$m]:-?} - ${m} - ${BL_BUILT_HASH[$m]:-N/A} - ${blflag}"
   if [[ -s "$workDir/diff_${m}.txt" ]]; then
     n=$(wc -l < "$workDir/diff_${m}.txt")
     mapfile -t -n 5 lines < "$workDir/diff_${m}.txt"
@@ -616,14 +723,27 @@ for m in "${MODELS[@]}"; do
   echo "revision:       ${m} ($(rev_label "$m"))"
   echo "zeroedHash:     ${ZEROED_HASH[$m]}  (signature zeroed at offset ${SEEK[$m]}; never publish)"
   echo "fingerprint:    ${FINGERPRINT[$m]}  (Trezor firmware fingerprint of the build)"
+  echo "bootloader:     ${BL_VER[$m]:-?} from ${BL_TAG[$m]:-?} (commit ${BL_COMMIT[$m]:-?}): ${BL_NOTE[$m]:-not checked}"
+  echo "bootloaderSigned: ${BL_SIGNED_HASH[$m]:-N/A}  (committed signed file; never publish)"
+  [[ -n "${BL_HASHALG[$m]:-}" ]] && echo "bootloaderCodeHash: committed 0x20 field = ${BL_HASHALG[$m]} of the built code"
+  if [[ -s "$workDir/diff_bootloader_${m}.txt" ]]; then
+    echo "bootloaderDiff: $workDir/diff_bootloader_${m}.txt (first lines below)"
+    mapfile -t -n 5 bl_lines < "$workDir/diff_bootloader_${m}.txt"; printf '  %s\n' "${bl_lines[@]}"
+  fi
 done
+echo
+echo "Bootloader note: this script built the firmware from core/v${normalizedVersion} and the"
+echo "bootloader it embeds from that bootloader's own release tag, then filled in the gaps that"
+echo "only Trezor's signing can create (signature zeroed; code hash recomputed from our build)."
+echo "A reproducible verdict means both the firmware and the bootloader matched."
 echo
 echo "Overall verdict (all revisions): ${verdict}"
 echo
 
 summary=""
 for m in "${MODELS[@]}"; do
-  if [[ "${MATCH[$m]}" == "1" ]]; then r="match"; else r="built ${BUILT_HASH[$m]} != zeroed ${ZEROED_HASH[$m]}"; fi
+  if [[ "${MATCH[$m]}" == "1" ]]; then r="firmware match"; else r="firmware built ${BUILT_HASH[$m]} != zeroed ${ZEROED_HASH[$m]}"; fi
+  r="${r}, bootloader ${BL_VER[$m]:-?} (${BL_TAG[$m]:-?}): ${BL_NOTE[$m]:-not checked}"
   summary="${summary}${m}: ${r}; "
 done
 
@@ -633,7 +753,7 @@ if [[ "$verdict" == "reproducible" ]]; then
   echo "${PRODUCT} verification finished!"
   exit "$EXIT_OK"
 else
-  write_results "not_reproducible" "${PRODUCT} v${version} (${firmwareType}; ${MODELS[*]}) not reproducible: ${summary}signature zeroed at offset 1471, 65B."
+  write_results "not_reproducible" "${PRODUCT} v${version} (${firmwareType}; ${MODELS[*]}) not reproducible (firmware and bootloader must both match): ${summary}firmware signature zeroed at offset 1471, 65B."
   echo
   echo "${PRODUCT} verification finished!"
   exit "$EXIT_FAIL"
