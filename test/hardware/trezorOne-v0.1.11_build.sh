@@ -2,7 +2,7 @@
 # ==============================================================================
 # trezorOne_build.sh - Trezor One (T1B1) Firmware Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.1.10
+# Version:       v0.1.11
 # Organization:  WalletScrutiny.com
 # Last modified by: Claude Code for Danny
 # Last modified on: 2026-10-22
@@ -23,15 +23,19 @@
 # By using this script, you acknowledge these disclaimers and accept full responsibility.
 #
 # SCRIPT SUMMARY:
+# - Self-identification (container): prints script name, version and its own SHA-256
 # - Phase 1 (container): downloads releases.json, parses version metadata, downloads
 #   official firmware, strips 256-byte TRZR header, zeroes 195-byte signature region,
 #   computes SHA256 hashes
-# - Phase 2 (Dockerfile container): clones trezor-firmware at legacy/v{version}, builds
-#   T1B1 firmware + bootloader using Alpine 3.15.0 + Nix 2.31.4 + pinned nixpkgs,
-#   extracts commit hash and git tag type
+# - Phase 2a (image build): Alpine 3.15.0 + Nix 2.31.4 + pinned nixpkgs, clones
+#   trezor-firmware at legacy/v{version}, prefetches the nix-shell toolchain.
+#   A failure here is infrastructure (network), so no verdict is written.
+# - Phase 2b (image build on top of 2a): builds T1B1 firmware + bootloader with
+#   uv run script/cibuild. A failure here is a source build failure (ftbfs).
 # - Phase 3 (container): zeroes sig region in built firmware, compares with official,
 #   computes bootloader SHA256d, parses bl_check.txt and bl_check.c
-# - Host: reads one-value-per-file results, writes COMPARISON_RESULTS.yaml and summary
+# - Host: bash builtins only (plus mkdir/rm for the workspace and the stale YAML);
+#   writes COMPARISON_RESULTS.yaml next to this script and prints the results block
 # - Only host dependency: Docker or Podman
 #
 # BACKGROUND:
@@ -42,15 +46,28 @@
 #   - Build entry point: uv run script/cibuild (from legacy/ directory)
 # Signature region: TRZF bytes 544-738 (195 bytes) zeroed before comparison.
 # Bootloader hashes in bl_check.txt are SHA256d (double-SHA256).
+#
+# EXIT CODES: 0 reproducible · 1 not reproducible, ftbfs or failure ·
+#             2 invalid parameters · 130 stopped
+# A COMPARISON_RESULTS.yaml is written only for a real verdict: never on invalid
+# input, a stop, a missing runtime, a network failure or a firmware file that
+# fails the releases.json fingerprint.
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.10"
+SCRIPT_VERSION="v0.1.11"
+APP_ID="trezorOne"
 RESULTS_WRITTEN=false
-IMAGE_NAME=""
+ENV_IMAGE=""
+BUILD_IMAGE=""
 TEMP_CONTAINER=""
+WORK_DIR=""
 
-ALPINE_IMAGE="alpine:3.15.0@sha256:21a3deaa0d32a8057914f36584b5288d2e5ecc984380bc0118285c70fa8c9300"
+EXIT_OK=0
+EXIT_FAIL=1
+EXIT_INVALID=2
+
+ALPINE_IMAGE="docker.io/library/alpine:3.15.0@sha256:21a3deaa0d32a8057914f36584b5288d2e5ecc984380bc0118285c70fa8c9300"
 
 # ---------------------------------------------------------------------------
 # Colors and logging
@@ -66,11 +83,63 @@ log_success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 log_warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
+# emit — prints stdin unchanged (bash builtins only; replaces cat on the host)
+emit() { local c=""; IFS= read -r -d '' c || true; printf '%s' "$c"; }
+
+# ---------------------------------------------------------------------------
+# Paths (bash parameter expansion; no dirname/basename/readlink on the host)
+# ---------------------------------------------------------------------------
+_src="${BASH_SOURCE[0]}"
+if [[ "$_src" == */* ]]; then _src_dir="${_src%/*}"; else _src_dir="."; fi
+SCRIPT_DIR="$(cd "$_src_dir" && pwd -P)"
+SCRIPT_NAME="${_src##*/}"
+SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
+CANONICAL_RESULTS="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
+
+# ---------------------------------------------------------------------------
+# Container runtime detection — the only required host dependency.
+# Prefer the first candidate whose daemon/engine is actually usable (info check),
+# so a broken Docker install doesn't block a working Podman setup.
+# ---------------------------------------------------------------------------
+CONTAINER_CMD=""
+for _candidate in docker podman; do
+  if command -v "$_candidate" &>/dev/null && "$_candidate" info &>/dev/null; then
+    CONTAINER_CMD="$_candidate"
+    break
+  fi
+done
+if [[ -z "$CONTAINER_CMD" ]]; then
+  for _candidate in docker podman; do
+    if command -v "$_candidate" &>/dev/null; then
+      CONTAINER_CMD="$_candidate"
+      break
+    fi
+  done
+fi
+
+# ---------------------------------------------------------------------------
+# Self-identification — first action, before argument parsing. The hash is
+# computed inside the pinned Alpine image (no host sha256sum). Never aborts:
+# any problem gives N/A.
+# ---------------------------------------------------------------------------
+SCRIPT_SHA256="N/A"
+if [[ -n "$CONTAINER_CMD" && -f "$SCRIPT_PATH" ]]; then
+  _hash_out="$(${CONTAINER_CMD} run --rm -v "${SCRIPT_PATH}:/script.sh:ro" "${ALPINE_IMAGE}" \
+    sha256sum /script.sh </dev/null 2>/dev/null || true)"
+  _hash="${_hash_out%% *}"
+  [[ "$_hash" =~ ^[0-9a-f]{64}$ ]] && SCRIPT_SHA256="$_hash"
+fi
+log_info "Script: ${SCRIPT_NAME} ${SCRIPT_VERSION} sha256 ${SCRIPT_SHA256}"
+
+# Remove a previous verdict before this invocation can fail, so ABS can never
+# pick up a stale COMPARISON_RESULTS.yaml from an earlier run.
+rm -f -- "$CANONICAL_RESULTS"
+
 # ---------------------------------------------------------------------------
 # Disclaimer banner
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}"
-cat << 'DISCLAIMER'
+emit << 'BANNER_EOF'
 ==============================================================================
                              DISCLAIMER
 ==============================================================================
@@ -80,45 +149,20 @@ significant CPU, memory (4+ GB), and disk space (10+ GB).
 Build time: 30-60 minutes on first run (Nix downloads toolchains cold).
 Use at your own risk.
 ==============================================================================
-DISCLAIMER
+BANNER_EOF
 echo -e "${NC}"
-sleep 3
-
-log_info "trezorOne_build.sh ${SCRIPT_VERSION} starting"
 
 # ---------------------------------------------------------------------------
 # Root guard — must not run as root
 # ---------------------------------------------------------------------------
-if [[ "$(id -u)" -eq 0 ]]; then
+if (( EUID == 0 )); then
   log_error "Do not run this script as root. Please run as a normal user."
-  exit 2
+  exit "$EXIT_INVALID"
 fi
 
-# ---------------------------------------------------------------------------
-# Container runtime detection — the only required host dependency
-# Prefer the first candidate whose daemon/engine is actually usable (info check).
-# This ensures a broken Docker install doesn't block a working Podman setup.
-# ---------------------------------------------------------------------------
-CONTAINER_CMD=""
-for _candidate in docker podman; do
-  if command -v "$_candidate" &>/dev/null && "$_candidate" info &>/dev/null 2>&1; then
-    CONTAINER_CMD="$_candidate"
-    break
-  fi
-done
-if [[ -z "$CONTAINER_CMD" ]]; then
-  # Daemon checks both failed; fall back to whichever binary exists and let it error naturally
-  for _candidate in docker podman; do
-    if command -v "$_candidate" &>/dev/null; then
-      CONTAINER_CMD="$_candidate"
-      log_warn "${CONTAINER_CMD} found but daemon check failed — proceeding anyway"
-      break
-    fi
-  done
-fi
 if [[ -z "$CONTAINER_CMD" ]]; then
   log_error "Neither docker nor podman found. Please install Docker or Podman."
-  exit 2
+  exit "$EXIT_FAIL"
 fi
 log_info "Container runtime: ${CONTAINER_CMD}"
 
@@ -126,10 +170,10 @@ log_info "Container runtime: ${CONTAINER_CMD}"
 # Usage
 # ---------------------------------------------------------------------------
 usage() {
-  cat << EOF
+  emit << EOF
 Trezor One (T1B1) Firmware Reproducible Build Verification
 
-  $(basename "$0") --version VERSION [--arch ARCH] [--type TYPE] [--binary FILE]
+  ${SCRIPT_NAME} --version VERSION [--arch ARCH] [--type TYPE] [--binary FILE]
 
   --version   Firmware version without 'v' prefix (e.g., 1.14.1)
   --arch      Architecture (default: arm — only valid value for T1B1)
@@ -137,9 +181,10 @@ Trezor One (T1B1) Firmware Reproducible Build Verification
   --binary    Path to official firmware .bin file (skips download)
 
 EXIT CODES
-  0 = reproducible
-  1 = not_reproducible (differences found)
-  2 = ftbfs / invalid parameters
+  0   = reproducible
+  1   = not_reproducible, ftbfs, or a failure with no verdict
+  2   = invalid parameters
+  130 = stopped
 EOF
 }
 
@@ -153,11 +198,11 @@ binary_file=""
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
-    --version) [[ $# -ge 2 ]] || { log_error "--version requires a value"; exit 2; }; version="$2"; shift 2 ;;
-    --arch)    [[ $# -ge 2 ]] || { log_error "--arch requires a value"; exit 2; }; arch="$2"; shift 2 ;;
-    --type)    [[ $# -ge 2 ]] || { log_error "--type requires a value"; exit 2; }; build_type="$2"; shift 2 ;;
-    --binary)  [[ $# -ge 2 ]] || { log_error "--binary requires a value"; exit 2; }; binary_file="$2"; shift 2 ;;
-    --help|-h) usage; exit 0 ;;
+    --version) [[ $# -ge 2 ]] || { log_error "--version requires a value"; exit "$EXIT_INVALID"; }; version="$2"; shift 2 ;;
+    --arch)    [[ $# -ge 2 ]] || { log_error "--arch requires a value"; exit "$EXIT_INVALID"; }; arch="$2"; shift 2 ;;
+    --type)    [[ $# -ge 2 ]] || { log_error "--type requires a value"; exit "$EXIT_INVALID"; }; build_type="$2"; shift 2 ;;
+    --binary)  [[ $# -ge 2 ]] || { log_error "--binary requires a value"; exit "$EXIT_INVALID"; }; binary_file="$2"; shift 2 ;;
+    --help|-h) usage; exit "$EXIT_OK" ;;
     *) log_warn "Ignoring unknown parameter: $1"; shift ;;
   esac
 done
@@ -168,9 +213,9 @@ done
 # When --binary is provided without --version, attempt to infer version from filename.
 # Covers patterns like trezor-1.14.1.bin and trezor-1.14.1-bitcoinonly.bin.
 if [[ -z "$version" && -n "$binary_file" ]]; then
-  if [[ "$(basename "$binary_file")" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+  if [[ "${binary_file##*/}" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]]; then
     version="${BASH_REMATCH[1]}"
-    log_warn "No --version provided; inferred '${version}' from filename '$(basename "$binary_file")'"
+    log_warn "No --version provided; inferred '${version}' from filename '${binary_file##*/}'"
   fi
 fi
 
@@ -178,12 +223,12 @@ if [[ -z "$version" ]]; then
   log_error "--version is required (and could not be inferred from the binary filename)"
   echo
   usage
-  exit 2
+  exit "$EXIT_INVALID"
 fi
 
 if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   log_error "Invalid version format '${version}'. Expected X.Y.Z (e.g., 1.14.1)"
-  exit 2
+  exit "$EXIT_INVALID"
 fi
 
 case "${build_type,,}" in
@@ -200,9 +245,13 @@ if [[ "${arch,,}" != "arm" ]]; then
   arch="arm"
 fi
 
-if [[ -n "$binary_file" && ! -f "$binary_file" ]]; then
-  log_error "--binary file not found: ${binary_file}"
-  exit 2
+binary_abs=""
+if [[ -n "$binary_file" ]]; then
+  if [[ ! -f "$binary_file" ]]; then
+    log_error "--binary file not found: ${binary_file}"
+    exit "$EXIT_INVALID"
+  fi
+  if [[ "$binary_file" == /* ]]; then binary_abs="$binary_file"; else binary_abs="${PWD}/${binary_file}"; fi
 fi
 
 BITCOIN_ONLY_VAL="$( [[ "$build_type" == "btc-only" ]] && echo 1 || echo 0 )"
@@ -210,21 +259,25 @@ GIT_TAG="legacy/v${version}"
 RELEASE_FILENAME="$( [[ "$build_type" == "btc-only" ]] && echo "trezor-t1b1-${version}-bitcoinonly.bin" || echo "trezor-t1b1-${version}.bin" )"
 
 # ---------------------------------------------------------------------------
-# Workspace setup
+# Workspace setup — per-run, in the caller's directory, never reused or deleted,
+# so concurrent runs (same or other users, e.g. ABS) cannot touch each other's files.
 # ---------------------------------------------------------------------------
-# Per-run workspace in the caller's directory, never reused or deleted, so
-# concurrent runs (same or other users, e.g. ABS) cannot touch each other's files.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-RUN_ID="$(date +%s)-$$"
-WORK_DIR="$(pwd -P)/trezorOne_verification_${version}_${build_type}_${RUN_ID}"
-BUILD_OUTPUT_DIR="${WORK_DIR}/build_output"
-CANONICAL_RESULTS="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
+printf -v RUN_ID '%(%s)T-%s' -1 "$$"
+WORK_DIR_CANDIDATE="$(pwd -P)/trezorOne_verification_${version}_${build_type}_${RUN_ID}"
+BUILD_OUTPUT_DIR="${WORK_DIR_CANDIDATE}/build_output"
 
-if ! mkdir -- "$WORK_DIR"; then
-  log_error "Work directory already exists or cannot be created: ${WORK_DIR}"
-  exit 2
+if ! mkdir -- "$WORK_DIR_CANDIDATE"; then
+  log_error "Work directory already exists or cannot be created: ${WORK_DIR_CANDIDATE}"
+  exit "$EXIT_INVALID"
 fi
-mkdir -p "$BUILD_OUTPUT_DIR"
+WORK_DIR="$WORK_DIR_CANDIDATE"
+mkdir -- "$BUILD_OUTPUT_DIR"
+
+# Image names: localhost/ keeps them fully qualified (no short-name lookup);
+# the run id keeps cleanup from touching another run's images.
+_tag_suffix="${build_type}-${version//./_}-${RUN_ID}"
+ENV_IMAGE_NAME="localhost/trezor-one-env-${_tag_suffix}"
+BUILD_IMAGE_NAME="localhost/trezor-one-build-${_tag_suffix}"
 
 log_info "=============================================="
 log_info "Trezor One (T1B1) Firmware Verification"
@@ -235,7 +288,8 @@ log_info "Work dir: ${WORK_DIR}"
 log_info "=============================================="
 
 # ---------------------------------------------------------------------------
-# write_results_yaml — writes minimal 3-field COMPARISON_RESULTS.yaml
+# write_results_yaml — writes minimal 3-field COMPARISON_RESULTS.yaml.
+# Called only for a real verdict (reproducible, not_reproducible, ftbfs).
 # ---------------------------------------------------------------------------
 write_results_yaml() {
   local v="$1" notes="${2:-}"
@@ -251,6 +305,14 @@ write_results_yaml() {
   log_info "COMPARISON_RESULTS.yaml written (verdict: ${v})"
 }
 
+# no_verdict — failure that says nothing about the source (network, stop,
+# provenance): no YAML, so ABS publishes nothing.
+no_verdict() {
+  log_error "$1"
+  log_error "No verdict written (this is not a build failure of the source)."
+  exit "$EXIT_FAIL"
+}
+
 # ---------------------------------------------------------------------------
 # hand_back_workspace — Phase 1/3 containers run as root and write into WORK_DIR.
 # Under docker those files are root-owned on the host; chown them back to the
@@ -263,33 +325,36 @@ hand_back_workspace() {
   if [[ "$CONTAINER_CMD" == "podman" ]]; then
     podman unshare chown -R 0:0 "$WORK_DIR" >/dev/null 2>&1 || true
   else
+    # GROUPS[0] is the caller's primary gid (bash builtin; no host id command)
     ${CONTAINER_CMD} run --rm -v "${WORK_DIR}:/work" "${ALPINE_IMAGE}" \
-      sh -c "chown -R $(id -u):$(id -g) /work && chmod -R u+rwX /work" >/dev/null 2>&1 || true
+      sh -c "chown -R ${EUID}:${GROUPS[0]} /work && chmod -R u+rwX /work" >/dev/null 2>&1 || true
   fi
 }
 
 # ---------------------------------------------------------------------------
-# Cleanup trap — removes container/image on any exit, hands the workspace
-# back to the caller; writes ftbfs if needed
+# Cleanup trap — removes this run's container/images, hands the workspace back
+# to the caller. Never writes a verdict: an unexpected exit or a stop is not one.
 # ---------------------------------------------------------------------------
 cleanup() {
   local ec=$?
-  [[ -n "$TEMP_CONTAINER" ]] && ${CONTAINER_CMD} rm -f "$TEMP_CONTAINER" 2>/dev/null || true
-  [[ -n "$IMAGE_NAME" ]]    && ${CONTAINER_CMD} rmi -f "$IMAGE_NAME"    2>/dev/null || true
+  [[ -n "$TEMP_CONTAINER" ]] && ${CONTAINER_CMD} rm -f "$TEMP_CONTAINER" >/dev/null 2>&1 || true
+  [[ -n "$BUILD_IMAGE" ]]    && ${CONTAINER_CMD} rmi -f "$BUILD_IMAGE"   >/dev/null 2>&1 || true
+  [[ -n "$ENV_IMAGE" ]]      && ${CONTAINER_CMD} rmi -f "$ENV_IMAGE"     >/dev/null 2>&1 || true
   hand_back_workspace
   if [[ "$RESULTS_WRITTEN" != "true" ]]; then
-    write_results_yaml "ftbfs" "Script exited unexpectedly (exit code: ${ec})"
+    log_warn "No COMPARISON_RESULTS.yaml written for this run."
   fi
   echo "Exit code: ${ec}"
 }
 trap cleanup EXIT
+trap 'exit 130' INT TERM
 
 # ===========================================================================
 # Write helper Python scripts to WORK_DIR (host writes files; containers run them)
 # ===========================================================================
 
 # parse_releases.py — parses releases.json, writes one-value-per-file outputs
-cat > "${WORK_DIR}/parse_releases.py" << 'PYEOF'
+emit > "${WORK_DIR}/parse_releases.py" << 'PYEOF'
 #!/usr/bin/env python3
 """
 Parses releases.json and writes metadata files for the requested version.
@@ -298,6 +363,7 @@ Outputs (to /work/):
   firmware_url.txt          — download URL for the firmware binary
   bootloader_version.txt    — bootloader version bundled with this firmware (e.g. "1.12.1")
   releases_fingerprint.txt  — SHA256 of first 1024-byte TRZF header with sig/index region zeroed
+Exit 3 when the version is not listed.
 """
 import json, sys
 
@@ -343,11 +409,11 @@ for r in releases:
     sys.exit(0)
 
 sys.stderr.write(f"Version {target_ver} not found in releases.json\n")
-sys.exit(1)
+sys.exit(3)
 PYEOF
 
 # parse_bl_check.py — extracts expected bootloader SHA256d and cross-checks bl_check.c
-cat > "${WORK_DIR}/parse_bl_check.py" << 'PYEOF2'
+emit > "${WORK_DIR}/parse_bl_check.py" << 'PYEOF2'
 #!/usr/bin/env python3
 """
 Parses bl_check.txt for the expected SHA256d of a bootloader version,
@@ -404,45 +470,47 @@ with open("/work/bl_hash_in_c.txt", "w") as f:
     f.write(hash_in_c + "\n")
 PYEOF2
 
-# ---------------------------------------------------------------------------
-# If --binary provided, copy it into WORK_DIR so Phase 1 container can use it
-# ---------------------------------------------------------------------------
-if [[ -n "$binary_file" ]]; then
-  cp "$binary_file" "${WORK_DIR}/official_firmware_provided.bin"
-  log_info "Using provided binary: ${binary_file}"
-fi
-
 # ===========================================================================
 # PHASE 1: FETCH CONTAINER
 # All downloading, JSON parsing, TRZR stripping, sig zeroing, and hashing
-# happen inside this container. Host never calls curl/python3/sha256sum/dd/xxd.
+# happen inside this container. A provided --binary is mounted read-only.
+# Container exit codes: 3 version not listed, 4 download failed,
+# 5 fingerprint mismatch.
 # ===========================================================================
 log_info ""
 log_info "--- Phase 1: Fetch and prepare official firmware ---"
 
-if ! ${CONTAINER_CMD} run --rm -i \
+BINARY_MOUNT=()
+if [[ -n "$binary_abs" ]]; then
+  BINARY_MOUNT=(-v "${binary_abs}:/input/official.bin:ro")
+  log_info "Using provided binary: ${binary_abs}"
+fi
+
+phase1_rc=0
+${CONTAINER_CMD} run --rm -i \
   -v "${WORK_DIR}:/work" \
+  "${BINARY_MOUNT[@]}" \
   -e "VERSION=${version}" \
   -e "BUILD_TYPE=${build_type}" \
   "${ALPINE_IMAGE}" \
-  sh << 'FETCH_SCRIPT'
+  sh << 'FETCH_SCRIPT' || phase1_rc=$?
 set -e
-apk add --no-cache curl python3 coreutils xxd >/dev/null 2>&1
+apk add --no-cache curl python3 coreutils xxd >/dev/null 2>&1 || exit 4
 
 echo "[Phase1] Downloading releases.json..."
-curl -sSL --fail "https://data.trezor.io/firmware/t1b1/releases.json" -o /work/releases.json
+curl -sSL --fail "https://data.trezor.io/firmware/t1b1/releases.json" -o /work/releases.json || exit 4
 
 echo "[Phase1] Parsing releases.json for version ${VERSION}..."
-python3 /work/parse_releases.py /work/releases.json "${VERSION}" "${BUILD_TYPE}"
+python3 /work/parse_releases.py /work/releases.json "${VERSION}" "${BUILD_TYPE}" || exit $?
 FIRMWARE_URL=$(cat /work/firmware_url.txt | tr -d '[:space:]')
 echo "[Phase1] URL: ${FIRMWARE_URL}"
 
-if [ -f /work/official_firmware_provided.bin ]; then
+if [ -f /input/official.bin ]; then
   echo "[Phase1] Using provided --binary file."
-  cp /work/official_firmware_provided.bin /work/official_firmware_raw.bin
+  cp /input/official.bin /work/official_firmware_raw.bin
 else
   echo "[Phase1] Downloading official firmware..."
-  curl -sSL --fail "${FIRMWARE_URL}" -o /work/official_firmware_raw.bin
+  curl -sSL --fail "${FIRMWARE_URL}" -o /work/official_firmware_raw.bin || exit 4
 fi
 
 # SHA256 of full raw file (used as appHash in results — not the fingerprint)
@@ -478,8 +546,8 @@ echo "[Phase1] Official nosig SHA256: $(cat /work/official_nosig_sha256.txt)"
 # Compute firmware fingerprint per firmware_sign.py logic:
 # SHA256 of the first 1024-byte TRZF header with the sig/index region (bytes 544-738) zeroed.
 # This matches what firmware_sign.py prints as "Firmware fingerprint" during the build,
-# and is what releases.json records. A mismatch means the downloaded file is not the expected
-# release — abort to avoid producing a misleading verdict.
+# and is what releases.json records. A mismatch means the file is not the expected
+# release — stop without a verdict.
 dd if=/work/official_firmware_trzf.bin of=/tmp/fp_header.bin bs=1 count=1024 2>/dev/null
 dd if=/dev/zero of=/tmp/fp_header.bin bs=1 seek=544 count=195 conv=notrunc 2>/dev/null
 COMPUTED_FP=$(sha256sum /tmp/fp_header.bin | cut -d' ' -f1)
@@ -488,9 +556,9 @@ echo "[Phase1] Computed firmware fingerprint: ${COMPUTED_FP}"
 if [ -n "${EXPECTED_FP}" ]; then
   echo "[Phase1] releases.json fingerprint:   ${EXPECTED_FP}"
   if [ "${COMPUTED_FP}" != "${EXPECTED_FP}" ]; then
-    echo "[Phase1] FATAL: fingerprint mismatch — downloaded firmware does not match releases.json"
+    echo "[Phase1] FATAL: fingerprint mismatch — firmware file does not match releases.json"
     echo "MISMATCH" > /work/fingerprint_check.txt
-    exit 1
+    exit 5
   fi
   echo "[Phase1] Fingerprint OK"
   echo "OK" > /work/fingerprint_check.txt
@@ -499,52 +567,51 @@ else
   echo "SKIPPED" > /work/fingerprint_check.txt
 fi
 FETCH_SCRIPT
-then
-  log_error "Phase 1 (fetch) container failed — network error, version not found, or fingerprint mismatch (see output above)"
-  write_results_yaml "ftbfs" "Phase 1 container failed for version ${version} (see output above)"
-  exit 2
-fi
+
+case "$phase1_rc" in
+  0) ;;
+  3) log_error "Version ${version} is not listed in Trezor's releases.json"
+     exit "$EXIT_INVALID" ;;
+  5) no_verdict "Firmware file fails the releases.json fingerprint — not the published release" ;;
+  *) no_verdict "Phase 1 (fetch) failed (exit ${phase1_rc}) — network or download problem" ;;
+esac
 
 # Read Phase 1 outputs using shell builtins only
-FIRMWARE_URL=""; BOOTLOADER_VERSION=""; OFFICIAL_NOSIG_SHA256=""; OFFICIAL_RAW_SHA256=""
-[[ -f "${WORK_DIR}/firmware_url.txt" ]]          && read -r FIRMWARE_URL          < "${WORK_DIR}/firmware_url.txt"
+BOOTLOADER_VERSION=""; OFFICIAL_NOSIG_SHA256=""; OFFICIAL_RAW_SHA256=""
 [[ -f "${WORK_DIR}/bootloader_version.txt" ]]    && read -r BOOTLOADER_VERSION    < "${WORK_DIR}/bootloader_version.txt"
 [[ -f "${WORK_DIR}/official_nosig_sha256.txt" ]] && read -r OFFICIAL_NOSIG_SHA256 < "${WORK_DIR}/official_nosig_sha256.txt"
 [[ -f "${WORK_DIR}/official_raw_sha256.txt" ]]   && read -r OFFICIAL_RAW_SHA256   < "${WORK_DIR}/official_raw_sha256.txt"
 
 if [[ -z "$OFFICIAL_NOSIG_SHA256" ]]; then
-  log_error "Phase 1 failed to produce official nosig SHA256"
-  write_results_yaml "ftbfs" "Phase 1 (fetch) container failed — check network access"
-  exit 2
+  no_verdict "Phase 1 did not produce the official firmware hash"
 fi
 log_success "Phase 1 complete. Bootloader version: ${BOOTLOADER_VERSION:-unknown}"
 
 # ===========================================================================
-# PHASE 2: BUILD CONTAINER (Dockerfile-based)
-# Builds T1B1 firmware + bootloader using Alpine 3.15.0 + Nix 2.31.4.
-# Also extracts commit hash and git tag type for the results summary.
+# PHASE 2a: ENVIRONMENT IMAGE (network steps)
+# Alpine 3.15.0 + Nix 2.31.4 + pinned nixpkgs, source clone at the release tag,
+# and a prefetch of the nix-shell toolchain. These steps only download; a
+# failure here is infrastructure, so no verdict is written.
 # Note: build-docker.sh is NOT called directly (would require Docker-in-Docker).
-# Instead we replicate its T1B1 steps inside our own container.
+# Instead we replicate its T1B1 steps inside our own images.
 # ===========================================================================
 log_info ""
-log_info "--- Phase 2: Building firmware (30-60 min on first run) ---"
+log_info "--- Phase 2a: Preparing build environment and source ---"
 
-IMAGE_NAME="trezor-one-build-${build_type}-${version//./_}-${RUN_ID}"
-DOCKERFILE_PATH="${WORK_DIR}/Dockerfile.trezorOne"
-
-cat > "$DOCKERFILE_PATH" << DOCKERFILE_EOF
+ENV_DOCKERFILE="${WORK_DIR}/Dockerfile.env"
+emit > "$ENV_DOCKERFILE" << DOCKERFILE_EOF
 FROM ${ALPINE_IMAGE}
 
-# Install minimal host tools needed before Nix takes over.
-# gnupg is included for git tag -v signature attempt.
+# Minimal host tools needed before Nix takes over.
+# gnupg is included for the git tag -v signature attempt.
 RUN apk add --no-cache \\
-    bash curl xz git shadow sudo ca-certificates \\
+    bash curl xz git shadow ca-certificates \\
     coreutils findutils grep gzip tar util-linux gnupg
 
-# Create non-root build user. Nix installer requires a non-root user
-# with passwordless sudo to set up /nix.
+# Non-root build user. A single-user Nix install needs no privileges
+# when /nix already exists and belongs to that user, so /nix is created here.
 RUN adduser -D -s /bin/bash builder && \\
-    echo "builder ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+    mkdir -m 0755 /nix && chown builder /nix
 
 USER builder
 ENV HOME=/home/builder
@@ -587,10 +654,39 @@ RUN git -C /home/builder/trezor-firmware -c gpg.format=openpgp tag -v "\${GIT_TA
 
 WORKDIR /home/builder/trezor-firmware
 
+# Prefetch the nix-shell toolchain (shell.nix at the repo root), so the build
+# step below fails only on the source, not on a download.
+RUN . /home/builder/.nix-profile/etc/profile.d/nix.sh && nix-shell --run true
+DOCKERFILE_EOF
+
+if ! ${CONTAINER_CMD} build \
+  --build-arg "GIT_TAG=${GIT_TAG}" \
+  --no-cache \
+  --tag "${ENV_IMAGE_NAME}" \
+  --file "${ENV_DOCKERFILE}" \
+  "${WORK_DIR}"; then
+  no_verdict "Environment image failed (Nix install, nixpkgs, clone of ${GIT_TAG} or toolchain prefetch) — infrastructure, not the source"
+fi
+ENV_IMAGE="$ENV_IMAGE_NAME"
+log_success "Environment image created: ${ENV_IMAGE}"
+
+# ===========================================================================
+# PHASE 2b: BUILD IMAGE (the source build)
+# cibuild runs: libopencm3 -> libtrezor.a -> bootloader -> protob -> firmware -> sign.
+# A failure here is a source build failure: ftbfs.
+# ===========================================================================
+log_info ""
+log_info "--- Phase 2b: Building firmware (30-60 min on first run) ---"
+
+BUILD_DOCKERFILE="${WORK_DIR}/Dockerfile.build"
+emit > "$BUILD_DOCKERFILE" << DOCKERFILE_EOF
+FROM ${ENV_IMAGE}
+
+WORKDIR /home/builder/trezor-firmware
+
 # Build firmware and bootloader inside nix-shell.
 # nix-shell reads shell.nix at the repo root, which pulls in gcc-arm-embedded-13,
 # uv, gnumake, and the full deterministic toolchain from pinned nixpkgs.
-# cibuild runs: libopencm3 -> libtrezor.a -> bootloader -> protob -> firmware -> sign
 # BITCOIN_ONLY=0 = universal coins; BITCOIN_ONLY=1 = bitcoin-only build
 # PRODUCTION=1   = production memory protection and signature enforcement
 ARG BITCOIN_ONLY_VAL
@@ -612,29 +708,29 @@ CMD ["ls", "-la", "/home/builder/trezor-firmware/build/"]
 DOCKERFILE_EOF
 
 if ! ${CONTAINER_CMD} build \
-  --build-arg "GIT_TAG=${GIT_TAG}" \
   --build-arg "BITCOIN_ONLY_VAL=${BITCOIN_ONLY_VAL}" \
   --no-cache \
-  --tag "${IMAGE_NAME}" \
-  --file "${DOCKERFILE_PATH}" \
+  --tag "${BUILD_IMAGE_NAME}" \
+  --file "${BUILD_DOCKERFILE}" \
   "${WORK_DIR}"; then
-  log_error "Container build failed — firmware could not be built from source"
-  write_results_yaml "ftbfs" "Docker/Podman build failed for ${GIT_TAG}"
-  exit 2
+  log_error "Firmware build failed — the source at ${GIT_TAG} did not build"
+  write_results_yaml "ftbfs" "Trezor One ${version} (${build_type}): cibuild failed at ${GIT_TAG}; the environment and source download had succeeded"
+  exit "$EXIT_FAIL"
 fi
-log_success "Build image created: ${IMAGE_NAME}"
+BUILD_IMAGE="$BUILD_IMAGE_NAME"
+log_success "Build image created: ${BUILD_IMAGE}"
 
 # Extract build artifacts from image to host via a temporary container
-TEMP_CONTAINER="${IMAGE_NAME}-extract"
-${CONTAINER_CMD} create --name "$TEMP_CONTAINER" "$IMAGE_NAME" >/dev/null
+TEMP_CONTAINER="trezor-one-extract-${_tag_suffix}"
+if ! ${CONTAINER_CMD} create --name "$TEMP_CONTAINER" "$BUILD_IMAGE" >/dev/null; then
+  TEMP_CONTAINER=""
+  no_verdict "Could not create a container from the build image to extract artifacts"
+fi
 
 if ! ${CONTAINER_CMD} cp \
     "${TEMP_CONTAINER}:/home/builder/trezor-firmware/build/." \
     "${BUILD_OUTPUT_DIR}/"; then
-  log_error "Failed to extract build artifacts from container"
-  ${CONTAINER_CMD} rm -f "$TEMP_CONTAINER" >/dev/null 2>&1 || true; TEMP_CONTAINER=""
-  write_results_yaml "ftbfs" "Failed to copy build artifacts from container"
-  exit 2
+  no_verdict "Failed to copy build artifacts from the container"
 fi
 
 # Extract supporting files needed for bootloader verification and results summary
@@ -649,20 +745,21 @@ ${CONTAINER_CMD} cp "${TEMP_CONTAINER}:/home/builder/trezor-firmware/BUILD_TAG_T
 ${CONTAINER_CMD} cp "${TEMP_CONTAINER}:/home/builder/trezor-firmware/BUILD_TAG_VERIFY.txt" \
   "${WORK_DIR}/tag_verify.txt"      2>/dev/null || true
 
-# Clean up container and image — no longer needed
+# Clean up container and images — no longer needed
 ${CONTAINER_CMD} rm -f "$TEMP_CONTAINER" >/dev/null 2>&1 || true; TEMP_CONTAINER=""
-${CONTAINER_CMD} rmi -f "$IMAGE_NAME"    >/dev/null 2>&1 || true; IMAGE_NAME=""
+${CONTAINER_CMD} rmi -f "$BUILD_IMAGE"   >/dev/null 2>&1 || true; BUILD_IMAGE=""
+${CONTAINER_CMD} rmi -f "$ENV_IMAGE"     >/dev/null 2>&1 || true; ENV_IMAGE=""
 
-# Verify key artifacts were produced
+# Verify key artifacts were produced (cibuild succeeded but left no output)
 if [[ ! -f "${BUILD_OUTPUT_DIR}/firmware/firmware.bin" ]]; then
   log_error "firmware.bin not found in build output"
-  write_results_yaml "ftbfs" "cibuild did not produce firmware.bin"
-  exit 2
+  write_results_yaml "ftbfs" "Trezor One ${version} (${build_type}): cibuild did not produce firmware.bin"
+  exit "$EXIT_FAIL"
 fi
 if [[ ! -f "${BUILD_OUTPUT_DIR}/bootloader/bootloader.bin" ]]; then
   log_error "bootloader.bin not found in build output"
-  write_results_yaml "ftbfs" "cibuild did not produce bootloader.bin"
-  exit 2
+  write_results_yaml "ftbfs" "Trezor One ${version} (${build_type}): cibuild did not produce bootloader.bin"
+  exit "$EXIT_FAIL"
 fi
 log_success "Phase 2 complete — firmware.bin and bootloader.bin extracted"
 
@@ -701,8 +798,8 @@ echo "${BUILT_NOSIG_HASH}" > /work/built_nosig_sha256.txt
 
 echo ""
 echo "=== COMPARISON of firmware (sig region zeroed, bytes 544-738) ==="
-echo "  official (nosig): ${OFFICIAL_NOSIG_HASH}  path: /work/official_firmware_nosig.bin"
-echo "  built    (nosig): ${BUILT_NOSIG_HASH}  path: /work/built_firmware_nosig.bin"
+echo "  official (nosig): ${OFFICIAL_NOSIG_HASH}"
+echo "  built    (nosig): ${BUILT_NOSIG_HASH}"
 
 if cmp -s /work/official_firmware_nosig.bin /work/built_firmware_nosig.bin; then
   echo "  result: MATCH"
@@ -712,7 +809,7 @@ else
   echo "no" > /work/firmware_match.txt
   cmp -l /work/official_firmware_nosig.bin /work/built_firmware_nosig.bin \
     > /work/diff_firmware.txt 2>&1 || true
-  echo "  (full byte diff written to /work/diff_firmware.txt)"
+  wc -l < /work/diff_firmware.txt > /work/diff_firmware_lines.txt
 fi
 
 # ---------------------------------------------------------------------------
@@ -733,8 +830,6 @@ else
 fi
 echo "${BL_LABEL}" > /work/bootloader_source_label.txt
 echo "  bootloader source file: ${BL_FILE}"
-
-wc -c < "${BL_FILE}" > /work/bootloader_size.txt
 
 # SHA256d = sha256(sha256(bytes)) — this is what bl_check.txt records and
 # what Trezor's firmware runtime enforces during bootloader integrity check.
@@ -767,21 +862,23 @@ echo ""
 echo "[Phase3] Done"
 COMPARE_SCRIPT
 then
-  log_error "Phase 3 (comparison) container failed"
-  write_results_yaml "ftbfs" "Phase 3 container failed for version ${version}"
-  exit 2
+  no_verdict "Phase 3 (comparison) container failed"
 fi
 
 # Read Phase 3 outputs using shell builtins
 BUILT_NOSIG_SHA256=""; FIRMWARE_MATCH=""; BUILT_BL_SHA256D=""; EXPECTED_BL_HASH=""; BL_HASH_IN_C=""
-BL_SOURCE_LABEL="bootloader.bin"
+DIFF_LINES="0"; BL_SOURCE_LABEL="bootloader.bin"
 [[ -f "${WORK_DIR}/built_nosig_sha256.txt" ]]     && read -r BUILT_NOSIG_SHA256  < "${WORK_DIR}/built_nosig_sha256.txt"
 [[ -f "${WORK_DIR}/firmware_match.txt" ]]          && read -r FIRMWARE_MATCH      < "${WORK_DIR}/firmware_match.txt"
 [[ -f "${WORK_DIR}/built_bl_sha256d.txt" ]]        && read -r BUILT_BL_SHA256D    < "${WORK_DIR}/built_bl_sha256d.txt"
 [[ -f "${WORK_DIR}/expected_bl_hash.txt" ]]        && read -r EXPECTED_BL_HASH    < "${WORK_DIR}/expected_bl_hash.txt"
 [[ -f "${WORK_DIR}/bl_hash_in_c.txt" ]]            && read -r BL_HASH_IN_C        < "${WORK_DIR}/bl_hash_in_c.txt"
 [[ -f "${WORK_DIR}/bootloader_source_label.txt" ]] && read -r BL_SOURCE_LABEL     < "${WORK_DIR}/bootloader_source_label.txt"
+[[ -f "${WORK_DIR}/diff_firmware_lines.txt" ]]     && read -r DIFF_LINES          < "${WORK_DIR}/diff_firmware_lines.txt"
 
+if [[ -z "$FIRMWARE_MATCH" ]]; then
+  no_verdict "Phase 3 did not record a firmware comparison result"
+fi
 log_success "Phase 3 complete"
 
 # ===========================================================================
@@ -841,23 +938,38 @@ case "${BUILD_TAG_TYPE}" in
   commit) TAG_TYPE_LABEL="lightweight"; TAG_SIG_LINE="[INFO] Lightweight tag (cannot contain a GPG signature)" ;;
 esac
 
-TAG_VERIFY_OUTPUT=""
+# Tag verification output without git's SSH-signer config noise (bash loop; no host grep)
+TAG_VERIFY_LINES=()
 if [[ -f "${WORK_DIR}/tag_verify.txt" ]]; then
-  TAG_VERIFY_OUTPUT=$(grep -v "gpg.ssh.allowedSignersFile" "${WORK_DIR}/tag_verify.txt" || true)
+  while IFS= read -r _line || [[ -n "$_line" ]]; do
+    [[ "$_line" == *gpg.ssh.allowedSignersFile* ]] && continue
+    TAG_VERIFY_LINES+=("$_line")
+  done < "${WORK_DIR}/tag_verify.txt"
 fi
 
-# Verdict string — format doc uses "reproducible" or "differences found"
-VERDICT_STR="$( [[ "$OVERALL_VERDICT" == "reproducible" ]] && echo "reproducible" || echo "differences found" )"
+# First 5 differing bytes for the terminal (bash mapfile; no host head)
+DIFF_PREVIEW=()
+if [[ "$FIRMWARE_MATCH" != "yes" && -f "${WORK_DIR}/diff_firmware.txt" ]]; then
+  mapfile -t -n 5 DIFF_PREVIEW < "${WORK_DIR}/diff_firmware.txt"
+fi
 
 echo ""
+echo "Hash legend:"
+echo "  appHash = SHA-256 of the official firmware file exactly as downloaded. Publish this one."
+echo "  officialNosigHash / builtNosigHash (after End) = SHA-256 of the images with the"
+echo "  signature region (bytes 544-738) zeroed. Comparison only; never publish."
+echo "  builtBootloaderSha256d = double SHA-256 of the bootloader, as bl_check.txt records it."
+echo ""
 echo "===== Begin Results ====="
-echo "appId:          trezorOne"
+echo "appId:          ${APP_ID}"
 echo "signer:         N/A"
-echo "firmwareVersion: ${version}"
-echo "firmwareBuild:   N/A"
-echo "verdict:        ${VERDICT_STR}"
+echo "apkVersionName: ${version}"
+echo "apkVersionCode: N/A"
+echo "verdict:        ${OVERALL_VERDICT}"
 echo "appHash:        ${OFFICIAL_RAW_SHA256}"
 echo "commit:         ${BUILD_COMMIT}"
+echo "scriptVersion:  ${SCRIPT_VERSION}"
+echo "scriptHash:     ${SCRIPT_SHA256}"
 echo ""
 echo "Diff:"
 echo "BUILDS MATCH BINARIES"
@@ -868,33 +980,34 @@ echo "SUMMARY"
 echo "total: ${TOTAL_ARTIFACTS}"
 echo "matches: ${MATCH_COUNT}"
 echo "mismatches: ${MISMATCH_COUNT}"
-
-if [[ "$FIRMWARE_MATCH" != "yes" && -f "${WORK_DIR}/diff_firmware.txt" ]]; then
+if (( ${#DIFF_PREVIEW[@]} > 0 )); then
   echo ""
-  echo "First 5 differing bytes (full diff: ${WORK_DIR}/diff_firmware.txt):"
-  head -5 "${WORK_DIR}/diff_firmware.txt" 2>/dev/null || true
+  echo "First differing bytes (offset official built), ${DIFF_LINES} lines in total:"
+  printf '%s\n' "${DIFF_PREVIEW[@]}"
+  echo "Full diff: ${WORK_DIR}/diff_firmware.txt"
 fi
-
 echo ""
 echo "Revision, tag (and its signature):"
-echo "${TAG_VERIFY_OUTPUT}"
+if (( ${#TAG_VERIFY_LINES[@]} > 0 )); then printf '%s\n' "${TAG_VERIFY_LINES[@]}"; fi
 echo ""
 echo "Signature Summary:"
 echo "Tag type: ${TAG_TYPE_LABEL}"
 echo "${TAG_SIG_LINE}"
-echo ""
-echo "Keys used:"
-echo "Firmware signed by Trezor (SatoshiLabs s.r.o.)"
-echo "See: https://github.com/trezor/trezor-firmware/blob/legacy/v${version}/legacy/firmware/firmware_sign.py"
-echo ""
-if [[ -n "$BL_NOTES" ]]; then
-  echo "===== Also ===="
-  echo "Bootloader check: ${BL_NOTES}"
-  echo "Bootloader comparison: SHA256d (double-SHA256) vs bl_check.txt entry for v${BOOTLOADER_VERSION:-N/A}"
-  [[ "${BL_HASH_IN_C}" == "yes" ]] && echo "Bootloader hash cross-verified against bl_check.c (compiled into firmware)"
-  echo ""
-fi
 echo "===== End Results ====="
+echo ""
+echo "type:                   ${build_type}"
+echo "tag:                    ${GIT_TAG}"
+echo "officialFile:           ${RELEASE_FILENAME}"
+echo "officialNosigHash:      ${OFFICIAL_NOSIG_SHA256}"
+echo "builtNosigHash:         ${BUILT_NOSIG_SHA256}"
+echo "builtBootloaderSha256d: ${BUILT_BL_SHA256D:-N/A}"
+echo "firmwareVerdict:        ${FIRMWARE_VERDICT}"
+echo "bootloaderVerdict:      ${BOOTLOADER_VERDICT}"
+echo "bootloaderCheck:        ${BL_NOTES}"
+echo "                        SHA256d (double-SHA256) vs bl_check.txt entry for v${BOOTLOADER_VERSION:-N/A}"
+[[ "${BL_HASH_IN_C}" == "yes" ]] && echo "                        cross-verified against bl_check.c (compiled into firmware)"
+echo "signerNote:             firmware signed by Trezor (SatoshiLabs s.r.o.); see"
+echo "                        https://github.com/trezor/trezor-firmware/blob/legacy/v${version}/legacy/firmware/firmware_sign.py"
 echo ""
 echo "Run a full"
 echo "diffoscope \"${WORK_DIR}/official_firmware_nosig.bin\" \"${WORK_DIR}/built_firmware_nosig.bin\""
@@ -915,8 +1028,9 @@ log_info "Results   : ${CANONICAL_RESULTS}"
 log_info "Work dir  : ${WORK_DIR}"
 log_info "=============================================="
 
-case "$OVERALL_VERDICT" in
-  reproducible)     log_success "REPRODUCIBLE"; exit 0 ;;
-  not_reproducible) log_warn    "NOT REPRODUCIBLE"; exit 1 ;;
-  *)                log_error   "FTBFS"; exit 2 ;;
-esac
+if [[ "$OVERALL_VERDICT" == "reproducible" ]]; then
+  log_success "REPRODUCIBLE"
+  exit "$EXIT_OK"
+fi
+log_warn "NOT REPRODUCIBLE"
+exit "$EXIT_FAIL"
