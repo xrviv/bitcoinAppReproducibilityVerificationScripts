@@ -2,10 +2,10 @@
 # ==============================================================================
 # trezorsafe3_build.sh - Trezor Safe 3 (T2B1 rev.A / T3B1 rev.B) Firmware Reproducible Build Verification
 # ==============================================================================
-# Version:           v0.1.0
+# Version:           v0.1.1
 # Organization:      WalletScrutiny.com
-# Last modified by:  dannybuntu
-# Last modified on:  2026-09-21
+# Last modified by:  Claude Code for Danny
+# Last modified on:  2026-10-22
 # Project:           https://github.com/trezor/trezor-firmware
 # Usage:             trezorsafe3_build.sh --version VERSION [--type TYPE] [--binary PATH]
 #                    [--revision a|b] [--arch ARCH]
@@ -33,26 +33,39 @@
 # publishes separate firmware for each: T2B1 (rev.A, STM32F427) and T3B1 (rev.B, STM32U58x).
 # - Selects the revision(s): from the official file's own firmware header (hw_model) when
 #   --binary is given; otherwise both revisions, or the one named by --revision
+# - Creates a per-run workspace in the caller's directory (never reused or deleted)
 # - Clones trezor-firmware and checks out tag core/vVERSION
 # - Downloads the official signed firmware for each selected revision from data.trezor.io
 #   (or uses --binary)
-# - Builds with Trezor's own build-docker.sh (--targets firmware, one edition, selected models)
+# - Prepares Trezor's build environment with build-docker.sh --init-only (downloads only; a
+#   failure here writes no verdict), then builds with build-docker.sh --no-init
+#   (--targets firmware, one edition, selected models; a failure here is ftbfs)
 # - Zeroes each official file's 65-byte firmware-header signature at offset 512 + 959 = 1471
 #   (Safe 3 vendor header is 512 bytes; docs/common/reproducible-build.md), refusing to guess
 #   if the TRZV / 512-byte / TRZF / hw_model header shape does not match
 # - Compares SHA-256 of each zeroed official file with the unsigned local build of the same
 #   revision; the verdict is reproducible only if every compared revision matches
-# - Prints labelled hashes per revision (appHash = official as downloaded) and writes
-#   COMPARISON_RESULTS.yaml
+# - Prints one results block per revision (appHash = that revision's official file as
+#   downloaded) and writes COMPARISON_RESULTS.yaml next to this script
+# - Exit codes: 0 reproducible; 1 not reproducible, ftbfs or a failure with no verdict;
+#   2 invalid parameters; 130 stopped. A YAML is written only for a real verdict.
 # ==============================================================================
 
 set -eE
 
-# ---- Globals (RESULTS_FILE captured before any cd) --------------------------
-SCRIPT_VERSION="v0.1.0"
+# ---- Globals (paths captured before any cd) ---------------------------------
+SCRIPT_VERSION="v0.1.1"
 SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 SCRIPT_SHA256=""
-RESULTS_FILE="$(pwd)/COMPARISON_RESULTS.yaml"
+RESULTS_FILE="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
+CALLER_DIR="$(pwd -P)"
+RUN_ID="$(date +%s)-$$"
+RESULTS_WRITTEN=0
+workDir=""
+CONTAINER_CMD=""
+CONTAINER_NAME=""
+SNAPSHOT_NAME=""
 repo="https://github.com/trezor/trezor-firmware.git"
 firmwareType="standard"
 version=""
@@ -102,38 +115,57 @@ script_version: ${SCRIPT_VERSION}
 verdict: ${verdict}
 notes: "${notes}"
 EOF
+  RESULTS_WRITTEN=1
   echo -e "${GREEN}Results written to: $RESULTS_FILE${NC}"
 }
 
-# Catch any unguarded command failure (cp/dd/sha256sum/mkdir/...) and still emit a YAML.
+# no_verdict: a failure that says nothing about the source (runtime, host tools, network,
+# a missing tag, an official file of the wrong shape). Writes no YAML, so ABS publishes nothing.
+no_verdict() {
+  echo -e "${RED}Error: $1${NC}"
+  echo -e "${RED}No verdict written (this is not a build failure of the source).${NC}"
+  exit "$EXIT_FAIL"
+}
+
+# Any unguarded command failure is a script/infrastructure problem, never a verdict.
 handle_err() {
   local rc=$?
-  echo -e "${RED}Unexpected error (exit ${rc}).${NC}"
-  write_results "ftbfs" "${PRODUCT} v${version:-?} (${firmwareType}): unexpected error (exit ${rc}) during verification."
-  exit "$EXIT_FAIL"
+  trap - ERR
+  no_verdict "unexpected error (exit ${rc}) during verification"
 }
 trap handle_err ERR
 
-# ---- Ownership normalization (WS non-root-ownership rule) --------------------
-# build-docker.sh runs its build as root inside the container and only chowns /build back
-# at the very end of a successful build. If the build fails part-way, root-owned files can
-# be left under the bind-mounted build/ directory, which the (non-root) caller could never
-# delete. On exit, if anything under the work dir is not owned by the caller, chown it back
-# from inside the already-present build image. Best effort: never changes the exit code.
-normalize_ownership() {
-  [[ -n "${workDir:-}" && -d "$workDir" ]] || return 0
-  [[ -n "$(find "$workDir" ! -uid "$(id -u)" -print -quit 2>/dev/null)" ]] || return 0
-  if [[ "${CONTAINER_CMD:-}" == "docker" && -n "${CONTAINER_NAME:-}" ]] \
-     && docker image inspect "$CONTAINER_NAME" &>/dev/null; then
-    echo "Restoring ownership of files left by the build container..."
-    docker run --rm -v "$workDir:/w" --entrypoint chown "$CONTAINER_NAME" \
-      -R "$(id -u):$(id -g)" /w &>/dev/null || true
+# ---- Exit cleanup: ownership hand-back, then this run's images --------------
+# build-docker.sh runs its build as root inside the container and chowns /build back to the
+# directory owner at the end. Under docker a part-way failure can leave root-owned files; under
+# rootless podman that chown maps to a subuid. Either way the (non-root) caller could not
+# delete them. Hand everything under the workspace back to the caller, then remove the
+# per-run environment image and snapshot. Best effort: never changes the exit code.
+cleanup() {
+  local rc=$?
+  if [[ -n "$workDir" && -d "$workDir" ]]; then
+    if [[ "$CONTAINER_CMD" == "podman" ]]; then
+      podman unshare chown -R 0:0 "$workDir" &>/dev/null || true
+    elif [[ "$CONTAINER_CMD" == "docker" && -n "$CONTAINER_NAME" ]] \
+         && [[ -n "$(find "$workDir" ! -uid "$(id -u)" -print -quit 2>/dev/null)" ]] \
+         && docker image inspect "$CONTAINER_NAME" &>/dev/null; then
+      echo "Restoring ownership of files left by the build container..."
+      docker run --rm -v "$workDir:/w" --entrypoint chown "$CONTAINER_NAME" \
+        -R "$(id -u):$(id -g)" /w &>/dev/null || true
+    fi
+    if [[ -n "$(find "$workDir" ! -uid "$(id -u)" -print -quit 2>/dev/null)" ]]; then
+      echo -e "${YELLOW}[WARN] Some files under $workDir are not owned by $(id -un).${NC}"
+    fi
   fi
-  if [[ -n "$(find "$workDir" ! -uid "$(id -u)" -print -quit 2>/dev/null)" ]]; then
-    echo -e "${YELLOW}[WARN] Some files under $workDir are not owned by $(id -un).${NC}"
+  if [[ -n "$CONTAINER_CMD" && -n "$CONTAINER_NAME" ]]; then
+    "$CONTAINER_CMD" rm -f "$SNAPSHOT_NAME" &>/dev/null || true
+    "$CONTAINER_CMD" rmi -f "$SNAPSHOT_NAME" "$CONTAINER_NAME" &>/dev/null || true
   fi
+  [[ "$RESULTS_WRITTEN" == "1" ]] || echo -e "${YELLOW}[WARN] No COMPARISON_RESULTS.yaml written for this run.${NC}"
+  echo "Exit code: ${rc}"
 }
-trap normalize_ownership EXIT
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 
 # Refuse to run as root (WS rule: runs as a normal user, never with elevated privileges).
 # Never write the privilege-escalation command's name as a word anywhere in this file: the
@@ -141,7 +173,7 @@ trap normalize_ownership EXIT
 # external/build_server/utils.mjs).
 if [[ "$(id -u)" -eq 0 ]]; then
   echo -e "${RED}Error: do not run this script as root.${NC}"
-  exit "$EXIT_FAIL"
+  exit "$EXIT_INVALID"
 fi
 
 usage() {
@@ -195,6 +227,10 @@ echo "Script:  $(basename "$SCRIPT_PATH") ${SCRIPT_VERSION}"
 echo "         sha256: ${SCRIPT_SHA256}"
 echo
 
+# Remove a previous verdict before this invocation can fail, so ABS can never pick up a
+# stale COMPARISON_RESULTS.yaml from an earlier run.
+rm -f -- "$RESULTS_FILE"
+
 # ---- Container runtime detection (actually wired into build-docker.sh) ------
 # build-docker.sh reads $DOCKER (default "docker"); export the detected runtime
 # so a podman-only host genuinely uses podman instead of silently failing.
@@ -203,13 +239,9 @@ if command -v docker &>/dev/null && docker info &>/dev/null; then
 elif command -v podman &>/dev/null; then
   CONTAINER_CMD="podman"
 elif command -v docker &>/dev/null; then
-  echo -e "${RED}Error: docker is installed but its daemon is not responding, and podman is unavailable.${NC}"
-  write_results "ftbfs" "${PRODUCT}: docker daemon not responding and podman unavailable."
-  exit "$EXIT_FAIL"
+  no_verdict "docker is installed but its daemon is not responding, and podman is unavailable"
 else
-  echo -e "${RED}Error: neither docker nor podman found. Install one of them.${NC}"
-  write_results "ftbfs" "${PRODUCT}: no container runtime (docker/podman) available on host."
-  exit "$EXIT_FAIL"
+  no_verdict "neither docker nor podman found; install one of them"
 fi
 export DOCKER="$CONTAINER_CMD"
 echo "Container runtime: $CONTAINER_CMD"
@@ -342,38 +374,38 @@ for tool in git wget sha256sum od dd awk; do
   command -v "$tool" &>/dev/null || missingTools+=("$tool")
 done
 if [[ ${#missingTools[@]} -gt 0 ]]; then
-  echo -e "${RED}Error: missing host tools: ${missingTools[*]}${NC}"
-  write_results "ftbfs" "${PRODUCT} v${version} (${firmwareType}): missing host tools: ${missingTools[*]}."
-  exit "$EXIT_FAIL"
+  no_verdict "missing host tools: ${missingTools[*]}"
 fi
 
-# Work dir: version + type + revision(s) + PID so parallel/repeat runs never share a directory.
-workDir="$(pwd)/trezor-safe3-work_${version}_${firmwareType}_${revTag}_$$"
+# Per-run workspace in the caller's directory: version + type + revision(s) + epoch-PID, created
+# with an exclusive mkdir. Never reused, renamed or deleted, so concurrent runs (same or other
+# users, e.g. ABS) cannot touch each other's files.
+wd="${CALLER_DIR}/trezorSafe3_verification_${version}_${firmwareType}_${revTag}_${RUN_ID}"
+if ! mkdir -- "$wd"; then
+  echo -e "${RED}Error: work directory already exists or cannot be created: $wd${NC}"
+  exit "$EXIT_INVALID"
+fi
+workDir="$wd"
 
 echo
 echo "Verifying ${PRODUCT} firmware v$version ($firmwareType)"
 for m in "${MODELS[@]}"; do echo "  revision: ${m} ($(rev_label "$m"))"; done
+echo "Work dir: $workDir"
 echo
 
 prepare() {
-  echo "Setting up workspace..."
-  rm -rf "$workDir" || true
-  mkdir -p "$workDir"
   cd "$workDir"
 
   echo "Cloning Trezor firmware repository..."
   if ! git clone "$repo" trezor-firmware; then
-    echo -e "${RED}Failed to clone repository${NC}"
-    write_results "ftbfs" "${PRODUCT} v${version}: failed to clone ${repo}."
-    exit "$EXIT_FAIL"
+    no_verdict "failed to clone ${repo}"
   fi
 
   cd trezor-firmware
   echo "Checking out core/v${normalizedVersion}..."
   if ! git checkout "core/v${normalizedVersion}"; then
-    echo -e "${RED}Failed to checkout core/v${normalizedVersion}${NC}"
-    write_results "ftbfs" "${PRODUCT} v${version}: git tag core/v${normalizedVersion} not found."
-    exit "$EXIT_FAIL"
+    echo -e "${RED}Error: git tag core/v${normalizedVersion} not found (not a released version).${NC}"
+    exit "$EXIT_INVALID"
   fi
   commit=$(git rev-parse "HEAD")
   tagType=$(git cat-file -t "core/v${normalizedVersion}" 2>/dev/null || echo "unknown")
@@ -397,9 +429,7 @@ download_official() {
       url="https://data.trezor.io/firmware/${m,,}/trezor-${m,,}-${normalizedVersion}${editionSuffix}.bin"
       echo "Downloading official ${m} firmware..."
       if ! wget -q -O "official_${m}.bin" "$url"; then
-        echo -e "${RED}Failed to download official firmware: $url${NC}"
-        write_results "ftbfs" "${PRODUCT} v${version} (${firmwareType}, ${m}): failed to download official firmware from ${url}."
-        exit "$EXIT_FAIL"
+        no_verdict "failed to download official firmware: $url"
       fi
     fi
     OFFICIAL_HASH[$m]=$(sha256sum "official_${m}.bin" | awk '{print $1}')
@@ -414,28 +444,37 @@ build_firmware() {
   # (T2B1 rev10, T3B1 revB as of core/v2.12.5); no HW_REVISION override is passed, matching
   # upstream's own default production build.
 
-  # Revision-, edition- and version-scoped image/container name. build-docker.sh derives its
-  # snapshot container name from CONTAINER_NAME + tag, so a name without the model would
-  # collide with another Trezor model's run of the same version and edition.
-  local modelsCsv m
-  if [[ "$firmwareType" == "bitcoin-only" ]]; then
-    export CONTAINER_NAME="trezor-firmware-env-${revTag}-bitcoinonly-${normalizedVersion}.nix"
-    skipFlag="--skip-normal"
-  else
-    export CONTAINER_NAME="trezor-firmware-env-${revTag}-standard-${normalizedVersion}.nix"
-    skipFlag="--skip-bitcoinonly"
-  fi
+  # Per-run image/container name (revision, edition, version, run id). build-docker.sh names
+  # its snapshot image and container CONTAINER_NAME__<tag>, so the run id keeps parallel runs
+  # apart and lets cleanup remove exactly this run's images.
+  local modelsCsv m buildArgs
+  local edition="standard"
+  skipFlag="--skip-bitcoinonly"
+  if [[ "$firmwareType" == "bitcoin-only" ]]; then edition="bitcoinonly"; skipFlag="--skip-normal"; fi
+  export CONTAINER_NAME="trezor-firmware-env-${revTag}-${edition}-${normalizedVersion}-${RUN_ID}.nix"
+  local tagRef="core/v${normalizedVersion}"
+  SNAPSHOT_NAME="${CONTAINER_NAME}__${tagRef//[^a-zA-Z0-9]/_}"   # same rule as build-docker.sh
   modelsCsv=$(IFS=,; echo "${MODELS[*]}")
-  echo "Building ${firmwareType} firmware for ${modelsCsv}..."
 
   # Only the firmware target, as upstream CI does (.github/workflows/common.yml:
   # --targets 'firmware'). Neither Safe 3 revision has a secmon (no `secmon` key in model.toml).
   # build-docker.sh bind-mounts build/core-<MODEL>{,-bitcoinonly} without creating them;
   # Docker creates bind sources implicitly, rootless podman refuses, so create them first.
   for m in "${MODELS[@]}"; do mkdir -p "build/core-${m}" "build/core-${m}-bitcoinonly"; done
-  if ! ./build-docker.sh --models "$modelsCsv" --targets firmware "$skipFlag" "core/v${normalizedVersion}"; then
+  buildArgs=(--models "$modelsCsv" --targets firmware "$skipFlag")
+
+  # Step 1, environment only (upstream --init-only): Alpine tarball, Nix image, source clone,
+  # submodules, uv and cargo dependencies. Downloads only, so a failure is not a verdict.
+  echo "Preparing the build environment (downloads only)..."
+  if ! ./build-docker.sh "${buildArgs[@]}" --init-only "$tagRef"; then
+    no_verdict "build-docker.sh --init-only failed (environment or dependency download)"
+  fi
+
+  # Step 2, the build itself (upstream --no-init) in the snapshot from step 1.
+  echo "Building ${firmwareType} firmware for ${modelsCsv}..."
+  if ! ./build-docker.sh "${buildArgs[@]}" --no-init "$tagRef"; then
     echo -e "${RED}Build failed!${NC}"
-    write_results "ftbfs" "${PRODUCT} v${version} (${firmwareType}, ${modelsCsv}): build-docker.sh build failed."
+    write_results "ftbfs" "${PRODUCT} v${version} (${firmwareType}, ${modelsCsv}): build-docker.sh build failed after the environment and sources were prepared."
     exit "$EXIT_FAIL"
   fi
 
@@ -477,9 +516,7 @@ compare_firmware() {
     # bytes into the firmware header -> offset 512 + 959 = 1471.
     read -r magicHex vhLen fwMagicHex hwModel <<< "$(read_header "official_${m}.bin")"
     if [[ "$magicHex" != "54525a56" || "$vhLen" != "$EXPECTED_VH_LEN" || "$fwMagicHex" != "54525a46" || "$hwModel" != "$m" ]]; then
-      echo -e "${RED}Unexpected ${m} firmware header (magic=0x${magicHex}, vendor header=${vhLen}B, firmware magic=0x${fwMagicHex}, hw_model=${hwModel}).${NC}"
-      write_results "ftbfs" "${PRODUCT} v${version} (${firmwareType}, ${m}): unexpected firmware header (magic=0x${magicHex}, vendor header=${vhLen}B, firmware magic=0x${fwMagicHex}, hw_model=${hwModel}); expected TRZV / ${EXPECTED_VH_LEN}B / TRZF / ${m} - refusing to guess signature offset."
-      exit "$EXIT_FAIL"
+      no_verdict "unexpected official ${m} firmware header (magic=0x${magicHex}, vendor header=${vhLen}B, firmware magic=0x${fwMagicHex}, hw_model=${hwModel}); expected TRZV / ${EXPECTED_VH_LEN}B / TRZF / ${m} - refusing to guess the signature offset"
     fi
     seekSize=$(( vhLen + SIG_INNER ))   # 512 + 959 = 1471
     SEEK[$m]="$seekSize"
@@ -503,6 +540,9 @@ compare_firmware() {
       echo -e "${RED}NOT REPRODUCIBLE: ${m} firmware differs${NC}"
       MATCH[$m]=0
       verdict="not_reproducible"
+      # Full byte diff in the workspace; the results block shows at most 5 lines of it.
+      cmp -l "official_${m}.zeroed" "trezor-firmware/build/core-${m}${editionSuffix}/firmware/firmware.bin" \
+        > "diff_${m}.txt" 2>&1 || true
     fi
   done
 }
@@ -520,62 +560,65 @@ compare_firmware
 print_hash_legend() {
   echo
   echo "----- What these hashes mean -----"
-  echo "Each revision has its own firmware file and its own set of hashes:"
+  echo "Each revision has its own firmware file and its own results block:"
   echo "T2B1 = Safe 3 rev.A (STM32F427), T3B1 = Safe 3 rev.B (STM32U58x)."
   echo "appHash       SHA-256 of that revision's official firmware exactly as downloaded"
   echo "              from data.trezor.io (signed). THIS is the official hash to publish"
   echo "              for that file."
-  echo "zeroedHash    The official firmware with its 65-byte firmware-header signature"
-  echo "              (offset 1471) set to zero. Published nowhere, shown by no device;"
-  echo "              it exists only to be compared with the unsigned local build."
-  echo "builtHash     SHA-256 of the firmware this script built from the tagged repository"
-  echo "              (core/v${normalizedVersion}) for that revision."
-  echo "fingerprint   Trezor's firmware fingerprint of the build (header with signatures"
-  echo "              cleared). This is the value a Trezor shows on screen during a"
-  echo "              firmware update, and should equal the fingerprint Trezor lists for"
-  echo "              this version in data.trezor.io/firmware/<t2b1|t3b1>/releases.json."
+  echo "zeroedHash    (after End) The official firmware with its 65-byte firmware-header"
+  echo "              signature (offset 1471) set to zero. Comparison only; never publish."
+  echo "builtHash     (in Diff) SHA-256 of the firmware built from core/v${normalizedVersion}."
+  echo "fingerprint   (after End) Trezor's firmware fingerprint of the build (header with"
+  echo "              signatures cleared), the value a Trezor shows during a firmware update."
   echo
   echo "MATCH means builtHash == zeroedHash. It does NOT verify Trezor's signature."
-  echo "Do not publish zeroedHash or builtHash as the official hash."
   echo "----------------------------------"
 }
 
-print_hash_legend
-echo
-echo "===== Begin Results ====="
-echo "appId:          ${APP_ID}"
-echo "firmware:       ${PRODUCT}"
-echo "version:        $version"
-echo "type:           $firmwareType"
-echo "revisions:      ${MODELS[*]}"
-echo "verdict:        $verdict"
-for m in "${MODELS[@]}"; do
-  echo "--- ${m} ($(rev_label "$m")) ---"
-  echo "appHash_${m}:   ${OFFICIAL_HASH[$m]}"
-  echo "                  official ${m} firmware as downloaded (signed) - publish this"
-  echo "zeroedHash_${m}: ${ZEROED_HASH[$m]}"
-  echo "                  official ${m} firmware with signature zeroed at offset ${SEEK[$m]}"
-  echo "builtHash_${m}: ${BUILT_HASH[$m]}"
-  echo "                  built from the tagged repository - must equal zeroedHash_${m}"
-  echo "fingerprint_${m}: ${FINGERPRINT[$m]}"
-  echo "                  Trezor firmware fingerprint of the build (shown on device)"
-done
-echo "commit:         $commit"
-echo "scriptVersion:  $SCRIPT_VERSION"
-echo "scriptHash:     $SCRIPT_SHA256"
-echo
-echo "Diff:"
-echo "BUILDS MATCH BINARIES"
-for m in "${MODELS[@]}"; do
+# One standard 9-field results block per revision: each revision is a separate official file.
+print_results_block() {
+  local m="$1" flag n lines=()
   if [[ "${MATCH[$m]}" == "1" ]]; then flag="1 (MATCHES)"; else flag="0 (DOESN'T MATCH)"; fi
+  echo "===== Begin Results ====="
+  echo "appId:          ${APP_ID}"
+  echo "signer:         N/A"
+  echo "apkVersionName: ${normalizedVersion}"
+  echo "apkVersionCode: N/A"
+  if [[ "${MATCH[$m]}" == "1" ]]; then echo "verdict:        reproducible"; else echo "verdict:        not_reproducible"; fi
+  echo "appHash:        ${OFFICIAL_HASH[$m]}"
+  echo "commit:         ${commit}"
+  echo "scriptVersion:  ${SCRIPT_VERSION}"
+  echo "scriptHash:     ${SCRIPT_SHA256}"
+  echo
+  echo "Diff:"
+  echo "BUILDS MATCH BINARIES"
   echo "trezor-${m,,}-${normalizedVersion}${editionSuffix}.bin - ${m}-${firmwareType} - ${BUILT_HASH[$m]} - ${flag}"
+  if [[ -s "$workDir/diff_${m}.txt" ]]; then
+    n=$(wc -l < "$workDir/diff_${m}.txt")
+    mapfile -t -n 5 lines < "$workDir/diff_${m}.txt"
+    echo "First differing bytes (offset zeroed-official built), ${n} lines in total:"
+    printf '%s\n' "${lines[@]}"
+    echo "Full diff: $workDir/diff_${m}.txt"
+  fi
+  echo
+  echo "Revision, tag (and its signature):"
+  echo "Tag type: ${tagType} (core/v${normalizedVersion} -> ${commit})"
+  echo "[INFO] Tag signature not verified by this script."
+  echo "===== End Results ====="
+}
+
+print_hash_legend
+for m in "${MODELS[@]}"; do
+  echo
+  echo "### ${m} ($(rev_label "$m"))"
+  print_results_block "$m"
+  echo "type:           ${firmwareType}"
+  echo "revision:       ${m} ($(rev_label "$m"))"
+  echo "zeroedHash:     ${ZEROED_HASH[$m]}  (signature zeroed at offset ${SEEK[$m]}; never publish)"
+  echo "fingerprint:    ${FINGERPRINT[$m]}  (Trezor firmware fingerprint of the build)"
 done
-echo "(each compared after zeroing its 65-byte signature at offset 1471; no other bytes excluded)"
 echo
-echo "Revision, tag (and its signature):"
-echo "Tag type: ${tagType} (core/v${normalizedVersion} -> ${commit})"
-echo "[INFO] Tag signature not verified by this script."
-echo "===== End Results ====="
+echo "Overall verdict (all revisions): ${verdict}"
 echo
 
 summary=""
