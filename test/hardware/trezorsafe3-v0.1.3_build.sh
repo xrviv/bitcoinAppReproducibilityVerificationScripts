@@ -1,18 +1,18 @@
 #!/bin/bash
 # ==============================================================================
-# trezorsafe5_build.sh - Trezor Safe 5 (T3T1) Firmware Reproducible Build Verification
+# trezorsafe3_build.sh - Trezor Safe 3 (T2B1 rev.A / T3B1 rev.B) Firmware Reproducible Build Verification
 # ==============================================================================
-# Version:           v0.1.2
+# Version:           v0.1.3
 # Organization:      WalletScrutiny.com
 # Last modified by:  Claude Code for Danny
 # Last modified on:  2026-10-22
 # Project:           https://github.com/trezor/trezor-firmware
-# Usage:             trezorsafe5_build.sh --version VERSION [--type TYPE] [--binary PATH]
-#                    [--arch ARCH]
+# Usage:             trezorsafe3_build.sh --version VERSION [--type TYPE] [--binary PATH]
+#                    [--revision a|b] [--arch ARCH]
 # ==============================================================================
 # LICENSE: MIT License
 #
-# Changelog is kept outside this file (WalletScrutiny script notes, hardware/trezorSafe5).
+# Changelog is kept outside this file (WalletScrutiny script notes, hardware/trezorSafe3).
 # ==============================================================================
 #
 # TECHNICAL DISCLAIMER:
@@ -29,18 +29,20 @@
 # By using this script, you acknowledge these disclaimers and accept full responsibility.
 #
 # SCRIPT SUMMARY:
-# The Trezor Safe 5 is model T3T1 (one hardware revision, one firmware file per edition).
-# - Checks the official file's own firmware header (hw_model must be T3T1) when --binary is given
+# The Trezor Safe 3 ships as two hardware revisions with different main processors, and Trezor
+# publishes separate firmware for each: T2B1 (rev.A, STM32F427) and T3B1 (rev.B, STM32U58x).
+# - Selects the revision(s): from the official file's own firmware header (hw_model) when
+#   --binary is given; otherwise both revisions, or the one named by --revision
 # - Creates a per-run workspace in the caller's directory (never reused or deleted)
 # - Clones trezor-firmware and checks out tag core/vVERSION
-# - Downloads the official signed firmware from data.trezor.io
+# - Downloads the official signed firmware for each selected revision from data.trezor.io
 #   (or uses --binary)
 # - Prepares Trezor's build environment with build-docker.sh --init-only (downloads only; a
 #   failure here writes no verdict), then builds with build-docker.sh --no-init
 #   (--targets firmware, one edition, selected models; a failure here is ftbfs)
-# - Zeroes the official file's 65-byte firmware-header signature at offset 1024 + 959 = 1983
-#   (Safe 5 vendor header is 1024 bytes; python/src/trezorlib/firmware/core.py), refusing to
-#   guess if the TRZV / 1024-byte / TRZF / hw_model header shape does not match
+# - Zeroes each official file's 65-byte firmware-header signature at offset 512 + 959 = 1471
+#   (Safe 3 vendor header is 512 bytes; docs/common/reproducible-build.md), refusing to guess
+#   if the TRZV / 512-byte / TRZF / hw_model header shape does not match
 # - Compares SHA-256 of each zeroed official file with the unsigned local build of the same
 #   revision; the verdict is reproducible only if every compared revision matches
 # - Bootloader: each firmware embeds a prebuilt, signed bootloader committed to the repository
@@ -48,7 +50,7 @@
 #   clones the matching release tag core/bl<VERSION>, builds the bootloader there with that tag's
 #   own build-docker.sh (--targets bootloader), then fills in the two fields Trezor's signing
 #   adds: the 65-byte signature (0x3BF) is zeroed on both sides, and the code hash at 0x20 in
-#   the committed file must equal the SHA-256 or BLAKE2s of our built code. The revision is
+#   the committed file must equal the model's hash (models.py) of our built code. The revision is
 #   reproducible only if both the firmware and its bootloader match (as in the Trezor One script).
 # - Prints one results block per revision (appHash = that revision's official file as
 #   downloaded) and writes COMPARISON_RESULTS.yaml next to this script
@@ -59,7 +61,7 @@
 set -eE
 
 # ---- Globals (paths captured before any cd) ---------------------------------
-SCRIPT_VERSION="v0.1.2"
+SCRIPT_VERSION="v0.1.3"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 SCRIPT_SHA256=""
@@ -79,10 +81,10 @@ BINARY_PATH=""
 ARCH=""
 REVISION_ARG=""
 
-PRODUCT="Trezor Safe 5"
-APP_ID="trezorSafe5"
-ALL_MODELS=(T3T1)
-EXPECTED_VH_LEN=1024   # Safe 5 vendor header size (confirmed on the v2.12.4 official file)
+PRODUCT="Trezor Safe 3"
+APP_ID="trezorSafe3"
+ALL_MODELS=(T2B1 T3B1)
+EXPECTED_VH_LEN=512    # Safe 3 vendor header size (upstream reproducible-build.md)
 SIG_INNER=959          # signature offset inside the 1024-byte firmware header (0x3bf)
 
 EXIT_OK=0
@@ -101,8 +103,9 @@ sha256_of() {
 
 rev_label() {
   case "$1" in
-    T3T1) echo "Safe 5" ;;
-    *)    echo "unknown model" ;;
+    T2B1) echo "rev.A, STM32F427" ;;
+    T3B1) echo "rev.B, STM32U58x" ;;
+    *)    echo "unknown revision" ;;
   esac
 }
 
@@ -122,6 +125,11 @@ notes: "${notes}"
 EOF
   RESULTS_WRITTEN=1
   echo -e "${GREEN}Results written to: $RESULTS_FILE${NC}"
+  # Per-run copy inside this run's workspace. Deliberately NOT named COMPARISON_RESULTS.yaml:
+  # ABS searches its build directory recursively for that name.
+  if [[ -n "$workDir" && -d "$workDir" ]]; then
+    cp -p "$RESULTS_FILE" "$workDir/results_${RUN_ID}.yaml" 2>/dev/null || true
+  fi
 }
 
 # no_verdict: a failure that says nothing about the source (runtime, host tools, network,
@@ -188,26 +196,29 @@ fi
 
 usage() {
   echo 'NAME
-       trezorsafe5_build.sh - verify Trezor Safe 5 (T3T1) firmware
+       trezorsafe3_build.sh - verify Trezor Safe 3 (T2B1 rev.A / T3B1 rev.B) firmware
 
 SYNOPSIS
-       trezorsafe5_build.sh --version VERSION [--type TYPE] [--binary PATH]
-                            [--arch ARCH]
+       trezorsafe3_build.sh --version VERSION [--type TYPE] [--binary PATH]
+                            [--revision a|b] [--arch ARCH]
 
 DESCRIPTION
-       The Safe 5 is Trezor model T3T1.
+       The Safe 3 has two hardware revisions with separate firmware files:
+       T2B1 = rev.A (STM32F427), T3B1 = rev.B (STM32U58x).
 
        --version   Firmware version to verify, e.g. "2.12.5" (required)
        --type      Firmware type. Accepted: standard|universal|multi  or
                    bitcoin-only|btc-only|btconly  (default: standard)
        --binary    Official firmware .bin, or a directory holding
-                   trezor-t3t1-VERSION[-bitcoinonly].bin. Its model is checked from the
-                   firmware header. Optional; downloaded if omitted.
+                   trezor-t2b1-/trezor-t3b1-VERSION[-bitcoinonly].bin. The revision of a file
+                   is read from its firmware header. Optional; downloaded if omitted.
+       --revision  a|b (also T2B1|T3B1). Limit to one revision. Default: both
+                   revisions when downloading; with --binary, the revision in that file.
        --arch      Accepted for ABS compatibility; unused
 
 EXAMPLES
-       trezorsafe5_build.sh --version 2.13.0 --type btc-only
-       trezorsafe5_build.sh --version 2.13.0 --type universal'
+       trezorsafe3_build.sh --version 2.12.5 --type btc-only
+       trezorsafe3_build.sh --version 2.12.5 --type universal --revision b'
 }
 
 # ---- Disclaimer -------------------------------------------------------------
@@ -233,6 +244,21 @@ SCRIPT_SHA256="$(sha256_of "$SCRIPT_PATH")"
 echo "Script:  $(basename "$SCRIPT_PATH") ${SCRIPT_VERSION}"
 echo "         sha256: ${SCRIPT_SHA256}"
 echo
+
+# One run at a time per script directory: every run writes the same COMPARISON_RESULTS.yaml
+# next to the script (where ABS reads it), so two parallel runs from one folder would overwrite
+# each other's verdict. flock releases on any exit, so a crash never leaves a stale lock. ABS gives
+# each job its own directory, so this never triggers there. Refusing writes no verdict.
+if command -v flock &>/dev/null; then
+  exec 9>"${SCRIPT_DIR}/.comparison_results.lock"
+  if ! flock -n 9; then
+    echo -e "${RED}Error: another verification is already running from ${SCRIPT_DIR} (it shares COMPARISON_RESULTS.yaml). Run this one after it, or from a copy of the script in another folder.${NC}"
+    echo -e "${RED}No verdict written.${NC}"
+    exit "$EXIT_FAIL"
+  fi
+else
+  echo -e "${YELLOW}[WARN] flock not found; parallel runs from this folder would share COMPARISON_RESULTS.yaml.${NC}"
+fi
 
 # Remove a previous verdict before this invocation can fail, so ABS can never pick up a
 # stale COMPARISON_RESULTS.yaml from an earlier run.
@@ -299,9 +325,16 @@ case "${firmwareType,,}" in
 esac
 if [[ "$firmwareType" == "bitcoin-only" ]]; then editionSuffix="-bitcoinonly"; else editionSuffix=""; fi
 
-# ---- --revision (Safe 3 option; the Safe 5 has one model) ------------------
+# ---- Normalize --revision ---------------------------------------------------
 revisionModel=""
-[[ -z "$REVISION_ARG" ]] || echo -e "${YELLOW}[WARN] Ignoring --revision '$REVISION_ARG': the Safe 5 has one model (T3T1)${NC}"
+case "${REVISION_ARG,,}" in
+  "")                      revisionModel="" ;;
+  a|reva|rev.a|t2b1)       revisionModel="T2B1" ;;
+  b|revb|rev.b|t3b1)       revisionModel="T3B1" ;;
+  *)
+    echo -e "${RED}Error: invalid --revision '$REVISION_ARG' (use a|b or T2B1|T3B1)${NC}"
+    exit "$EXIT_INVALID" ;;
+esac
 
 # Read a firmware file's header: prints "<magicHex> <vhLen> <fwMagicHex> <hwModel>".
 read_header() {
@@ -344,8 +377,8 @@ if [[ -n "$BINARY_PATH" ]]; then
   elif [[ -f "$BINARY_PATH" ]]; then
     # The file says which revision it is: hw_model sits 24 bytes into the firmware header.
     read -r _ _ _ fileModel <<< "$(read_header "$BINARY_PATH")"
-    if [[ " ${ALL_MODELS[*]} " != *" ${fileModel} "* ]]; then
-      echo -e "${RED}Error: --binary is not ${PRODUCT} firmware (hw_model '${fileModel}', expected ${ALL_MODELS[*]})${NC}"
+    if [[ "$fileModel" != "T2B1" && "$fileModel" != "T3B1" ]]; then
+      echo -e "${RED}Error: --binary is not Safe 3 firmware (hw_model '${fileModel}', expected T2B1 or T3B1)${NC}"
       exit "$EXIT_INVALID"
     fi
     if [[ -n "$revisionModel" && "$revisionModel" != "$fileModel" ]]; then
@@ -362,8 +395,8 @@ else
   if [[ -n "$revisionModel" ]]; then MODELS=("$revisionModel"); else MODELS=("${ALL_MODELS[@]}"); fi
 fi
 
-# Model tag for resource names.
-revTag="${MODELS[0],,}"
+# Revision tag for resource names: t2b1, t3b1, or safe3 when both are built together.
+if [[ ${#MODELS[@]} -eq 1 ]]; then revTag="${MODELS[0],,}"; else revTag="safe3"; fi
 
 # ---- Host tools ------------------------------------------------------------------
 # Trezor's own build-docker.sh needs a host git checkout and host wget/sha256sum (it
@@ -380,7 +413,7 @@ fi
 # Per-run workspace in the caller's directory: version + type + revision(s) + epoch-PID, created
 # with an exclusive mkdir. Never reused, renamed or deleted, so concurrent runs (same or other
 # users, e.g. ABS) cannot touch each other's files.
-wd="${CALLER_DIR}/trezorSafe5_verification_${version}_${firmwareType}_${revTag}_${RUN_ID}"
+wd="${CALLER_DIR}/trezorSafe3_verification_${version}_${firmwareType}_${revTag}_${RUN_ID}"
 if ! mkdir -- "$wd"; then
   echo -e "${RED}Error: work directory already exists or cannot be created: $wd${NC}"
   exit "$EXIT_INVALID"
@@ -389,7 +422,7 @@ workDir="$wd"
 
 echo
 echo "Verifying ${PRODUCT} firmware v$version ($firmwareType)"
-for m in "${MODELS[@]}"; do echo "  model: ${m} ($(rev_label "$m"))"; done
+for m in "${MODELS[@]}"; do echo "  revision: ${m} ($(rev_label "$m"))"; done
 echo "Work dir: $workDir"
 echo
 
@@ -441,7 +474,7 @@ build_firmware() {
   cd "$workDir/trezor-firmware"
 
   # Note: builds each model's default board pinned in this tag's model.toml
-  # (as of core/v2.13.0); no HW_REVISION override is passed, matching
+  # (T2B1 rev10, T3B1 revB as of core/v2.12.5); no HW_REVISION override is passed, matching
   # upstream's own default production build.
 
   # Per-run image/container name (revision, edition, version, run id). build-docker.sh names
@@ -457,8 +490,7 @@ build_firmware() {
   modelsCsv=$(IFS=,; echo "${MODELS[*]}")
 
   # Only the firmware target, as upstream CI does (.github/workflows/common.yml:
-  # --targets 'firmware'). T3T1 has no secmon (no `secmon` key in model.toml); the default list
-  # fails on it since core/v2.12.2 (trezor-firmware#7775).
+  # --targets 'firmware'). Neither Safe 3 revision has a secmon (no `secmon` key in model.toml).
   # build-docker.sh bind-mounts build/core-<MODEL>{,-bitcoinonly} without creating them;
   # Docker creates bind sources implicitly, rootless podman refuses, so create them first.
   for m in "${MODELS[@]}"; do mkdir -p "build/core-${m}" "build/core-${m}-bitcoinonly"; done
@@ -511,15 +543,15 @@ compare_firmware() {
   for m in "${MODELS[@]}"; do
     BUILT_HASH[$m]=$(sha256sum "trezor-firmware/build/core-${m}${editionSuffix}/firmware/firmware.bin" | awk '{print $1}')
 
-    # Fail closed on header shape: "TRZV" (0x54525a56), a 1024-byte vendor header (bytes 4-7,
+    # Fail closed on header shape: "TRZV" (0x54525a56), a 512-byte vendor header (bytes 4-7,
     # uint32 LE), "TRZF" (0x54525a46) right after it, and hw_model (firmware header +24)
     # equal to this revision. The 65-byte signature (sigmask 1B + signature 64B) sits 959
-    # bytes into the firmware header -> offset 1024 + 959 = 1983.
+    # bytes into the firmware header -> offset 512 + 959 = 1471.
     read -r magicHex vhLen fwMagicHex hwModel <<< "$(read_header "official_${m}.bin")"
     if [[ "$magicHex" != "54525a56" || "$vhLen" != "$EXPECTED_VH_LEN" || "$fwMagicHex" != "54525a46" || "$hwModel" != "$m" ]]; then
       no_verdict "unexpected official ${m} firmware header (magic=0x${magicHex}, vendor header=${vhLen}B, firmware magic=0x${fwMagicHex}, hw_model=${hwModel}); expected TRZV / ${EXPECTED_VH_LEN}B / TRZF / ${m} - refusing to guess the signature offset"
     fi
-    seekSize=$(( vhLen + SIG_INNER ))   # 1024 + 959 = 1983
+    seekSize=$(( vhLen + SIG_INNER ))   # 512 + 959 = 1471
     SEEK[$m]="$seekSize"
 
     cp "official_${m}.bin" "official_${m}.zeroed"
@@ -554,8 +586,9 @@ compare_firmware() {
 # with that tag's build-docker.sh, so the bootloader the firmware installs is checked too.
 # Signing adds two things a local build cannot have: the 65-byte signature (sigmask 0x3BF +
 # signature 0x3C0) and the code hash at 0x20 (docs/core/misc/boot.md). The signature is zeroed on
-# both sides; the committed code hash must equal a hash of OUR built code (SHA-256 or BLAKE2s;
-# at core/bl2.1.16 the Safe 3 revisions used one each), so it is recomputed rather than ignored.
+# both sides; the committed code hash must equal a hash of OUR built code (T3B1: SHA-256,
+# T2B1: BLAKE2s, per upstream models.py), so it is recomputed rather than ignored.
+declare -A BL_CODE_HASH_ALG=([T2B1]=blake2s256 [T3B1]=sha256 [T3T1]=sha256)
 declare -A BL_VER=() BL_TAG=() BL_COMMIT=() BL_SIGNED_HASH=() BL_BUILT_HASH=() BL_HASHALG=() BL_MATCH=() BL_NOTE=()
 
 check_bootloader() {
@@ -582,11 +615,13 @@ check_bootloader() {
     return 0
   fi
   want=$(od -An -tx1 -j32 -N32 "$committed" | tr -d ' \n')
-  for alg in sha256 blake2s256; do
-    got=$(tail -c +1025 "$built" | openssl dgst "-${alg}" -r | cut -c1-64)
-    if [[ "$got" == "$want" ]]; then BL_HASHALG[$m]="$alg"; BL_MATCH[$m]=1; BL_NOTE[$m]="match"; return 0; fi
-  done
-  BL_NOTE[$m]="code hash at 0x20 (${want}) is neither SHA-256 nor BLAKE2s of the built code"
+  # Each model's code-hash function, as upstream defines it (python/src/trezorlib/firmware/
+  # models.py, *_HASH_PARAMS at core/bl2.1.16): T2B1 BLAKE2s; T3B1 and T3T1 SHA-256.
+  alg="${BL_CODE_HASH_ALG[$m]:-}"
+  if [[ -z "$alg" ]]; then BL_NOTE[$m]="no known code-hash function for model ${m}"; return 0; fi
+  got=$(tail -c +1025 "$built" | openssl dgst "-${alg}" -r | cut -c1-64)
+  if [[ "$got" == "$want" ]]; then BL_HASHALG[$m]="$alg"; BL_MATCH[$m]=1; BL_NOTE[$m]="match"; return 0; fi
+  BL_NOTE[$m]="code hash at 0x20 (${want}) is not the ${alg} of the built code (${got})"
 }
 
 build_bootloaders() {
@@ -647,12 +682,13 @@ build_bootloaders
 print_hash_legend() {
   echo
   echo "----- What these hashes mean -----"
-  echo "Safe 5 = Trezor model T3T1."
-  echo "appHash       SHA-256 of the official firmware exactly as downloaded"
+  echo "Each revision has its own firmware file and its own results block:"
+  echo "T2B1 = Safe 3 rev.A (STM32F427), T3B1 = Safe 3 rev.B (STM32U58x)."
+  echo "appHash       SHA-256 of that revision's official firmware exactly as downloaded"
   echo "              from data.trezor.io (signed). THIS is the official hash to publish"
   echo "              for that file."
   echo "zeroedHash    (after End) The official firmware with its 65-byte firmware-header"
-  echo "              signature (offset 1983) set to zero. Comparison only; never publish."
+  echo "              signature (offset 1471) set to zero. Comparison only; never publish."
   echo "builtHash     (in Diff) SHA-256 of the firmware built from core/v${normalizedVersion}."
   echo "fingerprint   (after End) Trezor's firmware fingerprint of the build (header with"
   echo "              signatures cleared), the value a Trezor shows during a firmware update."
@@ -735,12 +771,12 @@ for m in "${MODELS[@]}"; do
 done
 
 if [[ "$verdict" == "reproducible" ]]; then
-  write_results "reproducible" "${PRODUCT} v${version} (${firmwareType}; ${MODELS[*]}) reproducible from the tagged repository via build-docker.sh at core/v${normalizedVersion} (commit ${commit}); ${summary}official firmware-header signature (offset 1983, 65B) zeroed before SHA-256 comparison."
+  write_results "reproducible" "${PRODUCT} v${version} (${firmwareType}; ${MODELS[*]}) reproducible from the tagged repository via build-docker.sh at core/v${normalizedVersion} (commit ${commit}); ${summary}official firmware-header signature (offset 1471, 65B) zeroed before SHA-256 comparison."
   echo
   echo "${PRODUCT} verification finished!"
   exit "$EXIT_OK"
 else
-  write_results "not_reproducible" "${PRODUCT} v${version} (${firmwareType}; ${MODELS[*]}) not reproducible (firmware and bootloader must both match): ${summary}firmware signature zeroed at offset 1983, 65B."
+  write_results "not_reproducible" "${PRODUCT} v${version} (${firmwareType}; ${MODELS[*]}) not reproducible (firmware and bootloader must both match): ${summary}firmware signature zeroed at offset 1471, 65B."
   echo
   echo "${PRODUCT} verification finished!"
   exit "$EXIT_FAIL"
