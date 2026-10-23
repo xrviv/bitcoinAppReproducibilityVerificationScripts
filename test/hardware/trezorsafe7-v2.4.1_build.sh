@@ -1,6 +1,6 @@
 #!/bin/bash
 # trezorsafe7_build.sh - Trezor Safe 7 (T3W1) firmware reproducible build verification
-# Version: v2.4.0 · Organization: WalletScrutiny.com · License: MIT
+# Version: v2.4.1 · Organization: WalletScrutiny.com · License: MIT
 # Last modified by: Claude Code for Danny
 # Last modified on: 2026-10-23
 # Disclaimer: for reproducible-build verification only; no warranty; runs containers and
@@ -15,7 +15,7 @@
 set -eE
 
 # ---- Globals (bash parameter expansion only; no host dirname/readlink) -------
-SCRIPT_VERSION="v2.4.0"
+SCRIPT_VERSION="v2.4.1"
 _src="${BASH_SOURCE[0]}"
 if [[ "$_src" == */* ]]; then _srcDir="${_src%/*}"; else _srcDir="."; fi
 SCRIPT_DIR="$(cd "$_srcDir" && pwd -P)"
@@ -506,10 +506,14 @@ inner_main() {
 # Host part: bash builtins plus mkdir/rm and the container runtime. Nothing else runs on the host.
 # =============================================================================
 
-CALLER_DIR="$(pwd -P)"
-RUN_ID="$(printf '%(%s)T' -1)-$$"
+# Host-only state. Inside the tools container workDir and RUN_ID come from the host's environment
+# and must not be reset here.
+if [[ "${WS_INNER:-}" != "1" ]]; then
+  CALLER_DIR="$(pwd -P)"
+  RUN_ID="$(printf '%(%s)T' -1)-$$"
+  workDir=""
+fi
 RESULTS_WRITTEN=0
-workDir=""
 CONTAINER_CMD=""
 TOOLS_IMAGE=""
 HOST_SOCK=""

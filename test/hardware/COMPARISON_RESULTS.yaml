@@ -1,0 +1,4 @@
+script_version: v0.1.11
+verdict: reproducible
+notes: |
+  Firmware v1.14.2 type=universal tag=legacy/v1.14.2 commit=037e506db454691bda188df2803df2fc26c75f36. Firmware: reproducible. Bootloader: reproducible. Bootloader v1.12.1 SHA256d matches bl_check.txt
