@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # onekeyclassic1s_build.sh - OneKey Classic 1S firmware reproducible build verification
-# Version: v0.1.0 · Organization: WalletScrutiny.com · License: MIT
+# Version: v0.1.1 · Organization: WalletScrutiny.com · License: MIT
 # Last modified by: Claude Code for Danny
 # Last modified on: 2026-10-24
 # Disclaimer: for reproducible-build verification only; no warranty; runs containers and
@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.0"
+SCRIPT_VERSION="v0.1.1"
 APP_ID="onekey.classic.1s"
 REPO_URL="https://github.com/OneKeyHQ/firmware-classic1s"
 API_URL="https://api.github.com/repos/OneKeyHQ/firmware-classic1s"
@@ -32,6 +32,7 @@ EXIT_FAIL=1
 EXIT_INVALID=2
 
 ALPINE_IMAGE="docker.io/library/alpine:3.15.0@sha256:21a3deaa0d32a8057914f36584b5288d2e5ecc984380bc0118285c70fa8c9300"
+NIX_INSTALL_SHA256="01604861291c8be8484442e91ead44c8aac0050f82c5d917827f61e7c01bd819"
 
 # ---- Colors and logging ----
 NC="\033[0m"
@@ -212,6 +213,15 @@ if [[ -n "$binary_file" ]]; then
     exit "$EXIT_INVALID"
   fi
   if [[ "$binary_file" == /* ]]; then binary_abs="$binary_file"; else binary_abs="${PWD}/${binary_file}"; fi
+  # A release file of the other edition (named -Stable-btc- or not) is invalid input
+  _bn="${binary_abs##*/}"
+  if [[ -f "$binary_abs" && "$_bn" == classic1s.*-Stable-* ]]; then
+    _bn_type="universal"; [[ "$_bn" == *-Stable-btc-* ]] && _bn_type="btc-only"
+    if [[ "$_bn_type" != "$build_type" ]]; then
+      log_error "--binary ${_bn} is the ${_bn_type} firmware, but --type is ${build_type}"
+      exit "$EXIT_INVALID"
+    fi
+  fi
 fi
 
 BITCOIN_ONLY_VAL="$( [[ "$build_type" == "btc-only" ]] && echo 1 || echo 0 )"
@@ -520,8 +530,10 @@ ENV USER=builder
 WORKDIR /home/builder
 
 # Nix 2.23.3 single-user, as upstream CI (.github/workflows/build-classic1s.yml).
-RUN curl --silent --location https://releases.nixos.org/nix/nix-2.23.3/install | \\
-    sh -s -- --no-daemon
+# Installer pinned to its published sha256 (install.sha256); it checks the Nix tarball itself.
+RUN curl --silent --fail --location -o /home/builder/nix-install https://releases.nixos.org/nix/nix-2.23.3/install && \\
+    echo "${NIX_INSTALL_SHA256}  /home/builder/nix-install" | sha256sum -c - && \\
+    sh /home/builder/nix-install --no-daemon && rm -f /home/builder/nix-install
 
 ENV PATH="/home/builder/.nix-profile/bin:/nix/var/nix/profiles/default/bin:\${PATH}"
 
