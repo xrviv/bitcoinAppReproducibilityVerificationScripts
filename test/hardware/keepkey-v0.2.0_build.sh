@@ -2,12 +2,12 @@
 # ==============================================================================
 # keepkey_build.sh - KeepKey Firmware Reproducible Build Verification
 # ==============================================================================
-# Version: v0.1.0
+# Version: v0.2.0
 # Organization: WalletScrutiny.com
 # Project: https://github.com/keepkey/keepkey-firmware
 # License: MIT
 # Last modified by: Daniel Garcia (WalletScrutiny)
-# Last modified on: 2026-10-19
+# Last modified on: 2026-10-27
 # ==============================================================================
 #
 # TECHNICAL DISCLAIMER:
@@ -23,9 +23,11 @@
 #   release tag v<version> with all submodules.
 # - Pulls the build image pinned by digest in the tag's own
 #   scripts/build/docker/device/release.sh and runs the same cmake/make steps,
-#   twice, in independent source trees (A/B determinism gate).
+#   twice, in independent source trees (A/B determinism gate). --type btc-only
+#   adds -DKK_BITCOIN_ONLY=ON, as the v7.14.3 release notes do.
 # - Compares the payload (everything after the 256-byte KPKY header) of the
-#   official firmware.keepkey.bin with build A's, as the release notes define it.
+#   official file (firmware.keepkey.bin, or firmware.keepkey.bitcoin-only.bin for
+#   btc-only) with build A's bin/firmware.keepkey.bin, as the release notes define it.
 # - Checks that the two headers differ only in the signature fields (signature
 #   indexes and the three 64-byte signature slots), and cross-checks the payload
 #   hash with the release's HASHES.txt (informational).
@@ -33,11 +35,14 @@
 
 set -eEuo pipefail
 
-SCRIPT_VERSION="v0.1.0"
+SCRIPT_VERSION="v0.2.0"
 APP_ID="keepKey"
 REPO_URL="https://github.com/keepkey/keepkey-firmware"
 RELEASE_URL="https://github.com/keepkey/keepkey-firmware/releases/download"
-OFFICIAL_NAME="firmware.keepkey.bin"
+# Upstream always builds bin/firmware.keepkey.bin; the release file name depends on --type.
+BUILT_NAME="firmware.keepkey.bin"
+OFFICIAL_NAME="${BUILT_NAME}"
+CMAKE_VARIANT_ARGS=""
 HEADER_SIZE=256
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
@@ -183,13 +188,14 @@ usage() {
 keepkey_build.sh ${SCRIPT_VERSION} - KeepKey firmware reproducible build verifier
 
 Usage:
-  $0 --version VERSION [--arch arm] [--type firmware] [--binary PATH]
+  $0 --version VERSION [--arch arm] [--type firmware|btc-only] [--binary PATH]
 
 Parameters:
-  --version VERSION   Firmware version without 'v' prefix, e.g. 7.14.2. Required.
+  --version VERSION   Firmware version without 'v' prefix, e.g. 7.14.3. Required.
   --arch ARCH         ABS compatibility parameter. Only 'arm' is supported.
-  --type TYPE         ABS compatibility parameter. Only 'firmware' is supported.
-  --binary PATH       Optional official ${OFFICIAL_NAME} (or a directory holding one).
+  --type TYPE         'firmware' (multi-coin, firmware.keepkey.bin; default) or 'btc-only'
+                      (firmware.keepkey.bitcoin-only.bin, built with -DKK_BITCOIN_ONLY=ON).
+  --binary PATH       Optional official file for --type (or a directory holding one).
                       If omitted, downloads it from the GitHub release v<version>.
   --apk PATH          Android-only parameter; accepted as an alias for --binary.
   --jobs N            Parallel make jobs. Default: plain 'make', as upstream release.sh.
@@ -273,8 +279,13 @@ validate_inputs() {
     *) log_fail "Unsupported --arch '${ARCH}'. KeepKey firmware supports arch 'arm'."; exit "${EXIT_INVALID}" ;;
   esac
   case "${TYPE,,}" in
-    firmware|"") TYPE="firmware" ;;
-    *) log_fail "Unsupported --type '${TYPE}'. KeepKey firmware supports type 'firmware'."; exit "${EXIT_INVALID}" ;;
+    firmware|multi|"") TYPE="firmware" ;;
+    btc-only|btc_only|btc|bitcoin-only|bitcoin_only|bitcoinonly)
+      TYPE="btc-only"
+      OFFICIAL_NAME="firmware.keepkey.bitcoin-only.bin"
+      CMAKE_VARIANT_ARGS="-DKK_BITCOIN_ONLY=ON"
+      ;;
+    *) log_fail "Unsupported --type '${TYPE}'. KeepKey firmware supports types 'firmware' and 'btc-only'."; exit "${EXIT_INVALID}" ;;
   esac
   if [[ -n "${JOBS}" && ! "${JOBS}" =~ ^[1-9][0-9]*$ ]]; then
     log_fail "Invalid --jobs '${JOBS}'. Expected a positive integer."
@@ -413,7 +424,7 @@ run_firmware_build() {
   local chown_cmd make_cmd="make"
   chown_cmd="$(container_chown_trap /root/keepkey-firmware)"
   [[ -n "${JOBS}" ]] && make_cmd="make -j${JOBS}"
-  log_info "Running build ${label} (${make_cmd})."
+  log_info "Running build ${label} (${make_cmd}${CMAKE_VARIANT_ARGS:+, ${CMAKE_VARIANT_ARGS}})."
   run_ctr "build-${label}" \
     -v "${source_dir}:/root/keepkey-firmware" \
     "${BUILD_IMAGE}" \
@@ -422,14 +433,14 @@ run_firmware_build() {
       trap '${chown_cmd}' EXIT
       mkdir /root/build && cd /root/build
       cmake -C /root/keepkey-firmware/cmake/caches/device.cmake /root/keepkey-firmware \
-        -DCMAKE_BUILD_TYPE=MinSizeRel -DCMAKE_COLOR_MAKEFILE=ON
+        -DCMAKE_BUILD_TYPE=MinSizeRel -DCMAKE_COLOR_MAKEFILE=ON ${CMAKE_VARIANT_ARGS}
       ${make_cmd}
       mkdir -p /root/keepkey-firmware/bin
       cp bin/*.bin /root/keepkey-firmware/bin/
       cp bin/*.elf /root/keepkey-firmware/bin/
     "
-  if [[ ! -f "${source_dir}/bin/${OFFICIAL_NAME}" ]]; then
-    die_ftbfs "Build ${label} completed without bin/${OFFICIAL_NAME}."
+  if [[ ! -f "${source_dir}/bin/${BUILT_NAME}" ]]; then
+    die_ftbfs "Build ${label} completed without bin/${BUILT_NAME}."
   fi
 }
 
@@ -528,7 +539,7 @@ main() {
   run_firmware_build "${WORK_DIR}/source-a" "A"
   run_firmware_build "${WORK_DIR}/source-b" "B"
 
-  local builtA="${WORK_DIR}/source-a/bin/${OFFICIAL_NAME}" builtB="${WORK_DIR}/source-b/bin/${OFFICIAL_NAME}"
+  local builtA="${WORK_DIR}/source-a/bin/${BUILT_NAME}" builtB="${WORK_DIR}/source-b/bin/${BUILT_NAME}"
   local official="${WORK_DIR}/official-${OFFICIAL_NAME}"
   local buildAHash buildBHash buildAPayload officialHash officialPayload hashesPayload
   local headerDiffs unexpected finalVerdict officialMatch exitCode notes
@@ -538,7 +549,7 @@ main() {
   if [[ "${buildAHash}" != "${buildBHash}" ]]; then
     echo "A/B DETERMINISM: FAIL build_a_sha256=${buildAHash} build_b_sha256=${buildBHash}"
     print_results_block "not_reproducible" "not_checked" "${buildAHash}" "${buildBHash}" "not_checked" "0 (DOESN'T MATCH)" "0 (NOT CHECKED)"
-    write_results "not_reproducible" "KeepKey v${VERSION}: A/B determinism failed before official comparison. Build A and build B produced different bin/${OFFICIAL_NAME} hashes."
+    write_results "not_reproducible" "KeepKey v${VERSION}: A/B determinism failed before official comparison. Build A and build B produced different bin/${BUILT_NAME} hashes."
     exit "${EXIT_FAIL}"
   fi
   echo "A/B DETERMINISM: PASS build_a_sha256=${buildAHash} build_b_sha256=${buildBHash}"
@@ -587,11 +598,11 @@ main() {
   echo
 
   if [[ "${finalVerdict}" == "reproducible" ]]; then
-    notes="KeepKey v${VERSION} reproduced. Two independent builds with the build image pinned in the tag's release.sh produced the same ${OFFICIAL_NAME}, and its payload after the ${HEADER_SIZE}-byte header matches the official one. The headers differ only in the signature indexes and the three signature slots, which only the vendor's signing keys can produce."
+    notes="KeepKey v${VERSION} reproduced. Two independent builds with the build image pinned in the tag's release.sh${CMAKE_VARIANT_ARGS:+ plus ${CMAKE_VARIANT_ARGS}} produced the same ${BUILT_NAME}, and its payload after the ${HEADER_SIZE}-byte header matches the official ${OFFICIAL_NAME}. The headers differ only in the signature indexes and the three signature slots, which only the vendor's signing keys can produce."
   elif [[ "${buildAPayload}" == "${officialPayload}" ]]; then
     notes="KeepKey v${VERSION} did not reproduce: the payload matches, but the header differs outside the signature fields at byte offsets ${unexpected}."
   else
-    notes="KeepKey v${VERSION} did not reproduce. A/B determinism passed, but the payload after the ${HEADER_SIZE}-byte header differs from the official ${OFFICIAL_NAME}. Compare source-a/bin/${OFFICIAL_NAME} with official-${OFFICIAL_NAME} in the workspace."
+    notes="KeepKey v${VERSION} did not reproduce. A/B determinism passed, but the payload after the ${HEADER_SIZE}-byte header differs from the official ${OFFICIAL_NAME}. Compare source-a/bin/${BUILT_NAME} with official-${OFFICIAL_NAME} in the workspace."
   fi
   write_results "${finalVerdict}" "${notes}"
   exit "${exitCode}"
