@@ -2,7 +2,7 @@
 # ==============================================================================
 # keepkey_build.sh - KeepKey Firmware Reproducible Build Verification
 # ==============================================================================
-# Version: v0.2.0
+# Version: v0.2.1
 # Organization: WalletScrutiny.com
 # Project: https://github.com/keepkey/keepkey-firmware
 # License: MIT
@@ -35,7 +35,7 @@
 
 set -eEuo pipefail
 
-SCRIPT_VERSION="v0.2.0"
+SCRIPT_VERSION="v0.2.1"
 APP_ID="keepKey"
 REPO_URL="https://github.com/keepkey/keepkey-firmware"
 RELEASE_URL="https://github.com/keepkey/keepkey-firmware/releases/download"
@@ -598,7 +598,7 @@ main() {
   echo
 
   if [[ "${finalVerdict}" == "reproducible" ]]; then
-    notes="KeepKey v${VERSION} reproduced. Two independent builds with the build image pinned in the tag's release.sh${CMAKE_VARIANT_ARGS:+ plus ${CMAKE_VARIANT_ARGS}} produced the same ${BUILT_NAME}, and its payload after the ${HEADER_SIZE}-byte header matches the official ${OFFICIAL_NAME}. The headers differ only in the signature indexes and the three signature slots, which only the vendor's signing keys can produce."
+    notes="KeepKey v${VERSION} reproduced. Two independent builds with the build image pinned in the tag's release.sh${CMAKE_VARIANT_ARGS:+ plus ${CMAKE_VARIANT_ARGS}} produced the same ${BUILT_NAME}, and its payload after the ${HEADER_SIZE}-byte header matches the official ${OFFICIAL_NAME}. The headers differ only in the signature indexes and the three signature slots. These signature fields were not cryptographically verified."
   elif [[ "${buildAPayload}" == "${officialPayload}" ]]; then
     notes="KeepKey v${VERSION} did not reproduce: the payload matches, but the header differs outside the signature fields at byte offsets ${unexpected}."
   else
