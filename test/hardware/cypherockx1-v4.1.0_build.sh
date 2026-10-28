@@ -1,9 +1,10 @@
 #!/bin/bash
-# cypherockx1-v4.0.1_build.sh v4.0.1 - WalletScrutiny verification script for Cypherock X1 firmware
+# cypherockx1-v4.1.0_build.sh - WalletScrutiny verification script for Cypherock X1 firmware
+# Version: v4.1.0
 # Organization: WalletScrutiny.com
 # Last modified by: Claude Code for Danny
-# Last modified on: 2026-10-21
-# Usage: cypherockx1-v4.0.1_build.sh --version VERSION [--type TYPE] [--binary PATH] [--arch ARCH]
+# Last modified on: 2026-10-28
+# Usage: cypherockx1-v4.1.0_build.sh --version VERSION [--type TYPE] [--binary PATH] [--arch ARCH]
 # Project: https://github.com/Cypherock/x1_wallet_firmware
 #
 # TECHNICAL DISCLAIMER: This script is provided for reproducible-build verification only, with no
@@ -15,18 +16,20 @@
 # SCRIPT SUMMARY:
 # - Gets the official firmware for the requested variant: the GitHub release asset, or --binary.
 # - Clones the release tag with submodules inside a pinned git container.
-# - Builds inside Cypherock's builder image with the flags of upstream CI
+# - Builds inside the builder image that upstream CI names at the tag (v0.0.0 or v1.0.0, each pinned
+#   by digest here), with the flags and build directory of that CI
 #   (.github/workflows/containerized-build.yml): Main, Release, Device, VENDOR=Cypherock,
 #   BTC_ONLY per variant, SIGN_BINARY=OFF, Ninja.
 # - Compares SHA-256 of the whole built file with the whole official file (the release .bin is
 #   unsigned, so nothing is stripped) and writes COMPARISON_RESULTS.yaml next to this script.
 # Host requirements: docker or podman. Nothing is mounted into containers; files are copied out.
-# Exit codes: 0 reproducible; 1 not_reproducible or ftbfs (YAML written); 2 invalid input/environment.
+# Exit codes: 0 reproducible; 1 not_reproducible or ftbfs (YAML written), or a download/pull failure
+# (no YAML); 2 invalid input/environment or an unknown builder image (no YAML).
 
 set -Eeo pipefail
 
 # ---- Globals ------------------------------------------------------------------
-SCRIPT_VERSION="v4.0.1"
+SCRIPT_VERSION="v4.1.0"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 SCRIPT_SHA256=""
@@ -37,9 +40,13 @@ REPO_URL="https://github.com/Cypherock/x1_wallet_firmware.git"
 RELEASE_BASE="https://github.com/Cypherock/x1_wallet_firmware/releases/download"
 
 # Pinned images. The tag is kept for readability; the digest is what gets pulled.
-# Builder: the image named in upstream VERIFY.md and in CI up to v0.6.3331.
-BUILDER_REF="cypherock/x1-firmware-builder:v0.0.0"
-BUILDER_IMAGE="docker.io/${BUILDER_REF}@sha256:93ec18baf04065e79d2a138368e761496721e58129cfdfe856aafdb05984ac05"
+# Builder: the one upstream CI names at the tag (containerized-build.yml). v0.0.0 (Alpine, apk gcc)
+# up to v0.6.3331; v1.0.0 (Ubuntu 22.04, Arm GNU 10.3-2021.10, CMake 3.25.3) from v0.6.3332.
+# Docker Hub index digests as of 2026-10-28 (both last pushed Feb 2024).
+BUILDER_V0="docker.io/cypherock/x1-firmware-builder:v0.0.0@sha256:93ec18baf04065e79d2a138368e761496721e58129cfdfe856aafdb05984ac05"
+BUILDER_V1="docker.io/cypherock/x1-firmware-builder:v1.0.0@sha256:572aaa269791fdfe955911b19d1894b2f30251e12f6d73d2d8cfde7004384145"
+BUILDER_REF=""
+BUILDER_IMAGE=""
 GIT_IMAGE="docker.io/alpine/git:v2.54.0@sha256:6f3b5029566da8e90b24945933dcd806be866b64b1e706f51828bf84faccf21b"
 CURL_IMAGE="docker.io/curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777"
 # Upstream CI builds on ubuntu-latest (amd64). Pin it so other hosts do not pick another manifest.
@@ -68,6 +75,10 @@ tagType=""
 tagSig=""
 commitSig=""
 ciBuilder=""
+buildDirForm=""
+BUILD_DIR=""
+srcImageMade=0
+buildImageMade=0
 officialSource=""
 officialHash=""
 builtHash=""
@@ -106,6 +117,9 @@ echo "Script:  $(basename "$SCRIPT_PATH") ${SCRIPT_VERSION}"
 echo "         sha256: ${SCRIPT_SHA256}"
 echo
 
+# A YAML from an earlier run must never be read as this run's verdict.
+rm -f -- "$RESULTS_FILE"
+
 if [[ "$(id -u)" -eq 0 ]]; then
   log_error "Do not run this script as root. Run it as a normal user with access to docker or podman."
   exit "$EXIT_INVALID"
@@ -136,9 +150,9 @@ REQUIREMENTS
     The firmware build usually takes tens of minutes; the first run also pulls the builder image.
 
 EXAMPLES
-    cypherockx1_build.sh --version 0.6.3331
-    cypherockx1_build.sh --version 0.6.3331 --type bitcoin
-    cypherockx1_build.sh --version 0.6.3331 --type bitcoin --binary ~/Downloads/Cypherock-Main-BTC.bin
+    cypherockx1_build.sh --version 0.6.3341
+    cypherockx1_build.sh --version 0.6.3341 --type bitcoin
+    cypherockx1_build.sh --version 0.6.3341 --type bitcoin --binary ~/Downloads/Cypherock-Main-BTC.bin
 
 OUTPUT
     COMPARISON_RESULTS.yaml next to this script, and a work directory in the current directory
@@ -146,8 +160,8 @@ OUTPUT
 
 EXIT CODES
     0 reproducible
-    1 not_reproducible or ftbfs (COMPARISON_RESULTS.yaml written)
-    2 invalid input or environment (no verdict)
+    1 not_reproducible or ftbfs (COMPARISON_RESULTS.yaml written), or a download/pull failure (no verdict)
+    2 invalid input or environment, or an unknown builder image at the tag (no verdict)
 EOF
 }
 
@@ -267,11 +281,21 @@ fail_ftbfs() {
   exit "$EXIT_FAIL"
 }
 
+# A failure that says nothing about the source (network, registry): no YAML, so ABS publishes nothing.
+fail_no_verdict() {
+  log_error "$1"
+  log_error "No verdict: this failure is not a build result. Fix the cause and run again."
+  trap - ERR
+  rm -f -- "$RESULTS_FILE"
+  exit "$EXIT_FAIL"
+}
+
 # shellcheck disable=SC2329  # invoked through the ERR trap
 on_unexpected_error() {
   local rc=$? line="${BASH_LINENO[0]}"
   trap - ERR
-  fail_ftbfs "Unexpected error (exit ${rc}) near line ${line} before a verdict was reached."
+  # Build steps run under "if !", so they never reach this trap: anything here is not a build result.
+  fail_no_verdict "Unexpected error (exit ${rc}) near line ${line} before a verdict was reached."
 }
 
 # Removes only what this run created. Pulled base images are left for reuse.
@@ -281,12 +305,12 @@ cleanup() {
   if [[ -n "$EXTRACT_CTR" ]]; then
     $CONTAINER_CMD rm -f "$EXTRACT_CTR" >/dev/null 2>&1 || true
   fi
-  local img
-  for img in "$BUILD_IMAGE" "$SRC_IMAGE"; do
-    if [[ -n "$img" ]]; then
-      $CONTAINER_CMD rmi -f "$img" >/dev/null 2>&1 || true
-    fi
-  done
+  if [[ "$buildImageMade" -eq 1 ]]; then
+    $CONTAINER_CMD rmi -f "$BUILD_IMAGE" >/dev/null 2>&1 || true
+  fi
+  if [[ "$srcImageMade" -eq 1 ]]; then
+    $CONTAINER_CMD rmi -f "$SRC_IMAGE" >/dev/null 2>&1 || true
+  fi
 }
 
 hash_in_container() {
@@ -302,13 +326,11 @@ BUILD_IMAGE="ws-cypherockx1-build:${runTag}"
 officialFile="${workDir}/output/official-${ARTIFACT}"
 builtFile="${workDir}/output/built-${ARTIFACT}"
 
-rm -f -- "$RESULTS_FILE"
 trap cleanup EXIT
 trap on_unexpected_error ERR
 
 NOTES=(
   "Cypherock X1 firmware v${version}, ${firmwareType} variant (${ARTIFACT}), git tag v${version}."
-  "Build: upstream CI recipe (.github/workflows/containerized-build.yml), cmake Main/Release/Device, VENDOR=Cypherock, BTC_ONLY=${BTC_ONLY_FLAG}, SIGN_BINARY=OFF, Ninja, in ${BUILDER_REF} pinned by digest, platform ${PLATFORM}."
   "Comparison: SHA-256 of the whole built file against the whole official file. The release .bin is unsigned, so nothing is stripped."
 )
 
@@ -325,6 +347,9 @@ echo "Verifying Cypherock X1 firmware v${version} (${firmwareType}, ${ARTIFACT})
 echo
 
 # ---- Step 1: official firmware ---------------------------------------------------------
+# The curl image also hashes both files, so pull it even with --binary.
+$CONTAINER_CMD pull --platform "$PLATFORM" "$CURL_IMAGE" >/dev/null \
+  || fail_no_verdict "Could not pull ${CURL_IMAGE}."
 if [[ -n "$binaryPath" ]]; then
   log_info "Using provided official firmware: ${binaryPath}"
   cp -- "$binaryPath" "$officialFile"
@@ -335,11 +360,11 @@ else
   log_info "Downloading official firmware: ${url}"
   if ! $CONTAINER_CMD run --rm --platform "$PLATFORM" "$CURL_IMAGE" -fsSL --retry 3 --retry-delay 5 "$url" > "$officialFile"; then
     rm -f -- "$officialFile"
-    fail_ftbfs "Official firmware not downloadable from ${url} (no published release asset for this version and variant, or a network error). No build was attempted."
+    fail_no_verdict "Official firmware not downloadable from ${url} (no published release asset for this version and variant, or a network error). No build was attempted."
   fi
   officialSource="GitHub release asset ${url}"
 fi
-[[ -s "$officialFile" ]] || fail_ftbfs "Official firmware file is empty."
+[[ -s "$officialFile" ]] || fail_no_verdict "Official firmware file is empty."
 NOTES+=("Official firmware: ${officialSource}.")
 
 # ---- Step 2: clone the tag inside a container ------------------------------------------
@@ -360,23 +385,29 @@ RUN set -eu; \
     elif git cat-file -p "refs/tags/$VERSION_TAG" | grep -qE 'BEGIN (PGP|SSH) SIGNATURE'; then echo present; \
     else echo absent; fi > /ws_meta/tag_signature; \
     if git cat-file -p HEAD | grep -q '^gpgsig'; then echo present; else echo absent; fi > /ws_meta/commit_signature; \
-    { grep -o -m1 'cypherock/x1-firmware-builder:[A-Za-z0-9._-]*' .github/workflows/containerized-build.yml || echo unknown; } > /ws_meta/ci_builder
+    { grep -o -m1 'cypherock/x1-firmware-builder:[A-Za-z0-9._-]*' .github/workflows/containerized-build.yml || echo unknown; } > /ws_meta/ci_builder; \
+    if grep -qF 'BUILD_DIR="build_${{ inputs.vendor }}_${{ inputs.coin_support_variant }}"' .github/workflows/containerized-build.yml; then echo vendor; \
+    elif grep -qF 'BUILD_DIR="build_${{ inputs.coin_support_variant }}"' .github/workflows/containerized-build.yml; then echo variant; \
+    else echo unknown; fi > /ws_meta/build_dir_form
 EOF
 } > "${workDir}/ctx-source/Dockerfile"
 
+$CONTAINER_CMD pull --platform "$PLATFORM" "$GIT_IMAGE" >/dev/null \
+  || fail_no_verdict "Could not pull ${GIT_IMAGE}."
 log_info "Cloning tag v${version} with submodules (container)..."
+srcImageMade=1
 if ! $CONTAINER_CMD build --no-cache --platform "$PLATFORM" \
       --build-arg GIT_IMAGE="$GIT_IMAGE" \
       --build-arg VERSION_TAG="v${version}" \
       --build-arg REPO_URL="$REPO_URL" \
       -t "$SRC_IMAGE" -f "${workDir}/ctx-source/Dockerfile" "${workDir}/ctx-source"; then
-  fail_ftbfs "Could not clone tag v${version} with submodules from ${REPO_URL}."
+  fail_no_verdict "Could not clone tag v${version} with submodules from ${REPO_URL} (missing tag or network error)."
 fi
 
 # shellcheck disable=SC2016  # the single-quoted command expands inside the container
 if ! meta="$($CONTAINER_CMD run --rm --platform "$PLATFORM" --entrypoint sh "$SRC_IMAGE" \
       -c 'cd /ws_meta && for f in *; do printf "%s=%s\n" "$f" "$(cat "$f")"; done')"; then
-  fail_ftbfs "Could not read source metadata from the clone image."
+  fail_no_verdict "Could not read source metadata from the clone image."
 fi
 while IFS='=' read -r key value; do
   case "$key" in
@@ -385,16 +416,33 @@ while IFS='=' read -r key value; do
     tag_signature)    tagSig="$value" ;;
     commit_signature) commitSig="$value" ;;
     ci_builder)       ciBuilder="$value" ;;
+    build_dir_form)   buildDirForm="$value" ;;
   esac
 done <<< "$meta"
-[[ "$commit" =~ ^[0-9a-f]{40}$ ]] || fail_ftbfs "Clone did not report a valid commit."
+[[ "$commit" =~ ^[0-9a-f]{40}$ ]] || fail_no_verdict "Clone did not report a valid commit."
 log_info "Source at commit ${commit} (tag v${version})"
 NOTES+=("Source commit: ${commit}.")
 
-if [[ "$ciBuilder" != "unknown" && "$ciBuilder" != "$BUILDER_REF" ]]; then
-  log_warn "Upstream CI at v${version} uses ${ciBuilder}; this script builds with ${BUILDER_REF}."
-  NOTES+=("Warning: upstream CI at this tag names ${ciBuilder}; this build used ${BUILDER_REF}.")
-fi
+# Use the builder and build directory upstream CI used for this tag; refuse anything unknown.
+case "$ciBuilder" in
+  cypherock/x1-firmware-builder:v0.0.0) BUILDER_IMAGE="$BUILDER_V0" ;;
+  cypherock/x1-firmware-builder:v1.0.0) BUILDER_IMAGE="$BUILDER_V1" ;;
+  *)
+    log_error "Upstream CI at v${version} names builder '${ciBuilder}', which this script does not pin. Update the script."
+    exit "$EXIT_INVALID" ;;
+esac
+BUILDER_REF="$ciBuilder"
+case "$buildDirForm" in
+  vendor)  BUILD_DIR="build_Cypherock_${COIN_VARIANT}" ;;
+  variant) BUILD_DIR="build_${COIN_VARIANT}" ;;
+  *)
+    log_error "Could not read the build directory from upstream CI at v${version}. Update the script."
+    exit "$EXIT_INVALID" ;;
+esac
+log_info "Builder (from upstream CI at the tag): ${BUILDER_IMAGE}; build directory ${BUILD_DIR}"
+NOTES+=("Build: upstream CI recipe at the tag (.github/workflows/containerized-build.yml), cmake Main/Release/Device, VENDOR=Cypherock, BTC_ONLY=${BTC_ONLY_FLAG}, SIGN_BINARY=OFF, Ninja, build directory ${BUILD_DIR}, in ${BUILDER_REF} (the builder CI names at this tag) pinned by digest, platform ${PLATFORM}.")
+$CONTAINER_CMD pull --platform "$PLATFORM" "$BUILDER_IMAGE" >/dev/null \
+  || fail_no_verdict "Could not pull ${BUILDER_IMAGE}."
 
 # ---- Step 3: build the firmware inside the builder image ----------------------------------
 {
@@ -403,12 +451,11 @@ printf 'ARG BUILDER_IMAGE=%s\n' "$BUILDER_IMAGE"
 cat <<'EOF'
 FROM ${SRC_IMAGE} AS source
 FROM ${BUILDER_IMAGE}
-ARG COIN_VARIANT
 ARG BTC_ONLY_FLAG
+ARG BUILD_DIR
 COPY --from=source /src /firmware
 WORKDIR /firmware
 RUN set -e; \
-    BUILD_DIR="build_${COIN_VARIANT}"; \
     cmake -B "$BUILD_DIR" \
       -DDEV_SWITCH=OFF \
       -DUNIT_TESTS_SWITCH:BOOL=OFF \
@@ -427,18 +474,19 @@ EOF
 } > "${workDir}/ctx-build/Dockerfile"
 
 log_info "Building firmware (${COIN_VARIANT}) in ${BUILDER_REF}..."
+buildImageMade=1
 if ! $CONTAINER_CMD build --no-cache --platform "$PLATFORM" \
       --build-arg SRC_IMAGE="$SRC_IMAGE" \
       --build-arg BUILDER_IMAGE="$BUILDER_IMAGE" \
-      --build-arg COIN_VARIANT="$COIN_VARIANT" \
       --build-arg BTC_ONLY_FLAG="$BTC_ONLY_FLAG" \
+      --build-arg BUILD_DIR="$BUILD_DIR" \
       -t "$BUILD_IMAGE" -f "${workDir}/ctx-build/Dockerfile" "${workDir}/ctx-build"; then
   fail_ftbfs "Firmware build failed (cmake/ninja in ${BUILDER_REF})."
 fi
 
 if ! EXTRACT_CTR="$($CONTAINER_CMD create --platform "$PLATFORM" "$BUILD_IMAGE" true)"; then
   EXTRACT_CTR=""
-  fail_ftbfs "Could not create a container to extract the built firmware."
+  fail_no_verdict "Could not create a container to extract the built firmware."
 fi
 if ! $CONTAINER_CMD cp "${EXTRACT_CTR}:/ws_out/${ARTIFACT}" "$builtFile"; then
   fail_ftbfs "Build finished but ${ARTIFACT} was not produced."
@@ -449,7 +497,7 @@ fi
 officialHash="$(hash_in_container "$officialFile")"
 builtHash="$(hash_in_container "$builtFile")"
 [[ "$officialHash" =~ ^[0-9a-f]{64}$ && "$builtHash" =~ ^[0-9a-f]{64}$ ]] \
-  || fail_ftbfs "Could not hash the firmware files."
+  || fail_no_verdict "Could not hash the firmware files."
 NOTES+=("Official SHA-256: ${officialHash}." "Built SHA-256: ${builtHash}.")
 
 if [[ "$builtHash" == "$officialHash" ]]; then
@@ -481,11 +529,6 @@ if [[ "$commitSig" == "present" ]]; then
 else
   commitSigLine="[WARNING] Commit is not signed"
 fi
-if [[ "$ciBuilder" != "unknown" && "$ciBuilder" != "$BUILDER_REF" ]]; then
-  ciLine="Upstream CI at this tag names ${ciBuilder}; this build used ${BUILDER_REF}"
-else
-  ciLine="none"
-fi
 
 echo
 echo "===== Begin Results ====="
@@ -496,17 +539,15 @@ echo "apkVersionCode: N/A"
 echo "verdict:        ${verdict}"
 echo "appHash:        ${officialHash}"
 echo "commit:         ${commit}"
-echo "builtHash:      ${builtHash}"
-echo "type:           ${firmwareType}"
-echo "artifact:       ${ARTIFACT}"
-echo "tag:            v${version}"
-echo "builderImage:   ${BUILDER_IMAGE}"
-echo "platform:       ${PLATFORM}"
 echo "scriptVersion:  ${SCRIPT_VERSION}"
 echo "scriptHash:     ${SCRIPT_SHA256}"
 echo
 echo "Diff:"
-echo "BUILDS MATCH BINARIES"
+if [[ "$verdict" == "reproducible" ]]; then
+  echo "BUILDS MATCH BINARIES"
+else
+  echo "BUILDS DO NOT MATCH BINARIES"
+fi
 echo "${ARTIFACT} - ${archLabel}-${firmwareType} - ${builtHash} - ${matchFlag}"
 echo
 echo "SUMMARY"
@@ -524,12 +565,16 @@ echo "Signature Summary:"
 echo "Tag type: ${tagTypeLabel}"
 echo "${tagSigLine}"
 echo "${commitSigLine}"
-echo
-echo "Warnings:"
-echo "${ciLine}"
 echo "===== End Results ====="
 echo
 echo "Publish appHash: the official ${ARTIFACT} exactly as downloaded or provided (whole file)."
+echo "builtHash:      ${builtHash} (our build; must equal appHash)"
+echo "type:           ${firmwareType}"
+echo "artifact:       ${ARTIFACT}"
+echo "tag:            v${version}"
+echo "builderImage:   ${BUILDER_IMAGE} (named by upstream CI at the tag)"
+echo "buildDir:       ${BUILD_DIR}"
+echo "platform:       ${PLATFORM}"
 echo "Official source: ${officialSource}"
 echo
 echo "Run a full comparison:"
