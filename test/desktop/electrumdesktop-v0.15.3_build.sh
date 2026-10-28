@@ -2,10 +2,10 @@
 # ==============================================================================
 # electrumdesktop_build.sh - Electrum Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:          v0.15.1
+# Version:          v0.15.3
 # Organization:     WalletScrutiny.com
-# Last modified by: Claude Fable 5 (WalletScrutiny session)
-# Last modified on: 2026-07-13
+# Last modified by: Claude Opus 5.5 (WalletScrutiny session)
+# Last modified on: 2026-10-26
 # Project:          https://github.com/spesmilo/electrum
 # ==============================================================================
 # MIT License. Provided as-is for reproducible-build verification and security
@@ -28,7 +28,7 @@ INFO_ICON="[INFO]"
 
 APP_NAME="Electrum Desktop"
 APP_ID="electrum"
-SCRIPT_VERSION="v0.15.1"
+SCRIPT_VERSION="v0.15.3"
 
 # ---------- Logging Functions ----------
 log_info() { echo -e "${BLUE}${INFO_ICON}${NC} $*"; }
@@ -413,24 +413,6 @@ elif [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" ]]; then
   fi
   log_success "type2-runtime commit: ${TYPE2_RUNTIME_COMMIT}"
 
-  SNAPSHOT_DATE=$(curl -sf "${electrum_raw}/contrib/build-linux/appimage/apt.sources.list" \
-    | grep -oE '[0-9]{8}T[0-9]{6}Z' | head -1)
-  if [[ -z "$SNAPSHOT_DATE" ]]; then
-    log_error "Failed to fetch Debian snapshot date from Electrum ${version}"
-    echo "Exit code: 1"
-    exit 1
-  fi
-  log_success "Debian snapshot: ${SNAPSHOT_DATE}"
-
-  BASE_IMAGE_DIGEST=$(curl -sf "${electrum_raw}/contrib/build-linux/appimage/Dockerfile" \
-    | grep '^FROM ' | grep -oE 'sha256:[a-f0-9]+' | head -1)
-  if [[ -z "$BASE_IMAGE_DIGEST" ]]; then
-    log_error "Failed to fetch base image digest from Electrum ${version}"
-    echo "Exit code: 1"
-    exit 1
-  fi
-  log_success "Base image: debian:bullseye@${BASE_IMAGE_DIGEST}"
-
   # ============================================================================
   # STAGE 1: Obtain type2-runtime binary
   # Primary: build from source. Fallback: extract from official AppImage.
@@ -629,74 +611,25 @@ elif [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" ]]; then
   cd "$workspace"
 
   # ============================================================================
-  # STAGE 2: Build AppImage (Debian Bullseye container)
+  # STAGE 2: Electrum's own AppImage Dockerfile at this tag (as build.sh does)
   # ============================================================================
-  log_info "Stage 2: Generating Linux AppImage Dockerfile (Debian Bullseye)..."
-  cat > "$dockerfile_path" <<'DOCKERFILE_EOF'
-FROM debian:bullseye@__BASE_IMAGE_DIGEST__
-
-ENV LC_ALL=C.UTF-8 LANG=C.UTF-8
-ENV DEBIAN_FRONTEND=noninteractive
-
-ARG VERSION
-ARG UID=1000
-ENV ELECTRUM_VERSION=${VERSION}
-ENV USER="user"
-ENV HOME_DIR="/home/${USER}"
-ENV WORK_DIR="/opt/electrum"
-
-RUN apt-get update -qq > /dev/null && apt-get install -qq --yes --no-install-recommends \
-    ca-certificates
-
-RUN echo "deb https://snapshot.debian.org/archive/debian/__SNAPSHOT_DATE__/ bullseye main" > /etc/apt/sources.list && \
-    echo "deb-src https://snapshot.debian.org/archive/debian/__SNAPSHOT_DATE__/ bullseye main" >> /etc/apt/sources.list && \
-    echo "Package: *" > /etc/apt/preferences.d/snapshot && \
-    echo "Pin: origin \"snapshot.debian.org\"" >> /etc/apt/preferences.d/snapshot && \
-    echo "Pin-Priority: 1001" >> /etc/apt/preferences.d/snapshot
-
-# python3 (system) needed by contrib/locale/stats.py; make_appimage.sh compiles its own
-RUN apt-get update -q && \
-    apt-get install -qy --allow-downgrades \
-        sudo git wget make desktop-file-utils \
-        python3 \
-        autotools-dev autoconf libtool autopoint pkg-config xz-utils gettext \
-        libssl-dev libssl1.1 openssl \
-        zlib1g-dev libffi-dev \
-        libncurses5-dev libncurses5 libtinfo-dev libtinfo5 \
-        libsqlite3-dev \
-        libusb-1.0-0-dev libudev-dev libudev1 \
-        libdbus-1-3 xutils-dev \
-        libxkbcommon0 libxkbcommon-x11-0 \
-        libxcb1-dev libxcb-xinerama0 libxcb-randr0 libxcb-render0 \
-        libxcb-shm0 libxcb-shape0 libxcb-sync1 libxcb-xfixes0 libxcb-xkb1 \
-        libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-util1 \
-        libxcb-render-util0 libxcb-cursor0 libx11-xcb1 \
-        libc6-dev libc6 libc-dev-bin \
-        libv4l-dev libjpeg62-turbo-dev libx11-dev \
-        libfuse2 && \
-    rm -rf /var/lib/apt/lists/* && \
-    apt-get autoremove -y && \
-    apt-get clean
-
-RUN useradd --uid $UID --create-home --shell /bin/bash ${USER} && \
-    mkdir -p ${WORK_DIR} /output && \
-    chown -R ${USER}:${USER} ${WORK_DIR} /output
-
-USER ${USER}
-
-RUN git clone https://github.com/spesmilo/electrum.git ${WORK_DIR}
-
-WORKDIR ${WORK_DIR}
-
-RUN git checkout ${ELECTRUM_VERSION}
-
-RUN mkdir -p ${WORK_DIR}/contrib/build-linux/appimage/.cache/appimage/type2-runtime
-
-CMD ["/bin/bash"]
-DOCKERFILE_EOF
-
-  sed -i "s|__BASE_IMAGE_DIGEST__|${BASE_IMAGE_DIGEST}|g" "$dockerfile_path"
-  sed -i "s|__SNAPSHOT_DATE__|${SNAPSHOT_DATE}|g" "$dockerfile_path"
+  electrum_src="$workspace/electrum"
+  log_info "Stage 2: Cloning Electrum ${version} for its own Dockerfile and make_appimage.sh..."
+  if ! ${container_cmd} run --rm -v "$workspace:/ws:rw" alpine sh -c "
+      apk add --no-cache -q git >/dev/null 2>&1 &&
+      git config --global --add safe.directory /ws/electrum &&
+      git clone -q https://github.com/spesmilo/electrum.git /ws/electrum &&
+      cd /ws/electrum && git checkout -q ${version} && git log -1 --format='HEAD: %H %s' &&
+      chown -R ${host_uid}:${host_gid} /ws/electrum"; then
+    log_error "Electrum clone/checkout failed"
+    echo "Exit code: 1"
+    exit 1
+  fi
+  build_context="$electrum_src/contrib/build-linux/appimage"
+  build_dockerfile="$build_context/Dockerfile"
+  log_info "Upstream apt sources: $(tr '\n' ' ' < "$build_context/apt.sources.list")"
+  mkdir -p "$build_context/.cache/appimage/type2-runtime"
+  cp "$workspace/runtime-x86_64" "$build_context/.cache/appimage/type2-runtime/runtime-x86_64"
 
 elif [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "tarball" ]]; then
   log_info "Generating Linux Tarball Dockerfile (Debian Bookworm)..."
@@ -757,7 +690,7 @@ DOCKERFILE_EOF
 
 fi
 
-log_success "Dockerfile generated"
+[[ -n "${build_dockerfile:-}" ]] || log_success "Dockerfile generated"
 
 # ---------- Build Container Image ----------
 log_info "Building container image (this may take 30-60 minutes)..."
@@ -780,8 +713,8 @@ if ! ${container_cmd} build \
   ${build_args} \
   ${docker_cache_flags} \
   -t "${image_name}" \
-  -f "$dockerfile_path" \
-  "$workspace"; then
+  -f "${build_dockerfile:-$dockerfile_path}" \
+  "${build_context:-$workspace}"; then
   log_error "Container build failed"
   echo "Exit code: 1"
   exit 1
@@ -790,10 +723,10 @@ fi
 log_success "Container image built successfully"
 
 # ---------- Run AppImage Build (special case) ----------
-# For AppImage, the Dockerfile only sets up the environment.
-# We run make_appimage.sh separately with the type2-runtime mounted.
+# For AppImage, the upstream image only sets up the environment; make_appimage.sh
+# runs in the clone (type2-runtime already in its .cache).
 if [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" ]]; then
-  log_info "Running make_appimage.sh with mounted type2-runtime..."
+  log_info "Running make_appimage.sh in the mounted clone..."
 
   # Create output directory
   appimage_output_dir="$workspace/appimage-output"
@@ -801,10 +734,10 @@ if [[ "$arch" == "x86_64-linux-gnu" && "$build_type" == "appimage" ]]; then
 
   if ! ${container_cmd} run --rm \
     -u "${host_uid}:${host_gid}" \
-    -v "$workspace/runtime-x86_64:/opt/electrum/contrib/build-linux/appimage/.cache/appimage/type2-runtime/runtime-x86_64:rw" \
-    -v "$appimage_output_dir:/output:rw" \
-    "${image_name}" \
-    bash -c 'cd /opt/electrum/contrib/build-linux/appimage && ./make_appimage.sh && cp /opt/electrum/dist/*.AppImage /output/'; then
+    -v "$electrum_src:/opt/electrum:rw" \
+    -w /opt/electrum/contrib/build-linux/appimage \
+    "${image_name}" ./make_appimage.sh ||
+    ! cp "$electrum_src"/dist/*.AppImage "$appimage_output_dir/"; then
     log_error "AppImage build failed"
     echo "Exit code: 1"
     exit 1
@@ -896,13 +829,9 @@ if [[ "$arch" == "win64" ]]; then
     bash -c '
       set -euo pipefail
       for file in "$@"; do
-        if [[ -f "/input/${file}" ]]; then
-          if osslsigncode remove-signature -in "/input/${file}" -out "/output/${file}" >/dev/null 2>&1; then
-            :
-          else
-            cp "/input/${file}" "/output/${file}"
-          fi
-        fi
+        [[ -f "/input/${file}" ]] || continue
+        osslsigncode remove-signature -in "/input/${file}" -out "/output/${file}"
+        echo "[OK] Signature removed: ${file}"
       done
     ' bash "${official_files[@]}"; then
     log_error "Signature stripping failed"

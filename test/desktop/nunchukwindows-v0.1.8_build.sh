@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # nunchukwindows_build.sh - Nunchuk Desktop Windows Reproducible Build Verifier
-# Version: v0.1.7
+# Version: v0.1.8
 # Last modified by: Danny Garcia, Carol (Buzz), Claude Code
 # Last modified on: 2026-10-21
 # Organization: WalletScrutiny.com
@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.7"
+SCRIPT_VERSION="v0.1.8"
 APP_ID="nunchuk"
 APP_NAME="Nunchuk Desktop (Windows)"
 GH_REPO="nunchuk-io/nunchuk-desktop"
@@ -195,7 +195,7 @@ parse_args() {
         [[ -e "$BINARY_PATH" ]] || die_invalid "--binary path does not exist: $BINARY_PATH"
         BINARY_PATH="$(realpath "$BINARY_PATH")"
         local pat m=() magic want
-        [[ "$APP_TYPE" == setup ]] && { pat='*-x64-setup.exe'; want=4d5a; } || { pat='*-x64-portable.zip'; want=504b0304; }
+        [[ "$APP_TYPE" == setup ]] && { pat='*-x64-setup*.exe'; want=4d5a; } || { pat='*-x64-portable*.zip'; want=504b0304; }
         # ABS passes a directory when a submission has several files: take the one for --type.
         if [[ -d "$BINARY_PATH" ]]; then
             shopt -s nullglob
@@ -306,8 +306,9 @@ check_prereqs() {
     log_ok "Prerequisites: /dev/kvm, golden image ${GOLDEN_DIR} (evaluation ends ${ends}), VM key"
 }
 
-# Release names (from 2.9.1); CI builds them as -unsigned and the release renames them.
+# Release names: 2.9.1 renamed CI's -unsigned files; from 2.9.2 the release keeps the CI names.
 asset_name() {
+    [[ "$APP_VERSION" == 2.9.1 ]] || { built_name "$1"; return; }
     case "$1" in
         setup) printf 'nunchuk-windows-v%s-x64-setup.exe' "$APP_VERSION" ;;
         portable) printf 'nunchuk-windows-v%s-x64-portable.zip' "$APP_VERSION" ;;
@@ -763,10 +764,10 @@ emit_verification_summary() {
     echo "release runner: ${REL_IMAGE_OS:-?} ${REL_IMAGE_VERSION:-?}, cl.exe ${REL_MSVC} (runner fields not reproduced, see Warnings)"
     echo "toolchain:      VS Build Tools 17.14.41, MSVC 14.44.35207, SDK 10.0.22621.0, pwsh 7.6.6, Python 3.12.10, NASM 3.02, Strawberry Perl 5.32.1.1"
     echo "                cl.exe is checked against the release's build-info.json. build-info.json does not record"
-    echo "                Python, NASM or Perl: those are from upstream's 2.9.1 CI job log (run 38044363978:"
+    echo "                Python, NASM or Perl: those are from upstream's CI job logs (2.9.1 run 38044363978, 2.9.2 run 40099229609:"
     echo "                'Successfully set up CPython (3.12.10)', 'nasm v3.2.0', 'NASM version 3.02', C:\\Strawberry perl)"
     echo "                and the runner toolset (strawberryperl 5.32.1.1)."
-    [[ "$APP_VERSION" == 2.9.1 ]] || echo "[WARNING] Toolchain versions were confirmed for 2.9.1 only; check them against this release's CI run"
+    [[ "$APP_VERSION" == 2.9.[12] ]] || echo "[WARNING] Toolchain versions were confirmed for 2.9.1 and 2.9.2 only; check them against this release's CI run"
     echo ""
     echo "Elapsed time per phase:"
     printf '%s' "$PHASE_TIMES"
