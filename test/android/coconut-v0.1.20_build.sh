@@ -1,38 +1,19 @@
 #!/bin/bash
-# coconut_build.sh v0.1.19 — Coconut Wallet (onl.coconut.wallet) Android reproducible build
-# verification
+# coconut-v0.1.20_build.sh — Coconut Wallet (onl.coconut.wallet) Android reproducible build verification
+# Version: v0.1.20
 # Organization: WalletScrutiny.com
 # Last modified by: Daniel Garcia
-# Last modified on: 2026-10-20
+# Last modified on: 2026-10-29
 # Project: https://github.com/noncelab/coconut_wallet
-#
-# TECHNICAL DISCLAIMER:
-# This script is provided for technical analysis and reproducible build verification purposes
-# only. No warranty is provided regarding security, functionality, or fitness for any particular
-# purpose. Users assume all risks associated with running this script and analyzing the software.
-#
-# LEGAL DISCLAIMER:
-# This script is designed for legitimate security research and reproducible build verification.
-# Users are responsible for ensuring compliance with all applicable laws and regulations. The
-# developers assume no liability for any misuse or legal consequences arising from use.
-#
-# SCOPE: mainnet flavor only (onl.coconut.wallet); regtest is a separate Play listing, out of
-# scope. Builds the AAB from source and compares a bundletool split set, split by split, against
-# the official Play splits supplied via --binary/--apk. No upstream Android CI exists; the recipe
-# is reconstructed from android/fastlane/Fastfile, Makefile and the release helper script.
-#
-# NOTE A: the three .env assets are recovered from the official APK (gitignored upstream).
-# NOTE B: google-services.json is not reconstructed; REQUIRE_GOOGLE_SERVICES stays unset.
-# NOTE C: the BitBox02 bridge is built from the non-upstream fork upstream's README requires.
-# NOTE D: upstream's Makefile does not parse at v0.17.0; a whitespace-only repair is applied.
-# The full design notes (SCOPE, STEPS, NOTE A-D) are kept in this script's changelog.
-#
+# Disclaimer: for reproducible-build verification and research only. No warranty; users assume all risk and are responsible for legal compliance; the developers assume no liability for misuse.
+# Steps: build the mainnet AAB from the tag in podman (Fastlane recipe), derive bundletool splits for the official device spec, compare split by split with the official Play splits (--binary/--apk).
+# Notes A-D (.env from the official APK, no google-services, BitBox02 fork, Makefile repair) and all design notes: script-notes/android/onl.coconut.wallet/changelog.md
 # Exit codes: 0 = reproducible, 1 = not_reproducible or ftbfs, 2 = invalid parameters.
 set -euo pipefail
 
 EXEC_DIR="$(pwd)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.1.19"
+readonly SCRIPT_VERSION="v0.1.20"
 readonly SCRIPT_NAME="coconut_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 readonly SCRIPT_PATH
@@ -43,34 +24,16 @@ readonly REPO_URL="https://github.com/noncelab/coconut_wallet.git"
 readonly BITBOX_FORK_URL="https://github.com/4xvgal/bitbox02-api-go.git"
 readonly BITBOX_FORK_BRANCH="fix/nil-guard-psbt"
 
-# Pinned tooling. bundletool 1.16.0 (what AGP 8.6.0's POM declares) was tried first and does NOT
-# match Google Play's server-side split generator for this release: res/xml/splits0.xml used
-# locale codes id/he where Play's has in/iw, and the split manifests differed in the
-# requiredSplitTypes namespace and isSplitRequired. With 1.18.3, tested against the v0.17.0 AAB,
-# splits0.xml is byte-identical and the only manifest differences left are Play's own additions
-# (stamp meta-data, derived.apk.id, PairIP). apktool 3.0.3 is the current stable release at time
-# of writing. Both hashes were computed from the actual downloaded release asset.
 readonly BT_VER="1.18.3"
 readonly BT_URL="https://github.com/google/bundletool/releases/download/${BT_VER}/bundletool-all-${BT_VER}.jar"
 readonly BT_SHA="a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29"
 readonly AT_VER="3.0.3"
 readonly AT_URL="https://github.com/iBotPeaches/Apktool/releases/download/v${AT_VER}/apktool_${AT_VER}.jar"
 readonly AT_SHA="dbf930b076c6b9be08d57c449cacefc3bdd6b71ebd59b3066fc0e1f5b14f9423"
+readonly HELPER_IMAGE="docker.io/library/eclipse-temurin:17-jre@sha256:4faa9eaf440514dd4f7ef71fecb92526e13679aea039bed5d2fc98e885c60dee"
 readonly GO_VER="1.26.0"
 readonly GO_URL="https://go.dev/dl/go${GO_VER}.linux-amd64.tar.gz"
 readonly GO_SHA="aac1b08a0fb0c4e0a7c1555beb7b59180b05dfc5a3d62e40e9de90cd42f88235"
-# FLUTTER_TAG and NDK_VER are no longer fixed here (v0.1.18): FLUTTER_TAG is read from the release
-# tag's .fvmrc, NDK_VER from that Flutter release's own ndkVersion default (see "SETUP: TOOLCHAIN
-# VERSIONS"). android/app/build.gradle uses `ndkVersion flutter.ndkVersion`; AGP needs exactly that
-# revision present to strip the release jniLibs (llvm-strip), else it auto-downloads it or packages
-# the .so files unstripped, both diff sources. One NDK in the image, used by both cargo ndk (Trezor
-# bridge, via ANDROID_NDK_HOME) and AGP (app), removes that variable. Which NDK the vendor's macOS
-# build used for the Trezor bridge is unknown.
-# pubspec.lock is gitignored upstream, so pub get resolves today's graph. For 0.20.0 that picks
-# url_launcher_android 6.3.29 (androidx.core 1.17.0, browser 1.9.0 -> needs AGP 8.9.1; upstream pins
-# 8.6.0): build fails. The official APK's META-INF/*.version say core 1.13.1, browser 1.8.0 =
-# url_launcher_android 6.3.14-6.3.25. 6.3.25 (newest of those) is pinned via dependency_overrides.
-# The vendor's exact version is unknown: a guess, reported in the results.
 readonly PUB_OVERRIDE="url_launcher_android: 6.3.25"
 
 readonly EXIT_SUCCESS=0
@@ -88,17 +51,11 @@ sha256_of() {
     sha256sum "$1" | awk '{print $1}'
 }
 
-# Print at most N lines. `head` makes the upstream writer see SIGPIPE, which under
-# `set -o pipefail` can abort the run before a verdict is written — this drains the input instead.
 cap() { awk -v n="${1:-5}" 'NR<=n{print} {last=NR} END{if(last>n) printf "    ... %d more line(s); full listing saved\n", last-n}'; }
 
-# --- Self-identification (script-notes/script-version-and-hash.md). First action, before
-# argument parsing, so even an invalid-argument run records which bytes ran. ---
 SCRIPT_SHA256="$(sha256_of "$SCRIPT_PATH")"
 printf '%s %s sha256:%s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION" "$SCRIPT_SHA256"
 
-# A previous run's verdict must never survive this invocation, including one that exits during
-# argument validation or preflight.
 rm -f "${EXEC_DIR}/COMPARISON_RESULTS.yaml"
 
 usage() {
@@ -109,13 +66,13 @@ Usage: ${SCRIPT_NAME} --binary <dir-of-official-splits|base.apk> [--version <v>]
   --binary   REQUIRED. Directory holding the official Play split APKs (base.apk plus
              split_config.*.apk), or the path to base.apk itself, whose siblings in
              the same directory then form the split set. Alias: --apk.
-  --version  REQUIRED. Selects tag v<version>, whose .fvmrc sets the Flutter version;
-             cross-checked against base.apk's versionName inside the container.
-  --arch     Optional. Logged; the device spec's ABI comes from the official splits.
+  --version  Optional. Selects tag v<version>, whose .fvmrc sets the Flutter version;
+             read from base.apk's versionName when omitted (ABS passes none).
+  --arch     Optional. Checked against the split set's ABI split; mismatch exits 2.
   --type     Optional. Logged, unused (mainnet flavor only — see header SCOPE).
   --commit   Optional. Build this revision instead of the derived release tag.
 
-Requires: podman or docker. No smartphone, no adb, no sudo.
+Requires: podman or docker only. No smartphone, no adb, no root.
 Exit codes: 0 = reproducible, 1 = not_reproducible / ftbfs, 2 = invalid parameters.
 USAGE
 }
@@ -129,26 +86,19 @@ write_yaml() {
           printf '%s\n' "$notes" | sed 's/^/  /'
       fi
     } > "${EXEC_DIR}/COMPARISON_RESULTS.yaml"
-    RESULT_DONE=true
     log "COMPARISON_RESULTS.yaml written with verdict: ${verdict}"
 }
 
-RESULT_DONE=false
 WORK_DIR=""
 CONTAINER_RUNTIME=""
 
-# Leave nothing the invoking user cannot delete — the build server has no sudo
-# (non-sudo-directories-guideline.md).
 normalize_ownership() {
     [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" && -n "${CONTAINER_RUNTIME}" ]] || return 0
     if [[ "${CONTAINER_RUNTIME}" == "podman" ]]; then
-        # Inside "podman unshare" the caller IS uid 0; the caller's real uid maps to a subuid there,
-        # so chown to $(id -u) would hand the tree to e.g. 166536 and the host could not delete it.
-        # 0:0 in the namespace == the invoking user on the host (same form as bitbox02_build.sh).
         podman unshare chown -R 0:0 "${WORK_DIR}" 2>/dev/null \
             || log_warn "Could not normalize ownership under ${WORK_DIR}"
     else
-        docker run --rm --user 0:0 -v "${WORK_DIR}:/work" debian:bookworm-slim \
+        docker run --rm --user 0:0 -v "${WORK_DIR}:/work" "$HELPER_IMAGE" \
             chown -R "$(id -u):$(id -g)" /work >/dev/null 2>&1 \
             || log_warn "Could not normalize ownership under ${WORK_DIR}"
     fi
@@ -160,20 +110,15 @@ normalize_ownership() {
 cleanup() {
     local rc=$?
     normalize_ownership
-    if [[ "$RESULT_DONE" == false && $rc -ne 0 && $rc -ne "$EXIT_INVALID" ]]; then
-        write_yaml "ftbfs" "Run aborted unexpectedly with status ${rc} before a verdict was reached. See the terminal output for the failing step."
-    fi
+    return "$rc"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
 die_invalid() { log_err "$1"; echo "Exit code: ${EXIT_INVALID}"; exit "${EXIT_INVALID}"; }
-fail() { log_err "$2"; write_yaml "$1" "$2"; echo "Exit code: ${EXIT_FAILED}"; exit "${EXIT_FAILED}"; }
+die_err() { log_err "$1 No YAML written."; echo "Exit code: ${EXIT_FAILED}"; exit "${EXIT_FAILED}"; }
 
-# ------------------------------------------------------------------------------
-# Arguments
-# ------------------------------------------------------------------------------
 binary_arg=""; version_arg=""; arch_arg=""; type_arg=""; commit_arg=""
 need_arg() { [[ -n "${2:-}" && "${2:0:2}" != "--" ]] || die_invalid "Option $1 requires a value."; }
 while [[ $# -gt 0 ]]; do
@@ -185,14 +130,12 @@ while [[ $# -gt 0 ]]; do
         --commit)       need_arg "$1" "${2:-}"; commit_arg="$2"; shift 2 ;;
         --script-version) echo "${SCRIPT_NAME} ${SCRIPT_VERSION}"; exit "${EXIT_SUCCESS}" ;;
         -h|--help)      usage; exit "${EXIT_SUCCESS}" ;;
-        # Unknown parameters must never be fatal (luis-changes-2026-03-11 / -03-12).
         *)              log_warn "Ignoring unrecognised parameter: $1"; shift ;;
     esac
 done
 
-[[ "$(id -u)" -eq 0 ]] && die_invalid "Refusing to run as root. Run as a normal user; no sudo is needed."
+[[ "$(id -u)" -eq 0 ]] && die_invalid "Refusing to run as root. Run as a normal user."
 [[ -n "$binary_arg" ]] || { usage; die_invalid "--binary (alias --apk) is required — Play splits cannot be downloaded, they must be supplied."; }
-[[ "$version_arg" =~ ^[0-9]+(\.[0-9]+)*$ ]] || { usage; die_invalid "--version is required (e.g. 0.20.0): it selects the tag whose .fvmrc sets the Flutter version."; }
 
 OFFICIAL_DIR=""
 if [[ -f "$binary_arg" ]]; then
@@ -211,12 +154,26 @@ shopt -u nullglob
 OFFICIAL_BASE="${OFFICIAL_DIR}/base.apk"
 [[ -f "$OFFICIAL_BASE" ]] || die_invalid "base.apk not found in ${OFFICIAL_DIR}. The Play split set must include it."
 
-[[ -n "$arch_arg" ]] && log "--arch ${arch_arg} accepted; the device spec's ABI comes from the official split set"
+if [[ -n "$arch_arg" ]]; then
+    case "$arch_arg" in
+        *arm64*|*aarch64*) abi="arm64_v8a" ;;
+        *armeabi*|*armv7*|arm) abi="armeabi_v7a" ;;
+        *x86_64*|*x86-64*|*amd64*) abi="x86_64" ;;
+        x86|*i686*|*i386*) abi="x86" ;;
+        *) die_invalid "Unsupported --arch '${arch_arg}' (arm64-v8a, armeabi-v7a, x86_64, x86)." ;;
+    esac
+    has_abi=false
+    for a in arm64_v8a armeabi_v7a x86_64 x86; do [[ -f "${OFFICIAL_DIR}/split_config.${a}.apk" ]] && has_abi=true; done
+    if [[ "$has_abi" == true ]]; then
+        [[ -f "${OFFICIAL_DIR}/split_config.${abi}.apk" ]] \
+            || die_invalid "--arch ${arch_arg} does not match the split set: no split_config.${abi}.apk in ${OFFICIAL_DIR}."
+        log_ok "--arch ${arch_arg} matches split_config.${abi}.apk"
+    else
+        log_warn "--arch ${arch_arg}: the split set has no ABI split; the device spec's ABI comes from base.apk"
+    fi
+fi
 [[ -n "$type_arg" ]] && log "--type ${type_arg} accepted but not used (mainnet flavor only)"
 
-# ------------------------------------------------------------------------------
-# Preflight
-# ------------------------------------------------------------------------------
 section "PRE-FLIGHT"
 if command -v podman >/dev/null 2>&1; then
     CONTAINER_RUNTIME="podman"
@@ -226,6 +183,17 @@ else
     die_invalid "Neither podman nor docker found. Install one of them (podman preferred)."
 fi
 log_ok "Using ${CONTAINER_RUNTIME} as container runtime"
+HELPER_USER=(); [[ "$CONTAINER_RUNTIME" == docker ]] && HELPER_USER=(--user "$(id -u):$(id -g)")
+hrun() { "$CONTAINER_RUNTIME" run --rm "${HELPER_USER[@]}" -e HOME=/tmp "$@"; }
+if [[ -z "$version_arg" ]]; then
+    version_arg="$(hrun -v "${OFFICIAL_DIR}:/o:ro" "$HELPER_IMAGE" sh -c 'curl -fsSL "$1" -o /tmp/at.jar \
+        && echo "$2  /tmp/at.jar" | sha256sum -c --quiet \
+        && java -jar /tmp/at.jar d -f -s -o /tmp/m /o/base.apk >/dev/null 2>&1 \
+        && sed -n "s/^ *versionName: *'"'"'\{0,1\}\([^'"'"']*\).*/\1/p" /tmp/m/apktool.yml' sh "$AT_URL" "$AT_SHA")" \
+        || die_err "Could not read versionName from base.apk (apktool in ${HELPER_IMAGE})."
+    log "--version not given; base.apk versionName = ${version_arg}"
+fi
+[[ "$version_arg" =~ ^[0-9]+(\.[0-9]+)*$ ]] || die_invalid "Version '${version_arg}' is not of the form X.Y.Z."
 
 RUN_ID="$(date +%s)-$$"
 WORK_DIR="$(pwd -P)/coconut_verification_${version_arg:-unset}_${RUN_ID}"  # per run, caller dir (never /tmp)
@@ -244,136 +212,66 @@ cat <<BANNER
  Date:      $(date)
 BANNER
 
-# ------------------------------------------------------------------------------
-# Pinned host-side tooling (bundletool, apktool) — fetched and hash-verified once
-# on the host so the container build below does not need outbound trust beyond
-# these two pins plus what the Dockerfile itself fetches (Flutter/Go/rustup/SDK,
-# all likewise pinned by tag/version below).
-# ------------------------------------------------------------------------------
 section "SETUP: PINNED TOOLING"
 fetch_pinned() {
-    local url="$1" want="$2" dest="$3" got
-    curl -fsSL "$url" -o "$dest" || fail "ftbfs" "Could not download $(basename "$dest") from ${url}."
-    got="$(sha256_of "$dest")"
-    [[ "$got" == "$want" ]] || fail "ftbfs" "$(basename "$dest") SHA-256 mismatch. Expected ${want}, got ${got}. Refusing to run an unverified tool."
-    log_ok "$(basename "$dest") verified: ${want}"
+    hrun -v "${WORK_DIR}/tools:/t" "$HELPER_IMAGE" sh -c 'curl -fsSL "$1" -o "/t/$3" && echo "$2  /t/$3" | sha256sum -c --quiet' sh "$1" "$2" "$3" \
+        || die_err "Could not download or verify $3 (${1}; expected sha256 ${2})."
+    log_ok "$3 verified: $2"
 }
-fetch_pinned "$BT_URL" "$BT_SHA" "${WORK_DIR}/tools/bundletool.jar"
-fetch_pinned "$AT_URL" "$AT_SHA" "${WORK_DIR}/tools/apktool.jar"
+fetch_pinned "$BT_URL" "$BT_SHA" bundletool.jar
+fetch_pinned "$AT_URL" "$AT_SHA" apktool.jar
 
-# Flutter comes from the tag's .fvmrc (upstream's FVM pin; 0.17.0 = 3.29.1, 0.20.0 = 3.35.7), NDK
-# from that Flutter tag's ndkVersion default (Kotlin file since 3.32, Groovy before). The driver
-# re-reads .fvmrc from the clone and stops if it differs.
 section "SETUP: TOOLCHAIN VERSIONS"
 FVMRC_URL="https://raw.githubusercontent.com/noncelab/coconut_wallet/v${version_arg}/.fvmrc"
-FLUTTER_TAG="$(curl -fsSL "$FVMRC_URL" | sed -n 's/.*"flutter"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)" || true
-[[ "$FLUTTER_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "ftbfs" "Could not read a Flutter version from ${FVMRC_URL}."
+FLUTTER_TAG="$(hrun "$HELPER_IMAGE" curl -fsSL "$FVMRC_URL" | sed -n 's/.*"flutter"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)" || true
+[[ "$FLUTTER_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die_err "Could not read a Flutter version from ${FVMRC_URL}."
 NDK_VER=""
 for f in packages/flutter_tools/gradle/src/main/kotlin/FlutterExtension.kt packages/flutter_tools/gradle/src/main/groovy/flutter.groovy; do
-    NDK_VER="$(curl -fsSL "https://raw.githubusercontent.com/flutter/flutter/${FLUTTER_TAG}/${f}" 2>/dev/null \
+    NDK_VER="$(hrun "$HELPER_IMAGE" curl -fsSL "https://raw.githubusercontent.com/flutter/flutter/${FLUTTER_TAG}/${f}" 2>/dev/null \
         | sed -n 's/.*ndkVersion[^=]*=[[:space:]]*"\([0-9.]*\)".*/\1/p' | head -1)" || true
     [[ -n "$NDK_VER" ]] && break
 done
-[[ "$NDK_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "ftbfs" "Could not read Flutter ${FLUTTER_TAG}'s default ndkVersion."
+[[ "$NDK_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die_err "Could not read Flutter ${FLUTTER_TAG}'s default ndkVersion."
 readonly FLUTTER_TAG NDK_VER
 log_ok "Flutter ${FLUTTER_TAG} (tag v${version_arg} .fvmrc), NDK ${NDK_VER} (Flutter ${FLUTTER_TAG} default)"
 
-# ------------------------------------------------------------------------------
-# Build the toolchain image. Everything below this point that touches the
-# network, Flutter, Go, Rust, the Android SDK/NDK or Gradle runs inside it.
-# ------------------------------------------------------------------------------
 section "BUILD: TOOLCHAIN IMAGE"
 DOCKERFILE="${WORK_DIR}/Dockerfile"
 cat > "$DOCKERFILE" <<DOCKERFILE_EOF
 FROM docker.io/debian:bookworm-slim
 ENV DEBIAN_FRONTEND=noninteractive
-# Pin the locale for the WHOLE image. Two reasons, and the second is the important one:
-#  1. JDK 17 predates JEP 400, so javac's default source charset follows the locale. bookworm-slim
-#     sets no LANG (POSIX/C -> US-ASCII), and gomobile copies Go doc comments verbatim into the
-#     Java it generates -- go/bridge.go:34 contains an em dash, so javac aborts with
-#     "unmappable character (0xE2) for encoding US-ASCII". Upstream's source is valid UTF-8; a
-#     normal dev machine has a UTF-8 locale and never sees this. The gap is ours, not theirs.
-#  2. Locale is a build-determinism input in its own right -- it can change sort order, date and
-#     number formatting, and text processing anywhere in the pipeline. A reproducible-build
-#     verifier should fix it explicitly for the entire image rather than inherit whatever the base
-#     image happens to default to. C.UTF-8 is built into glibc on bookworm; no locales package.
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
 RUN set -ex; apt-get update; apt-get install -y --no-install-recommends \\
       curl git unzip xz-utils ca-certificates openjdk-17-jdk-headless \\
       build-essential clang cmake ninja-build pkg-config protobuf-compiler \\
       python3 file rsync libglu1-mesa libdbus-1-dev; \\
     rm -rf /var/lib/apt/lists/*
-# libdbus-1-dev is a HOST-side build dependency only: rust/trezor-bridge pulls trezor-connect-rs
-# with the "bluetooth" feature, whose Linux BLE backend goes through BlueZ over D-Bus, so
-# libdbus-sys is compiled for x86_64-unknown-linux-gnu while cross-compiling the Android targets.
-# It does not enter any Android .so. Upstream builds on macOS, where BLE resolves to CoreBluetooth
-# instead, which is why their own builds never need it.
-# Android cmdline-tools + SDK components pinned to what android/app/build.gradle and
-# android/settings.gradle declare (compileSdk/targetSdk 36, AGP 8.6.0's toolchain).
-# ANDROID_HOME as well as ANDROID_SDK_ROOT: gomobile reads the older ANDROID_HOME name and, when it
-# is unset, falls back to \$HOME/Android/Sdk, which is not where this image puts the SDK. Flutter
-# likewise falls back to these env vars when its own "flutter config --android-sdk" setting (written
-# under the build user's \$HOME) is not visible. Pinning both names in the image makes every consumer
-# find the SDK regardless of which user or HOME the container runs with. (First hit while the
-# container still ran non-root; kept because it is correct either way.)
 ENV ANDROID_SDK_ROOT=/opt/android-sdk ANDROID_HOME=/opt/android-sdk
 RUN set -ex; mkdir -p \$ANDROID_SDK_ROOT/cmdline-tools; \\
     curl -fsSL -o /tmp/cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip; \\
     unzip -q /tmp/cmdline-tools.zip -d \$ANDROID_SDK_ROOT/cmdline-tools; \\
     mv \$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools \$ANDROID_SDK_ROOT/cmdline-tools/latest; \\
     rm /tmp/cmdline-tools.zip
-# /root/go/bin is where the "go install" step below puts the gomobile binary (default
-# GOPATH=\$HOME/go, GOBIN unset) -- without it on PATH, the "gomobile init" a few steps down
-# no-ops and the driver's "make gomobile-android" would fail outright at runtime.
-# NOTE: this heredoc is unquoted, so no backticks in these comments --
-# bash would run them as command substitution on the host while writing the Dockerfile.
 ENV PATH=\$PATH:\$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:\$ANDROID_SDK_ROOT/platform-tools:\$ANDROID_SDK_ROOT/build-tools/36.0.0:/usr/local/go/bin:/root/go/bin:/root/.cargo/bin
 RUN yes | sdkmanager --licenses >/dev/null 2>&1 || true; \\
     sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;${NDK_VER}" >/dev/null
 ENV ANDROID_NDK_HOME=\$ANDROID_SDK_ROOT/ndk/${NDK_VER}
-# tar restores the stored owner when it runs as root, and rootless podman only maps 65536 uids into
-# the container, so extracting a tarball whose entries carry a large uid fails with "Cannot change
-# ownership to uid 397546: Invalid argument" even as container root. Flutter's gradle-wrapper.tgz
-# is exactly that (entries owned by jakobr/eng = 397546:5000). GNU tar reads TAR_OPTIONS from the
-# environment, so this applies to every tar the toolchain runs, at image build and at run time.
 ENV TAR_OPTIONS=--no-same-owner
-# Flutter, pinned to the exact tag .fvmrc declares — no FVM wrapper needed, this IS ${FLUTTER_TAG}.
 ENV PATH=\$PATH:/opt/flutter/bin
-# Clone, configure, precache and open permissions in ONE layer. Two problems, both from the image
-# building as root while the container runs as the invoking user:
-#  - git refuses to operate on a repo owned by another user ("detected dubious ownership"), and
-#    flutter shells out to git constantly. safe.directory is set --system (/etc/gitconfig) so every
-#    UID picks it up; --global would land in /root/.gitconfig, which is not read when the container
-#    runs as anyone but root.
-#  - flutter takes a write lock on bin/cache/lockfile for every command and updates artifacts
-#    under bin/cache, so FLUTTER_ROOT has to be writable by that user. chmod, not chown: the
-#    runtime UID is not known at image-build time.
-# Deliberately one RUN: a later "chmod -R" would force an overlayfs copy-up of the entire SDK into
-# a new layer, roughly doubling image size.
 RUN set -ex; git clone --branch ${FLUTTER_TAG} --depth 1 https://github.com/flutter/flutter.git /opt/flutter; \\
     git config --system --add safe.directory /opt/flutter; \\
     flutter config --no-analytics --android-sdk \$ANDROID_SDK_ROOT >/dev/null; \\
     flutter precache --android >/dev/null 2>&1 || true; \\
     chmod -R a+rwX /opt/flutter
-# Go, pinned to what go/go.mod declares (go 1.26), verified by upstream's own published checksum.
 RUN set -ex; curl -fsSL -o /tmp/go.tgz ${GO_URL}; \\
     echo "${GO_SHA}  /tmp/go.tgz" | sha256sum -c -; \\
     tar -C /usr/local -xzf /tmp/go.tgz; rm /tmp/go.tgz
-# "gomobile init" stays non-fatal (modern gomobile bind provisions its own toolchain), but its
-# failure is now printed instead of swallowed -- a bare "|| true" hid whether it had EVER run.
 RUN go install golang.org/x/mobile/cmd/gomobile@latest; \\
     gomobile init || echo "WARNING: gomobile init failed (non-fatal, continuing)"
-# Rust stable + cargo-ndk + the three Android targets rust/trezor-bridge/scripts/build_android.sh
-# installs itself (repeated here so the image has them pre-warmed).
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; \\
     . /root/.cargo/env; \\
     rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android; \\
     cargo install cargo-ndk
-# rustup-init installs under root's \$HOME (/root), which the base image leaves at mode 0700 --
-# unreadable to the non-root UID this image runs as at runtime (--userns=keep-id / --user).
-# CARGO_HOME/RUSTUP_HOME also default to \$HOME, so pinning them explicitly keeps the rustup shims
-# pointing at the toolchain this image actually installed no matter which user or HOME the container
-# runs with. Same class of bug as the /build permission fix above.
 ENV CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup
 RUN chmod 755 /root
 COPY bundletool.jar /opt/bundletool.jar
@@ -381,23 +279,14 @@ COPY apktool.jar /opt/apktool.jar
 RUN printf '#!/bin/sh\nexec java -jar /opt/bundletool.jar "\$@"\n' > /usr/local/bin/bundletool && chmod +x /usr/local/bin/bundletool; \\
     printf '#!/bin/sh\nexec java -jar /opt/apktool.jar "\$@"\n' > /usr/local/bin/apktool && chmod +x /usr/local/bin/apktool
 WORKDIR /build
-# Built as root; the container actually runs as the invoking host user via --userns=keep-id
-# (podman) / --user (docker), which varies per caller and isn't known at image-build time. A
-# root-owned 0755 /build would refuse that user's writes (git clone's internal mkdir for the
-# worktree included) -- open it up the same way /tmp is.
 RUN chmod 1777 /build
 DOCKERFILE_EOF
 cp "${WORK_DIR}/tools/bundletool.jar" "${WORK_DIR}/tools/apktool.jar" "${WORK_DIR}/"
 IMAGE_NAME="coconut-verify-$(sha256_of "$DOCKERFILE" | cut -c1-12)"
 ( cd "${WORK_DIR}" && "$CONTAINER_RUNTIME" build -t "$IMAGE_NAME" -f Dockerfile . ) \
-    || fail "ftbfs" "Toolchain image build failed. See terminal output above."
+    || die_err "Toolchain image build failed. See terminal output above."
 log_ok "Image built: ${IMAGE_NAME}"
 
-# ------------------------------------------------------------------------------
-# In-container build + comparison driver. One script so the entire clone,
-# native-bridge build, app build, split generation and diff run under a single
-# `podman run`, writing all results back into the mounted /work.
-# ------------------------------------------------------------------------------
 DRIVER="${WORK_DIR}/driver.sh"
 cat > "$DRIVER" <<'DRIVER_EOF'
 #!/bin/bash
@@ -407,11 +296,12 @@ REPO_URL="https://github.com/noncelab/coconut_wallet.git"
 BITBOX_FORK_URL="https://github.com/4xvgal/bitbox02-api-go.git"
 BITBOX_FORK_BRANCH="fix/nil-guard-psbt"
 cd /work
+echo "error" > /work/verdict.txt
 
 echo "== PHASE 0: OFFICIAL METADATA =="
 apktool d -f -s --frame-path /tmp/apktool-frame -o /work/comparison/meta /work/official/base.apk >/dev/null
 pkg="$(grep -o 'package="[^"]*"' /work/comparison/meta/AndroidManifest.xml | head -1 | cut -d'"' -f2)"
-[[ "$pkg" == "$APP_ID" ]] || { echo "PACKAGE MISMATCH: expected ${APP_ID}, got ${pkg}" >&2; echo "ftbfs" > /work/verdict.txt; exit 1; }
+[[ "$pkg" == "$APP_ID" ]] || { echo "PACKAGE MISMATCH: expected ${APP_ID}, got ${pkg}" >&2; echo "invalid" > /work/verdict.txt; exit 1; }
 yml() { sed -n "s/^[[:space:]]*$1:[[:space:]]*'\{0,1\}\([^']*\)'\{0,1\}[[:space:]]*\$/\1/p" /work/comparison/meta/apktool.yml | head -1; }
 VERSION_NAME="$(yml versionName)"
 VERSION_CODE="$(yml versionCode)"
@@ -427,8 +317,7 @@ git clone --quiet "$REPO_URL" /build/coconut_wallet
 cd /build/coconut_wallet
 TAG="v${VERSION_NAME}"
 if ! git checkout --quiet "$TAG" 2>/dev/null; then
-    echo "Tag ${TAG} not found; falling back to matching pubspec app_versions.aos_mainnet on develop tip." >&2
-    echo "ftbfs" > /work/verdict.txt
+    echo "Tag ${TAG} not found upstream; stopping." >&2
     exit 1
 fi
 COMMIT_HASH="$(git rev-parse HEAD)"
@@ -436,7 +325,7 @@ echo "$COMMIT_HASH" > /work/commit.txt
 fvm_pin="$(sed -n 's/.*"flutter"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' .fvmrc 2>/dev/null | head -1)"
 if [[ "$fvm_pin" != "$FLUTTER_TAG" ]]; then
     echo "FLUTTER MISMATCH: tag ${TAG} .fvmrc says '${fvm_pin}', image has ${FLUTTER_TAG} (check --version)" >&2
-    echo "ftbfs" > /work/verdict.txt
+    echo "invalid" > /work/verdict.txt
     exit 1
 fi
 echo "Flutter ${FLUTTER_TAG} = .fvmrc at ${TAG}"
@@ -453,30 +342,17 @@ echo "bitbox02-api-go fork resolved to commit: $(cat /work/bitbox_fork_commit.tx
 echo "== PHASE 3: RECOVER .env ASSETS FROM THE OFFICIAL APK (script NOTE A) =="
 for f in mainnet.env regtest.env testnet.env; do
     unzip -p /work/official/base.apk "assets/flutter_assets/${f}" > "/build/coconut_wallet/${f}" \
-        || { echo "Could not extract ${f} from the official APK's Flutter assets." >&2; echo "ftbfs" > /work/verdict.txt; exit 1; }
+        || { echo "Could not extract ${f} from the official APK's Flutter assets." >&2; exit 1; }
 done
 echo "Recovered: mainnet.env regtest.env testnet.env"
 
 echo "== PHASE 4: NATIVE BRIDGES FROM SOURCE (policy: no vendored first-party blobs) =="
 . /root/.cargo/env
-# cargo must WRITE its registry (the Trezor bridge pulls ~241 crates). The image's
-# (Retained from the non-root run model, where CARGO_HOME=/root/.cargo was readable but not
-# writable. Harmless now that the container runs as root, and keeps the docker path safe.)
-# CARGO_HOME=/root/.cargo is readable to a non-root runtime user but not writable -- the earlier
-# fix made /root traversable, not writable. Move only the MUTABLE part: the cargo/rustc/cargo-ndk
-# binaries are still found via PATH (/root/.cargo/bin) and the toolchains via RUSTUP_HOME
-# (/root/.rustup), for which read access is enough. Per-run and container-local by design, so no
-# build state survives between runs -- the right default for a reproducibility verifier.
 export CARGO_HOME=/tmp/cargo-home
 mkdir -p "$CARGO_HOME"
 cd /build/coconut_wallet/go && go mod tidy
 cd /build/coconut_wallet
 
-# Upstream Makefile does not parse -- see NOTE D. GNU make reads the whole file before running any
-# target, so one space-indented recipe line breaks EVERY target, including the gomobile-android and
-# trezor-android ones upstream's own README instructs you to run. Repair make SYNTAX only
-# (leading spaces -> TAB on recipe lines); never touch a recipe's command text. The full before/after
-# diff is printed here and saved to makefile-repair.diff so a reader can audit exactly what changed.
 echo "0" > /work/makefile_repaired.txt
 if ! make -n gomobile-android >/dev/null 2>&1; then
     echo "Upstream Makefile does not parse. Applying whitespace-only make-syntax repair (NOTE D)."
@@ -493,8 +369,7 @@ if ! make -n gomobile-android >/dev/null 2>&1; then
     echo "Repair applied. Only leading whitespace changed; no recipe command text was modified."
 fi
 
-make gomobile-android
-make trezor-android
+{ make gomobile-android && make trezor-android; } || { echo "Native bridge build failed." >&2; echo "ftbfs" > /work/verdict.txt; exit 1; }
 
 echo "== PHASE 5: THROWAWAY RELEASE KEYSTORE =="
 mkdir -p /build/coconut_wallet/android
@@ -514,17 +389,15 @@ echo "exclusion (meta-inf-filter-scope.md), not a fabricated signature match."
 
 echo "== PHASE 6: fvm flutter build appbundle (REQUIRE_GOOGLE_SERVICES intentionally unset -- NOTE B) =="
 cd /build/coconut_wallet
-grep -q '^dependency_overrides:' pubspec.yaml && { echo "pubspec.yaml already has dependency_overrides" >&2; echo ftbfs > /work/verdict.txt; exit 1; }
-printf '\ndependency_overrides:\n  %s\n' "$PUB_OVERRIDE" >> pubspec.yaml
-echo "Pinned (not upstream, see script header): ${PUB_OVERRIDE}"
-flutter pub get 2>&1 | tee /work/pub-get.log
-# pubspec.lock is gitignored upstream (.gitignore: "*.lock", no exception), so pub get resolves the
-# dependency graph afresh at build time. Keep the resolved lockfile with the run for the record.
+if grep -q '^dependency_overrides:' pubspec.yaml; then
+    echo "upstream $(sed -n '/^dependency_overrides:/,/^[^ #]/{/^  [a-z]/p}' pubspec.yaml | xargs)" > /work/pub_override.txt
+else
+    printf '\ndependency_overrides:\n  %s\n' "$PUB_OVERRIDE" >> pubspec.yaml
+    echo "ours (not upstream, a guess) ${PUB_OVERRIDE}" > /work/pub_override.txt
+fi
+echo "Dependency override: $(cat /work/pub_override.txt)"
+flutter pub get 2>&1 | tee /work/pub-get.log || { echo "flutter pub get failed." >&2; echo "ftbfs" > /work/verdict.txt; exit 1; }
 cp pubspec.lock /work/pubspec.lock.resolved
-# Generated Dart is gitignored upstream too (*.g.dart, *.realm.dart, and slang's
-# lib/localization/strings.g.dart, imported by 150+ files). README "Code generation" / Makefile
-# "ready" target: build_runner, realm generate, slang -- run here in that order, without the fvm
-# prefix (the image's flutter IS the .fvmrc version). The Fastlane lane does not run this; developers do.
 { dart run build_runner clean \
     && dart run build_runner build --delete-conflicting-outputs \
     && dart run realm generate \
@@ -537,21 +410,13 @@ flutter build appbundle --flavor mainnet --release \
 AAB="$(find build/app/outputs/bundle/mainnetRelease -name '*.aab' | head -1)"
 [[ -n "$AAB" ]] || { echo "No AAB produced." >&2; echo "ftbfs" > /work/verdict.txt; exit 1; }
 sha256sum "$AAB" | awk '{print $1}' > /work/aab_hash.txt
-# Keep the bundle itself: /build dies with the container, and a follow-up bundletool run or a
-# diffoscope against it needs the artifact, not just its hash.
 cp "$AAB" /work/app-mainnet-release.aab
 
 echo "== PHASE 7: DEVICE SPEC FROM THE OFFICIAL SPLITS =="
-# Every dimension comes from the official split names, so bundletool selects the SAME splits Play
-# did: ABI from split_config.<abi>, density from split_config.<bucket> (a hardcoded 280 dpi would
-# make bundletool pick a different density split than the official xxhdpi one and both sides would
-# show as UNMATCHED), locales from whatever is left (split_config.en -> "en").
 abis=""; locales=""; density=""
 for f in /work/official/split_config.*.apk; do
     base="$(basename "$f" .apk)"; tag="${base#split_config.}"
     case "$tag" in
-        # bundletool's device spec takes Android ABI names (arm64-v8a), not the ARM64_V8A enum style:
-        # with the latter it rejects the bundle as "doesn't support ABI architectures of the device".
         arm64_v8a) abis="${abis:+$abis,}\"arm64-v8a\"" ;;
         armeabi_v7a) abis="${abis:+$abis,}\"armeabi-v7a\"" ;;
         x86_64) abis="${abis:+$abis,}\"x86_64\"" ;;
@@ -574,9 +439,6 @@ bundletool build-apks --bundle="$AAB" --output-format=DIRECTORY --output=/work/b
     --ks=/build/coconut_wallet/android/app/ws-throwaway.jks --ks-pass=pass:wschangeme \
     --ks-key-alias=wsthrow --key-pass=pass:wschangeme \
     --device-spec=/work/device-spec.json
-# bundletool names its module-relative splits base-master.apk / base-<dimension>.apk; Google Play
-# names the same artifacts base.apk / split_config.<dimension>.apk. Rename onto Play's convention
-# so the two sides key-match below (same mapping bitbanana_build.sh uses).
 mkdir -p /work/built-renamed
 for f in /work/built-apks/splits/*.apk; do
     bn="$(basename "$f")"
@@ -606,8 +468,6 @@ for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
         echo "${cfg} UNMATCHED" >> /work/comparison/summary.txt
         MISSING_TOTAL=$((MISSING_TOTAL + 1)); continue
     fi
-    # Unzipped into /work (bind-mounted), not /tmp, so they survive the container exiting and a
-    # human can run a follow-up diff/meld/diffoscope against them (report-generation-guidelines).
     od="/work/unzipped/official/${cfg}"; bd="/work/unzipped/built/${cfg}"
     rm -rf "$od" "$bd"; mkdir -p "$od" "$bd"
     unzip -q -o "$o" -d "$od"; unzip -q -o "$b" -d "$bd"
@@ -616,15 +476,12 @@ for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
     n="$(printf '%s\n' "$raw" | grep -vc '^$' || true)"
     echo "raw diffs: ${n} (full: comparison/diff-unzipped-${cfg}.txt)"
 
-    # Sanctioned exclusion 1: root META-INF signing filenames ONLY, matched by name, never by
-    # directory prefix (meta-inf-filter-scope.md). Everything else under META-INF counts.
     sign_re="^(Only in ${od}/META-INF: (MANIFEST\.MF|[A-Z0-9]+\.(SF|RSA|DSA|EC))\$|Files ${od}/META-INF/(MANIFEST\.MF|[A-Z0-9]+\.(SF|RSA|DSA|EC)) and ${bd}/META-INF/(MANIFEST\.MF|[A-Z0-9]+\.(SF|RSA|DSA|EC)) differ)\$"
     sign_lines="$(printf '%s\n' "$raw" | grep -E "$sign_re" || true)"
     c_sign="$(printf '%s\n' "$sign_lines" | grep -vc '^$' || true)"
     c_arsc="$(printf '%s\n' "$raw" | grep -Fxc "Files ${od}/resources.arsc and ${bd}/resources.arsc differ" || true)"
     a_arsc=0
     if [[ "$c_arsc" -eq 1 ]]; then
-        # Sanctioned exclusion 2: resources.arsc decode-compare (review-notes/resources.arsc.md).
         rm -rf /tmp/arsc_o /tmp/arsc_b
         if apktool d -f --no-src --no-debug-info --frame-path /tmp/apktool-frame -o /tmp/arsc_o "$o" >/dev/null 2>&1 \
             && apktool d -f --no-src --no-debug-info --frame-path /tmp/apktool-frame -o /tmp/arsc_b "$b" >/dev/null 2>&1; then
@@ -642,7 +499,7 @@ for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
         fi
     fi
     acc=$((c_sign + a_arsc))
-    [[ "$acc" -le "$n" ]] || { echo "Internal accounting error on split ${cfg}." >&2; echo "ftbfs" > /work/verdict.txt; exit 1; }
+    [[ "$acc" -le "$n" ]] || { echo "Internal accounting error on split ${cfg}." >&2; exit 1; }
     un=$((n - acc))
     echo "accepted: ${acc} (signing-filename ${c_sign}, resources.arsc ${a_arsc}) | unaccounted: ${un}"
     [[ "$un" -gt 0 ]] && printf '%s\n' "$raw" | grep -v '^$'
@@ -661,35 +518,18 @@ echo "$MISSING_TOTAL" > /work/missing_total.txt
 DRIVER_EOF
 chmod +x "$DRIVER"
 
-# ------------------------------------------------------------------------------
-# Run it. Everything the container writes lands under WORK_DIR via the bind mount.
-# ------------------------------------------------------------------------------
 section "BUILD + COMPARE"
-# Run as root INSIDE the container. This is the fix for a whole recurring class of failures, not a
-# shortcut: the image is necessarily built as root, so every path in it (/opt/flutter, /root/.cargo,
-# /root/go, the Android SDK) is root-owned. A non-root runtime user could be granted write access by
-# chmod, but NOT ownership -- and several steps need ownership specifically. tar restoring mtime and
-# mode while unpacking Flutter's gradle-wrapper artifact is the case that forced this: utime() and
-# chmod() on a directory require being its owner (or CAP_FOWNER); no amount of a+rwX helps.
-#
-# This does NOT leave root-owned droppings on the host:
-#   - rootless podman (what the build server uses): container UID 0 maps to the INVOKING user's UID
-#     on the host, so everything written through the /work bind mount is already owned correctly.
-#   - docker (rootful fallback): output would be real-root owned, which the cleanup path already
-#     handles -- normalize_ownership() chowns WORK_DIR back to the caller from the EXIT trap, on
-#     failure paths too (non-sudo-directories-guideline.md).
-# HOME is left at the image default (/root) rather than forced to /tmp, so the toolchain state the
-# image installed under /root -- cargo, rustup, the flutter --no-analytics config -- is actually
-# found at runtime instead of being invisible.
-# The earlier defensive fixes (chmod 1777 /build, chmod 755 /root, chmod -R a+rwX /opt/flutter,
-# CARGO_HOME relocation, git safe.directory) are deliberately RETAINED: they are harmless here and
-# keep the docker path and any future non-root run model working.
 RUN_USER_ARGS="--user 0:0"
 "$CONTAINER_RUNTIME" run --rm ${RUN_USER_ARGS} --env "FLUTTER_TAG=${FLUTTER_TAG}" --env "PUB_OVERRIDE=${PUB_OVERRIDE}" --volume "${WORK_DIR}:/work" "$IMAGE_NAME" \
     bash /work/driver.sh 2>&1 | tee "${WORK_DIR}/container-run.log" \
     || true   # verdict/exit handling below reads /work/verdict.txt regardless of container rc
 
-VERDICT="$(cat "${WORK_DIR}/verdict.txt" 2>/dev/null || echo ftbfs)"
+VERDICT="$(cat "${WORK_DIR}/verdict.txt" 2>/dev/null || echo error)"
+case "$VERDICT" in
+    reproducible|not_reproducible|ftbfs) ;;
+    invalid) die_invalid "Input does not match this app or version (see container output above)." ;;
+    *) die_err "Run stopped before a verdict (see container output above, ${WORK_DIR}/container-run.log)." ;;
+esac
 VERSION_NAME="$(cat "${WORK_DIR}/version_name.txt" 2>/dev/null || echo "$version_arg")"
 VERSION_CODE="$(cat "${WORK_DIR}/version_code.txt" 2>/dev/null || echo unknown)"
 COMMIT_HASH="$(cat "${WORK_DIR}/commit.txt" 2>/dev/null || echo unknown)"
@@ -705,6 +545,7 @@ case "$MAKEFILE_REPAIRED" in
     *) MAKEFILE_NOTE="unknown -- run did not reach the Makefile check" ;;
 esac
 SIGNER="$(cat "${WORK_DIR}/signer.txt" 2>/dev/null || echo unknown)"
+PUB_USED="$(cat "${WORK_DIR}/pub_override.txt" 2>/dev/null || echo unknown)"
 
 section "RESULT"
 echo "Official splits: ${#OFFICIAL_SPLITS[@]}   Raw diffs: ${RAW_TOTAL}   Unaccounted: ${UNACC_TOTAL}   Unmatched: ${MISSING_TOTAL}"
@@ -743,7 +584,7 @@ echo "buildEnv:       podman image with Flutter ${FLUTTER_TAG}, Go ${GO_VER}, Ru
 echo "buildCmd:       flutter build appbundle --flavor mainnet --release --dart-define=USE_FIREBASE=true --build-name=<versionName> --build-number=<versionCode>"
 echo "bundletool:     ${BT_VER} (reproduces Play's splits0.xml and split manifest attributes for this release; AGP 8.6.0 itself declares 1.16.0), sha256 ${BT_SHA}"
 echo "lockfile:       pubspec.lock is gitignored upstream; dependencies resolved at build time (saved as pubspec.lock.resolved in the workspace)"
-echo "pubOverride:    ${PUB_OVERRIDE} (NOT upstream; chosen to match the official APK's androidx versions; vendor's exact version unknown)"
+echo "pubOverride:    ${PUB_USED} (upstream = the tag's pubspec.yaml; ours = matches the official APK's androidx)"
 echo "envRecovery:    mainnet.env/regtest.env/testnet.env extracted from the official APK's Flutter assets (script NOTE A) -- review before trusting"
 echo "googleServices: REQUIRE_GOOGLE_SERVICES intentionally NOT set; official build sets it (script NOTE B) -- UNRESOLVED divergence"
 echo "makefileRepair: ${MAKEFILE_NOTE}"
@@ -761,7 +602,7 @@ echo "diff --recursive ${WORK_DIR}/unzipped/official/<split> ${WORK_DIR}/unzippe
 echo "or diffoscope \"${OFFICIAL_BASE}\" ${WORK_DIR}/built-renamed/base.apk"
 echo "for more details."
 
-NOTES="Coconut Wallet ${APP_ID} v${VERSION_NAME} (commit ${COMMIT_HASH}), Google Play split set built with the project's own Fastlane recipe reverse-engineered from android/fastlane/Fastfile (no upstream CI builds this artifact). ${RAW_TOTAL} raw difference(s) across splits; excluded only root META-INF signing filenames and a resources.arsc decode match (review-notes/resources.arsc.md) -- both sanctioned, evidence-backed exceptions, not general acceptable-diff filtering. ${UNACC_TOTAL} unaccounted difference(s) -- the verdict is judged on this alone. ${MISSING_TOTAL} split(s) unmatched. Known open items, NOT resolved by this script: (1) mainnet/regtest/testnet .env recovered from the official APK's bundled Flutter assets rather than from upstream (gitignored, obtainable only by emailing the vendor) -- review this design decision; (2) built WITHOUT REQUIRE_GOOGLE_SERVICES=true because google-services.json is unobtainable and unlike the .env files is not bundled into the APK, while the official mainnet build sets it -- any Firebase/google-services-shaped diff should be attributed to this; (3a) upstream's Makefile does not parse at this tag (line 23 space-indented instead of TAB, broken since 2025-10-08 commit 5579122b), which breaks every make target including the gomobile/trezor bridge targets its own README tells you to run; this run applied a whitespace-only make-syntax repair -- ${MAKEFILE_NOTE}; (3) the BitBox02 bridge is built against a non-upstream fork (${BITBOX_FORK_URL} @ ${BITBOX_FORK_BRANCH}, commit ${BITBOX_FORK_COMMIT}) the README requires in place of upstream BitBoxSwiss; (4) the NDK revision used to compile the Trezor bridge (${NDK_VER}) is Flutter ${FLUTTER_TAG}'s ndkVersion default; the vendor's own NDK for that bridge is unknown; (5) pinned ${PUB_OVERRIDE} (guess). Official base.apk SHA-256 ${APP_HASH}."
+NOTES="Coconut Wallet ${APP_ID} v${VERSION_NAME} (commit ${COMMIT_HASH}), Google Play split set built with the project's own Fastlane recipe reverse-engineered from android/fastlane/Fastfile (no upstream CI builds this artifact). ${RAW_TOTAL} raw difference(s) across splits; excluded only root META-INF signing filenames and a resources.arsc decode match (review-notes/resources.arsc.md) -- both sanctioned, evidence-backed exceptions, not general acceptable-diff filtering. ${UNACC_TOTAL} unaccounted difference(s) -- the verdict is judged on this alone. ${MISSING_TOTAL} split(s) unmatched. Known open items, NOT resolved by this script: (1) mainnet/regtest/testnet .env recovered from the official APK's bundled Flutter assets rather than from upstream (gitignored, obtainable only by emailing the vendor) -- review this design decision; (2) built WITHOUT REQUIRE_GOOGLE_SERVICES=true because google-services.json is unobtainable and unlike the .env files is not bundled into the APK, while the official mainnet build sets it -- any Firebase/google-services-shaped diff should be attributed to this; (3a) upstream's Makefile does not parse at this tag (line 23 space-indented instead of TAB, broken since 2025-10-08 commit 5579122b), which breaks every make target including the gomobile/trezor bridge targets its own README tells you to run; this run applied a whitespace-only make-syntax repair -- ${MAKEFILE_NOTE}; (3) the BitBox02 bridge is built against a non-upstream fork (${BITBOX_FORK_URL} @ ${BITBOX_FORK_BRANCH}, commit ${BITBOX_FORK_COMMIT}) the README requires in place of upstream BitBoxSwiss; (4) the NDK revision used to compile the Trezor bridge (${NDK_VER}) is Flutter ${FLUTTER_TAG}'s ndkVersion default; the vendor's own NDK for that bridge is unknown; (5) dependency override: ${PUB_USED}. Official base.apk SHA-256 ${APP_HASH}."
 write_yaml "$VERDICT" "$NOTES"
 
 if [[ "$VERDICT" == "reproducible" ]]; then
