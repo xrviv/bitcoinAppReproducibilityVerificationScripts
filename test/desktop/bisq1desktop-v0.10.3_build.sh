@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# bisq1desktop-v0.10.2_build.sh - Bisq 1 Desktop Reproducible Build Verification
+# bisq1desktop-v0.10.3_build.sh - Bisq 1 Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.10.2
+# Version:       v0.10.3
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-10-21
+# Last Modified: 2026-10-29
 # Project:       https://github.com/bisq-network/bisq
 # ==============================================================================
 # LICENSE: MIT License
@@ -24,18 +24,6 @@
 # IMPORTANT: DO NOT include changelog in script header
 # Maintain changelog in separate file: ~/work/ws-notes/script-notes/desktop/bisq1/changelog.md
 # ==============================================================================
-#
-# SCRIPT SUMMARY (v0.10.0 - bob): Bisq's own recipe (docs/reproducible-builds/linux.md), toolchain per tag.
-#   deb/rpm: clone once (~1.8 GB), two local checkouts A/B + submodules; >=1.10.0 builds in the tag's own
-#   docker/release-builder image (Zulu 21.0.6, SOURCE_DATE_EPOCH=0, apt snapshot): verifyReleaseBuild +
-#   verifyInstallerEvidenceBundle (pre-1.10.4) or :desktop:<type> (1.10.4+: generateInstallers hard-fails for
-#   DEB/RPM, and deb+rpm in ONE invocation loses the first via deleteExistingInstallerArtifacts). pre-1.10:
-#   embedded Ubuntu 22.04 + Zulu 11/17 image. VERDICT is mechanical on the outer sha256: reproducible iff
-#   rebuilt == official AND A==B. EVIDENCE only: dpkg-deb -R / rpm2cpio payload split, bundled JDK vs the
-#   tag's Dockerfile pin (bisq#7930), gpg --verify vs desktop/package/*.asc. Engine: docker, or rootless
-#   podman behind a `docker` shim (--userns=keep-id added when detected).
-#   exe: jpackage+WiX cannot run on Linux; triggers bisq1-windows-build.yml on the WS fork (windows-2025,
-#   Zulu 21.0.6, WiX v3, A/B), downloads both EXEs, same verdict; --built <dir> = offline. Needs GITHUB_TOKEN.
 # ==============================================================================
 
 set -euo pipefail
@@ -43,8 +31,8 @@ set -euo pipefail
 # Ubuntu host with umask 002 gives 0664 and 5 jars differ for that reason alone (found at 1.10.7). Pin it.
 umask 022
 
-SCRIPT_VERSION="v0.10.2"
-SCRIPT_NAME="bisq1desktop-v0.10.2_build.sh"
+SCRIPT_VERSION="v0.10.3"
+SCRIPT_NAME="bisq1desktop-v0.10.3_build.sh"
 APP_NAME="Bisq 1"
 APP_ID="bisq"
 REPO_URL="https://github.com/bisq-network/bisq"
@@ -62,9 +50,9 @@ BUILT_DIR=""
 NO_CACHE=false
 KEEP_CONTAINER=false
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+CALLER_DIR="$(pwd -P)"
 WORK_DIR=""
-rm -f "${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"   # no stale verdict
+rm -f "${CALLER_DIR}/COMPARISON_RESULTS.yaml"   # no stale verdict
 
 IMAGE_NAME=""
 CONTAINER_A=""; CONTAINER_B=""; CONTAINER_CMP=""
@@ -76,7 +64,7 @@ log_warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 die() { local m="$1"; local c="${2:-$EXIT_BUILD_FAILED}"; log_error "$m"; exit "$c"; }
 YAML_OUT=""   # set by each path before use
-ftbfs_die() { write_yaml "$YAML_OUT" ftbfs "$1"; die "$1"; }   # tool failure: ftbfs YAML + exit 1
+ftbfs_die() { write_yaml "$YAML_OUT" ftbfs "$1"; die "$1"; }   # source failed to build: ftbfs YAML + exit 1
 
 VERIFY_SCRIPT=""
 cleanup_on_exit() {
@@ -87,10 +75,10 @@ cleanup_on_exit() {
     fi
     [[ -n "${VERIFY_SCRIPT:-}" ]] && rm -f "$VERIFY_SCRIPT" 2>/dev/null || true
     [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]] || return 0
-    # Hand the workspace back; verdict also next to the script.
+    # Hand the workspace back; move the verdict out (ABS searches recursively: one YAML only).
     [[ -n "${DOCKER_RUN_EXTRA:-}" ]] && docker unshare chown -R 0:0 "$WORK_DIR" >/dev/null 2>&1
     chmod -R u+rwX "$WORK_DIR" 2>/dev/null || true
-    [[ -f "$WORK_DIR/COMPARISON_RESULTS.yaml" ]] && cp -f "$WORK_DIR/COMPARISON_RESULTS.yaml" "$SCRIPT_DIR/"
+    [[ -f "$WORK_DIR/COMPARISON_RESULTS.yaml" ]] && mv -f "$WORK_DIR/COMPARISON_RESULTS.yaml" "$CALLER_DIR/"
     return 0
 }
 trap cleanup_on_exit EXIT INT TERM
@@ -133,15 +121,9 @@ resolve_tag_commit() {
     echo "${c:-N/A}"
 }
 
-# Standardized WS verification summary (verification-result-summary-format.md). Stdout verdict
-# wording differs from the YAML's on purpose: reproducible | differences found | BLANK (ftbfs).
+# Standardized WS verification summary; verdict is the YAML's (reproducible | not_reproducible | ftbfs).
 emit_results_block() {  # yaml_verdict appHash commit
-    local v
-    case "$1" in
-        reproducible)     v="reproducible" ;;
-        not_reproducible) v="differences found" ;;
-        *)                v="" ;;
-    esac
+    local v="${1:-ftbfs}"
     echo ""
     echo "===== Begin Results ====="
     echo "appId:          ${APP_ID}"
@@ -196,14 +178,14 @@ acquire_built_exes_via_ci() {
     export GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
     # Missing token / docker = infrastructure unavailable -> ftbfs + exit 1 (EXIT_BUILD_FAILED), same
     # class as the deb/rpm 'docker not found' path (exit 2 is reserved for invalid CLI parameters).
-    [[ -n "$GITHUB_TOKEN" ]] || ftbfs_die "GITHUB_TOKEN/GH_TOKEN required to dispatch CI + read artifacts; or pass --built <dir>."
-    command -v docker >/dev/null 2>&1 || ftbfs_die "docker required for the gh helper container."
-    docker info >/dev/null 2>&1 || ftbfs_die "docker daemon not running."
+    [[ -n "$GITHUB_TOKEN" ]] || die "GITHUB_TOKEN/GH_TOKEN required to dispatch CI + read artifacts; or pass --built <dir>."
+    command -v docker >/dev/null 2>&1 || die "docker required for the gh helper container."
+    docker info >/dev/null 2>&1 || die "docker daemon not running."
     GH_MOUNT_DIR="$artdir"; mkdir -p "$artdir"
     # gh helper image is a shared cached tooling image (debian base + apt pkgs unpinned; same shared
     # rationale as the release-builder image — rebuilt only when absent).
     if ! docker image inspect "$GH_HELPER_IMAGE" >/dev/null 2>&1; then
-        build_gh_helper || ftbfs_die "gh helper image build failed (see output)."
+        build_gh_helper || die "gh helper image build failed (see output)."
     fi
 
     # Unique correlation ID echoed into the workflow run-name so we attach to OUR run exactly,
@@ -211,7 +193,7 @@ acquire_built_exes_via_ci() {
     local request_id; request_id="wsreq-${ver}-$(date -u +%Y%m%d%H%M%S)-${RANDOM}${RANDOM}"
     log_info "Triggering ${GH_WORKFLOW} on ${GH_REPO}@${GH_WORKFLOW_REF} (version=${ver}, request_id=${request_id})..."
     gh_c workflow run "$GH_WORKFLOW" --repo "$GH_REPO" --ref "$GH_WORKFLOW_REF" -f version="$ver" -f request_id="$request_id" \
-        || ftbfs_die "Failed to trigger ${GH_WORKFLOW}."
+        || die "Failed to trigger ${GH_WORKFLOW}."
 
     log_info "Waiting for the run (correlating by request_id)..."
     local run_id="" i c
@@ -227,7 +209,7 @@ acquire_built_exes_via_ci() {
         [[ -n "$run_id" ]] && break
         log_info "poll ${i}/30..."
     done
-    [[ -n "$run_id" && "$run_id" != "null" ]] || ftbfs_die "Workflow run not found after polling."
+    [[ -n "$run_id" && "$run_id" != "null" ]] || die "Workflow run not found after polling."
     log_info "Run ID ${run_id}; watching to completion (build ~20-30 min)..."
     gh_c run watch "$run_id" --repo "$GH_REPO" --exit-status \
         || ftbfs_die "GitHub Actions run ${run_id} failed."
@@ -242,7 +224,7 @@ acquire_built_exes_via_ci() {
     for label in A B; do
         rm -rf "${artdir:?}/${label}"; mkdir -p "${artdir}/${label}"
         gh_c run download "$run_id" --repo "$GH_REPO" --name "bisq1-${ver}-win-exe-${label}" --dir "/work/${label}" \
-            || ftbfs_die "Failed to download bisq1-${ver}-win-exe-${label}."
+            || die "Failed to download bisq1-${ver}-win-exe-${label}."
     done
     # Provenance artifact (workflow/runner/JDK+WiX versions, A/B hashes) — kept for the human report.
     rm -rf "${artdir:?}/provenance"; mkdir -p "${artdir}/provenance"
@@ -316,7 +298,7 @@ verify_windows_exe() {
         log_info "Downloading official ${official_name} ..."
         curl -fL --progress-bar -o "$official" \
             "${REPO_URL}/releases/download/${BISQ_VERSION}/${official_name}" \
-            || ftbfs_die "Failed to download official ${official_name}."
+            || die "Failed to download official ${official_name}."
     fi
     [[ -f "$official" ]] || die "official EXE not found: $official" "$EXIT_INVALID_PARAMS"
 
@@ -337,9 +319,6 @@ verify_windows_exe() {
     # version artifact can never be mistaken for this run (order-independent: we require A==B and A==official).
     mapfile -t built < <(find "$search_dir" -type f -name "${official_name}" | sort)
     if [[ "${#built[@]}" -ne 2 ]]; then
-        write_yaml "$yaml" "ftbfs" \
-"Expected exactly 2 '${official_name}' files (A and B), found ${#built[@]} under ${search_dir}.
-Each must come from a DISTINCT artifact (bisq1-${ver}-win-exe-A and -B, version ${ver} only)."
         die "need exactly 2 '${official_name}' (found ${#built[@]})" "$EXIT_INVALID_PARAMS"
     fi
     # Reject the degenerate case of both entries being the SAME underlying file (no real A/B isolation).
@@ -500,7 +479,6 @@ if [[ "$BISQ_TYPE" == "exe" ]]; then
     exit $?
 fi
 
-IMAGE_NAME="bisq-release-builder-linux:java-21.0.6"
 CONTAINER_A="bisq1-build-a-${VC}-${TC}-${SUFFIX}"
 CONTAINER_B="bisq1-build-b-${VC}-${TC}-${SUFFIX}"
 CONTAINER_CMP="bisq1-cmp-${VC}-${TC}-${SUFFIX}"
@@ -520,8 +498,8 @@ log_info "Work Dir: $WORK_DIR"
 log_info ""
 
 # ---- Docker preflight ----
-command -v docker >/dev/null 2>&1 || ftbfs_die "Docker not found on host."
-docker info >/dev/null 2>&1 || ftbfs_die "Docker daemon not running."
+command -v docker >/dev/null 2>&1 || die "Docker not found on host."
+docker info >/dev/null 2>&1 || die "Docker daemon not running."
 log_success "Docker OK"
 # Rootless podman behind a `docker` shim needs --userns=keep-id for --user $(id -u) to keep write access to
 # the bind mounts (real docker needs nothing). Detected, never assumed.
@@ -539,7 +517,7 @@ else
     log_info "Downloading official release: ${OFFICIAL_PKG_NAME}"
     curl -fL --progress-bar -o "${execution_dir}/${OFFICIAL_PKG_NAME}" \
         "https://github.com/bisq-network/bisq/releases/download/${BISQ_VERSION}/${OFFICIAL_PKG_NAME}" \
-      || ftbfs_die "Failed to download official ${OFFICIAL_PKG_NAME}."
+      || die "Failed to download official ${OFFICIAL_PKG_NAME}."
 fi
 OFFICIAL_HASH="$(sha256sum "${execution_dir}/${OFFICIAL_PKG_NAME}" | cut -d' ' -f1)"
 log_success "Official staged: ${OFFICIAL_PKG_NAME} (sha256=${OFFICIAL_HASH})"
@@ -560,17 +538,17 @@ fi
 SRC_BASE="${WORK_DIR}/src-base"
 log_info "cloning ${REPO_URL} once (full git output shown)..."
 git clone "$REPO_URL" "$SRC_BASE" \
-  || ftbfs_die "git clone failed (base)."
+  || die "git clone failed (base)."
 clone_checkout() {  # dest label
     local dest="$1" label="$2"
     log_info "[$label] local clone + checkout ${BISQ_VERSION} (full git output shown)..."
     git clone "$SRC_BASE" "$dest" \
-      || ftbfs_die "git clone failed ($label)."
+      || die "git clone failed ($label)."
     git -C "$dest" remote set-url origin "$REPO_URL"
     git -C "$dest" checkout "$BISQ_VERSION" \
-      || ftbfs_die "git checkout ${BISQ_VERSION} failed ($label)."
+      || die "git checkout ${BISQ_VERSION} failed ($label)."
     git -C "$dest" submodule update --init --recursive \
-      || ftbfs_die "Submodule init failed ($label); upstream requires submodules."
+      || die "Submodule init failed ($label); upstream requires submodules."
     log_success "[$label] $(git -C "$dest" describe --tags 2>/dev/null || echo "$BISQ_VERSION") + submodules"
 }
 clone_checkout "$SRC_A" "A"
@@ -602,6 +580,7 @@ RECIPE_JDK_PIN="n/a (legacy toolchain)"
 if [[ "$LEGACY_TOOLCHAIN" != "true" ]]; then
     RECIPE_JDK_PIN="$(sed -n 's/^FROM .*azul\/zulu-openjdk:\([^@ ]*\).*/\1/p' "${UPSTREAM_DOCKERDIR}/Dockerfile" | head -1)"
     RECIPE_JDK_PIN="${RECIPE_JDK_PIN:-unknown}"
+    IMAGE_NAME="bisq-release-builder-linux:java-${RECIPE_JDK_PIN}"   # cache key follows the tag's pin
     log_info "Recipe JDK pin (Dockerfile FROM): ${RECIPE_JDK_PIN}"
 fi
 
@@ -634,7 +613,7 @@ LEGACYEOF
 CACHE_FLAG=""; [[ "$NO_CACHE" == "true" ]] && CACHE_FLAG="--no-cache"
 if [[ "$LEGACY_TOOLCHAIN" == "true" ]]; then
     if [[ "$NO_CACHE" == "true" ]] || ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
-        build_legacy_image || ftbfs_die "legacy image build failed."
+        build_legacy_image || die "legacy image build failed."
     fi
 else
     log_info "Building release-builder image from upstream Dockerfile..."
@@ -864,7 +843,7 @@ case "$PAYLOAD_DIFF" in
   *)       CLASS_HINT="CLASSIFICATION HINT: classification unavailable (extraction failed); see comparison-detail.txt." ;;
 esac
 
-TOOLCHAIN_NOTE="the pinned release-builder image (azul/zulu-openjdk:21.0.6, its own docker/release-builder Dockerfile)"
+TOOLCHAIN_NOTE="the pinned release-builder image (azul/zulu-openjdk:${RECIPE_JDK_PIN}, its own docker/release-builder Dockerfile)"
 [[ "${LEGACY_TOOLCHAIN:-false}" == "true" ]] && TOOLCHAIN_NOTE="a legacy Ubuntu 22.04 + Zulu 11/17 image (JDK11 build, JDK17 jpackage; no release-builder Dockerfile pre-1.10)"
 COMMON_NOTE="Bisq 1 ${BISQ_VERSION} ${BISQ_TYPE} built with ${TOOLCHAIN_NOTE}.
 official_sha256=${OFF_H} build_a_sha256=${A_H} build_b_sha256=${B_H}.
@@ -902,7 +881,7 @@ set -e
 
 # ---- Results ----
 if [[ ! -f "${execution_dir}/COMPARISON_RESULTS.yaml" ]]; then
-    ftbfs_die "Comparison produced no COMPARISON_RESULTS.yaml."
+    die "Comparison produced no COMPARISON_RESULTS.yaml."
 fi
 log_info ""
 log_info "======================================================"
