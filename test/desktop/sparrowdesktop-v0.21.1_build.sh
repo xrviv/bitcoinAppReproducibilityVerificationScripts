@@ -1,6 +1,6 @@
 #!/bin/bash
 # sparrowdesktop_build.sh — Sparrow Desktop (Linux tarball/deb/rpm) reproducible build verification
-# Version: v0.21.0
+# Version: v0.21.1
 # Organization: WalletScrutiny.com
 # Last modified by: Daniel Garcia
 # Last modified on: 2026-10-30
@@ -11,7 +11,7 @@
 # Exit codes: 0 = reproducible, 1 = not_reproducible or ftbfs, 2 = invalid parameters, 130 = stopped.
 set -euo pipefail
 
-SCRIPT_VERSION="v0.21.0"
+SCRIPT_VERSION="v0.21.1"
 APP_ID="sparrow"
 
 EXIT_SUCCESS=0
@@ -45,6 +45,16 @@ die() {
 
 warn() {
     echo "WARN: $1" >&2
+}
+
+# A COMPARISON_RESULTS.yaml already here may belong to another script run from the same folder;
+# rename it so ABS never reads it and nothing is lost.
+keep_existing_results() {
+    [[ -e "$RESULTS_FILE" ]] || return 0
+    local kept
+    kept="${EXEC_DIR}/COMPARISON_RESULTS-kept-$(date -u -r "$RESULTS_FILE" +%Y%m%dT%H%M%SZ)-$$.yaml"
+    mv -n "$RESULTS_FILE" "$kept" || die "Could not move the existing COMPARISON_RESULTS.yaml aside" $EXIT_BUILD_FAILED
+    warn "Existing COMPARISON_RESULTS.yaml renamed to $(basename "$kept")"
 }
 
 cleanup() {
@@ -222,6 +232,7 @@ build_and_verify() {
         echo ""
         # ftbfs only when the source itself failed to build; any other failure writes no YAML.
         if grep -q "BUILD FAILED" build.log; then
+            keep_existing_results
             printf 'script_version: %s\nverdict: ftbfs\nnotes: "./gradlew failed for tag %s; see the build log."\n' \
                 "$SCRIPT_VERSION" "$APP_VERSION" > "$RESULTS_FILE"
             display_results
@@ -236,6 +247,7 @@ build_and_verify() {
     "$DOCKER_CMD" cp "$CONTAINER_NAME:/output/file-comparison.txt" ./ 2>/dev/null || true
     APP_HASH=$("$DOCKER_CMD" run --rm "$IMAGE_NAME" cat /output/app_hash 2>/dev/null) || APP_HASH="N/A"
     APP_COMMIT=$("$DOCKER_CMD" run --rm "$IMAGE_NAME" cat /output/commit 2>/dev/null) || APP_COMMIT="N/A"
+    keep_existing_results
     "$DOCKER_CMD" cp "$CONTAINER_NAME:/output/COMPARISON_RESULTS.yaml" "$RESULTS_FILE" 2>/dev/null || \
         die "Failed to extract YAML results" $EXIT_BUILD_FAILED
 
@@ -822,7 +834,7 @@ main() {
 
     parse_arguments "$@"
     detect_container_cmd
-    rm -f "$RESULTS_FILE"
+    keep_existing_results
     build_and_verify
 }
 
