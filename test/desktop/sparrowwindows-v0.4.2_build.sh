@@ -1,23 +1,22 @@
 #!/bin/bash
 # sparrowwindows_build.sh - Sparrow Wallet Windows (MSI/ZIP) Reproducible Build Verifier
-# Version: v0.4.1
-# Last modified on: 2026-10-16 (v0.4.1)
-# Builds Sparrow in a throw-away copy of a Windows Server 2022 VM (dockur/windows, KVM) at
-# D:\a\sparrow\sparrow and compares the MSI/ZIP with the signed official release. Needs /dev/kvm,
-# the golden image and VM key (--windows-dir; runbook: GitLab #984). Linux: sparrowdesktop_build.sh.
-# The MSI comparator prints everything it sets aside, and its scope.
+# Version: v0.4.2
 # Organization: WalletScrutiny.com
-# Repository: https://gitlab.com/walletscrutiny/walletScrutinyCom
-#
+# Last modified by: Daniel Garcia
+# Last modified on: 2026-10-30
+# Disclaimer: for reproducible-build verification and research only. No warranty; users assume all risk and are responsible for legal compliance; the developers assume no liability for misuse.
+# Steps: build Sparrow with the pinned JDK in a throw-away Windows Server 2022 VM (dockur/windows, KVM) at
+# D:\a\sparrow\sparrow, compare the MSI/ZIP with the signed release (every set-aside printed), write
+# COMPARISON_RESULTS.yaml next to the caller. Needs /dev/kvm, golden image, VM key (GitLab #984).
 set -euo pipefail
 
-SCRIPT_VERSION="v0.4.1"
+SCRIPT_VERSION="v0.4.2"
 APP_ID="sparrow"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256=""
 RESOLVED_COMMIT="unknown"
 
-HELPER_IMAGE="sparrow-win-helper:0.4"
+HELPER_IMAGE="localhost/sparrow-win-helper:0.4"
 DOCKUR_IMAGE="docker.io/dockurr/windows@sha256:16fd7c39a3e48bb946d29c59dc6015942e5b900a1fa5d7e5552053bfc48ee2ea"
 WIN_DIR="${WIN_DIR:-/var/lib/walletscrutiny-windows}"
 VM_NAME=""
@@ -28,13 +27,15 @@ EXIT_SUCCESS=0
 EXIT_BUILD_FAILED=1
 EXIT_INVALID_PARAMS=2
 
-# Trust anchor: the fingerprint is the pin, the vendored key only a convenience.
+# The fingerprint is the trust anchor.
 SPARROW_KEY_FPR="D4D0D3202FC06849A257B38DE94618334C674B40"
 SPARROW_KEY_URL="https://keybase.io/craigraw/pgp_keys.asc"
 SPARROW_RELEASE_BASE="https://github.com/sparrowwallet/sparrow/releases/download"
 
-# JDK inside the golden image; a release needing another JDK needs a new golden image.
-DEFAULT_JDK_VERSION="25.0.2+10"
+# Upstream's JDK for 2.5.6 (package.yaml java-version), installed per run; golden image untouched.
+JDK_VERSION="25.0.5+8"
+JDK_ZIP="OpenJDK25U-jdk_x64_windows_hotspot_25.0.5_8.zip"
+JDK_ZIP_SHA256="636bdc13dc649ddc7d5921c5c7d23cca6e44fd19d662b45cc9c02135a6c96c42"
 DOCKER_CMD="${DOCKER_CMD:-}"
 
 APP_VERSION=""
@@ -46,8 +47,8 @@ BINARY_PATH=""
 SKIP_SIG_VERIFY=false
 BINARY_SOURCE="operator-supplied"
 SIG_STATUS="not checked"
+RESULTS_FILE=""
 
-# Never fatal: a hashing problem is not a build outcome.
 sha256_of() {
   [[ -f "$1" ]] || { echo "N/A"; return 0; }
   sha256sum "$1" | awk '{print $1}'
@@ -59,6 +60,14 @@ die() {
 }
 warn() {
   echo "WARN: $1" >&2
+}
+# An existing COMPARISON_RESULTS.yaml may be another run's: rename it so ABS never reads it.
+keep_existing_results() {
+  [[ -e "$RESULTS_FILE" ]] || return 0
+  local kept
+  kept="${RESULTS_FILE%/*}/COMPARISON_RESULTS-kept-$(date -u -r "$RESULTS_FILE" +%Y%m%dT%H%M%SZ)-$$.yaml"
+  mv -n "$RESULTS_FILE" "$kept" || die "Could not move the existing COMPARISON_RESULTS.yaml aside"
+  warn "Existing COMPARISON_RESULTS.yaml renamed to ${kept##*/}"
 }
 detect_container_cmd() {
   [[ -z "$DOCKER_CMD" ]] || return 0
@@ -88,22 +97,19 @@ is_windows_arch() {
 build_helper() {
   echo "[INFO] Building helper container..."
   "$DOCKER_CMD" build -t "${HELPER_IMAGE}" - << 'HEOF'
-FROM debian:bookworm-slim
+FROM docker.io/library/debian:bookworm-slim
 RUN apt-get update -qq \
 && apt-get install -y --no-install-recommends curl ca-certificates gnupg unzip p7zip-full python3-minimal openssh-client \
 && rm -rf /var/lib/apt/lists/*
 HEOF
 }
-# Helper writes land under /work (= WORK_DIR); restore_host_owner hands them back.
 helper_c() {
   "$DOCKER_CMD" run --rm -v "${WORK_DIR}:/work" -w /work \
     --entrypoint "$1" "${HELPER_IMAGE}" "${@:2}"
 }
 fetch_url() { helper_c curl -fsSL -o "/work/official/$2" "$1" 2>/dev/null; }
 
-# The key is FETCHED, never trusted: VALIDSIG carries the primary fingerprint of whoever
-# actually signed, asserted against SPARROW_KEY_FPR, so the download path need not be
-# trusted. Keyring is ephemeral in WORK_DIR; ~/.gnupg would pass unreproducibly.
+# The fetched key is not trusted: VALIDSIG must carry SPARROW_KEY_FPR. Ephemeral keyring in WORK_DIR.
 verify_official_signature() {
   local art="$1"
   if [[ "$SKIP_SIG_VERIFY" == true ]]; then
@@ -151,44 +157,30 @@ verify_official_signature() {
   echo "[INFO]   sha256 matches manifest entry"
 }
 
-# One release asset into official/. Never fatal; callers decide.
 fetch_release_asset() {
   fetch_url "${SPARROW_RELEASE_BASE}/${APP_VERSION}/$1" "$1"
 }
+# Every file goes to $4; the terminal shows at most 5 differences.
 compare_extracted() {
-  local listing="$1" oroot="$2" broot="$3"
-  local rel oh bh st idx=0
-  CMP_TOTAL=$(wc -l < "$listing" | tr -d ' ')
-  CMP_OK=0
-  CMP_BAD=0
+  local listing="$1" oroot="$2" broot="$3" out="$4" rel oh bh
+  CMP_TOTAL=$(wc -l < "$listing" | tr -d ' '); CMP_OK=0; CMP_BAD=0
   while IFS= read -r rel; do
-    idx=$((idx + 1))
-    oh="(missing)"; bh="(missing)"
-    [[ -f "${oroot}/${rel#./}" ]] && oh=$(sha256_of "${oroot}/${rel#./}")
-    [[ -f "${broot}/${rel#./}" ]] && bh=$(sha256_of "${broot}/${rel#./}")
-    if [[ "$oh" == "$bh" ]]; then
-      st="✓ MATCH"; CMP_OK=$((CMP_OK + 1))
-    else
-      st="⚠ DIFFER"; CMP_BAD=$((CMP_BAD + 1))
-    fi
-    printf "  %3d/%-3d: %s\n" "$idx" "$CMP_TOTAL" "${rel#./}"
-    echo "            Official: ${oh}"
-    echo "            Built:    ${bh}"
-    echo "            Status:   ${st}"
-    echo ""
-  done < "$listing"
+    rel="${rel#./}"; oh="(missing)"; bh="(missing)"
+    [[ -f "${oroot}/${rel}" ]] && oh=$(sha256_of "${oroot}/${rel}")
+    [[ -f "${broot}/${rel}" ]] && bh=$(sha256_of "${broot}/${rel}")
+    if [[ "$oh" == "$bh" ]]; then CMP_OK=$((CMP_OK + 1)); echo "MATCH  ${rel} ${oh}"
+    else CMP_BAD=$((CMP_BAD + 1)); echo "DIFFER ${rel} official ${oh} built ${bh}"; fi
+  done < "$listing" > "$out"
+  grep -m5 '^DIFFER' "$out" | sed 's/^/  /' || true
+  [[ "$CMP_BAD" -le 5 ]] || echo "  ... and $((CMP_BAD - 5)) more difference(s)"
+  echo "  Every file: ${out}"
 }
 
-# Writes the normalized MSI comparator into the work directory. Its allowlist is
-# five classes wide and every item it removes is printed by name; anything else
-# fails the run, and malformed input is an error rather than a verdict.
+# Normalized MSI comparator: five allowlisted classes, each removal printed by name; malformed input = error.
 write_comparator() {
   cat > "${WORK_DIR}/msicmp.py" << 'MSICMP_END'
 #!/usr/bin/env python3
-"""Normalized comparison of two MSI installers: named streams, decoded database
-tables, and - when the .msi paths are given - the OLE container itself.
-Exit 0 equivalent, 1 differences remain, 2 comparator error (never a verdict).
-"""
+"""Compare two MSIs: streams, decoded tables, OLE container. Exit 0 same, 1 differ, 2 error."""
 import sys, os, struct, re
 from collections import Counter
 
@@ -196,7 +188,7 @@ NORM, DIFF = [], []
 def norm(m): NORM.append(m)
 def diff(m): DIFF.append(m)
 class Bad(Exception):
-  """Malformed or unsupported input. Never a verdict about the artifact."""
+  """Malformed input; never a verdict."""
 
 def rd(d, n):
   p = os.path.join(d, n)
@@ -205,8 +197,7 @@ def rd(d, n):
 
 # -- cabinet
 def cab_normalized(b, who):
-  """Copy of the cabinet with only the per-file date/time fields zeroed; every
-  other byte (header, folders, data, checksums, names, padding) left intact."""
+  """Cabinet copy with only per-file date/time zeroed."""
   if len(b) < 36 or b[:4] != b'MSCF':
     raise Bad(f'{who}: not a cabinet')
   (_, r1, cbCab, r2, coffFiles, r3, vmin, vmaj,
@@ -251,8 +242,7 @@ PID_REVNUMBER, PID_CREATE_DTM, PID_LASTSAVE_DTM = 9, 12, 13
 VT_LPSTR, VT_FILETIME = 30, 64
 
 def summary_normalized(b, who):
-  """Zero exactly the PackageCode GUID and the two FILETIME payloads in a copy, with
-  a note of what was blanked; every other byte of the stream is left alone."""
+  """Copy with only the PackageCode GUID and two FILETIME payloads zeroed."""
   if len(b) < 48: raise Bad(f'{who}: summary stream too short')
   bo, fmt, osv, clsid, nsets = struct.unpack_from('<HHI16sI', b, 0)
   if bo != 0xFFFE: raise Bad(f'{who}: bad property-set byte order 0x{bo:04x}')
@@ -324,9 +314,7 @@ def pool(d, who):
   return strings, refs, width, codepage
 
 def compare_pools(a, b, raw_differs):
-  """Compare pools as a multiset of (string bytes, that entry's own refcount).
-  Summing refcounts per string would hide a redistribution across duplicate
-  entries, so each entry is kept whole."""
+  """Multiset of (string, own refcount); summing per string would hide redistribution."""
   sa, ra, wa, ca = a; sb, rb, wb, cb = b
   bad = False
   if ca != cb: diff(f'string pool codepage differs: {ca} vs {cb}'); bad = True
@@ -397,8 +385,7 @@ def decode(d, tname, cols, strings, width, who):
 # -- container
 FREE = 0xFFFFFFFF
 
-# CFBF v4 pads the 512-byte header out to a whole sector, so sector 0 starts at ss,
-# not at 512. Getting this wrong reports a phantom tail and misreads every chain.
+# CFBF v4 pads the header to a whole sector: sector 0 starts at ss, not 512.
 def _hdr(ss): return max(ss, 512)
 
 def _fat(b, ss):
@@ -416,17 +403,14 @@ def _fat(b, ss):
   return f
 
 def ole_map(path, who):
-  """(total, ss, nsec, tail, non-empty free sectors, dated dir entries, partial). Stream
-  names and contents are not re-derived here; run() already compares them from the
-  extracted trees, so this covers only what extraction cannot expose."""
+  """(total, ss, nsec, tail, non-empty free, dated dir entries, partial): what extraction hides."""
   b = open(path, 'rb').read()
   if b[:8] != b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1': raise Bad(f'{who}: not a compound file')
   ss = 1 << struct.unpack_from('<H', b, 30)[0]
   if ss not in (512, 4096): raise Bad(f'{who}: unsupported sector size {ss}')
   h, f = _hdr(ss), _fat(b, ss)
   nsec, tail = divmod(len(b) - h, ss)
-  # jpackage's MSI stops at the last byte its final stream needs (signtool's rewrite pads).
-  # A partial sector the FAT allocates as end of chain is stream content, already compared.
+  # jpackage's MSI ends mid-sector (signtool pads); an end-of-chain partial sector is stream content.
   part = 0
   if tail and nsec < len(f) and f[nsec] == 0xFFFFFFFE:
     nsec, tail, part = nsec + 1, 0, tail
@@ -444,9 +428,7 @@ def ole_map(path, who):
   return len(b), ss, nsec, tail, nzfree, dt, part
 
 def compare_container(pa, pb):
-  """Named streams are compared above; metadata sectors are structural. That leaves
-  three hiding places, checked here: past the final sector, unallocated sectors, and
-  extra streams - plus directory-entry timestamps, reported for the same reason."""
+  """Hiding places: past the final sector, unallocated sectors, dated directory entries."""
   ma, mb = ole_map(pa, 'official'), ole_map(pb, 'built')
   print('CONTAINER')
   for w, m in (('official', ma), ('built', mb)):
@@ -547,8 +529,7 @@ if __name__ == '__main__':
 MSICMP_END
 }
 
-# True when the container engine runs rootless, where container UID 0 already maps to
-# the invoking user. Test how the engine actually runs, never its executable name.
+# True when the engine runs rootless (container UID 0 = invoking user); asks the engine, not its name.
 is_rootless() {
   local r=""
   case "$DOCKER_CMD" in
@@ -559,12 +540,7 @@ is_rootless() {
   [[ "$r" == "true" ]]
 }
 
-# Hand the workspace back so the caller can delete it without sudo
-# (non-sudo-directories-guideline.md). Helpers bind-mount WORK_DIR and write as container
-# root; under a rootful engine those land root-owned and the build-server account cannot
-# remove them. Rootless, the caller IS container UID 0, so chown 0:0 there, numeric uid
-# otherwise. Runs on failure too via the EXIT trap. Never fatal: a verdict already
-# reached must not be lost to a cleanup problem.
+# Hand the workspace back to the caller (chown 0:0 rootless, numeric uid rootful); never fatal.
 restore_host_owner() {
   [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" && -n "${DOCKER_CMD}" ]] || return 0
   "$DOCKER_CMD" image inspect "${HELPER_IMAGE}" >/dev/null 2>&1 || return 0
@@ -576,8 +552,7 @@ restore_host_owner() {
     || warn "Could not restore ownership of ${WORK_DIR}; deleting it may need 'podman unshare rm -rf'"
 }
 
-# SSH into the VM from the helper container (host network reaches the 127.0.0.1-only port),
-# so the host needs no ssh client. The key is this run's private 0600 copy.
+# SSH into the VM via the helper container (host network, 127.0.0.1-only port; this run's 0600 key).
 vm_ssh() {
   "$DOCKER_CMD" run --rm -i --network host -v "${WORK_DIR}/vm/key:/key:ro" --entrypoint ssh \
     "${HELPER_IMAGE}" -i /key -p "$VM_PORT" -o BatchMode=yes -o ConnectTimeout=10 \
@@ -585,8 +560,7 @@ vm_ssh() {
     Docker@127.0.0.1 "$@"
 }
 
-# Missing KVM, golden image or key is an environment problem, not a build outcome:
-# exit 2, no verdict.
+# Missing KVM, golden image or key: environment problem, exit 2, no verdict.
 check_vm_prereqs() {
   local g="${WIN_DIR}/golden-2022" f ends
   [[ -r /dev/kvm && -w /dev/kvm ]] || die "/dev/kvm is not usable by $(id -un) (kvm group?)" $EXIT_INVALID_PARAMS
@@ -599,8 +573,7 @@ check_vm_prereqs() {
   echo "[INFO] Golden image: ${g} (evaluation ends ${ends:-unknown})"
 }
 
-# Boots a throw-away copy of the golden image: qcow2 overlays in the workspace, backed by the
-# read-only golden disks mounted at the same paths in every container.
+# Throw-away VM: qcow2 overlays in the workspace over the read-only golden disks (same mount paths).
 start_vm() {
   local g="${WIN_DIR}/golden-2022" vm="${WORK_DIR}/vm" i u=() x=()
   mkdir -p "${vm}/storage" "${vm}/storage2"
@@ -632,18 +605,32 @@ start_vm() {
   die "Windows VM did not answer over SSH within 10 minutes" $EXIT_INVALID_PARAMS
 }
 
-# The release workflow's steps, in D:\a\sparrow\sparrow: clone the tag with submodules,
-# point the Gradle wrapper at services.gradle.org, jpackage, packageZipDistribution.
-# Backgrounded so INT/TERM interrupt the wait at once.
+# Release workflow in D:\a\sparrow\sparrow: clone, pinned JDK, Gradle from services.gradle.org, jpackage,
+# packageZipDistribution. NO-VERDICT, network errors or no Gradle BUILD FAILED: no YAML.
 build_in_vm() {
   local log="${WORK_DIR}/logs/vm-build.log" c
   echo "[INFO] Building Sparrow ${APP_VERSION} inside the VM (log: logs/vm-build.log)..."
-  sed "s/@VER@/${APP_VERSION}/" << 'PSEOF' | vm_ssh 'powershell -NoProfile -Command -' 2>&1 | tee "$log" &
-$ErrorActionPreference='Stop'
+  local jdk_url="https://github.com/adoptium/temurin25-binaries/releases/download/jdk-${JDK_VERSION/+/%2B}/${JDK_ZIP}"
+  sed -e "s/@VER@/${APP_VERSION}/" -e "s|@JDKURL@|${jdk_url}|" -e "s/@JDKSHA@/${JDK_ZIP_SHA256}/" \
+    -e "s/@JDKVER@/${JDK_VERSION}/" << 'PSEOF' | vm_ssh 'powershell -NoProfile -Command -' 2>&1 | tee "$log" &
+$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'
 cmd /c "mkdir D:\a\sparrow 2>nul & git clone -q --depth 1 --branch @VER@ --recurse-submodules --shallow-submodules https://github.com/sparrowwallet/sparrow D:\a\sparrow\sparrow 2>&1"
-if ($LASTEXITCODE) { throw 'clone failed' }
+if ($LASTEXITCODE) { 'NO-VERDICT: clone failed'; exit 1 }
 Set-Location D:\a\sparrow\sparrow
 'COMMIT=' + (git rev-parse HEAD)
+$up=[regex]::Match((Get-Content .github\workflows\package.yaml -Raw),"java-version:\s*'([^']+)'").Groups[1].Value
+'Upstream workflow JDK: ' + $up + '; this script: @JDKVER@'
+if ($up -ne '@JDKVER@'.Split('+')[0]) { 'NO-VERDICT: JDK_MISMATCH: upstream @VER@ uses JDK ' + $up; exit 1 }
+New-Item -ItemType Directory -Force C:\dl,C:\jdk | Out-Null
+curl.exe -sSfL -o C:\dl\jdk.zip '@JDKURL@'
+if ($LASTEXITCODE) { 'NO-VERDICT: JDK download failed'; exit 1 }
+if ((Get-FileHash C:\dl\jdk.zip -Algorithm SHA256).Hash -ne '@JDKSHA@'.ToUpper()) { 'NO-VERDICT: JDK zip sha256 mismatch'; exit 1 }
+'JDK zip sha256 OK'
+Expand-Archive C:\dl\jdk.zip C:\jdk -Force
+$env:JAVA_HOME='C:\jdk\jdk-@JDKVER@'; $env:Path=$env:JAVA_HOME + '\bin;' + $env:Path
+$jv=(cmd /c "java -version 2>&1" | Select-Object -First 1)
+'JDK: ' + $jv
+if ($jv -notmatch ('"' + '@JDKVER@'.Split('+')[0] + '"')) { 'NO-VERDICT: java on PATH is not @JDKVER@'; exit 1 }
 $props='gradle/wrapper/gradle-wrapper.properties'
 $c=Get-Content $props -Raw
 $v=[regex]::Match($c,'gradle-(\d+\.\d+(?:\.\d+)?)-bin').Groups[1].Value
@@ -660,13 +647,18 @@ PSEOF
   wait "$BUILD_PID" || true
   BUILD_PID=""
   tr -d '\r' < "$log" > "${log}.tmp" && mv "${log}.tmp" "$log"
-  grep -qx 'BUILD-OK' "$log" || ftbfs_die "The Windows build failed inside the VM; see logs/vm-build.log"
+  ! grep -q '^NO-VERDICT' "$log" || die "$(grep -m1 '^NO-VERDICT' "$log")"
+  if ! grep -qx 'BUILD-OK' "$log"; then
+    grep -q 'BUILD FAILED' "$log" || die "Stopped before a verdict (no Gradle BUILD FAILED); see logs/vm-build.log"
+    ! grep -qE 'Could not (resolve|GET|download)|UnknownHost|Connection (refused|timed out)' "$log" \
+      || die "Gradle failed on a network error; no verdict. See logs/vm-build.log"
+    ftbfs_die "Gradle build failed inside the VM; see logs/vm-build.log"
+  fi
   c=$(sed -n 's/^COMMIT=//p' "$log" | head -1)
   [[ ! "$c" =~ ^[0-9a-f]{40}$ ]] || RESOLVED_COMMIT="$c"
 }
 
-# Streams one artifact out of the VM and checks it against the hash Windows computed.
-# A bad copy is a tool error, not a verdict.
+# Copies one artifact out of the VM; a hash mismatch is a tool error.
 fetch_from_vm() {
   local name="$1" dest="$2" want got ps
   want=$(awk -v n="$name" '$1 == "HASH" && $3 == n {print $2}' "${WORK_DIR}/logs/vm-build.log")
@@ -688,8 +680,8 @@ cleanup() {
 }
 
 ftbfs_die() {
-  printf 'script_version: %s\nverdict: ftbfs\nnotes: "%s"\n' "$SCRIPT_VERSION" "$1" > "$results_file"
-  cp "$results_file" "$execution_dir/" 2>/dev/null || true
+  keep_existing_results
+  printf 'script_version: %s\nverdict: ftbfs\nnotes: "%s"\n' "$SCRIPT_VERSION" "$1" > "$RESULTS_FILE"
   die "$1" $EXIT_BUILD_FAILED
 }
 build_and_verify_windows() {
@@ -697,8 +689,10 @@ build_and_verify_windows() {
   version_component=$(sanitize_component "$APP_VERSION")
   execution_dir="$(pwd -P)"
   RUN_ID="$(date +%s)-$$"
+  RESULTS_FILE="${execution_dir}/COMPARISON_RESULTS.yaml"
+  keep_existing_results
 
-  # A new workspace per run in the caller's directory (per-run-workspace-guideline.md).
+  # New workspace per run in the caller's directory (per-run-workspace-guideline.md).
   if [[ -n "$CUSTOM_WORK_DIR" ]]; then
     WORK_DIR="$CUSTOM_WORK_DIR"
   else
@@ -709,12 +703,10 @@ build_and_verify_windows() {
   local log_dir="${WORK_DIR}/logs"
   local official_dir="${WORK_DIR}/official"
   local built_dir="${WORK_DIR}/built"
-  local results_file="${WORK_DIR}/COMPARISON_RESULTS.yaml"
 
   mkdir -p "$WORK_DIR" "$log_dir" "$official_dir" "$built_dir"
   cd "$WORK_DIR"
-  # Cleanup runs on every exit path. A stopped run (130) writes no verdict: ABS would
-  # publish any YAML it finds.
+  # Cleanup on every exit; a stopped run (130) writes no YAML.
   trap cleanup EXIT
   trap 'exit 130' INT TERM
 
@@ -742,10 +734,9 @@ build_and_verify_windows() {
     echo "[INFO] Downloaded $(sha256_of "$otgt")"
   fi
 
-  # Input-integrity problem, not a build outcome: no verdict.
   verify_official_signature "$oname"
 
-  echo "[INFO] JDK in the golden image: Temurin ${DEFAULT_JDK_VERSION}"
+  echo "[INFO] JDK: Temurin ${JDK_VERSION}, downloaded into the VM and sha256-checked (${JDK_ZIP_SHA256})"
   start_vm
   build_in_vm
   local built_type_dir="${built_dir}/${APP_TYPE}"
@@ -760,7 +751,7 @@ build_and_verify_windows() {
     echo "[INFO] === ZIP Comparison ==="
     local built_zip_file
     built_zip_file=$(find "$built_type_dir" -name "*.zip" | head -1)
-    [[ -n "$built_zip_file" ]] || ftbfs_die "Built ZIP file not found in downloaded artifact"
+    [[ -n "$built_zip_file" ]] || die "Built ZIP not found; no verdict"
 
     local ozs bzs
     ozs=$(sha256_of "$otgt")
@@ -775,13 +766,12 @@ build_and_verify_windows() {
     unzip -q "$otgt" -d "$official_zip_extract"
     unzip -q "$built_zip_file" -d "$built_zip_extract"
 
-    # union of both extractions
     local zip_union="${WORK_DIR}/zip-union-files.txt"
     { (cd "$official_zip_extract" && find . -type f); (cd "$built_zip_extract" && find . -type f); } \
       | sort -u > "$zip_union"
     echo "[INFO] $(wc -l < "$zip_union" | tr -d ' ') files to verify (union of both extractions)"
     echo ""
-    compare_extracted "$zip_union" "$official_zip_extract" "$built_zip_extract"
+    compare_extracted "$zip_union" "$official_zip_extract" "$built_zip_extract" "${log_dir}/zip-comparison.txt"
     rm -f "$zip_union"
 
     echo "[INFO] ZIP: ${CMP_OK}/${CMP_TOTAL} files verified"
@@ -795,7 +785,7 @@ build_and_verify_windows() {
     echo "[INFO] === MSI Comparison ==="
     local built_msi_file
     built_msi_file=$(find "$built_type_dir" -name "*.msi" | head -1)
-    [[ -n "$built_msi_file" ]] || ftbfs_die "Built MSI file not found in downloaded artifact"
+    [[ -n "$built_msi_file" ]] || die "Built MSI not found; no verdict"
 
     local official_msi_sha built_msi_sha
     official_msi_sha=$(sha256_of "$otgt")
@@ -811,9 +801,9 @@ build_and_verify_windows() {
       "$DOCKER_CMD" run --rm -v "${WORK_DIR}:/work" "${HELPER_IMAGE}" bash -c "
         7z x -tCompound /work/official/${oname} -o/work/ex-official -y >/dev/null 2>&1 &&
         7z x -tCompound /work/built/msi/${bn} -o/work/ex-built -y >/dev/null 2>&1" \
-        || ftbfs_die "Extraction of one or both MSIs failed"
+        || die "MSI extraction failed; no verdict"
       [[ -n "$(ls -A "${WORK_DIR}/ex-official" 2>/dev/null)" && -n "$(ls -A "${WORK_DIR}/ex-built" 2>/dev/null)" ]] \
-        || ftbfs_die "MSI extraction produced no streams on one or both sides"
+        || die "MSI extraction produced no streams; no verdict"
 
       echo ""
       local cmp_rc=0
@@ -821,8 +811,7 @@ build_and_verify_windows() {
         python3 /work/msicmp.py /work/ex-official /work/ex-built \
          "/work/official/${oname}" "/work/built/msi/${bn}" \
         > "${log_dir}/msi-compare.txt" 2>&1 || cmp_rc=$?
-      # Diff output rule: at most 5 difference lines on the terminal; the
-      # full comparator output stays in logs/msi-compare.txt.
+      # At most 5 difference lines on the terminal; full output in logs/msi-compare.txt.
       awk -v logfile="${log_dir}/msi-compare.txt" '
         /^  ! / { d++; if (d > 5) next }
         { print }
@@ -835,7 +824,7 @@ build_and_verify_windows() {
       elif [[ "$cmp_rc" -eq 1 ]]; then
         echo "[INFO] MSI: DIFFERENCES REMAIN after normalization (listed above)."
       else
-        ftbfs_die "MSI comparator failed (exit ${cmp_rc}); this is a tool error, not a verdict"
+        die "MSI comparator failed (exit ${cmp_rc}); tool error, no verdict"
       fi
     fi
   fi
@@ -848,10 +837,10 @@ build_and_verify_windows() {
       note="The two installers are byte-identical."
     elif [[ "$msi_match" -eq 1 ]]; then
       verdict="reproducible"
-      note="No differences beyond the declared allowlist (Authenticode signature, PackageCode, build timestamps, table row order, string-pool order). Every named stream and decoded table matches, the cabinet matches byte-for-byte after zeroing only its per-file date/time fields, and the container is accounted for: nothing past the final sector, no data in unallocated sectors, no dated directory entries, and the only one-sided stream is the publisher signature. Not byte-identical because ours is unsigned."
+      note="No differences beyond the allowlist (Authenticode signature, PackageCode, build timestamps, table row order, string-pool order); streams, tables, cabinet and container all accounted for. Not byte-identical: ours is unsigned."
     else
       verdict="not_reproducible"
-      note="Every named stream and decoded table was compared, the cabinet byte-for-byte after zeroing its per-file date/time fields. Differences remained after normalizing the allowlisted classes; they are listed in the recording."
+      note="Differences remained after normalizing the allowlisted classes; listed in the recording."
     fi
   else
     if [[ "$whole_match" -eq 1 ]]; then
@@ -859,19 +848,18 @@ build_and_verify_windows() {
       note="ZIP archives are byte-identical."
     else
       verdict="not_reproducible"
-      note="ZIP archives are not byte-identical. Sparrow builds this archive with preserveFileTimestamps disabled on Windows, so byte equality is the intended outcome; extracted-file equality alone is not reproducibility."
+      note="ZIP archives are not byte-identical; Sparrow disables file timestamps here, so byte equality is expected."
     fi
   fi
 
+  keep_existing_results
   printf 'script_version: %s\nverdict: %s\nnotes: |\n  %s\n  artifact_identical=%s\n' \
     "$SCRIPT_VERSION" "$verdict" "$note" \
-    "$([[ "$whole_match" -eq 1 ]] && echo true || echo false)" > "$results_file"
-  cp "$results_file" "$execution_dir/" 2>/dev/null || true
+    "$([[ "$whole_match" -eq 1 ]] && echo true || echo false)" > "$RESULTS_FILE"
 
-  display_results "$execution_dir"
+  display_results
 }
-# Hash legend, kept OUTSIDE the Begin/End markers so that block stays a clean
-# key: value list (dannys-amendments.md, "Ambiguous Artifact Hashes").
+# Hash legend, outside the Begin/End markers.
 print_hash_legend() {
   echo ""
   echo "HASH LEGEND"
@@ -880,11 +868,10 @@ print_hash_legend() {
   echo "  scriptHash  this script: which tooling produced these results."
 }
 
-# Standardized summary (verification-result-summary-format.md). The machine verdict
-# lives in COMPARISON_RESULTS.yaml; this block is the human/recording view.
+# Standardized summary (verification-result-summary-format.md).
 emit_verification_summary() {
   local yaml_verdict summary_verdict
-  yaml_verdict=$(grep "^verdict:" COMPARISON_RESULTS.yaml | cut -d' ' -f2)
+  yaml_verdict=$(grep "^verdict:" "$RESULTS_FILE" | cut -d' ' -f2)
   case "$yaml_verdict" in
     reproducible)     summary_verdict="reproducible" ;;
     not_reproducible) summary_verdict="differences found" ;;
@@ -899,8 +886,6 @@ emit_verification_summary() {
 
   print_hash_legend
 
-  # appHash is the official artifact EXACTLY AS DISTRIBUTED. Only canonical fields
-  # inside the markers; anything extra lives outside them.
   echo ""
   echo "===== Begin Results ====="
   echo "appId:          ${APP_ID}"
@@ -914,7 +899,6 @@ emit_verification_summary() {
   echo "scriptHash:     ${SCRIPT_SHA256:-N/A}"
   echo ""
 
-  # Desktop/binary workflow: Luis's machine-readable summary (format doc section 3).
   local match_flag=0 match_word="DOESN'T MATCH" matches=0 mismatches=1
   if [[ "$official_sha" == "$built_sha" && "$official_sha" != "N/A" ]]; then
     match_flag=1; match_word="MATCHES"; matches=1; mismatches=0
@@ -936,18 +920,11 @@ emit_verification_summary() {
   echo "official artifact: ${BINARY_SOURCE}"
   echo "manifest signature: ${SIG_STATUS}"
   echo "pinned key: ${SPARROW_KEY_FPR} (Craig Raw)"
-
-  # Canonical "Also" section for non-standard notes (format doc section 5).
-  if [[ "$APP_TYPE" == "msi" && "$match_flag" -eq 0 ]]; then
-    echo ""
-    echo "===== Also ===="
-    echo "MSI stream, table and container comparison, full output:"
-    echo "${WORK_DIR}/logs/msi-compare.txt"
-  fi
   echo ""
   echo "===== End Results ====="
+  [[ "$APP_TYPE" != "msi" || "$match_flag" -eq 1 ]] || echo "Full MSI comparison: ${WORK_DIR}/logs/msi-compare.txt"
 
-  # Diff investigation commands, after the end marker (format doc section 7).
+  # Diff investigation commands (format doc section 7).
   local ex_official ex_built
   if [[ "$APP_TYPE" == "msi" ]]; then
     ex_official="${WORK_DIR}/ex-official"; ex_built="${WORK_DIR}/ex-built"
@@ -966,24 +943,19 @@ emit_verification_summary() {
 }
 
 display_results() {
-  local exec_dir="$1"
-
   echo ""
   echo "======================================================"
   echo "RESULTS"
   echo "======================================================"
-  cat COMPARISON_RESULTS.yaml
+  cat "$RESULTS_FILE"
   echo ""
-  echo "Workspace: $WORK_DIR/COMPARISON_RESULTS.yaml"
-  if [[ "$exec_dir" != "$WORK_DIR" ]]; then
-    echo "Build server location: $exec_dir/COMPARISON_RESULTS.yaml"
-  fi
+  echo "YAML: $RESULTS_FILE"
 
   emit_verification_summary
   echo ""
 
   local verdict
-  verdict=$(grep "^verdict:" COMPARISON_RESULTS.yaml | cut -d' ' -f2)
+  verdict=$(grep "^verdict:" "$RESULTS_FILE" | cut -d' ' -f2)
 
   if [[ "$verdict" == "reproducible" ]]; then
     echo "✅ VERDICT: REPRODUCIBLE"
@@ -1025,7 +997,7 @@ parse_arguments() {
   [[ "$APP_VERSION" =~ ^[0-9A-Za-z._-]+$ ]] || die "Invalid --version '$APP_VERSION'" $EXIT_INVALID_PARAMS
   [[ -n "$APP_ARCH" ]] || die "Missing required parameter: --arch" $EXIT_INVALID_PARAMS
   is_windows_arch "$APP_ARCH" || die "--arch '$APP_ARCH' is not a Windows arch; Linux types are handled by sparrowdesktop_build.sh" $EXIT_INVALID_PARAMS
-  # --binary optional since v0.2.0; with no file name --type must be explicit.
+  # Without --binary, --type must be explicit.
   if [[ -z "$BINARY_PATH" ]]; then
     case "$APP_TYPE" in
       msi|zip) ;;
@@ -1054,7 +1026,6 @@ parse_arguments() {
 }
 
 main() {
-  # Runs as a normal user only; root runs break the ownership guarantees below.
   if [[ "${EUID}" -eq 0 ]]; then
     echo "ERROR: Do not run this script as root; run it as a normal user." >&2
     exit $EXIT_INVALID_PARAMS
@@ -1066,8 +1037,7 @@ main() {
   echo "======================================================"
   echo ""
 
-  # Self-identify before doing anything else, so a recording of this run always shows
-  # which bytes of tooling produced the result (script-version-and-hash.md, 2026-08-17).
+  # Self-identify first (script-version-and-hash.md).
   SCRIPT_SHA256="$(sha256_of "$SCRIPT_PATH")"
   echo "[INFO] Script:  $(basename "$SCRIPT_PATH") ${SCRIPT_VERSION}"
   echo "[INFO]         sha256: ${SCRIPT_SHA256}"
