@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WS 30301 missing-d restore — sign &amp; publish (NIP-07)</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 1.5rem; background: #14161a; color: #d8dce2; }
+  h1 { font-size: 1.15rem; } h2 { font-size: 1rem; margin-top: 1.6rem; }
+  button { padding: .45rem .9rem; margin-right: .5rem; border-radius: 6px; border: 1px solid #3a4150;
+           background: #232a36; color: #d8dce2; cursor: pointer; font-size: .9rem; }
+  button:disabled { opacity: .35; cursor: not-allowed; }
+  button.danger { border-color: #7a3a3a; background: #3a2323; }
+  #log { background: #0d0f12; border: 1px solid #2a2f38; padding: .6rem; height: 14rem; overflow-y: auto;
+         font-family: monospace; font-size: .78rem; white-space: pre-wrap; margin-top: .6rem; }
+  table { border-collapse: collapse; font-size: .78rem; margin-top: .6rem; width: 100%; }
+  th, td { border: 1px solid #2a2f38; padding: .25rem .5rem; text-align: left; }
+  td.ok { color: #7ec97e; } td.err { color: #e08a8a; } td.pend { color: #c9b97e; }
+  .mono { font-family: monospace; }
+  .warn { color: #e0c07a; }
+  input[type=text] { width: 100%; background: #0d0f12; color: #d8dce2; border: 1px solid #2a2f38; padding: .35rem; font-family: monospace; font-size: .8rem; }
+  input[type=number] { width: 5rem; background: #0d0f12; color: #d8dce2; border: 1px solid #2a2f38; padding: .35rem; }
+</style>
+</head>
+<body>
+<h1>WalletScrutiny kind-30301 missing-<code>d</code> restore — sign &amp; publish</h1>
+<p>Reauthors the missing-<code>d</code> verification events with the new deterministic <code>d</code> tag,
+signs them with your NIP-07 extension (window.nostr), and publishes to the WS relays.
+<strong>Nothing is sent anywhere until step 5.</strong></p>
+
+<h2>1. Load restore plan</h2>
+<input type="file" id="planFile" accept=".json">
+<span id="planStatus"></span>
+
+<h2>2. Connect NIP-07 signer</h2>
+<button id="btnConnect" disabled>Connect signer</button>
+<span id="signerStatus"></span>
+<p class="warn">Expected pubkey: <span class="mono">1f9e547c2f31942623b8ad1d07713282e8640fd8cf474e9f79f18ace8af216ed</span></p>
+
+<h2>3. Sign all events — OR import already-signed events</h2>
+<button id="btnSign" disabled>Sign 0 events</button>
+<span id="signStatus"></span>
+<p>Already signed in an earlier session? Import the signed-events backup JSON instead (no re-signing needed):</p>
+<input type="file" id="signedFile" accept=".json" disabled>
+<span id="importStatus"></span>
+
+<h2>4. Backup signed events (do this BEFORE publishing)</h2>
+<button id="btnBackup" disabled>Download signed-events JSON</button>
+<span class="warn" id="backupNote"></span>
+
+<h2>5. Publish</h2>
+<p>Relays (edit before publishing if needed, comma-separated):</p>
+<input type="text" id="relays" value="wss://relay.nostr.info/, wss://nostr.mom/, wss://relay.primal.net/, wss://relay.damus.io/, wss://nos.lol/">
+<p>Seconds between events: <input type="number" id="gapSecs" value="3" min="1" max="60">
+&nbsp; (each event also waits for the relay's OK before the next is sent; rate-limited events retry automatically with increasing backoff)</p>
+<p><button id="btnPublish" class="danger" disabled>Publish signed events to relays</button>
+<button id="btnResults" disabled>Download publish-results JSON</button></p>
+
+<div id="log"></div>
+<table id="tbl"><thead><tr>
+  <th>#</th><th>app</th><th>version</th><th>platform</th><th>new d (truncated)</th><th>signed</th><th>relay acks</th>
+</tr></thead><tbody></tbody></table>
+
+<script>
+const EXPECTED_PK = "1f9e547c2f31942623b8ad1d07713282e8640fd8cf474e9f79f18ace8af216ed";
+let entries = [], signed = [], results = {};
+
+const $ = id => document.getElementById(id);
+const log = m => { const el = $("log"); el.textContent += m + "\n"; el.scrollTop = el.scrollHeight; };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function renderTable() {
+  const tb = $("tbl").querySelector("tbody"); tb.innerHTML = "";
+  entries.forEach((e, i) => {
+    const tr = document.createElement("tr");
+    const acks = results[i] ? Object.values(results[i]).map(v => v === true ? "✓" : "✗").join(" ") : "";
+    const ackN = results[i] ? Object.values(results[i]).filter(v => v === true).length : "";
+    tr.innerHTML = `<td>${i + 1}</td><td>${e.app}</td><td>${e.version}</td><td>${e.platform}</td>` +
+      `<td class="mono">${e.new_d.slice(0, 48)}…</td>` +
+      `<td class="${signed[i] ? "ok" : "pend"}">${signed[i] ? signed[i].id.slice(0, 12) + "…" : "—"}</td>` +
+      `<td class="${ackN ? "ok" : ""}">${ackN !== "" ? ackN + "/" + Object.keys(results[i]).length + " " + acks : ""}</td>`;
+    tb.appendChild(tr);
+  });
+}
+
+$("planFile").addEventListener("change", async ev => {
+  const f = ev.target.files[0]; if (!f) return;
+  const plan = JSON.parse(await f.text());
+  entries = Array.isArray(plan) ? plan : (plan.entries || plan.plan || []);
+  signed = new Array(entries.length).fill(null); results = {};
+  const bad = entries.filter(e => !e.unsigned_template || e.pubkey !== EXPECTED_PK);
+  $("planStatus").textContent = ` loaded ${entries.length} entries` + (bad.length ? ` — ⚠ ${bad.length} not Danny/incomplete!` : " ✓");
+  log(`Plan loaded: ${entries.length} entries` + (bad.length ? ` — WARNING: ${bad.length} entries wrong pubkey or missing template` : ""));
+  const dset = new Set(entries.map(e => e.new_d));
+  if (dset.size !== entries.length) log("⚠ WARNING: duplicate new_d values present!");
+  $("btnConnect").disabled = false;
+  $("signedFile").disabled = false;
+  $("btnSign").textContent = `Sign ${entries.length} events`;
+  renderTable();
+});
+
+$("btnConnect").addEventListener("click", async () => {
+  if (!window.nostr) { $("signerStatus").textContent = " ✗ window.nostr not found — enable your NIP-07 extension"; return; }
+  const pk = await window.nostr.getPublicKey();
+  if (pk !== EXPECTED_PK) { $("signerStatus").textContent = ` ✗ signer pubkey ${pk.slice(0, 12)}… does NOT match — aborting`; return; }
+  $("signerStatus").textContent = " ✓ signer matches Danny's pubkey";
+  log("Signer connected, pubkey verified.");
+  $("btnSign").disabled = false;
+});
+
+// Import previously signed events (restore a lost session from the backup JSON).
+$("signedFile").addEventListener("change", async ev => {
+  const f = ev.target.files[0]; if (!f) return;
+  const evs = JSON.parse(await f.text());
+  const byD = new Map();
+  for (const e of (Array.isArray(evs) ? evs : [])) {
+    const d = (e.tags || []).find(t => t[0] === "d");
+    if (e.pubkey === EXPECTED_PK && e.id && e.sig && e.kind === 30301 && d) byD.set(d[1], e);
+  }
+  let matched = 0;
+  entries.forEach((en, i) => { if (byD.has(en.new_d)) { signed[i] = byD.get(en.new_d); matched++; } });
+  $("importStatus").textContent = ` imported ${matched}/${entries.length} signed events`;
+  log(`Imported ${matched}/${entries.length} signed events from backup (matched by d tag; pubkey/kind/id/sig checked).`);
+  if (matched > 0) { $("btnBackup").disabled = false; $("btnPublish").disabled = false;
+    $("backupNote").textContent = " (already backed up — imported from backup, publish is unlocked)"; }
+  renderTable();
+});
+
+$("btnSign").addEventListener("click", async () => {
+  $("btnSign").disabled = true;
+  for (let i = 0; i < entries.length; i++) {
+    if (signed[i]) continue;
+    try {
+      const ev = await window.nostr.signEvent(entries[i].unsigned_template);
+      if (ev.pubkey !== EXPECTED_PK || !ev.id || !ev.sig) throw new Error("bad signed event");
+      if (ev.kind !== 30301) throw new Error("kind changed");
+      signed[i] = ev;
+      $("signStatus").textContent = ` ${i + 1}/${entries.length}`;
+    } catch (e) { log(`✗ sign failed #${i + 1} (${entries[i].new_d.slice(0, 40)}…): ${e.message || e}`); }
+    renderTable();
+  }
+  const n = signed.filter(Boolean).length;
+  log(`Signing done: ${n}/${entries.length} signed.`);
+  $("btnBackup").disabled = n === 0;
+  if (n < entries.length) { $("btnSign").disabled = false; $("btnSign").textContent = "Retry unsigned"; }
+});
+
+function download(name, obj) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" }));
+  a.download = name; a.click();
+}
+
+$("btnBackup").addEventListener("click", () => {
+  download("2026-07-06-missing-d-signed-events.json", signed.filter(Boolean));
+  log("Signed-events backup downloaded. SAVE IT to ~/work/ws-notes/nostr-verifications/ before publishing.");
+  $("btnPublish").disabled = false;
+});
+
+// Publish to one relay: one event at a time, wait for its OK, pause gapMs between events,
+// exponential backoff + retry when the relay says rate-limited.
+function publishToRelay(url, events, gapMs) {
+  return new Promise(resolve => {
+    const out = {}; let settled = false;
+    const pending = new Map(); // event id -> resolve(ackValue)
+    const ws = new WebSocket(url.trim());
+    const finish = () => { if (!settled) { settled = true; try { ws.close(); } catch (_) {} resolve(out); } };
+    ws.onerror = () => { log(`✗ ${url}: connection error`); finish(); };
+    ws.onmessage = m => {
+      try {
+        const d = JSON.parse(m.data);
+        if (d[0] === "OK" && pending.has(d[1])) { pending.get(d[1])(d[2] === true ? true : (d[3] || "rejected")); pending.delete(d[1]); }
+      } catch (_) {}
+    };
+    ws.onopen = async () => {
+      log(`→ ${url}: connected, sending ${events.length} events (${gapMs / 1000}s apart, OK-gated)…`);
+      for (let i = 0; i < events.length; i++) {
+        const ev = events[i];
+        let backoff = 20000; // 20s, doubles per rate-limited retry
+        for (let attempt = 1; attempt <= 5; attempt++) {
+          if (ws.readyState !== 1) { out[ev.id] = out[ev.id] ?? "connection-lost"; break; }
+          const ack = await new Promise(res => {
+            pending.set(ev.id, res);
+            const t = setTimeout(() => { if (pending.has(ev.id)) { pending.delete(ev.id); res("no-ack-timeout"); } }, 10000);
+            const orig = pending.get(ev.id); pending.set(ev.id, v => { clearTimeout(t); orig(v); });
+            ws.send(JSON.stringify(["EVENT", ev]));
+          });
+          out[ev.id] = ack;
+          if (ack === true || !String(ack).toLowerCase().includes("rate-limit")) break;
+          if (attempt < 5) {
+            log(`  ⏳ ${url}: #${i + 1} rate-limited, waiting ${backoff / 1000}s (retry ${attempt}/4)…`);
+            await sleep(backoff); backoff = Math.min(backoff * 2, 120000);
+          }
+        }
+        if (out[ev.id] !== true) log(`  ✗ ${url}: #${i + 1} ${ev.id.slice(0, 12)}… → ${out[ev.id]}`);
+        if (i < events.length - 1) await sleep(gapMs);
+      }
+      finish();
+    };
+  });
+}
+
+$("btnPublish").addEventListener("click", async () => {
+  $("btnPublish").disabled = true;
+  const evs = signed.filter(Boolean);
+  const relays = $("relays").value.split(",").map(s => s.trim()).filter(Boolean);
+  const gapMs = Math.max(1, Number($("gapSecs").value) || 3) * 1000;
+  log(`Publishing ${evs.length} events to ${relays.length} relay(s), ${gapMs / 1000}s between events…`);
+  const perRelay = {};
+  for (const r of relays) perRelay[r] = await publishToRelay(r, evs, gapMs);
+  entries.forEach((e, i) => {
+    if (!signed[i]) return;
+    results[i] = {};
+    for (const r of relays) results[i][r] = perRelay[r][signed[i].id] ?? "no-ack";
+  });
+  renderTable();
+  let full = 0, partial = 0, none = 0;
+  Object.values(results).forEach(rr => {
+    const n = Object.values(rr).filter(v => v === true).length;
+    if (n === Object.keys(rr).length) full++; else if (n > 0) partial++; else none++;
+  });
+  log(`Publish complete: ${full} events acked by ALL relays, ${partial} partial, ${none} unacked.`);
+  $("btnResults").disabled = false;
+  $("btnPublish").disabled = false;
+});
+
+$("btnResults").addEventListener("click", () =>
+  download("2026-07-06-missing-d-publish-results.json", { results, events: signed.filter(Boolean).map(e => ({ id: e.id, d: e.tags[0][1] })) }));
+</script>
+</body>
+</html>
