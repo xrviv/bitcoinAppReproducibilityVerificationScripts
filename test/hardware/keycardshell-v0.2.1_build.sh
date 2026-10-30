@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# keycardshell-v0.2.0_build.sh - reproducible-build check of Keycard Shell firmware
-# Version: v0.2.0
+# keycardshell-v0.2.1_build.sh - reproducible-build check of Keycard Shell firmware
+# Version: v0.2.1
 # Organization: WalletScrutiny.com
 # Last modified by: Claude Code for Danny
-# Last modified on: 2026-10-14
+# Last modified on: 2026-10-30
 # Project: https://github.com/keycard-tech/keycard-shell
 # App ID: keycard-shell
 #
@@ -14,7 +14,9 @@
 # Build system: CMake + Ninja + ARM GNU Toolchain 15.2.rel1.
 #
 # Steps: take or download both official binaries, build the release tag inside a
-# container, compare, write COMPARISON_RESULTS.yaml beside this script.
+# container, compare, write COMPARISON_RESULTS.yaml beside this script (an existing one is
+# renamed aside, never deleted). Only a failed cmake build writes ftbfs; download, tool,
+# input and stop errors exit with no YAML.
 # Firmware: firmware-hash.py skips bytes 588-651 (64-byte ECDSA signature), so
 # binaries signed with different keys hash identically; dd cross-check.
 # Bootloader (unsigned): bytes 588-651 hold the firmware verification key. Our
@@ -28,9 +30,9 @@
 #   bootloader-perso.py          -> ${WORK_DIR}/tools/ (COPY into container)
 #
 # Usage:
-#   keycardshell-v0.2.0_build.sh --version 1.4.0
-#   keycardshell-v0.2.0_build.sh --binary /path/to/shellos-YYYYMMDD-X.Y.Z.bin
-#   keycardshell-v0.2.0_build.sh --binary /path/to/shellos-bootloader-YYYYMMDD-X.Y.Z.bin
+#   keycardshell-v0.2.1_build.sh --version 1.5.1
+#   keycardshell-v0.2.1_build.sh --binary /path/to/shellos-YYYYMMDD-X.Y.Z.bin
+#   keycardshell-v0.2.1_build.sh --binary /path/to/shellos-bootloader-YYYYMMDD-X.Y.Z.bin
 #   (--binary may also be a directory; the binary not supplied is downloaded)
 #
 # Host requirements: Bash, curl, tar and Podman or Docker. Run as a normal user.
@@ -41,13 +43,12 @@
 
 set -eEo pipefail
 
-SCRIPT_VERSION="v0.2.0"
+SCRIPT_VERSION="v0.2.1"
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="${SCRIPT_PATH%/*}"
 SCRIPT_HASH="$(sha256sum "${SCRIPT_PATH}" | cut -d' ' -f1)"
 echo "$(basename "${SCRIPT_PATH}") ${SCRIPT_VERSION} sha256:${SCRIPT_HASH}"
 RESULTS_FILE="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
-rm -f -- "${RESULTS_FILE}"
 
 # Pinned build inputs (2026-10-14)
 APT_SNAPSHOT="20261014T000000Z"
@@ -77,8 +78,18 @@ log_error() { echo "[ERROR] $*" >&2; }
 
 # ── results ──────────────────────────────────────────────────────────────────
 
+# An existing COMPARISON_RESULTS.yaml may be another run's: rename it, never delete it.
+keep_existing_results() {
+    [[ -e "${RESULTS_FILE}" ]] || return 0
+    local kept
+    kept="${SCRIPT_DIR}/COMPARISON_RESULTS-kept-$(date -u -r "${RESULTS_FILE}" +%Y%m%dT%H%M%SZ)-$$.yaml"
+    mv -n -- "${RESULTS_FILE}" "${kept}" || abort "Could not move the existing COMPARISON_RESULTS.yaml aside"
+    log_warn "Existing COMPARISON_RESULTS.yaml renamed to ${kept##*/}"
+}
+
 write_yaml() {
     local verdict="$1" notes="$2"
+    keep_existing_results
     {
         echo "script_version: ${SCRIPT_VERSION}"
         echo "verdict: ${verdict}"
@@ -89,22 +100,23 @@ write_yaml() {
     log_info "Result: ${verdict}"
 }
 
+# ABS publishes any YAML it finds, so only a real verdict writes one: ftbfs is for
+# a failed source build only. abort/invalid exit without a YAML.
 ftbfs()     { write_yaml "ftbfs"            "$1"; exit "${EXIT_FAIL}"; }
 not_repro() { write_yaml "not_reproducible" "$1"; exit "${EXIT_FAIL}"; }
 repro()     { write_yaml "reproducible"     "$1"; exit "${EXIT_OK}";  }
-invalid()   { log_error "$1"; write_yaml "ftbfs" "$1"; exit "${EXIT_INVALID}"; }
+abort()     { log_error "$1; no verdict"; FINAL_WRITTEN=true; exit "${EXIT_FAIL}"; }
+invalid()   { log_error "$1"; FINAL_WRITTEN=true; exit "${EXIT_INVALID}"; }
 
 handle_err() {
     trap - ERR
-    log_error "Unexpected error at line $1"
-    write_yaml "ftbfs" "Unexpected error at line $1" 2>/dev/null || true
-    exit "${EXIT_FAIL}"
+    abort "Unexpected error at line $1"
 }
 trap 'handle_err $LINENO' ERR
-trap 'trap - ERR; log_error "Interrupted"; write_yaml "ftbfs" "Run interrupted before a verdict." 2>/dev/null || true; exit 130' INT TERM
+trap 'trap - ERR; log_error "Interrupted; no verdict"; FINAL_WRITTEN=true; exit 130' INT TERM
 
-# EXIT: remove this run's image, hand the workspace back to the caller, and
-# record ftbfs if the run ended without a verdict.
+# EXIT: remove this run's image and hand the workspace back to the caller. A run
+# that ends without a verdict writes no YAML.
 cleanup() {
     local rc=$?
     trap - ERR
@@ -122,7 +134,7 @@ cleanup() {
     fi
     [[ -n "${IMAGE_TAG}" && -n "${CONTAINER}" ]] && "${CONTAINER}" rmi -f "${IMAGE_TAG}" >/dev/null 2>&1
     if [[ "${FINAL_WRITTEN}" != true ]]; then
-        write_yaml "ftbfs" "Run ended (exit ${rc}) before a verdict." 2>/dev/null
+        log_error "Run ended (exit ${rc}) before a verdict; no COMPARISON_RESULTS.yaml written"
         [[ ${rc} -eq 0 ]] && rc=${EXIT_FAIL}
     fi
     exit "${rc}"
@@ -143,7 +155,7 @@ while [[ $# -gt 0 ]]; do
         --arch)          ARCH="${2:-}";    shift 2 || shift ;;
         --type)          TYPE="${2:-}";    shift 2 || shift ;;
         --binary|--apk)  BINARY="${2:-}";  shift 2 || shift ;;
-        --help|-h)       usage; FINAL_WRITTEN=true; rm -f -- "${RESULTS_FILE}"; exit "${EXIT_OK}" ;;
+        --help|-h)       usage; FINAL_WRITTEN=true; exit "${EXIT_OK}" ;;
         *)               log_warn "Unknown parameter ignored: $1"; shift ;;
     esac
 done
@@ -201,6 +213,8 @@ log_info "Container runtime: ${CONTAINER}"
 
 # ── per-run workspace in the caller's directory ──────────────────────────────
 
+keep_existing_results
+
 RUN_ID="$(date +%s)-$$"
 WORK_DIR="$(pwd -P)/keycardshell_verification_${VERSION}_${RUN_ID}"
 mkdir -- "${WORK_DIR}" || invalid "Cannot create workspace ${WORK_DIR}"
@@ -218,24 +232,24 @@ if [[ -z "${FW_BIN}" || -z "${BL_BIN}" ]]; then
     AUTH=()
     [[ -n "${GITHUB_TOKEN:-}" ]] && AUTH=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
     RELEASE_JSON="$(curl -sf "${AUTH[@]}" "https://api.github.com/repos/keycard-tech/keycard-shell/releases/tags/v${VERSION}")" \
-        || ftbfs "Failed to fetch release info for v${VERSION}"
+        || abort "Failed to fetch release info for v${VERSION}"
     asset_url() {
         printf '%s' "${RELEASE_JSON}" | grep -oE "\"browser_download_url\": *\"[^\"]*/$1\"" \
             | sed -E 's/.*"(https:[^"]+)"$/\1/' | head -1 || true
     }
     if [[ -z "${FW_BIN}" ]]; then
         URL="$(asset_url "shellos-[0-9]{8}-[^\"/]*\\.bin")"
-        [[ -n "${URL}" ]] || ftbfs "No shellos-YYYYMMDD-${VERSION}.bin asset in release v${VERSION}"
+        [[ -n "${URL}" ]] || abort "No shellos-YYYYMMDD-${VERSION}.bin asset in release v${VERSION}"
         FW_BIN="${WORK_DIR}/official/$(basename "${URL}")"
         log_info "Downloading $(basename "${URL}")..."
-        curl -sfL -o "${FW_BIN}" "${URL}" || ftbfs "Failed to download the official firmware"
+        curl -sfL -o "${FW_BIN}" "${URL}" || abort "Failed to download the official firmware"
     fi
     if [[ -z "${BL_BIN}" ]]; then
         URL="$(asset_url "shellos-bootloader-[0-9]{8}-[^\"/]*\\.bin")"
         if [[ -n "${URL}" ]]; then
             BL_BIN="${WORK_DIR}/official/$(basename "${URL}")"
             log_info "Downloading $(basename "${URL}")..."
-            curl -sfL -o "${BL_BIN}" "${URL}" || ftbfs "Failed to download the official bootloader"
+            curl -sfL -o "${BL_BIN}" "${URL}" || abort "Failed to download the official bootloader"
         else
             BL_PUBLISHED=false
             log_warn "Release v${VERSION} publishes no bootloader binary; firmware only."
@@ -544,15 +558,15 @@ TOOLCHAIN_HOST="${WORK_DIR}/toolchain/arm-gnu-toolchain-15.2.rel1"
 log_info "Downloading ARM GNU Toolchain 15.2.rel1 (~148 MB)..."
 curl -sfL -o "${TOOLCHAIN_ARCHIVE}" \
     "https://developer.arm.com/-/media/Files/downloads/gnu/15.2.rel1/binrel/arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi.tar.xz" \
-    || ftbfs "Toolchain download failed"
+    || abort "Toolchain download failed"
 # sha256 published by Arm next to the archive (.sha256asc)
 echo "${TOOLCHAIN_SHA256}  ${TOOLCHAIN_ARCHIVE}" | sha256sum -c - \
-    || ftbfs "Toolchain archive sha256 mismatch"
+    || abort "Toolchain archive sha256 mismatch"
 mkdir -p "${WORK_DIR}/toolchain"
 tar -xf "${TOOLCHAIN_ARCHIVE}" -C "${WORK_DIR}/toolchain" \
-    || ftbfs "Toolchain extraction failed"
+    || abort "Toolchain extraction failed"
 mv "${WORK_DIR}/toolchain/${TOOLCHAIN_EXTRACTED}" "${TOOLCHAIN_HOST}" \
-    || ftbfs "Toolchain move failed"
+    || abort "Toolchain move failed"
 rm -f "${TOOLCHAIN_ARCHIVE}"
 
 # ── build environment image (no toolchain layer) ─────────────────────────────
@@ -566,11 +580,11 @@ log_info "Building container image ${IMAGE_TAG}..."
     -t "${IMAGE_TAG}" \
     -f "${WORK_DIR}/Dockerfile" \
     "${WORK_DIR}" 2>&1 | tee "${WORK_DIR}/build.log" \
-    || ftbfs "Container build failed — see ${WORK_DIR}/build.log"
+    || abort "Container build (clone, apt, uv) failed — see ${WORK_DIR}/build.log"
 
 # Resolve to image ID so subsequent run calls never trigger a registry lookup
 IMAGE_ID="$("${CONTAINER}" images -q "${IMAGE_TAG}" 2>/dev/null | head -1)"
-[[ -z "${IMAGE_ID}" ]] && ftbfs "Image not found after build"
+[[ -n "${IMAGE_ID}" ]] || abort "Image not found after build"
 log_info "Image ID: ${IMAGE_ID}"
 
 # ── cmake configure + build (toolchain mounted from host) ────────────────────
@@ -613,14 +627,14 @@ fw_hash() {
     "${CONTAINER}" run --rm -v "$1:/f.bin:ro" "${IMAGE_ID}" \
         sh -c "cd /build/keycard-shell && uv run python tools/firmware-hash.py -b /f.bin"
 }
-BUILT_HASH="$(fw_hash "${OUT}/shellos.bin")"   || ftbfs "firmware-hash.py failed on built firmware"
-OFFICIAL_HASH="$(fw_hash "${FW_BIN}")"         || ftbfs "firmware-hash.py failed on official firmware"
+BUILT_HASH="$(fw_hash "${OUT}/shellos.bin")"   || abort "firmware-hash.py failed on built firmware"
+OFFICIAL_HASH="$(fw_hash "${FW_BIN}")"         || abort "firmware-hash.py failed on official firmware"
 
 # ── firmware, method 2: dd over the same byte ranges ─────────────────────────
 
 log_info "Firmware method 2: dd chunks..."
-DD_FW_BUILT="$(chunks "${OUT}/shellos.bin")" || ftbfs "dd failed on built firmware"
-DD_FW_OFFICIAL="$(chunks "${FW_BIN}")"       || ftbfs "dd failed on official firmware"
+DD_FW_BUILT="$(chunks "${OUT}/shellos.bin")" || abort "dd failed on built firmware"
+DD_FW_OFFICIAL="$(chunks "${FW_BIN}")"       || abort "dd failed on official firmware"
 
 FW_PASS=false
 [[ "${BUILT_HASH}" == "${OFFICIAL_HASH}" && "${DD_FW_BUILT}" == "${DD_FW_OFFICIAL}" ]] && FW_PASS=true
@@ -638,7 +652,7 @@ if ${BL_PUBLISHED}; then
     BL_NAME="$(basename "${BL_BIN}")"
     OUR_KEY="$(tr -d ' \n' < "${OUT}/bootloader-pubkey.txt")"
     [[ "$(od -An -v -tx1 -j588 -N64 "${OUT}/shellos-bootloader.bin" | tr -d ' \n')" == "${OUR_KEY}" ]] \
-        || ftbfs "Built bootloader key is not at bytes 588-651; layout changed."
+        || abort "Built bootloader key is not at bytes 588-651; layout changed"
     od -An -v -tx1 -j588 -N64 "${BL_BIN}" | tr -d ' \n' > "${OUT}/official-bootloader-key.txt"
     log_info "Bootloader: personalising our ELF with the official key bytes..."
     "${CONTAINER}" run --rm \
@@ -648,11 +662,11 @@ if ${BL_PUBLISHED}; then
         OBJCOPY=/build/keycard-shell/toolchain/arm-gnu-toolchain-15.2.rel1/bin/arm-none-eabi-objcopy \
         uv run python tools/bootloader-perso.py -p /output/official-bootloader-key.txt \
             -e /tmp/bl.elf -o /output/shellos-bootloader-official-key.bin" \
-        2>&1 | tee -a "${WORK_DIR}/build.log" || ftbfs "bootloader-perso.py failed"
+        2>&1 | tee -a "${WORK_DIR}/build.log" || abort "bootloader-perso.py failed"
     BL_OFFICIAL_SHA="$(sha256sum "${BL_BIN}" | cut -d' ' -f1)"
     BL_REBUILT_SHA="$(sha256sum "${OUT}/shellos-bootloader-official-key.bin" | cut -d' ' -f1)"
-    DD_BL_BUILT="$(chunks "${OUT}/shellos-bootloader.bin")" || ftbfs "dd failed on built bootloader"
-    DD_BL_OFFICIAL="$(chunks "${BL_BIN}")"                  || ftbfs "dd failed on official bootloader"
+    DD_BL_BUILT="$(chunks "${OUT}/shellos-bootloader.bin")" || abort "dd failed on built bootloader"
+    DD_BL_OFFICIAL="$(chunks "${BL_BIN}")"                  || abort "dd failed on official bootloader"
     [[ "${BL_REBUILT_SHA}" == "${BL_OFFICIAL_SHA}" && "${DD_BL_BUILT}" == "${DD_BL_OFFICIAL}" ]] || BL_PASS=false
     BL_LINES=(
         "${BL_NAME} - whole file, our build + official key bytes 588-651 - ${BL_REBUILT_SHA} - $(mark "${BL_REBUILT_SHA}" "${BL_OFFICIAL_SHA}")"
