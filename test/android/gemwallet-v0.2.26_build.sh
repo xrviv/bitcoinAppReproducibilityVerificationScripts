@@ -1,6 +1,6 @@
 #!/bin/bash
-# gemwallet-v0.2.25_build.sh - Gem Wallet Android reproducible build verification
-# Version: v0.2.25
+# gemwallet-v0.2.26_build.sh - Gem Wallet Android reproducible build verification
+# Version: v0.2.26
 # Organization: WalletScrutiny.com
 # Disclaimer: provided as-is, without warranty. Review before running. This is not a security audit.
 # Steps: read the official APK(s) (Play split set or GitHub universal APK), clone the release tag,
@@ -10,7 +10,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_NAME="gemwallet_build.sh" SCRIPT_VERSION="v0.2.25"
+readonly SCRIPT_NAME="gemwallet_build.sh" SCRIPT_VERSION="v0.2.26"
 SCRIPT_HASH="$(sha256sum "$0" 2>/dev/null | awk '{print $1}' || true)"
 readonly SCRIPT_HASH="${SCRIPT_HASH:-N/A}"
 echo "${SCRIPT_NAME} ${SCRIPT_VERSION} sha256:${SCRIPT_HASH}"
@@ -331,10 +331,9 @@ rustup target add aarch64-linux-android armv7-linux-androideabi
 cv="$(sed -n 's/.*CARGO_NDK_VERSION:-\([0-9.]*\)}.*/\1/p' android/reproducible/versions.sh)"
 cargo install --locked "cargo-ndk@${cv:?}"
 nv="$(sed -n 's/^androidNdk *= *"\(.*\)"/\1/p' android/gradle/libs.versions.toml)"
-sdk="$(sed -n 's/^ *compileSdk *= *\([0-9]*\).*/\1/p' android/app/build.gradle.kts | head -n1)"
-sdkmanager "ndk;${nv:?}" ${sdk:+"platforms;android-$sdk"} >/dev/null
+sdkmanager "ndk;${nv:?}" >/dev/null
 export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$nv" ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/$nv" NDK_HOME="$ANDROID_HOME/ndk/$nv"
-echo "Toolchain: rust $(rustc --version | cut -d' ' -f2), cargo-ndk $cv, NDK $nv, compileSdk $sdk"
+echo "Toolchain: rust $(rustc --version | cut -d' ' -f2), cargo-ndk $cv, NDK $nv; Gradle installs the platform it needs"
 echo gradle > ../stage
 cd android
 touch local.properties
