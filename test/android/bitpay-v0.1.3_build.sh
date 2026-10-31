@@ -2,10 +2,10 @@
 # ==============================================================================
 # bitpay_build.sh - BitPay Wallet (Android) Reproducible Build Verification
 # ==============================================================================
-# Version:          v0.1.2
+# Version:          v0.1.3
 # Organization:     WalletScrutiny.com
 # Last modified by: Danny Garcia
-# Last modified on: 2026-09-24
+# Last modified on: 2026-10-31
 # App ID:           com.bitpay.wallet
 # Project:          https://github.com/bitpay/bitpay-app
 # Play Store:       https://play.google.com/store/apps/details?id=com.bitpay.wallet
@@ -32,7 +32,7 @@
 # SCRIPT SUMMARY:
 # BitPay ships Android through Google Play only; GitHub releases carry no APK, so --binary is required:
 # either a directory of Play splits (base.apk + split_config.*.apk) or a single APK (file, or a directory
-# holding only base.apk). Source: tag v<version> (v.<version> for releases up to 14.40.4).
+# holding only base.apk); a single file may have any name (ABS passes <sha256>.bin) if it is a ZIP. Source: tag v<version> (v.<version> for releases up to 14.40.4).
 # Build, as upstream's `yarn build:android:release`: yarn install --frozen-lockfile (postinstall:
 # patch-package, rn-nodeify, GIT_COMMIT_HASH into .env.*), `yarn set:prod`, then
 # ./gradlew app:assembleRelease (single APK) or app:bundleRelease (splits, rendered with bundletool from
@@ -42,12 +42,13 @@
 # into BundleHash.kt, i.e. the dex) and android/app/google-services.json. Values that are public in the
 # official APK (Firebase resources, Braze sender ID, Maps key, dev-server IP, build paths) are read back
 # from it and printed; pass --dotenv FILE for the rest. Every accepted difference must be earned by a
-# named check. COMPARISON_RESULTS.yaml on every exit.
+# named check. COMPARISON_RESULTS.yaml only for a real verdict: ABS publishes any verdict it finds, so a failure
+# that says nothing about the source (invocation, runtime, network, no tag yet, tooling) writes none.
 #
 # Exit codes: 0 = reproducible, 1 = differences or build failure, 2 = invalid parameters.
 # ==============================================================================
 
-SCRIPT_VERSION="v0.1.2"
+SCRIPT_VERSION="v0.1.3"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_HASH="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
 echo "$(basename "$SCRIPT_PATH") $SCRIPT_VERSION sha256:${SCRIPT_HASH:-unknown}"
@@ -82,7 +83,9 @@ generate_yaml() {
   log_info "COMPARISON_RESULTS.yaml written with verdict: $1"
 }
 fail() { generate_yaml ftbfs "$2"; echo ""; echo "Exit code: $1"; exit "$1"; }
-die_invalid() { log_error "$1"; fail 2 "Invalid invocation: $1"; }
+# No verdict: ABS then logs an error, publishes nothing, and a later run can still decide.
+no_verdict() { log_error "$2 No verdict written."; echo ""; echo "Exit code: $1"; exit "$1"; }
+die_invalid() { no_verdict 2 "Invalid invocation: $1"; }
 require_arg() { [[ -z "${2:-}" || "${2:-}" == --* ]] && die_invalid "$1 requires a value"; }
 
 usage() {
@@ -104,6 +107,8 @@ USAGE
 }
 
 [[ "$EUID" -eq 0 ]] && die_invalid "Do not run this script as root."
+# A YAML left by an earlier run in this folder must not be read as this run's verdict.
+rm -f "${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
 
 version_arg=""; binary_arg=""; commit_arg=""; dotenv_arg=""; node_env="production"
 while [[ $# -gt 0 ]]; do
@@ -131,7 +136,7 @@ fi
 declare -a OFFICIAL=()
 binary_arg="$(readlink -f "$binary_arg")" || die_invalid "--binary not found"
 if [[ -f "$binary_arg" ]]; then
-  [[ "$binary_arg" == *.apk ]] || die_invalid "--binary file must be an .apk: ${binary_arg}"
+  [[ "$(head -c 4 "$binary_arg" | od -An -tx1 | tr -d ' \n')" == 504b0304 ]] || die_invalid "--binary file is not an APK (no ZIP header): ${binary_arg}"
   OFFICIAL_DIR="$(dirname "$binary_arg")"; OFFICIAL=("$binary_arg"); MODE=apk
 elif [[ -d "$binary_arg" ]]; then
   OFFICIAL_DIR="$binary_arg"
@@ -157,7 +162,7 @@ RUN_ID="bitpay-${version_arg:-bin}-$(date +%s)-$$"
 IMG="ws-bitpay-${RUN_ID}"
 WS="$(pwd -P)/bitpay_verification_${RUN_ID}"
 META="${WS}/metadata"; BLD="${WS}/built"; CMP="${WS}/comparison"; CTX="${WS}/ctx"
-mkdir -p "$META" "$BLD" "$CMP" "$CTX" "${WS}/src" "${WS}/gradle-home" || die_invalid "Cannot create workspace ${WS}"
+mkdir "$WS" && mkdir -p "$META" "$BLD" "$CMP" "$CTX" "${WS}/src" "${WS}/gradle-home" || no_verdict 1 "Cannot create workspace ${WS}."
 NET=""
 cleanup() {
   if $CONTAINER_CMD image inspect "$IMG" >/dev/null 2>&1; then
@@ -208,7 +213,7 @@ RUN cd /opt && curl -fsSL -o apktool.jar https://github.com/iBotPeaches/Apktool/
 # yarn 1.22 ships with the node image (yarn.lock v1; no packageManager field).
 RUN mkdir -p /tmp/h /tmp/afw && chmod 0777 /tmp/h /tmp/afw
 DOCKERFILE_END
-$CONTAINER_CMD build -t "$IMG" -f "${CTX}/Dockerfile" "$CTX" || fail 1 "Container image build failed; no comparison was performed."
+$CONTAINER_CMD build -t "$IMG" -f "${CTX}/Dockerfile" "$CTX" || no_verdict 1 "Container image build failed (network or base image); nothing was built."
 log_success "Image built: ${IMG}"
 
 phase "PHASE 0: OFFICIAL ARTIFACT METADATA"
@@ -236,6 +241,9 @@ for A in "$@"; do
       echo "${k}=$(res "$A" "$k")" >> /m/inputs.txt; done
     mk="$("$BT/aapt2" dump xmltree --file AndroidManifest.xml "$A" 2>/dev/null | grep -A2 '"com.google.android.geo.API_KEY"' | sed -n 's/.*android:value([^)]*)="\([^"]*\)".*/\1/p' | head -1)"
     echo "maps_api_key=${mk}" >> /m/inputs.txt
+    # Sentry DSN (public client key) from the Hermes bundle; allowed-url-prefixes.js also adds its host to the manifest.
+    dsn="$(unzip -p "$A" assets/index.android.bundle 2>/dev/null | grep -aoE 'https://[0-9a-f]{32}@[a-z0-9.-]+\.sentry\.io/[0-9]+' | sort -u | head -1)"
+    echo "sentry_dsn=${dsn}" >> /m/inputs.txt
   fi
   # Build paths baked into native libraries: checkout root and Gradle user home.
   for so in $(unzip -Z1 "$A" 'lib/*.so' 2>/dev/null); do unzip -p "$A" "$so" | strings; done > /tmp/s.txt 2>/dev/null
@@ -247,12 +255,12 @@ META_END
 : > "${META}/apks.txt"; : > "${META}/inputs.txt"
 declare -a MNT=(); for f in "${OFFICIAL[@]}"; do MNT+=("/official/$(basename "$f")"); done
 crun -v "${OFFICIAL_DIR}:/official:ro" -v "${META}:/m" -v "${CTX}/meta.sh:/meta.sh:ro" "$IMG" bash /meta.sh "${MNT[@]}" \
-  || fail 1 "Could not read metadata from the official APKs."
+  || no_verdict 1 "Could not read metadata from the official APKs."
 main="$(basename "${OFFICIAL[0]}")"
 IFS='|' read -r _ pkg vname vcode main_split _ min_sdk signer _ dev_ip <<<"$(grep "^${main}|" "${META}/apks.txt" | head -1)"
 [[ "$(awk -F'|' '$2 != "'"$APP_ID"'"' "${META}/apks.txt" | wc -l)" -eq 0 && -n "$pkg" ]] || die_invalid "Not every official APK is ${APP_ID} (see [META] lines)"
 [[ -z "$main_split" ]] || die_invalid "${main} declares split '${main_split}'"
-[[ -n "$vname" && "$vcode" =~ ^[0-9]+$ ]] || fail 1 "Could not read versionName/versionCode from ${main}."
+[[ -n "$vname" && "$vcode" =~ ^[0-9]+$ ]] || no_verdict 1 "Could not read versionName/versionCode from ${main}."
 app_hash="$(sha256of "${OFFICIAL[0]}")"
 if [[ -z "$version_arg" ]]; then version_arg="$vname"
 elif [[ "$version_arg" != "$vname" ]]; then log_warn "--version ${version_arg} but ${main} says ${vname}; building ${version_arg}"; fi
@@ -294,9 +302,12 @@ run() { echo "=== $1 === $(date)"; shift; "$@" > /out/step.log 2>&1 || { tail -4
 # postinstall writes GIT_COMMIT_HASH into .env.development and .env.production.
 run "yarn install --frozen-lockfile" yarn install --frozen-lockfile --network-timeout 600000
 # Private .env.production: --dotenv lines, plus the keys recovered from the official APK.
+# postinstall writes it without a final newline; appending without one glues keys onto GIT_COMMIT_HASH.
+[[ -s .env.production && -n "$(tail -c1 .env.production)" ]] && echo >> .env.production
 if [[ -f /dotenv ]]; then grep -E '^[A-Za-z_][A-Za-z0-9_]*=' /dotenv >> .env.production; echo "  .env.production += --dotenv ($(grep -cE '^[A-Za-z_]' /dotenv) keys)"
 else echo "  WARNING: no --dotenv: upstream's private .env.production values are absent (inlined into the JS bundle)"; fi
 [[ -n "$(inp com_braze_firebase_cloud_messaging_sender_id)" ]] && ! grep -q '^BRAZE_SENDER_ID=' .env.production && echo "BRAZE_SENDER_ID=$(inp com_braze_firebase_cloud_messaging_sender_id)" >> .env.production
+[[ -n "$(inp sentry_dsn)" ]] && ! grep -q '^SENTRY_DSN=' .env.production && echo "SENTRY_DSN=$(inp sentry_dsn)" >> .env.production
 [[ -n "$(inp maps_api_key)" ]] && ! grep -q '^GOOGLE_MAPS_API_KEY=' .env.production && echo "GOOGLE_MAPS_API_KEY=$(inp maps_api_key)" >> .env.production
 echo "  .env.production keys: $(cut -d= -f1 .env.production | paste -sd' ' -)"
 # google-services.json (gitignored upstream) rebuilt from the official APK's resources.
@@ -326,7 +337,7 @@ keytool -genkeypair -keystore /tmp/ws.jks -alias ws -storepass wsverify -keypass
 SIGN=(-PAPP_UPLOAD_STORE_FILE=/tmp/ws.jks -PAPP_UPLOAD_KEY_ALIAS=ws -PAPP_UPLOAD_STORE_PASSWORD=wsverify -PAPP_UPLOAD_KEY_PASSWORD=wsverify)
 [[ "$NODEENV" == production ]] && export NODE_ENV=production || unset NODE_ENV
 echo "  NODE_ENV for bundling: ${NODE_ENV:-<unset>} -> babel reads .env.$([[ "$NODEENV" == production ]] && echo production || echo development)"
-cd android || exit 1
+cd android || exit 3
 if [[ "$MODE" == splits ]]; then
   run "gradle app:bundleRelease" ./gradlew app:bundleRelease --no-daemon "${SIGN[@]}"
   cp app/build/outputs/bundle/release/app-release.aab /out/ || { echo "FATAL: no app-release.aab"; exit 3; }
@@ -354,8 +365,11 @@ crun "${NET_ARGS[@]}" "${DOT_ARGS[@]}" -e "GRADLE_USER_HOME=${GRADLE_HOME}" \
   bash /build.sh "$version_arg" "$REPO_URL" "$commit_arg" "$MODE" "$node_env" "$SRC_ROOT" 2>&1 | tee "${BLD}/container.log"
 BRC=${PIPESTATUS[0]}
 if [[ $BRC -ne 0 ]]; then
-  [[ $BRC -eq 4 ]] && fail 1 "No source revision for ${version_arg} (see container.log); nothing was built. Official ${main} SHA-256 ${app_hash}."
-  fail 1 "Source build failed (container exit ${BRC}: 1 clone, 2 checkout, 3 install/build). Official ${main} SHA-256 ${app_hash}."
+  # Tags can land days after the Play release (v14.47.3: Play by 2026-09-30, tag 2026-10-07), so a
+  # missing revision or a failed clone is not a verdict on the source.
+  [[ $BRC -eq 4 ]] && no_verdict 1 "No source revision for ${version_arg} yet (no tag v${version_arg} or v.${version_arg}; see container.log); nothing was built."
+  [[ $BRC -eq 3 ]] || no_verdict 1 "Source checkout failed (container exit ${BRC}: 1 clone, 2 checkout, other: runtime); nothing was built."
+  fail 1 "Source build failed (container exit 3: install/build, see built/container.log). Official ${main} SHA-256 ${app_hash}."
 fi
 envv() { sed -n "s/^$1=//p" "${BLD}/src.env"; }
 commit="$(envv COMMIT)"; tag="$(envv TAG)"; tag_commit="$(envv TAG_COMMIT)"; tag_type="$(envv TAG_TYPE)"; rev_source="$(envv SOURCE)"; gradle_vc="$(envv GRADLE_VC)"
@@ -389,7 +403,7 @@ else
     java -jar /opt/bundletool.jar build-apks --bundle=/out/app-release.aab --output=/out/rendered/built.apks \
       --device-spec=/out/device-spec.json --aapt2=$ANDROID_HOME/build-tools/36.0.0/aapt2 --overwrite
     cd /out/rendered && unzip -q -o built.apks "splits/*.apk" && ls splits/' 2>&1 | tee "${BLD}/bundletool.log" | sed 's/^/  /'
-  [[ ${PIPESTATUS[0]} -eq 0 ]] || fail 1 "bundletool rendering failed (see built/bundletool.log). Official ${main} SHA-256 ${app_hash}."
+  [[ ${PIPESTATUS[0]} -eq 0 ]] || no_verdict 1 "bundletool rendering failed (tooling, see built/bundletool.log)."
   crun -v "${OFFICIAL_DIR}:/official:ro" -v "${BLD}:/out" "$IMG" bash -c '
     BT=$ANDROID_HOME/build-tools/36.0.0
     cfg() { s=$("$BT/aapt2" dump badging "$1" 2>/dev/null | grep "^package:" | sed -n "s/.*split=.\([^\x27]*\).*/\1/p"); echo "${s#config.}"; }
@@ -397,14 +411,14 @@ else
       for b in /out/rendered/splits/*.apk; do [[ "$(cfg "$b")" == "$co" ]] && { m="$b"; break; }; done
       echo "$(basename "$o")|${co:-base}|${m:+rendered/splits/$(basename "$m")}"; done' > "${BLD}/pairs.txt" 2>/dev/null
   prc=$?
-  [[ $prc -eq 0 && "$(grep -c . "${BLD}/pairs.txt")" -eq ${#OFFICIAL[@]} ]] || fail 1 "Pairing official and rendered splits failed (exit ${prc}). Official ${main} SHA-256 ${app_hash}."
+  [[ $prc -eq 0 && "$(grep -c . "${BLD}/pairs.txt")" -eq ${#OFFICIAL[@]} ]] || no_verdict 1 "Pairing official and rendered splits failed (exit ${prc})."
   while IFS='|' read -r o c b; do
     if [[ -n "$b" ]]; then PAIRS+=("${OFFICIAL_DIR}/${o}|${BLD}/${b}"); echo "  ${o} (split '${c}') <-> ${b}"
     else log_warn "No rendered counterpart for ${o} (split '${c}') -> counted as a difference"; PAIRS+=("${OFFICIAL_DIR}/${o}|"); fi
   done < "${BLD}/pairs.txt"
 fi
 # Every official APK must enter the comparison; an empty or short pair list never reads as reproducible.
-[[ ${#PAIRS[@]} -eq ${#OFFICIAL[@]} && ${#PAIRS[@]} -gt 0 ]] || fail 1 "Only ${#PAIRS[@]} of ${#OFFICIAL[@]} official APK(s) paired."
+[[ ${#PAIRS[@]} -eq ${#OFFICIAL[@]} && ${#PAIRS[@]} -gt 0 ]] || no_verdict 1 "Only ${#PAIRS[@]} of ${#OFFICIAL[@]} official APK(s) paired."
 
 phase "PHASE 2: COMPARISON"
 # Every raw diff must be EARNED by a class with printed evidence: root signature files, Play
@@ -490,7 +504,7 @@ for p in "${PAIRS[@]}"; do
   fi
   crun -v "${o}:/official.apk:ro" -v "${b}:/built.apk:ro" -v "${CMP}:/out" -v "${CTX}/compare.sh:/compare.sh:ro" \
     "$IMG" bash /compare.sh "$ptag" 2>&1 | tee -a "${CMP}/comparison.log"
-  read -r _ r a u < "${CMP}/summary_${ptag}.txt" 2>/dev/null || fail 1 "Comparison stage failed for ${ptag}. Official ${main} SHA-256 ${app_hash}."
+  read -r _ r a u < "${CMP}/summary_${ptag}.txt" 2>/dev/null || no_verdict 1 "Comparison stage failed for ${ptag} (tooling, see comparison/comparison.log)."
   tot_raw=$((tot_raw+r)); tot_acc=$((tot_acc+a)); tot_un=$((tot_un+u)); pair_notes+="${ptag}: raw ${r}, accepted ${a}, unaccounted ${u}; "
   files_lines+="$(basename "$o") - ${ptag} - $(sha256of "$b") - $([[ "$u" -eq 0 ]] && echo '1 (MATCHES)' || echo "0 (DOESN'T MATCH)")"$'\n'
 done
@@ -512,7 +526,7 @@ dot_note="${dotenv_arg:+supplied via --dotenv}"; dot_note="${dot_note:-absent}"
 gradle_task="app:assembleRelease"; [[ "$MODE" == splits ]] && gradle_task="app:bundleRelease"
 generate_yaml "$verdict" "${APP_ID} ${vname} (versionCode ${vcode}; ${MODE}) built from ${commit} (${rev_source}); ${tagnote}.
 Upstream build:android:release steps (yarn install, set:prod, gradle ${gradle_task}); NODE_ENV ${node_env}.
-Private .env.production: ${dot_note}; google-services.json, Braze sender, Maps key and build paths recovered from the official APK.
+Private .env.production: ${dot_note}; google-services.json, Braze sender, Sentry DSN, Maps key and build paths recovered from the official APK.
 Official ${main} SHA-256 ${app_hash}, signer ${signer:-unknown}.
 ${pair_notes}
 Totals: raw ${tot_raw}, accepted ${tot_acc}, unaccounted ${tot_un}."
@@ -537,7 +551,7 @@ echo "Revision, tag (and its signature):"
 echo "Built: ${commit} (${rev_source})"
 echo "Tag ${tag}: $([[ "$tag_type" == commit ]] && echo 'lightweight tag' || echo "${tag_type:-?} object") -> ${tag_commit}"
 echo "Signature verification: not implemented"
-echo "Release inputs: .env.production ${dot_note}; NODE_ENV ${node_env}; Firebase/Braze/Maps values, dev IP ${dev_ip:-none} and build paths from ${main}"
+echo "Release inputs: .env.production ${dot_note}; NODE_ENV ${node_env}; Firebase/Braze/Sentry/Maps values, dev IP ${dev_ip:-none} and build paths from ${main}"
 echo "===== End Results ====="
 echo ""; echo "Exit code: ${rc}"
 exit "$rc"
