@@ -1,27 +1,28 @@
 #!/usr/bin/env bash
 #
-# keycardshell-v0.2.1_build.sh - reproducible-build check of Keycard Shell firmware
-# Version: v0.2.1
+# keycardshell-v0.2.2_build.sh - reproducible-build check of Keycard Shell firmware
+# Version: v0.2.2
 # Organization: WalletScrutiny.com
 # Last modified by: Claude Code for Danny
-# Last modified on: 2026-10-30
+# Last modified on: 2026-11-02
 # Project: https://github.com/keycard-tech/keycard-shell
 # App ID: keycard-shell
 #
 # Verifies Keycard Shell firmware (shellos-YYYYMMDD-X.Y.Z.bin) AND bootloader
-# (shellos-bootloader-YYYYMMDD-X.Y.Z.bin, published from v1.4.0) against the
-# official GitHub release binaries. Hardware: STM32H573VITX, Cortex-M33.
+# (shellos-bootloader-YYYYMMDD-X.Y.Z.bin, published from v1.4.0) and, where the
+# release publishes it, the Bitcoin-only firmware (shellos-experimental-YYYYMMDD-X.Y.Z-btc-only.bin,
+# from v1.5.2; target shellos-btc.elf) against the official GitHub release binaries. Hardware: STM32H573VITX, Cortex-M33.
 # Build system: CMake + Ninja + ARM GNU Toolchain 15.2.rel1.
 #
 # Steps: take or download both official binaries, build the release tag inside a
 # container, compare, write COMPARISON_RESULTS.yaml beside this script (an existing one is
 # renamed aside, never deleted). Only a failed cmake build writes ftbfs; download, tool,
 # input and stop errors exit with no YAML.
-# Firmware: firmware-hash.py skips bytes 588-651 (64-byte ECDSA signature), so
+# Firmware (both variants): firmware-hash.py skips bytes 588-651 (64-byte ECDSA signature), so
 # binaries signed with different keys hash identically; dd cross-check.
 # Bootloader (unsigned): bytes 588-651 hold the firmware verification key. Our
 # ELF is personalised with the official file's key bytes and must then equal
-# the official bootloader byte for byte. Both must match for "reproducible".
+# the official bootloader byte for byte. Every published binary must match for "reproducible".
 #
 # Upstream Python tools are inlined for transparency (same in v1.3.0 and v1.4.0, except
 # two pathlib patches for Python 3.10, marked PATCH below):
@@ -30,10 +31,11 @@
 #   bootloader-perso.py          -> ${WORK_DIR}/tools/ (COPY into container)
 #
 # Usage:
-#   keycardshell-v0.2.1_build.sh --version 1.5.1
-#   keycardshell-v0.2.1_build.sh --binary /path/to/shellos-YYYYMMDD-X.Y.Z.bin
-#   keycardshell-v0.2.1_build.sh --binary /path/to/shellos-bootloader-YYYYMMDD-X.Y.Z.bin
-#   (--binary may also be a directory; the binary not supplied is downloaded)
+#   keycardshell-v0.2.2_build.sh --version 1.5.2
+#   keycardshell-v0.2.2_build.sh --binary /path/to/shellos-YYYYMMDD-X.Y.Z.bin
+#   keycardshell-v0.2.2_build.sh --binary /path/to/shellos-bootloader-YYYYMMDD-X.Y.Z.bin
+#   keycardshell-v0.2.2_build.sh --binary /path/to/shellos-experimental-YYYYMMDD-X.Y.Z-btc-only.bin
+#   (--binary may also be a directory; the binaries not supplied are downloaded)
 #
 # Host requirements: Bash, curl, tar and Podman or Docker. Run as a normal user.
 # Each run uses its own workspace in the caller's directory and hands ownership back.
@@ -43,7 +45,7 @@
 
 set -eEo pipefail
 
-SCRIPT_VERSION="v0.2.1"
+SCRIPT_VERSION="v0.2.2"
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="${SCRIPT_PATH%/*}"
 SCRIPT_HASH="$(sha256sum "${SCRIPT_PATH}" | cut -d' ' -f1)"
@@ -163,11 +165,13 @@ done
 [[ -n "${VERSION}" || -n "${BINARY}" ]] || invalid "Provide --version <X.Y.Z> or --binary <path>."
 
 # --binary: the main firmware (shellos-YYYYMMDD-X.Y.Z.bin), the bootloader
-# (shellos-bootloader-YYYYMMDD-X.Y.Z.bin), or a directory holding one or both.
-# Whatever is not supplied is downloaded from the release. appHash is the
-# supplied file (the firmware when a directory holds both).
+# (shellos-bootloader-YYYYMMDD-X.Y.Z.bin), the Bitcoin-only firmware
+# (shellos-experimental-YYYYMMDD-X.Y.Z-btc-only.bin; upstream CI names it shellos-btc-*),
+# or a directory holding any of them. Whatever is not supplied is downloaded from the
+# release. appHash is the supplied file (firmware, else bootloader, else Bitcoin-only).
 FW_BIN=""
 BL_BIN=""
+BTC_BIN=""
 pick_one() {  # dir pattern label → PICKED
     local found
     mapfile -t found < <(find "$1" -maxdepth 1 -type f -name "$2" | sort)
@@ -178,16 +182,18 @@ if [[ -n "${BINARY}" ]]; then
     if [[ -d "${BINARY}" ]]; then
         pick_one "${BINARY}" 'shellos-[0-9]*.bin' firmware;           FW_BIN="${PICKED}"
         pick_one "${BINARY}" 'shellos-bootloader-*.bin' bootloader;   BL_BIN="${PICKED}"
-        [[ -n "${FW_BIN}${BL_BIN}" ]] || invalid "No shellos-*.bin in ${BINARY}."
+        pick_one "${BINARY}" 'shellos-*btc*.bin' "Bitcoin-only firmware"; BTC_BIN="${PICKED}"
+        [[ -n "${FW_BIN}${BL_BIN}${BTC_BIN}" ]] || invalid "No shellos-*.bin in ${BINARY}."
     elif [[ -f "${BINARY}" ]]; then
         case "$(basename "${BINARY}")" in
             *bootloader*) BL_BIN="${BINARY}" ;;
+            *btc*)        BTC_BIN="${BINARY}" ;;
             *)            FW_BIN="${BINARY}" ;;
         esac
     else
         invalid "Binary not found: ${BINARY}"
     fi
-    APP_BIN="${FW_BIN:-${BL_BIN}}"
+    APP_BIN="${FW_BIN:-${BL_BIN:-${BTC_BIN}}}"
     BIN_VERSION="$(basename "${APP_BIN}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
     if [[ -z "${VERSION}" ]]; then
         VERSION="${BIN_VERSION}"
@@ -223,11 +229,12 @@ IMAGE_TAG="keycardshell-build-${VERSION}-${RUN_ID}"
 log_info "Version:  ${VERSION}"
 log_info "Work dir: ${WORK_DIR}"
 
-# ── official binaries (firmware + bootloader) ─────────────────────────────────
+# ── official binaries (firmware + bootloader + Bitcoin-only) ─────────────────
 
 mkdir -- "${WORK_DIR}/official"
 BL_PUBLISHED=true
-if [[ -z "${FW_BIN}" || -z "${BL_BIN}" ]]; then
+BTC_PUBLISHED=true
+if [[ -z "${FW_BIN}" || -z "${BL_BIN}" || -z "${BTC_BIN}" ]]; then
     log_info "Fetching release info for v${VERSION} from GitHub..."
     AUTH=()
     [[ -n "${GITHUB_TOKEN:-}" ]] && AUTH=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
@@ -252,13 +259,25 @@ if [[ -z "${FW_BIN}" || -z "${BL_BIN}" ]]; then
             curl -sfL -o "${BL_BIN}" "${URL}" || abort "Failed to download the official bootloader"
         else
             BL_PUBLISHED=false
-            log_warn "Release v${VERSION} publishes no bootloader binary; firmware only."
+            log_warn "Release v${VERSION} publishes no bootloader binary."
+        fi
+    fi
+    if [[ -z "${BTC_BIN}" ]]; then
+        URL="$(asset_url "shellos-[^\"/]*btc[^\"/]*\\.bin")"
+        if [[ -n "${URL}" ]]; then
+            BTC_BIN="${WORK_DIR}/official/$(basename "${URL}")"
+            log_info "Downloading $(basename "${URL}")..."
+            curl -sfL -o "${BTC_BIN}" "${URL}" || abort "Failed to download the official Bitcoin-only firmware"
+        else
+            BTC_PUBLISHED=false
+            log_warn "Release v${VERSION} publishes no Bitcoin-only firmware."
         fi
     fi
 fi
 APP_BIN="${APP_BIN:-${FW_BIN}}"
 log_info "Official firmware:   ${FW_BIN}"
 ${BL_PUBLISHED} && log_info "Official bootloader: ${BL_BIN}"
+${BTC_PUBLISHED} && log_info "Official Bitcoin-only firmware: ${BTC_BIN}"
 
 # ── inline upstream Python tools ─────────────────────────────────────────────
 #
@@ -590,12 +609,16 @@ log_info "Image ID: ${IMAGE_ID}"
 # ── cmake configure + build (toolchain mounted from host) ────────────────────
 
 mkdir -p "${WORK_DIR}/build-output"
+# The default target builds every variant; shellos-btc.bin exists from v1.5.2. A release
+# that publishes a Bitcoin-only binary the tag cannot build is a failed source build.
+BUILT_FILES="build/shellos.bin build/shellos-bootloader.bin build/shellos-bootloader.elf deployment/bootloader-pubkey.txt"
+${BTC_PUBLISHED} && BUILT_FILES="${BUILT_FILES} build/shellos-btc.bin"
 log_info "Running cmake configure + build (toolchain mounted, ~5 min)..."
 "${CONTAINER}" run --rm \
     -v "${TOOLCHAIN_HOST}:/build/keycard-shell/toolchain/arm-gnu-toolchain-15.2.rel1:ro" \
     -v "${WORK_DIR}/build-output:/output:rw" \
     "${IMAGE_ID}" \
-    sh -c "cd /build/keycard-shell && cmake --preset release && cmake --build --preset release && cp build/shellos.bin build/shellos-bootloader.bin build/shellos-bootloader.elf deployment/bootloader-pubkey.txt /output/" \
+    sh -c "cd /build/keycard-shell && cmake --preset release && cmake --build --preset release && cp ${BUILT_FILES} /output/" \
     2>&1 | tee -a "${WORK_DIR}/build.log" \
     || ftbfs "cmake build failed — see ${WORK_DIR}/build.log"
 
@@ -639,6 +662,27 @@ DD_FW_OFFICIAL="$(chunks "${FW_BIN}")"       || abort "dd failed on official fir
 FW_PASS=false
 [[ "${BUILT_HASH}" == "${OFFICIAL_HASH}" && "${DD_FW_BUILT}" == "${DD_FW_OFFICIAL}" ]] && FW_PASS=true
 
+# ── Bitcoin-only firmware: same two methods as the main firmware ─────────────
+# Signed like the main firmware (production key in the release, throwaway key in our
+# build), so the same 64 signature bytes at 588-651 are skipped.
+
+BTC_PASS=true
+BTC_LINES=()
+if ${BTC_PUBLISHED}; then
+    BTC_NAME="$(basename "${BTC_BIN}")"
+    log_info "Bitcoin-only firmware: firmware-hash.py and dd chunks..."
+    BTC_BUILT_HASH="$(fw_hash "${OUT}/shellos-btc.bin")" || abort "firmware-hash.py failed on built Bitcoin-only firmware"
+    BTC_OFFICIAL_HASH="$(fw_hash "${BTC_BIN}")"          || abort "firmware-hash.py failed on official Bitcoin-only firmware"
+    DD_BTC_BUILT="$(chunks "${OUT}/shellos-btc.bin")"    || abort "dd failed on built Bitcoin-only firmware"
+    DD_BTC_OFFICIAL="$(chunks "${BTC_BIN}")"             || abort "dd failed on official Bitcoin-only firmware"
+    [[ "${BTC_BUILT_HASH}" == "${BTC_OFFICIAL_HASH}" && "${DD_BTC_BUILT}" == "${DD_BTC_OFFICIAL}" ]] || BTC_PASS=false
+    BTC_LINES=(
+        "${BTC_NAME} - firmware-hash.py (skips signature bytes 588-651) - ${BTC_BUILT_HASH} - $(mark "${BTC_BUILT_HASH}" "${BTC_OFFICIAL_HASH}")"
+        "${BTC_NAME} - dd bytes 0-587 (before signature) - $(head -1 <<< "${DD_BTC_BUILT}") - $(mark "$(head -1 <<< "${DD_BTC_BUILT}")" "$(head -1 <<< "${DD_BTC_OFFICIAL}")")"
+        "${BTC_NAME} - dd bytes 652-end (after signature) - $(tail -1 <<< "${DD_BTC_BUILT}") - $(mark "$(tail -1 <<< "${DD_BTC_BUILT}")" "$(tail -1 <<< "${DD_BTC_OFFICIAL}")")"
+    )
+fi
+
 # ── bootloader: rebuild with the official key bytes, compare whole files ─────
 # The bootloader is unsigned; bytes 588-651 hold the 64-byte firmware
 # verification key that bootloader-perso.py writes from deployment/
@@ -677,14 +721,14 @@ fi
 
 # ── results block ─────────────────────────────────────────────────────────────
 
-if ${FW_PASS} && ${BL_PASS}; then VERDICT="reproducible"; else VERDICT="not_reproducible"; fi
+if ${FW_PASS} && ${BL_PASS} && ${BTC_PASS}; then VERDICT="reproducible"; else VERDICT="not_reproducible"; fi
 
 FW_LINES=(
     "${FW_NAME} - firmware-hash.py (skips signature bytes 588-651) - ${BUILT_HASH} - $(mark "${BUILT_HASH}" "${OFFICIAL_HASH}")"
     "${FW_NAME} - dd bytes 0-587 (before signature) - $(head -1 <<< "${DD_FW_BUILT}") - $(mark "$(head -1 <<< "${DD_FW_BUILT}")" "$(head -1 <<< "${DD_FW_OFFICIAL}")")"
     "${FW_NAME} - dd bytes 652-end (after signature) - $(tail -1 <<< "${DD_FW_BUILT}") - $(mark "$(tail -1 <<< "${DD_FW_BUILT}")" "$(tail -1 <<< "${DD_FW_OFFICIAL}")")"
 )
-ALL_LINES=("${FW_LINES[@]}" "${BL_LINES[@]}")
+ALL_LINES=("${FW_LINES[@]}" "${BL_LINES[@]}" "${BTC_LINES[@]}")
 MATCHES=0
 for line in "${ALL_LINES[@]}"; do [[ "${line}" == *"1 (MATCHES)" ]] && MATCHES=$((MATCHES + 1)); done
 
@@ -701,7 +745,8 @@ echo "scriptHash:     ${SCRIPT_HASH}"
 echo ""
 echo "Diff:"
 printf '%s\n' "${ALL_LINES[@]}"
-${BL_PUBLISHED} || echo "Bootloader: not published for v${VERSION}; firmware only."
+${BL_PUBLISHED} || echo "Bootloader: not published for v${VERSION}."
+${BTC_PUBLISHED} || echo "Bitcoin-only firmware: not published for v${VERSION}."
 echo ""
 echo "SUMMARY"
 echo "total: ${#ALL_LINES[@]}"
@@ -713,6 +758,7 @@ echo "===== End Results ====="
 echo "Official firmware sha256:   $(sha256sum "${FW_BIN}" | cut -d' ' -f1)"
 ${BL_PUBLISHED} && echo "Official bootloader sha256: ${BL_OFFICIAL_SHA}"
 ${BL_PUBLISHED} && echo "Official bootloader key bytes 588-651: $(cat "${OUT}/official-bootloader-key.txt")"
+${BTC_PUBLISHED} && echo "Official Bitcoin-only firmware sha256: $(sha256sum "${BTC_BIN}" | cut -d' ' -f1)"
 echo "Evidence: ${WORK_DIR}"
 
 # ── COMPARISON_RESULTS.yaml ───────────────────────────────────────────────────
@@ -723,14 +769,18 @@ is signed with the production key and our build with a throwaway key. Cross-chec
 Bootloader: unsigned. Bytes 588-651 hold the firmware verification key; our build is
 personalised with the official file's 64 key bytes and must then equal the official
 bootloader byte for byte (also dd-checked outside those bytes).
+Bitcoin-only firmware (when published): target shellos-btc.elf of the same build, compared
+like the main firmware.
 firmware-sign.py and bootloader-perso.py carry a Python 3.10 pathlib patch; other tool
 logic is verbatim upstream."
 ${BL_PUBLISHED} || NOTES="${NOTES}
-Release v${VERSION} publishes no bootloader binary; only the firmware was compared."
+Release v${VERSION} publishes no bootloader binary; it was not compared."
+${BTC_PUBLISHED} || NOTES="${NOTES}
+Release v${VERSION} publishes no Bitcoin-only firmware; it was not compared."
 
 if [[ "${VERDICT}" == reproducible ]]; then
     repro "${NOTES}"
 else
-    not_repro "Firmware match: ${FW_PASS}; bootloader match: ${BL_PASS}.
+    not_repro "Firmware match: ${FW_PASS}; bootloader match: ${BL_PASS}; Bitcoin-only firmware match: ${BTC_PASS}.
 ${NOTES}"
 fi
