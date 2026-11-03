@@ -1,6 +1,6 @@
 #!/bin/bash
 # wasabiwindows_build.sh - Wasabi Wallet Windows Reproducible Build Verifier (win-x64 zip / MSI)
-# Version: v0.3.0
+# Version: v0.3.1
 # Last modified by: Claude Code for Danny
 # Last modified on: 2026-11-03
 # Upstream builds the Windows zip and MSI on a GitHub Windows runner with Contrib/release.sh
@@ -15,7 +15,7 @@
 # MIT License. Provided as-is for reproducible-build verification, without warranty.
 set -euo pipefail
 
-SCRIPT_VERSION="v0.3.0"
+SCRIPT_VERSION="v0.3.1"
 APP_ID="wasabi"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256=""
@@ -354,7 +354,8 @@ PSEOF
     rel=$(sed -n 's/^RELEASE-EXIT=//p' "$log" | head -1)
     [[ "$rel" =~ ^[1-9][0-9]*$ ]] || die "The VM stopped outside release.sh (setup, download, clone or SSH); see logs/vm-build.log"
     case "$rel" in 130|137|143) die "release.sh was stopped or killed (exit ${rel})" ;; esac
-    if [[ "$have_log" == true ]] && grep -qE 'NU1301|Unable to load the service index|Could not resolve host|Temporary failure in name resolution|Name or service not known|Connection timed out|There is not enough space on the disk|No space left on device' "$relog"; then
+    [[ "$have_log" == true ]] || die "release.sh failed (exit ${rel}), but its log could not be copied out of the VM intact, so the cause is unknown"
+    if grep -qE 'NU1301|Unable to load the service index|Could not resolve host|Temporary failure in name resolution|Name or service not known|Connection timed out|There is not enough space on the disk|No space left on device' "$relog"; then
       die "release.sh stopped (exit ${rel}) on a network or disk error; see logs/release.log"
     fi
     ftbfs_die "Upstream Contrib/release.sh wininstaller failed to build from source (exit ${rel}); see logs/release.log"
