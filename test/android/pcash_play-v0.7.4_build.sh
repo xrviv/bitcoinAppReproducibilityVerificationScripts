@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # pcash_play_build.sh - P.CASH Terminal (Google Play) reproducible build verification
-# Version:          v0.7.2
+# Version:          v0.7.4
 # Organization:     WalletScrutiny.com
-# Last Modified:    2026-09-22
+# Last modified by: Carol (Buzz), Claude Code for Danny
+# Last modified on: 2026-11-02
 # App ID:           cash.p.terminal
 # Project:          https://github.com/piratecash/pcash-wallet
 # Play Store:       https://play.google.com/store/apps/details?id=cash.p.terminal
@@ -13,9 +14,9 @@
 #
 # Provided for technical analysis and reproducible build verification only, with
 # no warranty of any kind. Review before running.
-# Exit codes: 0 = identical, 1 = difference or build failure, 2 = bad parameters.
+# Exit codes: 0 = identical, 1 = difference or build failure, 2 = wrong input (no YAML).
 
-SCRIPT_VERSION="v0.7.2"
+SCRIPT_VERSION="v0.7.4"
 
 SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
 SCRIPT_HASH="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
@@ -46,6 +47,9 @@ sha256of() { sha256sum "$1" | awk '{print $1}'; }
 # The YAML must land in the SCRIPT's directory (ABS reads it there); $PWD copy is convenience.
 execution_dir="$SCRIPT_DIR"
 invocation_dir="$(pwd -P)"
+# A stale verdict must never outlive a refused run. --help is not a run.
+[[ " $* " == *" --help "* || " $* " == *" -h "* ]] || \
+  rm -f "${execution_dir}/COMPARISON_RESULTS.yaml" "${invocation_dir}/COMPARISON_RESULTS.yaml"
 
 # Only these three keys, ever: script_version, verdict, notes.
 generate_yaml() {
@@ -70,7 +74,19 @@ fail() {
   exit "$code"
 }
 
-die_invalid() { log_error "$1"; fail 2 "Invalid invocation: $1"; }
+# Wrong input is not a build result: no YAML, exit 2, so ABS tries its next script.
+die_invalid() {
+  log_error "$1"
+  echo ""; echo "Exit code: 2 (wrong input; no COMPARISON_RESULTS.yaml written)"
+  exit 2
+}
+
+# Not a build result either (image, network, tooling): no YAML, exit 1, so nothing false is published.
+abort() {
+  log_error "$1"
+  echo ""; echo "Exit code: 1 (no verdict; no COMPARISON_RESULTS.yaml written)"
+  exit 1
+}
 
 [[ "$EUID" -eq 0 ]] && die_invalid "Do not run this script as root."
 
@@ -95,7 +111,7 @@ Usage: ${SCRIPT_NAME} --binary <dir-of-split-apks> [--git-revision <sha>] [--ver
  --version/--arch/--type  Optional; logged. Version comes from base.apk.
  WS_DEVICE_SDK   env: device API level for the device-spec (default 36).
 
-Exit codes: 0 = identical, 1 = any difference, 2 = invalid parameters.
+Exit codes: 0 = identical, 1 = any difference, 2 = wrong input (no YAML written).
 USAGE
 }
 
@@ -113,15 +129,18 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$binary_arg" ]]; then
-  log_error "--binary is required: pass the DIRECTORY of device-pulled Play splits (base.apk + split_config.*.apk)."
-  log_error "A single official p.cash.apk (GitHub Releases / F-Droid) is the other lineage: use $COUNTERPART."
-  fail 2 "--binary not provided. The Google Play lineage requires a directory of device-pulled split APKs; it cannot be downloaded. For a single p.cash.apk use $COUNTERPART."
+  die_invalid "--binary is required: the DIRECTORY of device-pulled Play splits. A single p.cash.apk is the other lineage: use $COUNTERPART."
 fi
 [[ -e "$binary_arg" ]] || die_invalid "--binary path does not exist: ${binary_arg}"
 if [[ ! -d "$binary_arg" ]]; then
-  log_error "--binary must be a DIRECTORY of split APKs, not a single file: ${binary_arg}"
-  log_error "A single p.cash.apk is the F-Droid/GitHub lineage (branch f-droid). Use $COUNTERPART."
-  fail 2 "--binary was a single file, but the Google Play lineage is distributed as split APKs. A single p.cash.apk belongs to the F-Droid/GitHub lineage; use $COUNTERPART."
+  kind="a single file"
+  if L="$(unzip -l "$binary_arg" 2>/dev/null)"; then
+    m="$(unzip -p "$binary_arg" AndroidManifest.xml 2>/dev/null | tr -d '\0')"
+    if ! grep -q 'classes[0-9]*\.dex' <<<"$L"; then kind="one config split without its base.apk"
+    elif [[ "$m" == *vending.splits.required* ]]; then kind="a Play base.apk without its config splits"
+    else kind="a single APK"; fi
+  fi
+  die_invalid "--binary is ${kind}: ${binary_arg}. Needs the whole Play split set as one directory (one kind-9401 bundle); one split alone cannot be verified. A complete p.cash.apk is the F-Droid/GitHub lineage: use $COUNTERPART."
 fi
 [[ -z "$rev_arg" || "$rev_arg" =~ ^[0-9a-fA-F]{7,40}$ ]] || \
   die_invalid "--git-revision must be 7-40 hex characters (got: '${rev_arg}')"
@@ -175,20 +194,27 @@ section "PRE-FLIGHT: HOST TOOL CHECK"
 printf "  %-10s OK  (%s)\n" "$CONTAINER_CMD" "$(command -v "$CONTAINER_CMD")"
 echo "  No host JDK, Gradle, Android SDK, bundletool or apktool is required or used."
 
-RUN_ID="pcash-play-$(date +%s)-$$"
+RUN_ID="$(date +%s)-$$"
 IMG="ws-pcash-play-${RUN_ID}"
-workspace="${execution_dir}/pcash_play_verification_${RUN_ID}"
+workspace="${invocation_dir}/pcash_play_verification_${version_arg:-provided}_${RUN_ID}"
 META_DIR="${workspace}/metadata"
 BUILD_DIR="${workspace}/source-build"
 CMP_DIR="${workspace}/comparison"
 img_ctx=""
 
-mkdir -p "$META_DIR" "$BUILD_DIR" "$CMP_DIR"
+# Exclusive: a run only ever touches the directory it created.
+mkdir "$workspace" || abort "Could not create workspace ${workspace}"
+mkdir -p "$META_DIR" "$BUILD_DIR" "$CMP_DIR" || abort "Could not create workspace folders in ${workspace}"
 
-# Runs as root in the container on purpose: it must be able to chown.
+# Docker: root in the container, so it can chown. Rootless podman: caller = 0 in its namespace.
 ensure_user_ownership() {
   local path="$1"
   [[ -e "$path" ]] || return 0
+  if [[ "$CONTAINER_CMD" == "podman" ]]; then
+    podman unshare chown -R 0:0 "$path" >/dev/null 2>&1 || \
+      log_warn "Could not normalise ownership for ${path}"
+    return 0
+  fi
   $CONTAINER_CMD image inspect "$IMG" >/dev/null 2>&1 || return 0
   $CONTAINER_CMD run --rm -v "${path}:/target" "$IMG" \
     sh -c "chown -R ${HOST_UID}:${HOST_GID} /target" >/dev/null 2>&1 || \
@@ -217,7 +243,7 @@ EOF
 
 phase "SETUP: BUILD CONTAINER IMAGE"
 
-img_ctx="$(mktemp -d)"
+img_ctx="$(mktemp -d -p "$workspace")"
 
 # bundletool must match the one AGP embeds (AGP 9.0.1 -> 1.18.3); /build chmod:
 # WORKDIR alone is root-owned and the mapped-user clone fails.
@@ -253,8 +279,7 @@ DOCKERFILE_END
 
 section "Building image ${IMG}"
 if ! $CONTAINER_CMD build -t "$IMG" -f "${img_ctx}/Dockerfile" "$img_ctx"; then
-  log_error "Container image build failed - see the build output above."
-  fail 1 "Container image build failed; no comparison was performed."
+  abort "Container image build failed - see the build output above. No verdict (mirror or network outages land here)."
 fi
 log_success "Image built: ${IMG}"
 
@@ -351,8 +376,7 @@ if ! crun \
   --volume "${META_DIR}:/output" \
   --volume "${img_ctx}/meta.sh:/meta.sh:ro" \
   "$IMG" bash /meta.sh; then
-  log_error "Metadata extraction failed - aapt2/apksigner could not read base.apk."
-  fail 1 "Could not read metadata from base.apk."
+  abort "Metadata extraction failed - aapt2/apksigner could not read base.apk. No verdict."
 fi
 
 meta() { cat "${META_DIR}/$1.txt" 2>/dev/null || echo "${2:-}"; }
@@ -399,12 +423,10 @@ cat <<EOF
 EOF
 
 if [[ -n "$base_split" ]]; then
-  log_error "base.apk declares split name '${base_split}', so it is not a base APK. Supply the directory exactly as pulled."
-  fail 2 "base.apk declares split name '${base_split}'; a Play base APK declares none. Not a valid Play split set."
+  die_invalid "base.apk declares split name '${base_split}', so it is not a base APK. Supply the directory exactly as pulled."
 fi
 if [[ "$config_splits" -eq 0 ]]; then
-  log_error "No split_config.*.apk found: a single APK is the GitHub/F-Droid packaging. Use $COUNTERPART."
-  fail 2 "No split_config APKs present: the artifact is a single APK, which is the GitHub/F-Droid packaging built from a DIFFERENT branch (f-droid). Use $COUNTERPART."
+  die_invalid "No split_config.*.apk found: a single APK is the GitHub/F-Droid packaging (branch f-droid). Use $COUNTERPART."
 fi
 log_success "Play packaging confirmed: base APK + ${config_splits} config split(s)"
 
@@ -412,8 +434,7 @@ log_success "Play packaging confirmed: base APK + ${config_splits} config split(
 section "Resolving source revision"
 if [[ "$has_firebase" != "1" ]]; then
   log_error "No Google/Firebase signal in this split set, so it is not the master build Play ships."
-  log_error "Refusing to build f-droid and compare across lineages. Check provenance, or use $COUNTERPART."
-  fail 2 "Lineage anomaly: a Play split set with no Google/Firebase signal (detector: $google_signals). Play ships the master build, which contains both. Refusing rather than comparing across lineages."
+  die_invalid "Refusing to compare across lineages (detector: $google_signals). Check provenance, or use $COUNTERPART."
 fi
 LINEAGE="master"
 GIT_BRANCH_NAME="master"
@@ -610,6 +631,7 @@ if [[ $BUILD_RC -ne 0 ]]; then
     log_error "Cannot pin a revision (${rev_source}). This is a FINDING, not a script fault."
     fail 1 "Google Play (master lineage): the source revision could not be pinned (${rev_source}${build_rev:+: $build_rev}); the shipped artifact cannot be matched to published source. No build attempted. Official base.apk SHA-256: ${app_hash}."
   fi
+  [[ $BUILD_RC -eq 1 ]] && abort "git clone failed (container exit 1). Network, not a build result. No verdict."
   log_error "Source build failed (container exit ${BUILD_RC}: 1=clone, 2=checkout, 3=gradle/bundletool)"
   log_info  "Full Gradle log: ${BUILD_DIR}/gradle-build.log"
   fail 1 "Source build failed for ${APP_ID} $wallet_version (container exit ${BUILD_RC}). Official base.apk SHA-256: ${app_hash}."
@@ -713,6 +735,29 @@ print("3 arrays, lengths %d/%d/%d both sides, %d triples, Counter equal "
       "(multiplicity kept)" % ((len(to),) * 4))
 PYEOF
 
+# Crashlytics mapping_file_id: a random ID per build since v0.60.1-google (mappingFileUploadEnabled).
+# Accepted ONLY as the sole decoded difference (Danny, 2026-10-12): one file, one line, 32 hex each side.
+cat > /tmp/mf.py <<'PYEOF'
+import sys, os, re, filecmp
+K = 'com.google.firebase.crashlytics.mapping_file_id'
+R = re.compile(r'\s*<string name="' + re.escape(K) + r'">([0-9a-f]{32})</string>\s*')
+def die(m): print("mapping_file_id: REFUSED: " + m); sys.exit(1)
+o, b = sys.argv[1], sys.argv[2]
+def files(r): return {os.path.relpath(os.path.join(d, f), r) for d, _, fs in os.walk(r) for f in fs}
+fo, fb = files(o), files(b)
+if fo != fb: die("file sets differ")
+dif = [p for p in sorted(fo) if not filecmp.cmp(os.path.join(o, p), os.path.join(b, p), shallow=False)]
+if dif != ['values/strings.xml']: die("differing files: %s" % dif[:3])
+lo, lb = (open(os.path.join(r, dif[0]), encoding='utf-8').read().split('\n') for r in (o, b))
+if len(lo) != len(lb): die("line counts differ")
+d = [i for i in range(len(lo)) if lo[i] != lb[i]]
+if len(d) != 1: die("%d lines differ" % len(d))
+mo, mb = R.fullmatch(lo[d[0]]), R.fullmatch(lb[d[0]])
+if not (mo and mb): die("the differing line is not mapping_file_id")
+if sum(K in x for x in lo) != 1 or sum(K in x for x in lb) != 1: die("key not unique")
+print("sole decoded difference is mapping_file_id %s vs %s" % (mo[1], mb[1]))
+PYEOF
+
 # SourceStamp: EARNED, never filename-excluded. Play injects it post-build.
 stamp_ok() {
   local o="$1" n sz
@@ -766,6 +811,7 @@ arsc_ok() {
     echo "      arsc: decoded res/ tree IDENTICAL (binary packing artifact)"
     return 0
   fi
+  local pre=""
   if python3 /tmp/cn.py /tmp/do/res /tmp/db/res > /tmp/cn.txt 2>&1; then
     sed 's/^/      arsc: /' /tmp/cn.txt
     rd2="$(diff -r /tmp/do/res /tmp/db/res 2>/dev/null)"
@@ -775,11 +821,18 @@ arsc_ok() {
       echo "      arsc: canonicalised FULL decoded res/ IDENTICAL"
       return 0
     fi
-    echo "      arsc: other decoded changes remain AFTER normalisation -> material"
-    printf '%s\n' "$rd2" | head -5 | sed 's/^/        /'
-    return 1
+    pre="cl-buildid-order+"
+  else
+    sed 's/^/      arsc: /' /tmp/cn.txt
   fi
-  sed 's/^/      arsc: /' /tmp/cn.txt
+  if python3 /tmp/mf.py /tmp/do/res /tmp/db/res > /tmp/mf.txt 2>&1; then
+    sed 's/^/      arsc: /' /tmp/mf.txt
+    ARSC_CLASS="${pre}mapping-file-id"; echo "$c" >> /out/mapping_id.txt
+    return 0
+  fi
+  sed 's/^/      arsc: /' /tmp/mf.txt
+  echo "      arsc: other decoded changes remain -> material"
+  diff -r /tmp/do/res /tmp/db/res 2>/dev/null | head -5 | sed 's/^/        /'
   return 1
 }
 
@@ -788,7 +841,7 @@ for f in /official/*.apk; do OFF["$(cfg_of "$f")"]="$f"; done
 for f in /built/*.apk;    do BLT["$(cfg_of "$f")"]="$f"; done
 
 RAW=0; SIGN=0; STAMP=0; MANI=0; ARSC=0; UNACC=0; MISSING=0; FAILED=0
-: > /out/summary.txt
+: > /out/summary.txt; : > /out/mapping_id.txt
 
 for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
   echo ""
@@ -872,9 +925,8 @@ crun \
 CMP_RC=${PIPESTATUS[0]}
 
 if [[ $CMP_RC -ne 0 ]] || ! grep -q '^TOTALS' "${CMP_DIR}/summary.txt" 2>/dev/null; then
-  log_error "Comparison stage failed (exit ${CMP_RC}) or wrote no TOTALS line"
   log_info  "Comparison log: ${CMP_DIR}/comparison.log"
-  fail 1 "Comparison stage failed for ${APP_ID} $wallet_version (exit ${CMP_RC}). Official base.apk SHA-256: ${app_hash}."
+  abort "Comparison stage failed (exit ${CMP_RC}) or wrote no TOTALS line. The build worked, so this is no ftbfs. No verdict."
 fi
 
 read -r _ raw_total t_sign t_stamp t_mani t_arsc t_unacc t_missing \
@@ -882,12 +934,14 @@ read -r _ raw_total t_sign t_stamp t_mani t_arsc t_unacc t_missing \
 raw_total="${raw_total:-1}"; t_sign="${t_sign:-0}"; t_stamp="${t_stamp:-0}"
 t_mani="${t_mani:-0}"; t_arsc="${t_arsc:-0}"; t_unacc="${t_unacc:-1}"; t_missing="${t_missing:-1}"
 t_acc=$((t_sign + t_stamp + t_mani + t_arsc))
+t_mfid="$(grep -c . "${CMP_DIR}/mapping_id.txt" 2>/dev/null)"; t_mfid="${t_mfid:-0}"
 
 section "RESULT"
 cat <<EOF
  Official splits:      ${#OFFICIAL_SPLITS[@]}
  Raw differences:      ${raw_total}
  Accepted (earned): ${t_acc} = sign ${t_sign} + stamp ${t_stamp} + manifest ${t_mani} + arsc ${t_arsc}
+ mapping_file_id only: ${t_mfid} split(s) (arsc accepted with a sole Crashlytics mapping_file_id delta)
  UNACCOUNTED:          ${t_unacc}   <- the verdict is judged on this alone
  Unmatched splits:     ${t_missing}
 
@@ -954,7 +1008,7 @@ depProvenance:   JitPack deps consumed as published binaries, not rebuilt from s
  comparison log. signer is Play App Signing's key, not the developer key.
 EOF
 
-generate_yaml "${VERDICT}" "Google Play split set, master lineage DETECTED from artifact contents ($google_signals). Revision ${built_ref:-unknown} from ${rev_source}. Built :app:bundleRelease, split with bundletool 1.18.3 (matches AGP 9.0.1). ${raw_total} raw difference(s); ${t_acc} EARNED exclusions - signing ${t_sign} (Play re-signs, local build unsigned), SourceStamp ${t_stamp} (1 root entry, off-only, 32 bytes, apksigner SourceStamp OK), AndroidManifest ${t_mani} (only Play's off-only distribution meta-data entries), resources.arsc ${t_arsc} (decoded res/ compared; where the sole delta was the three positional Crashlytics build_ids arrays, triples were zipped by index, Counter-compared with multiplicity preserved, canonicalised, and the ENTIRE decoded res/ tree then compared identical). ${t_unacc} UNACCOUNTED difference(s) - the verdict is judged on this alone. ${t_missing} split(s) unmatched. Official base.apk SHA-256 ${app_hash}. JitPack deps (com.github.piratecash forks) were consumed as published binaries, NOT rebuilt from source, so a byte-match does not attest their provenance."
+generate_yaml "${VERDICT}" "Google Play split set, master lineage DETECTED from artifact contents ($google_signals). Revision ${built_ref:-unknown} from ${rev_source}. Built :app:bundleRelease, split with bundletool 1.18.3 (matches AGP 9.0.1). ${raw_total} raw difference(s); ${t_acc} EARNED exclusions - signing ${t_sign} (Play re-signs, local build unsigned), SourceStamp ${t_stamp} (1 root entry, off-only, 32 bytes, apksigner SourceStamp OK), AndroidManifest ${t_mani} (only Play's off-only distribution meta-data entries), resources.arsc ${t_arsc} (decoded res/ compared; where the sole delta was the three positional Crashlytics build_ids arrays, triples were zipped by index, Counter-compared with multiplicity preserved, canonicalised, and the ENTIRE decoded res/ tree then compared identical; on ${t_mfid} split(s) the sole remaining decoded difference was com.google.firebase.crashlytics.mapping_file_id, a random ID per build since v0.60.1-google, accepted as approved by Danny 2026-10-12). ${t_unacc} UNACCOUNTED difference(s) - the verdict is judged on this alone. ${t_missing} split(s) unmatched. Official base.apk SHA-256 ${app_hash}. JitPack deps (com.github.piratecash forks) were consumed as published binaries, NOT rebuilt from source, so a byte-match does not attest their provenance."
 
 echo ""
 echo "Exit code: ${EXIT_CODE}"
