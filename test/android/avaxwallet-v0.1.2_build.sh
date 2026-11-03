@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# corewallet_build.sh - Core Wallet by Ava Labs (Android) Reproducible Build Verification
+# avaxwallet_build.sh - Core Wallet by Ava Labs (Android) Reproducible Build Verification
 # ==============================================================================
-# Version:          v0.1.1
+# Version:          v0.1.2
 # Organization:     WalletScrutiny.com
 # Last modified by: Carol (Buzz), Claude Code for Danny
 # Last modified on: 2026-11-02
@@ -36,7 +36,7 @@
 # Steps, as bitrise.yml: yarn install --immutable && yarn setup (postinstall: patch-package, skia,
 # rn-nodeify, OpenAPI codegen from live schema URLs), .env = .env.production, google-services.json
 # (external), versionName/versionCode written into app/build.gradle (Bitrise step), CI=true (enables
-# R8 in app/build.gradle), ./gradlew :app:bundleExternalRelease, then bundletool renders the splits
+# R8 in app/build.gradle), ccache as Bitrise Build Cache, ./gradlew :app:bundleExternalRelease, then bundletool renders the splits
 # for a device spec derived from the official split names. Unsigned; the source is not patched.
 # Private inputs: .env.production (react-native-config writes every key into BuildConfig and string
 # resources) and google-services.json; both are read back from the official base.apk. Build paths
@@ -47,7 +47,7 @@
 # Exit codes: 0 = reproducible, 1 = differences or build failure, 2 = invalid parameters, 130 = stopped.
 # ==============================================================================
 
-SCRIPT_VERSION="v0.1.1"
+SCRIPT_VERSION="v0.1.2"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_HASH="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
 echo "$(basename "$SCRIPT_PATH") $SCRIPT_VERSION sha256:${SCRIPT_HASH:-N/A}"
@@ -177,8 +177,8 @@ crun() { $CONTAINER_CMD run --rm "${RUN_USER[@]}" -e HOME=/tmp/h "${MEM_ARGS[@]}
 
 # Per-run workspace, named once and never renamed. Without --version the name says "provided".
 RUN_TAG="$(date +%s)-$$"
-IMG="localhost/ws-corewallet:${RUN_TAG}"
-WS="$(pwd -P)/corewallet_verification_${version_arg:-provided}_${RUN_TAG}"
+IMG="localhost/ws-avaxwallet:${RUN_TAG}"
+WS="$(pwd -P)/avaxwallet_verification_${version_arg:-provided}_${RUN_TAG}"
 mkdir "$WS" || no_verdict 1 "Cannot create workspace ${WS}."
 NET=""
 cleanup() {
@@ -228,6 +228,10 @@ RUN cd /opt && curl -fsSL -o apktool.jar https://github.com/iBotPeaches/Apktool/
   && echo "${APKTOOL_SHA256}  apktool.jar" | sha256sum -c - \\
   && curl -fsSL -o bundletool.jar https://github.com/google/bundletool/releases/download/${BUNDLETOOL_VERSION}/bundletool-all-${BUNDLETOOL_VERSION}.jar \\
   && echo "${BUNDLETOOL_SHA256}  bundletool.jar" | sha256sum -c - && chmod 0644 apktool.jar bundletool.jar
+# ccache 4.13.2 = the version bitrise-build-cache-cli installs for activate-build-cache-for-react-native.
+RUN cd /tmp && curl -fsSL -o cc.tgz https://github.com/ccache/ccache/releases/download/v4.13.2/ccache-4.13.2-linux-x86_64-glibc.tar.gz \\
+  && echo "e531303ffded7ddf0f275674d866f6ac1ad89148c235346e7b12c3c915d15f56  cc.tgz" | sha256sum -c - \\
+  && tar -xzf cc.tgz && install -m 0755 ccache-4.13.2-linux-x86_64-glibc/ccache /usr/local/bin/ccache && rm -rf cc.tgz ccache-4.13.2-*
 # /root stays traversable: the Gradle home is mounted at Bitrise's /root/.gradle.
 RUN mkdir -p /tmp/h /tmp/afw && chmod 0777 /tmp/h /tmp/afw && chmod 0755 /root
 DOCKERFILE_END
@@ -391,8 +395,17 @@ grep -nE '^[[:space:]]*version(Code|Name) ' android/app/build.gradle | sed 's/^/
 export ANDROID_USER_HOME="${HOME}/.android"; mkdir -p "$ANDROID_USER_HOME"
 # sentry.gradle uploads source maps to upstream's Sentry account; its own switch skips only the upload.
 export SENTRY_DISABLE_AUTO_UPLOAD=true
+# bitrise.yml _build-android runs activate-build-cache-for-react-native, which builds the C/C++ through
+# ccache with CCACHE_BASEDIR = the step's working dir (the checkout) and CCACHE_NOHASHDIR=true
+# (bitrise-build-cache-cli BuildEnv). ccache rewrites paths under the base dir to relative ones, which
+# changes __FILE__ strings, debug info and so the build IDs. Fresh local cache: every object is compiled here.
+export CCACHE_BASEDIR="$SRC" CCACHE_NOHASHDIR=true CCACHE_COMPILERCHECK=content CCACHE_DIR=/tmp/h/ccache
+export CMAKE_C_COMPILER_LAUNCHER=ccache CMAKE_CXX_COMPILER_LAUNCHER=ccache
+ccache -z >/dev/null; echo "  $(ccache --version | head -1), CCACHE_BASEDIR=${CCACHE_BASEDIR}"
 cd android || exit 3
 run "gradle :app:bundleExternalRelease -PreactNativeArchitectures=${ARCHS}" ./gradlew :app:bundleExternalRelease --no-daemon "-PreactNativeArchitectures=${ARCHS}"
+ccache -s -v > /out/ccache-stats.txt 2>&1; ncc="$(ccache --print-stats 2>/dev/null | awk -F'\t' '$1 ~ /^(cache_miss|direct_cache_hit|preprocessed_cache_hit)$/ {s+=$2} END {print s+0}')"
+echo "  ccache saw ${ncc} compilations (built/ccache-stats.txt)"; [[ "$ncc" -gt 0 ]] || echo "  WARNING: no compilation went through ccache; native paths will not match Bitrise"
 cp app/build/outputs/bundle/externalRelease/app-external-release.aab /out/app-release.aab || { echo "FATAL: no app-external-release.aab"; exit 3; }
 sha256sum /out/app-release.aab | sed 's/^/  /'
 echo "=== build complete $(date) ==="
@@ -401,7 +414,7 @@ BUILD_END
 # the official value on a per-run network when it is a private address.
 NET_ARGS=()
 if [[ "$dev_ip" =~ ^(10\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01])|192\.168)\.[0-9]+\.[0-9]+$ && "${dev_ip##*.}" != 1 ]]; then
-  NET="ws-corewallet-net-${RUN_TAG}"
+  NET="ws-avaxwallet-net-${RUN_TAG}"
   if $CONTAINER_CMD network create --subnet "${dev_ip%.*}.0/24" "$NET" >/dev/null 2>&1; then NET_ARGS=(--network "$NET" --ip "$dev_ip")
   else log_warn "Could not create a ${dev_ip%.*}.0/24 network; react_native_dev_server_ip will hold this container's address"; NET=""; fi
 fi
@@ -582,13 +595,13 @@ if [[ "$tot_raw" -gt 0 ]]; then
   cat "${DIFFS[@]}" 2>/dev/null | grep -v '^$' | head -5 | cut -c1-160 | sed 's/^/   /'
 fi
 n_skip="$(grep -c 'SKIP' "${BLD}/build.log" 2>/dev/null)"
-echo " Upstream fidelity: CI=true (as Bitrise); 'SKIP' lines in build.log: ${n_skip:-0}"
+echo " Upstream fidelity: CI=true and ccache CCACHE_BASEDIR (as Bitrise); 'SKIP' lines in build.log: ${n_skip:-0}"
 if [[ "$tot_un" -eq 0 ]]; then verdict="reproducible"; rc=0; head_line="BUILDS MATCH BINARIES"
 else verdict="not_reproducible"; rc=1; head_line="BUILDS DO NOT MATCH BINARIES"; fi
 tagnote="tag ${tag} = ${tag_commit}"; [[ "$tag_commit" != "$commit" ]] && tagnote+=" (NOT the built commit)"
 dot_note="recovered from ${main}"; [[ -n "$dotenv_arg" ]] && dot_note+=", overridden by --dotenv"
 generate_yaml "$verdict" "${APP_ID} ${vname} (versionCode ${vcode}; ${MODE}) built from ${commit} (${rev_source}); ${tagnote}; rc tags: ${rc_tags:-none}.
-Upstream Bitrise android workflow steps (yarn install --immutable, yarn setup, gradle :app:bundleExternalRelease, CI=true); -PreactNativeArchitectures=${rn_archs} assumed from the android-internal workflow; APP_ENV ${app_env}.
+Upstream Bitrise android workflow steps (yarn install --immutable, yarn setup, gradle :app:bundleExternalRelease, CI=true, ccache with CCACHE_BASEDIR as activate-build-cache-for-react-native); -PreactNativeArchitectures=${rn_archs} assumed from the android-internal workflow; APP_ENV ${app_env}.
 Unpinned inputs: the rc tag Play promoted is not recorded anywhere public, and postinstall generates API clients from live schema URLs; either can change only the JS bundle.
 .env.production ${dot_note}; google-services.json and build paths recovered from the official APK.
 Official ${main} SHA-256 ${app_hash}, signer ${signer:-unknown}.
