@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# wasabidesktop-v1.12.0_build.sh - Wasabi Wallet Desktop Reproducible Build Verification
+# wasabidesktop-v1.12.1_build.sh - Wasabi Wallet Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:          v1.12.0
+# Version:          v1.12.1
 # Organization:     WalletScrutiny.com
 # Last modified by: Claude Code for Danny
-# Last modified on: 2026-10-14
+# Last modified on: 2026-11-03
 # Project:          https://github.com/WalletWasabi/WalletWasabi
 # ==============================================================================
 # MIT License. Provided as-is for reproducible-build verification and security
@@ -22,7 +22,7 @@
 set -Eeuo pipefail
 
 # ---------- Script Metadata ----------
-SCRIPT_VERSION="v1.12.0"
+SCRIPT_VERSION="v1.12.1"
 APP_NAME="Wasabi Wallet"
 APP_ID="wasabi"
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
@@ -75,17 +75,22 @@ verdict: ${verdict}
 notes: |
 ${notes}
 EOF
-  if [ -n "${WORKSPACE:-}" ] && [ "${WORKSPACE}" != "${ORIG_DIR:-.}" ]; then
-    cp "${ORIG_DIR:-.}/COMPARISON_RESULTS.yaml" "${WORKSPACE}/COMPARISON_RESULTS.yaml" 2>/dev/null || true
-  fi
 }
 
-# Safety net: unexpected exits still produce a COMPARISON_RESULTS.yaml for ABS.
+# ABS publishes any YAML verdict whatever the exit code, so a stop that says nothing
+# about the source (input, tooling, network, signature, interruption) writes no YAML.
+abort() {
+  local ec="$1"; shift
+  trap - ERR
+  log_error "$*"
+  NO_VERDICT_REPORTED=true
+  echo "No verdict; no COMPARISON_RESULTS.yaml written. Exit code: ${ec}"
+  exit "$ec"
+}
+
 on_err() {
   local ec=$?
-  log_error "Unexpected failure (exit ${ec}) at line ${BASH_LINENO[0]}"
-  write_yaml "ftbfs" "  Script aborted unexpectedly at line ${BASH_LINENO[0]} (exit code ${ec}). See script stdout/stderr for details."
-  exit 1
+  abort 1 "Unexpected failure (exit ${ec}) at line ${BASH_LINENO[0]}. See the output above."
 }
 trap on_err ERR
 
@@ -93,9 +98,7 @@ trap on_err ERR
 # container image is built as root internally, while every bind-mounted run is
 # mapped to the invoking user.
 if [ "$(id -u)" -eq 0 ]; then
-  log_error "Do not run this verifier as root or through sudo."
-  write_yaml "ftbfs" "  Refusing to run as root: invoke the script as a normal user so all workspace files remain removable by that user."
-  exit 2
+  abort 2 "Do not run this verifier as root: workspace files must stay removable by the invoking user."
 fi
 
 usage() {
@@ -124,7 +127,8 @@ Known limitations:
     as a selectable --arch here; deliberately scoped out of this patch.
   - The requested tag must provide Contrib/release.sh with a working "debian"
     target and the expected Wasabi release filenames. Upstream changes are run
-    directly; an incompatible build recipe or SDK requirement reports ftbfs.
+    directly; a recipe that fails to build reports ftbfs. A missing recipe, an SDK
+    that cannot be resolved or a missing output file stops with no verdict.
   - The .NET SDK is resolved from the official artifact's runtimeconfig.json
     (highest SDK shipping that runtime with a published -noble image). Only when
     the runtime cannot be read (zip) does it fall back to the 10.0.301 pin.
@@ -150,9 +154,11 @@ Requirements:
 
 Output:
   - Exit code 0: reproducible
-  - Exit code 1: not_reproducible or ftbfs
-  - Exit code 2: invalid parameters
-  - COMPARISON_RESULTS.yaml (minimal 3-field format) in the execution directory
+  - Exit code 1: not_reproducible, ftbfs, or no verdict (tooling or network failure)
+  - Exit code 2: invalid parameters, no verdict
+  - Exit code 130: stopped, no verdict
+  - COMPARISON_RESULTS.yaml (minimal 3-field format) in the execution directory,
+    written only for a verdict
   - ===== Begin/End Results ===== human-readable summary block
 
 Version: ${SCRIPT_VERSION}
@@ -165,13 +171,14 @@ VERSION=""
 ARCH="x86_64-linux-gnu"
 TYPE=""
 BINARY_FILE=""
+BAD_ARG=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --version) [ $# -ge 2 ] || { log_error "--version requires a value"; write_yaml "ftbfs" "  --version requires a value."; exit 2; }; VERSION="$2"; shift 2 ;;
-    --arch) [ $# -ge 2 ] || { log_error "--arch requires a value"; write_yaml "ftbfs" "  --arch requires a value."; exit 2; }; ARCH="$2"; shift 2 ;;
-    --type) [ $# -ge 2 ] || { log_error "--type requires a value"; write_yaml "ftbfs" "  --type requires a value."; exit 2; }; TYPE="$2"; shift 2 ;;
-    --binary) [ $# -ge 2 ] || { log_error "--binary requires a value"; write_yaml "ftbfs" "  --binary requires a value."; exit 2; }; BINARY_FILE="$2"; shift 2 ;;
+    --version) [ $# -ge 2 ] || { BAD_ARG="$1"; break; }; VERSION="$2"; shift 2 ;;
+    --arch) [ $# -ge 2 ] || { BAD_ARG="$1"; break; }; ARCH="$2"; shift 2 ;;
+    --type) [ $# -ge 2 ] || { BAD_ARG="$1"; break; }; TYPE="$2"; shift 2 ;;
+    --binary) [ $# -ge 2 ] || { BAD_ARG="$1"; break; }; BINARY_FILE="$2"; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     *) log_warning "Unknown argument: $1 (ignored)"; shift ;;
   esac
@@ -181,19 +188,17 @@ ORIG_DIR="$(pwd -P)"
 rm -f -- "$ORIG_DIR/COMPARISON_RESULTS.yaml"
 
 # ---------- Validate Parameters (exit 2 = invalid params, mechanical policy) ----------
+[ -z "$BAD_ARG" ] || abort 2 "$BAD_ARG requires a value"
+
 if [ -z "$VERSION" ]; then
-  log_error "--version parameter is required"
   usage
-  write_yaml "ftbfs" "  --version parameter is required and was not provided."
-  exit 2
+  abort 2 "--version parameter is required"
 fi
 
 # Tight allow-list regex doubles as a shell-injection guard: only digits/dots/
 # optional leading v survive before VERSION is interpolated into URLs/paths.
 if ! [[ "$VERSION" =~ ^[vV]?[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
-  log_error "Invalid version format: $VERSION (expected X.Y.Z or vX.Y.Z)"
-  write_yaml "ftbfs" "  Invalid --version format: ${VERSION}"
-  exit 2
+  abort 2 "Invalid version format: $VERSION (expected X.Y.Z or vX.Y.Z)"
 fi
 
 if [ "$ARCH" == "win64" ]; then
@@ -203,9 +208,7 @@ if [ "$ARCH" == "win64" ]; then
   log_error "Wasabi's wininstaller target requires the WiX Toolset (heat/candle/light),"
   log_error "which is Windows-only and has no Linux port, so the upstream release script"
   log_error "cannot complete in this container. The win-x64 zip it produces mid-run cannot"
-  log_error "be trusted from a failed build. Use --arch x86_64-linux-gnu."
-  write_yaml "ftbfs" "  --arch win64 is not supported: Wasabi's wininstaller target requires the WiX Toolset (heat/candle/light), which is Windows-only with no Linux port, so the upstream release script cannot complete in this container. The win-x64 zip is produced mid-run but only before WiX fails the build, and is not retrieved. Use --arch x86_64-linux-gnu."
-  exit 2
+  abort 2 "be trusted from a failed build. Use --arch x86_64-linux-gnu."
 fi
 # Upstream's "debian" target builds linux-x64 AND linux-arm64 in one run, so the arm64
 # artifacts cost no extra build -- they were produced and discarded before v1.11.0.
@@ -215,18 +218,13 @@ case "$ARCH" in
     ARCH="aarch64-linux-gnu" ;;
 esac
 if [ "$ARCH" != "x86_64-linux-gnu" ] && [ "$ARCH" != "aarch64-linux-gnu" ]; then
-  log_error "Unsupported architecture: $ARCH"
-  echo "Supported: x86_64-linux-gnu, aarch64-linux-gnu"
-  write_yaml "ftbfs" "  Unsupported --arch: ${ARCH}. Supported: x86_64-linux-gnu, aarch64-linux-gnu."
-  exit 2
+  abort 2 "Unsupported architecture: $ARCH (supported: x86_64-linux-gnu, aarch64-linux-gnu)"
 fi
 
 [ -n "$TYPE" ] || TYPE="deb"
 
 if [[ "$TYPE" != "deb" && "$TYPE" != "tarball" && "$TYPE" != "zip" ]]; then
-  log_error "Invalid type '$TYPE' for architecture '$ARCH' (valid: deb, tarball, zip)"
-  write_yaml "ftbfs" "  Invalid --type '${TYPE}' for --arch '${ARCH}'."
-  exit 2
+  abort 2 "Invalid type '$TYPE' for architecture '$ARCH' (valid: deb, tarball, zip)"
 fi
 
 if [ -n "$BINARY_FILE" ]; then
@@ -235,9 +233,7 @@ if [ -n "$BINARY_FILE" ]; then
   BINARY_FILE=$(echo "$BINARY_FILE" | sed 's|//*|/|g')
 fi
 if [ -n "$BINARY_FILE" ] && [ ! -f "$BINARY_FILE" ]; then
-  log_error "--binary file not found: $BINARY_FILE"
-  write_yaml "ftbfs" "  --binary file not found: ${BINARY_FILE}"
-  exit 2
+  abort 2 "--binary file not found: $BINARY_FILE"
 fi
 
 # ---------- Detect Container Runtime + user-mapping args (avoid root-owned host files) ----------
@@ -255,9 +251,7 @@ elif command -v docker &> /dev/null && docker info &> /dev/null; then
   CONTAINER_RUN_USER_ARGS="--user $(id -u):$(id -g) -e HOME=/tmp"
   log_info "Using Docker for containerization"
 else
-  log_error "No working Docker or Podman (both must answer 'info')"
-  write_yaml "ftbfs" "  No working Docker or Podman found on host."
-  exit 1
+  abort 1 "No working Docker or Podman (both must answer 'info')"
 fi
 
 # ---------- Version Normalization ----------
@@ -294,7 +288,8 @@ cleanup_run() {
   # Hand back anything a container mapped to another UID (rootless podman subuids).
   [ "$CONTAINER_CMD" = podman ] && { podman unshare chown -R 0:0 "$WORKSPACE" >/dev/null 2>&1 || true; }
   chmod -R u+rwX "$WORKSPACE" 2>/dev/null || true
-  [ -f "$ORIG_DIR/COMPARISON_RESULTS.yaml" ] || write_yaml "ftbfs" "  Run ended (exit ${rc}) before a verdict."
+  [ -f "$ORIG_DIR/COMPARISON_RESULTS.yaml" ] || [ "${NO_VERDICT_REPORTED:-}" = true ] || \
+    log_warning "Run ended (exit ${rc}) before a verdict; no COMPARISON_RESULTS.yaml written."
   first_foreign="$(find_foreign_owned_workspace_file)"
   if [ -n "$first_foreign" ]; then
     log_error "Workspace ownership check failed: $first_foreign is not owned by UID $(id -u)."
@@ -303,7 +298,7 @@ cleanup_run() {
   fi
 }
 trap cleanup_run EXIT
-trap 'log_error "Interrupted"; write_yaml "ftbfs" "  Run interrupted before a verdict."; exit 130' INT TERM
+trap 'abort 130 "Interrupted before a verdict."' INT TERM
 
 # ---------- Determine Build Configuration ----------
 # BUILD_TARGET is what we pass to Contrib/release.sh; EXPECTED_FILE is what we hash.
@@ -364,19 +359,14 @@ WORKDIR /workspace
 BOOTSTRAP_EOF
 # python3, not python3-minimal: the latter has no json module (checked 2026-09-03).
 if ! $CONTAINER_CMD build -t "$BOOTSTRAP_IMAGE" -f "$WORKSPACE/Dockerfile.bootstrap" "$WORKSPACE" >/dev/null 2>&1; then
-  log_error "Failed to build the bootstrap helper image"
-  write_yaml "ftbfs" "  Failed to build the bootstrap helper image used to read the official artifact's runtime version."
-  exit 1
+  abort 1 "Failed to build the bootstrap helper image used to read the official artifact's runtime version."
 fi
 
 if [ -z "$BINARY_FILE" ]; then
   log_info "Downloading official artifact: $EXPECTED_FILE"
   if ! $CONTAINER_CMD run --rm $CONTAINER_RUN_USER_ARGS -v "$WORKSPACE:/workspace:Z" -w /workspace \
     "$BOOTSTRAP_IMAGE" curl -fsSL -o "official-$EXPECTED_FILE" "$DOWNLOAD_URL"; then
-    log_error "Failed to download the official release asset"
-    write_yaml "ftbfs" "  Failed to download the official release asset.
-  URL attempted: ${DOWNLOAD_URL}"
-    exit 1
+    abort 1 "Failed to download the official release asset: ${DOWNLOAD_URL}"
   fi
   log_success "Downloaded official-$EXPECTED_FILE"
 fi
@@ -449,17 +439,14 @@ SDKMAP_EOF
       SDK_SELECTION="observed from the official artifact's runtimeconfig.json (runtime ${OBSERVED_RUNTIME}); highest SDK shipping it that is published as a -noble image, mirroring global.json rollForward=latestFeature"
       log_success "Selected .NET SDK $SDK_VERSION (candidates: $SDK_ALTERNATIVES)"
     else
-      log_error "None of $SDK_ALTERNATIVES is published as a -noble image on mcr.microsoft.com."
-      write_yaml "ftbfs" "  Official artifact records .NET runtime ${OBSERVED_RUNTIME}; SDKs ${SDK_ALTERNATIVES} ship it but none is published as mcr.microsoft.com/dotnet/sdk:<version>-noble. Building with the pinned ${SDK_VERSION} would use a different runtime pack and produce a known-false not_reproducible, so this is a tool/environment failure, not a verdict."
-      exit 1
+      abort 1 "Official artifact records .NET runtime ${OBSERVED_RUNTIME}; SDKs ${SDK_ALTERNATIVES} ship it but none is published as mcr.microsoft.com/dotnet/sdk:<version>-noble. Building with the pinned ${SDK_VERSION} would produce a known-false not_reproducible."
     fi
   else
     # The fallback pin ships a different runtime pack, so a build now is guaranteed to
     # differ for our reasons, not Wasabi's (2026-09-03: 20 minutes to a false verdict).
     log_error "Could not map runtime $OBSERVED_RUNTIME to an SDK (lookup stderr, first lines):"
     head -5 "$WORKSPACE/sdkmap-error.txt" 2>/dev/null | sed 's/^/    /' >&2
-    write_yaml "ftbfs" "  Official artifact records .NET runtime ${OBSERVED_RUNTIME} but the runtime-to-SDK lookup against ${RELEASES_URL} produced nothing (see ${WORKSPACE}/sdkmap-error.txt). A build with the pinned SDK ${SDK_VERSION} would use a different runtime pack and produce a known-false not_reproducible, so this is a tool/environment failure, not a verdict."
-    exit 1
+    abort 1 "The runtime-to-SDK lookup against ${RELEASES_URL} produced nothing (see ${WORKSPACE}/sdkmap-error.txt). Building with the pinned ${SDK_VERSION} would produce a known-false not_reproducible."
   fi
 else
   log_warning "Could not read a runtime version from the official artifact; falling back to SDK $SDK_VERSION"
@@ -486,8 +473,7 @@ SDK_DIGEST=$($CONTAINER_CMD run --rm $CONTAINER_RUN_USER_ARGS "$BOOTSTRAP_IMAGE"
   "https://mcr.microsoft.com/v2/dotnet/sdk/manifests/${SDK_VERSION}-noble" | tr -d '\r' \
   | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p' || true)
 if ! [[ "$SDK_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-  write_yaml "ftbfs" "  Could not resolve the digest of mcr.microsoft.com/dotnet/sdk:${SDK_VERSION}-noble."
-  exit 1
+  abort 1 "Could not resolve the digest of mcr.microsoft.com/dotnet/sdk:${SDK_VERSION}-noble."
 fi
 log_info "SDK image: mcr.microsoft.com/dotnet/sdk:${SDK_VERSION}-noble@${SDK_DIGEST}"
 log_info "Generating embedded Dockerfile with .NET SDK ${SDK_VERSION}-noble..."
@@ -511,9 +497,7 @@ log_success "Dockerfile generated"
 IMAGE_NAME="wasabi-build:${VERSION_NO_V}-${ARCH}-${TYPE}-${RUN_ID}"
 log_info "Building container image (this may take a while on first run)..."
 if ! $CONTAINER_CMD build -t "$IMAGE_NAME" -f "$DOCKERFILE_PATH" "$WORKSPACE"; then
-  log_error "Container build failed"
-  write_yaml "ftbfs" "  Failed to build the verification container image (dotnet SDK ${SDK_VERSION}-noble base)."
-  exit 1
+  abort 1 "Failed to build the verification container image (dotnet SDK ${SDK_VERSION}-noble base)."
 fi
 log_success "Container image built: $IMAGE_NAME"
 
@@ -530,9 +514,7 @@ CLONE_STEPS="git init -q walletwasabi && cd walletwasabi && \
 if ! $CONTAINER_CMD run --rm $CONTAINER_RUN_USER_ARGS \
   -v "$WORKSPACE:/workspace:Z" -w /workspace \
   "$IMAGE_NAME" bash -c "$CLONE_STEPS"; then
-  log_error "Failed to clone repository at tag $GIT_TAG"
-  write_yaml "ftbfs" "  Failed to clone WalletWasabi at tag ${GIT_TAG}."
-  exit 1
+  abort 1 "Failed to clone WalletWasabi at tag ${GIT_TAG}."
 fi
 log_success "Cloned repository at $GIT_TAG"
 
@@ -587,24 +569,18 @@ if echo "$GPG_VERIFICATION" | grep -q "ANNOTATED_TAG_SIGNATURE_UNCHECKED"; then
   log_error "Tag ${GIT_TAG} is annotated (signed) but its signature could NOT be checked:"
   log_error "the zkSNACKs key could not be fetched from any keyserver. This is a network or"
   log_error "keyserver failure, NOT evidence of a bad signature. Refusing to build rather than"
-  log_error "report an unverified signed tag as if it were checked."
-  write_yaml "ftbfs" "  Tag ${GIT_TAG} is annotated but its GPG signature could not be checked: the zkSNACKs signing key could not be fetched from any keyserver (network/keyserver failure, not a bad signature). Commit ${ACTUAL_COMMIT}. Refusing to build."
-  exit 1
+  abort 1 "report an unverified signed tag as if it were checked. Commit ${ACTUAL_COMMIT}."
 fi
 if echo "$GPG_VERIFICATION" | grep -q "ANNOTATED_TAG_SIGNATURE_INVALID"; then
   log_error "Tag ${GIT_TAG} is annotated but its GPG signature did NOT verify."
-  log_error "Refusing to build from a tag whose signature fails to validate."
-  write_yaml "ftbfs" "  Tag ${GIT_TAG} is annotated but its GPG signature failed to verify (commit ${ACTUAL_COMMIT}). Refusing to build."
-  exit 1
+  abort 1 "Refusing to build from a tag whose signature fails to validate (commit ${ACTUAL_COMMIT})."
 fi
 if echo "$GPG_VERIFICATION" | grep -q "KEY_UNAVAILABLE"; then
   log_warning "zkSNACKs signing key could not be fetched from any keyserver (network or"
   log_warning "keyserver issue). This is INCONCLUSIVE, not a key mismatch. Recording commit"
   log_warning "  ${ACTUAL_COMMIT}"
 elif echo "$GPG_VERIFICATION" | grep -q "FINGERPRINT_MISMATCH"; then
-  log_error "GPG key fingerprint mismatch! Possible key substitution attack"
-  write_yaml "ftbfs" "  GPG key fingerprint mismatch for zkSNACKs signing key at commit ${ACTUAL_COMMIT}."
-  exit 1
+  abort 1 "GPG key fingerprint mismatch! Possible key substitution attack (commit ${ACTUAL_COMMIT})."
 elif echo "$GPG_VERIFICATION" | grep -q "FINGERPRINT_OK"; then
   log_success "GPG key fingerprint verified"
   if echo "$GPG_VERIFICATION" | grep -q "Good signature"; then
@@ -628,9 +604,7 @@ RELEASE_SCRIPT_SOURCE="$WORKSPACE/walletwasabi/Contrib/release.sh"
 RELEASE_SCRIPT_RUNNER="$WORKSPACE/release-under-test.sh"
 
 if [ ! -f "$RELEASE_SCRIPT_SOURCE" ]; then
-  log_error "Tag $GIT_TAG does not contain Contrib/release.sh"
-  write_yaml "ftbfs" "  Tag ${GIT_TAG} (commit ${ACTUAL_COMMIT}) does not contain Contrib/release.sh; the upstream Debian build procedure is unavailable."
-  exit 1
+  abort 1 "Tag ${GIT_TAG} (commit ${ACTUAL_COMMIT}) does not contain Contrib/release.sh; nothing was built."
 fi
 
 UPSTREAM_RELEASE_SCRIPT_HASH="$(sha256sum "$RELEASE_SCRIPT_SOURCE" | awk '{print $1}')"
@@ -638,7 +612,7 @@ cp "$RELEASE_SCRIPT_SOURCE" "$RELEASE_SCRIPT_RUNNER"
 log_info "Upstream release script: Contrib/release.sh from $GIT_TAG"
 log_info "Upstream release script sha256: $UPSTREAM_RELEASE_SCRIPT_HASH"
 
-# Upstream GitHub Actions runs this script through sudo, so dpkg-deb sees a
+# Upstream GitHub Actions runs this script as root, so dpkg-deb sees a
 # root-owned staging tree. Our container is deliberately mapped to the invoking
 # user so it cannot leave undeletable host files. Apply the equivalent
 # dpkg-deb option to a disposable copy of the requested tag's script.
@@ -646,7 +620,7 @@ if grep -Fq "dpkg-deb --root-owner-group" "$RELEASE_SCRIPT_RUNNER"; then
   RELEASE_ADAPTATION="upstream already uses dpkg-deb --root-owner-group"
 elif [ "$(grep -Fc "dpkg-deb -Zxz --build" "$RELEASE_SCRIPT_RUNNER" || true)" -eq 1 ]; then
   sed -i 's/dpkg-deb -Zxz --build/dpkg-deb --root-owner-group -Zxz --build/' "$RELEASE_SCRIPT_RUNNER"
-  RELEASE_ADAPTATION="added dpkg-deb --root-owner-group to match upstream sudo ownership"
+  RELEASE_ADAPTATION="added dpkg-deb --root-owner-group to match upstream root ownership"
 else
   RELEASE_ADAPTATION="none; no recognized dpkg-deb ownership command"
   log_warning "Could not identify the upstream dpkg-deb command for the root-owner adaptation."
@@ -667,23 +641,27 @@ log_info "Running Contrib/release.sh from $GIT_TAG with target: $BUILD_TARGET"
 # Preserve GitHub Actions' source path for releases before upstream added
 # PathMap. Newer tags carry their own path normalization and are still run
 # unchanged. RUNNER_OS is normally supplied by GitHub Actions.
-if ! $CONTAINER_CMD run --name "$CONTAINER_NAME" $CONTAINER_RUN_USER_ARGS \
+BUILD_RC=0
+$CONTAINER_CMD run --name "$CONTAINER_NAME" $CONTAINER_RUN_USER_ARGS \
   -e RUNNER_OS=Linux \
   -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
   -v "$WORKSPACE/walletwasabi:/home/runner/work/WalletWasabi/WalletWasabi:Z" \
   -v "$RELEASE_SCRIPT_RUNNER:/workspace/release-under-test.sh:Z,ro" \
   "$IMAGE_NAME" \
-  bash -c "cd /home/runner/work/WalletWasabi/WalletWasabi && bash -x /workspace/release-under-test.sh '$BUILD_TARGET'"; then
-  log_error "Build failed inside container"
-  write_yaml "ftbfs" "  Upstream Contrib/release.sh from ${GIT_TAG} (sha256 ${UPSTREAM_RELEASE_SCRIPT_HASH}) failed to build from source at commit ${ACTUAL_COMMIT}. Verifier adaptation: ${RELEASE_ADAPTATION}."
-  exit 1
-fi
+  bash -c "cd /home/runner/work/WalletWasabi/WalletWasabi && bash -x /workspace/release-under-test.sh '$BUILD_TARGET'" || BUILD_RC=$?
+case "$BUILD_RC" in
+  0) ;;
+  125|126|127|130|137|143)
+    abort 1 "Build container did not finish (exit ${BUILD_RC}: runtime failure, stop, kill or out of memory)." ;;
+  *)
+    log_error "Build failed inside container (exit ${BUILD_RC})"
+    write_yaml "ftbfs" "  Upstream Contrib/release.sh from ${GIT_TAG} (sha256 ${UPSTREAM_RELEASE_SCRIPT_HASH}) failed to build from source at commit ${ACTUAL_COMMIT} (exit ${BUILD_RC}). Verifier adaptation: ${RELEASE_ADAPTATION}."
+    exit 1 ;;
+esac
 
 log_info "Copying build artifact from container: $EXPECTED_FILE"
 if ! $CONTAINER_CMD cp "$CONTAINER_NAME:/home/runner/work/WalletWasabi/WalletWasabi/packages/$EXPECTED_FILE" "$WORKSPACE/output/$EXPECTED_FILE"; then
-  log_error "Expected build output not found: $EXPECTED_FILE"
-  write_yaml "ftbfs" "  Build succeeded but expected artifact ${EXPECTED_FILE} was not found in packages/."
-  exit 1
+  abort 1 "The build worked, but ${EXPECTED_FILE} was not found in packages/."
 fi
 log_success "Build completed and artifact copied"
 
@@ -775,13 +753,11 @@ else
   fi
 fi
 
-# Acceptance check from non-sudo-directories-guideline.md. The EXIT trap repeats
+# Acceptance check for caller-owned files. The EXIT trap repeats
 # it on failed runs; this explicit pass records success in completed validations.
 FIRST_FOREIGN_OWNED="$(find_foreign_owned_workspace_file)"
 if [ -n "$FIRST_FOREIGN_OWNED" ]; then
-  log_error "Workspace contains a file not owned by UID $(id -u): $FIRST_FOREIGN_OWNED"
-  write_yaml "ftbfs" "  Workspace ownership guarantee failed: ${FIRST_FOREIGN_OWNED} is not owned by invoking UID $(id -u)."
-  exit 1
+  abort 1 "Workspace contains a file not owned by UID $(id -u): $FIRST_FOREIGN_OWNED"
 fi
 log_success "Workspace ownership check passed: every generated path is owned by UID $(id -u)."
 OWNERSHIP_CHECK_RECORDED=true
@@ -800,7 +776,7 @@ NOTES="  Wasabi ${VERSION} (--arch ${ARCH} --type ${TYPE}). The build ran
   confined to WalletWasabi's own assemblies would point at the feature band, not the runtime.
   The script exports SOURCE_DATE_EPOCH and lets the
   requested tag's release procedure apply its own normalization. New versions are
-  attempted rather than rejected; an incompatible release procedure or SDK reports
+  attempted rather than rejected; a release procedure that fails to build reports
   ftbfs. zip artifacts are not timestamp-normalized by known 2.8.x upstream scripts
   and are expected to differ on that basis alone. --type msi is
   rejected outright (exit 2): WiX Toolset has no Linux port, and the published
