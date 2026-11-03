@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# pcash_build.sh - P.CASH Terminal reproducible build verification, every channel
-# Version:          v0.9.0
+# P.CASH Terminal reproducible build verification, every channel
+# Version:          v0.9.1
 # Organization:     WalletScrutiny.com
 # Last modified by: Carol (Buzz), Claude Code for Danny
-# Last modified on: 2026-11-02
+# Last modified on: 2026-11-03
 # App ID:           cash.p.terminal
 # Project:          https://github.com/piratecash/pcash-wallet
 #
@@ -20,16 +20,16 @@
 # Users are responsible for lawful use. Review before running.
 # Exit codes: 0 = identical, 1 = difference or build failure, 2 = wrong input (no YAML).
 
-SCRIPT_VERSION="v0.9.0"
+SCRIPT_VERSION="v0.9.1"
 
 SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
 SCRIPT_HASH="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
-echo "pcash_build.sh $SCRIPT_VERSION sha256:${SCRIPT_HASH:-N/A}"
+echo "$(basename -- "$SCRIPT_PATH") $SCRIPT_VERSION sha256:${SCRIPT_HASH:-N/A}"
 
 # No -e: diff and cmp return 1 on legitimate differences.
 set -uo pipefail
 
-SCRIPT_NAME="pcash_build.sh"
+SCRIPT_NAME="$(basename -- "$SCRIPT_PATH")"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_ID="cash.p.terminal"
 REPO_URL="https://github.com/piratecash/pcash-wallet"
@@ -46,14 +46,11 @@ banner() { printf '\n== %s ==\n  %s\n' "$*" "$(date)"; }
 section() { printf -- '\n-- %s --\n' "$*"; }
 sha256of() { sha256sum "$1" | awk '{print $1}'; }
 
-# The YAML must land in the SCRIPT's directory (ABS reads it there); $PWD copy is convenience.
 execution_dir="$SCRIPT_DIR"
 invocation_dir="$(pwd -P)"
-# A stale verdict must never outlive a refused run. --help is not a run.
 [[ " $* " == *" --help "* || " $* " == *" -h "* ]] || \
   rm -f "${execution_dir}/COMPARISON_RESULTS.yaml" "${invocation_dir}/COMPARISON_RESULTS.yaml"
 
-# Only these three keys, ever: script_version, verdict, notes.
 generate_yaml() {
   cat > "${execution_dir}/COMPARISON_RESULTS.yaml" <<EOF
 script_version: $SCRIPT_VERSION
@@ -66,23 +63,23 @@ EOF
   log_info "COMPARISON_RESULTS.yaml written with verdict: $1"
 }
 
-# ftbfs: only when the source itself fails to build (or cannot be pinned to published source).
+# ftbfs: only when the source itself fails to build.
 fail() { generate_yaml "ftbfs" "$2"; echo ""; echo "Exit code: $1"; exit "$1"; }
 
-# Wrong input is not a build result: no YAML, exit 2, so ABS tries its next script.
+# Wrong input is not a build result: no YAML, exit 2.
 die_invalid() {
   log_error "$1"
   echo ""; echo "Exit code: 2 (wrong input; no COMPARISON_RESULTS.yaml written)"
   exit 2
 }
 
-# Not a build result either (image, network, download, tooling): no YAML, exit 1.
 abort() {
   log_error "$1"
   echo ""; echo "Exit code: 1 (no verdict; no COMPARISON_RESULTS.yaml written)"
   exit 1
 }
 
+trap 'echo ""; log_error "Stopped. No verdict written."; exit 130' INT TERM
 [[ "$EUID" -eq 0 ]] && die_invalid "Do not run this script as root."
 
 version_arg=""; binary_arg=""; arch_arg=""; type_arg=""; rev_arg="${WS_GIT_REVISION:-}"
@@ -99,7 +96,8 @@ Usage: ${SCRIPT_NAME} [--binary <path>] [--version <v>] [--type google|fdroid] [
  --version/--type  Without --binary: release (default latest) and google|fdroid (default fdroid).
  --git-revision  Commit to build. Default: the APK's version-control-info.textproto, then the
                  release tag, then (Play) the oldest master commit with its versionName+versionCode.
- --arch          Logged. WS_DEVICE_SDK env: Play device API level (36). GITHUB_TOKEN env: optional.
+ --arch          Checked against the artifact's ABIs; mismatch exits 2.
+ WS_DEVICE_SDK env: Play device API level (36). GITHUB_TOKEN env: optional.
 
 Exit codes: 0 = identical, 1 = any difference, 2 = wrong input (no YAML written).
 USAGE
@@ -135,15 +133,22 @@ else
 fi
 [[ -z "$rev_arg" || "$rev_arg" =~ ^[0-9a-fA-F]{7,40}$ ]] || \
   die_invalid "--git-revision must be 7-40 hex characters (got: '${rev_arg}')"
-[[ -n "$arch_arg" ]] && log_info "--arch ${arch_arg} logged; ABIs come from the artifact"
+want_abi=""
+case "$arch_arg" in
+  "") ;;
+  arm64-v8a|arm64_v8a|arm64|aarch64) want_abi=arm64-v8a ;;
+  armeabi-v7a|armeabi_v7a|armv7|arm) want_abi=armeabi-v7a ;;
+  x86_64|x86-64|amd64) want_abi=x86_64 ;;
+  x86|i686) want_abi=x86 ;;
+  *) die_invalid "--arch '${arch_arg}' is not an Android ABI" ;;
+esac
 
 if [[ -z "${CONTAINER_CMD:-}" ]]; then
-  if command -v docker &>/dev/null; then CONTAINER_CMD=docker
-  elif command -v podman &>/dev/null; then CONTAINER_CMD=podman
+  if command -v podman &>/dev/null; then CONTAINER_CMD=podman
+  elif command -v docker &>/dev/null; then CONTAINER_CMD=docker
   else die_invalid "Neither docker nor podman found in PATH"; fi
 fi
 
-# Container user = host user, so no root-owned leftovers. HOME=/tmp: apktool caches there.
 if [[ "$CONTAINER_CMD" == "podman" ]]; then
   CONTAINER_RUN_USER_ARGS=(--userns=keep-id -e HOME=/tmp)
 else
@@ -168,11 +173,9 @@ OFFICIAL_DIR="${workspace}/official"
 DL_DIR="${workspace}/download"
 img_ctx=""
 
-# Exclusive: a run only ever touches the directory it created.
 mkdir "$workspace" || abort "Could not create workspace ${workspace}"
 mkdir -p "$META_DIR" "$BUILD_DIR" "$CMP_DIR" "$OFFICIAL_DIR" "$DL_DIR" || abort "Could not create workspace folders"
 
-# Docker: root in the container, so it can chown. Rootless podman: caller = 0 in its namespace.
 ensure_user_ownership() {
   [[ -e "$1" ]] || return 0
   if [[ "$CONTAINER_CMD" == "podman" ]]; then
@@ -204,8 +207,6 @@ EOF
 banner "SETUP: BUILD CONTAINER IMAGE"
 img_ctx="$(mktemp -d -p "$workspace")"
 
-# bundletool must match the one AGP embeds (AGP 9.0.1 -> 1.18.3); /build chmod:
-# WORKDIR alone is root-owned and the mapped-user clone fails.
 cat > "${img_ctx}/Dockerfile" <<'DOCKERFILE_END'
 FROM docker.io/library/ubuntu:24.04@sha256:a08e551cb33850e4740772b38217fc1796a66da2506d312abe51acda354ff061
 ARG DEBIAN_FRONTEND=noninteractive
@@ -221,9 +222,11 @@ RUN mkdir -p ${ANDROID_HOME}/cmdline-tools && cd ${ANDROID_HOME}/cmdline-tools &
   unzip -q c.zip && rm c.zip && mv cmdline-tools latest
 RUN yes | sdkmanager --licenses >/dev/null && \
   sdkmanager "platforms;android-36" "platforms;android-37.0" "build-tools;36.0.0" "platform-tools" >/dev/null
-ADD https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar /opt/bundletool.jar
-ADD https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar /opt/apktool.jar
-RUN chmod 0644 /opt/bundletool.jar /opt/apktool.jar
+RUN cd /opt && curl -fsSL -o bundletool.jar https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar && \
+  echo "a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29  bundletool.jar" | sha256sum -c - && \
+  curl -fsSL -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar && \
+  echo "dbf930b076c6b9be08d57c449cacefc3bdd6b71ebd59b3066fc0e1f5b14f9423  apktool.jar" | sha256sum -c - && \
+  chmod 0644 bundletool.jar apktool.jar
 RUN mkdir -p /tmp/afw /build && chmod 0777 /tmp /tmp/afw /build
 WORKDIR /build
 DOCKERFILE_END
@@ -233,7 +236,6 @@ $CONTAINER_CMD build -t "$IMG" -f "${img_ctx}/Dockerfile" "$img_ctx" || \
   abort "Container image build failed (see above; mirror or network). No verdict."
 log_success "Image built: ${IMG}"
 
-# Both detached signatures must be VALIDSIG by the pinned fingerprint and the checksum must match.
 if [[ "$NEED_DOWNLOAD" -eq 1 ]]; then
   banner "PHASE A: DOWNLOAD AND AUTHENTICATE p.cash.apk"
   cat > "${img_ctx}/fetch.sh" <<'FETCH_END'
@@ -275,7 +277,6 @@ fi
 
 banner "PHASE 0: CLASSIFY INPUT, OFFICIAL METADATA"
 
-# Classify from contents: aapt2 split= attribute and the manifest's required-splits markers.
 cat > "${img_ctx}/meta.sh" <<'META_END'
 #!/bin/bash
 set -uo pipefail
@@ -309,7 +310,6 @@ if [[ "$k" == play ]]; then A=/stage/base.apk; else A=/stage/p.cash.apk; fi
 cp "$base" "$A"
 
 info="$("$AAPT2" dump badging $A 2>/dev/null)"
-# Anchor on '^package:' and stop at the first quote (a greedy match returns versionName).
 pkg="$(grep '^package:' <<<"$info" | sed "s/^package: name='\([^']*\)'.*/\1/")"
 vname="$(grep '^package:' <<<"$info" | sed "s/.*versionName='\([^']*\)'.*/\1/")"
 vcode="$(grep '^package:' <<<"$info" | sed "s/.*versionCode='\([^']*\)'.*/\1/")"
@@ -319,27 +319,23 @@ rev="$(unzip -p $A META-INF/version-control-info.textproto 2>/dev/null \
 agp="$(unzip -p $A META-INF/com/android/build/gradle/app-metadata.properties 2>/dev/null \
   | sed -n 's/^androidGradlePluginVersion=//p' | head -1)"
 
-# Read the dex strings ONCE into a file: `strings | grep -q` under pipefail reports a false
-# "no match" when grep exits early and strings dies of SIGPIPE.
 rm -rf /tmp/dex && mkdir -p /tmp/dex
 unzip -q -o $A 'classes*.dex' -d /tmp/dex 2>/dev/null
 : > /tmp/ds.txt
 compgen -G "/tmp/dex/classes*.dex" > /dev/null && strings -a /tmp/dex/classes*.dex > /tmp/ds.txt 2>/dev/null
-# GIT_HASH is "<10hex>[-dirty][-fdroid]"; only the literal for the recorded revision is probative.
 gh=""; [[ -n "$rev" ]] && gh="$(grep -m1 -xE "${rev:0:10}(-dirty)?(-fdroid)?" /tmp/ds.txt)"
-# Report EVERY branch literal: head -1 would always claim "f-droid" (sorts first).
 gitbr="$(grep -xE 'f-droid|master' /tmp/ds.txt | sort -u | paste -sd, -)"
 
-# Lineage: ANY hit in any staged APK = present. A bare com.google.android.gms dex string is
-# NOT a signal: the f-droid 1.0.260 dex carries one.
 GPAT='firebase|crashlytics|com/google/android/gms'
-fb=0; bp=0; sigs=""
+fb=0; bp=0; sigs=""; abis=""
 for f in /stage/*.apk; do
   L="$(unzip -l "$f" 2>/dev/null)"; n="$(basename "$f")"
   grep -qiE "$GPAT" <<<"$L" && { fb=1; sigs="${sigs}zipnames:${n} "; }
   grep -qiE 'lib/[^/]+/lib(crashlytics|gms|google)' <<<"$L" && { fb=1; sigs="${sigs}nativelib:${n} "; }
   grep -q 'assets/dexopt/baseline.prof' <<<"$L" && bp=1
+  abis="${abis}$(sed -n 's|.* lib/\([^/]*\)/.*|\1|p' <<<"$L")"$'\n'
 done
+abis="$(grep . <<<"$abis" | sort -u | paste -sd, -)"
 grep -qE 'com\.google\.firebase' /tmp/ds.txt && { fb=1; sigs="${sigs}dexstrings:$(basename $A) "; }
 rm -rf /tmp/dres
 if java -jar /opt/apktool.jar d -f --no-src --no-debug-info --frame-path /tmp/afw -o /tmp/dres $A >/dev/null 2>&1; then
@@ -350,7 +346,7 @@ fi
 
 for kv in "pkg_name:${pkg:-unknown}" "version_name:${vname:-unknown}" "version_code:${vcode:-unknown}" \
   "signer:${signer:-unknown}" "vcs_revision:${rev}" "agp:${agp}" "gh:${gh}" "git_branch:${gitbr}" \
-  "has_firebase:${fb}" "has_baseline_profile:${bp}" "google_signals:${sigs:-none}"; do
+  "has_firebase:${fb}" "has_baseline_profile:${bp}" "google_signals:${sigs:-none}" "abis:${abis}"; do
   out "${kv%%:*}" "${kv#*:}"
 done
 echo "[META] ${pkg} ${vname}/${vcode}, vcs revision ${rev:-<none>}, AGP ${agp:-?}"
@@ -390,6 +386,10 @@ app_hash="$(sha256of "$apk_file")"
 
 [[ "$pkg_id" == "$APP_ID" ]] || die_invalid "APK package name mismatch: expected ${APP_ID}, got ${pkg_id}"
 log_success "Package name verified: ${pkg_id}"
+if [[ -n "$want_abi" ]]; then
+  [[ ",$(meta abis)," == *",${want_abi},"* ]] || die_invalid "--arch ${want_abi}: the official artifact carries '$(meta abis)'"
+  log_success "--arch ${want_abi} is in the official artifact"
+fi
 [[ -n "$wallet_version" && "$wallet_version" != "unknown" ]] || die_invalid "Could not read versionName from the APK"
 log_success "Version: $wallet_version (versionCode $version_code)"
 log_info    "Signer SHA-256:   ${signer}"
@@ -410,7 +410,6 @@ else
   LINEAGE="f-droid"; CHANNEL="github/f-droid p.cash.apk (-fdroid)"; TAG="v${wallet_version}-fdroid"
   TASK=":app:assembleRelease"; GRADLE_FLAGS="-Pfdroid=true"; FLAG_WHY="F-Droid recipe (gradleProps fdroid=true)"
 fi
-# -Pfdroid=true only disables the ArtProfile tasks: an APK without baseline.prof was built so.
 if [[ "$KIND" == apk && "$LINEAGE" == master && "$has_baseline" == "0" ]]; then
   GRADLE_FLAGS="-Pfdroid=true"; FLAG_WHY="official APK has no assets/dexopt/baseline.prof"
 fi
@@ -444,16 +443,13 @@ banner "PHASE 1: BUILD FROM SOURCE"
 cat > "${img_ctx}/build.sh" <<'BUILD_END'
 #!/bin/bash
 set -uo pipefail
-# app/build.gradle throws if some but not all FIREBASE_DEV_* are set; BUILD_NUMBER overrides versionCode.
 unset FIREBASE_DEV_KEYSTORE_PATH FIREBASE_DEV_STORE_PASSWORD FIREBASE_DEV_KEY_ALIAS FIREBASE_DEV_KEY_PASSWORD BUILD_NUMBER
 export GRADLE_USER_HOME=/tmp/gradle-home
 mkdir -p "$GRADLE_USER_HOME"
 
 echo "=== Clone ${REPO_URL} === $(date)"
-# The checkout directory name is the Gradle root project name unless settings.gradle pins it
-# (upstream 5bc084d32, 2026-09-19); it leaks into KMP module names and so into the dex.
 SRC=/build/pcash-wallet-android
-git clone "$REPO_URL" "$SRC" || { echo "FATAL: clone failed"; exit 1; }
+git clone "$REPO_URL" "$SRC" || { echo "FATAL: clone failed"; exit 5; }
 cd "$SRC"
 git config --global --add safe.directory "$SRC"
 
@@ -478,7 +474,6 @@ if [[ -n "$GIT_REF" ]]; then
   [[ "$vn" == "$WANT_VNAME" && "$vc" == "$WANT_VCODE" ]] \
     || echo "  WARNING: it declares versionName ${vn:-?} / versionCode ${vc:-?}, the artifact is ${WANT_VNAME}/${WANT_VCODE}"
 else
-  # Walk master's first-parent line for commits declaring BOTH versionName and versionCode.
   echo "=== Pinning master revision for ${WANT_VNAME} / versionCode ${WANT_VCODE} ==="
   : > /output/mc.txt
   for c in $(git rev-list --first-parent origin/master); do
@@ -497,7 +492,6 @@ else
 fi
 printf '%s\n' "$n" > /output/candidate-count.txt
 
-# Named branch, not detached HEAD: the branch name feeds getGitVersionSuffix() (-fdroid suffix).
 git checkout -B "$BRANCH" "$GIT_REF" || { echo "FATAL: could not check out ${GIT_REF}"; exit 2; }
 echo "=== Revision under build ==="
 git log -1 --pretty=format:'%H %ci %s' ; echo
@@ -507,7 +501,6 @@ agp="$(sed -n 's/^\(gradle\|androidGradlePlugin\) = "\([^"]*\)".*/\2/p' gradle/l
 printf '%s\n' "$agp" > /output/agp.txt
 echo "AGP at this revision: ${agp:-?}"
 
-# Release tag provenance (reported, never decisive).
 t="${TAG}: absent"
 if [[ -n "$tag_commit" ]]; then
   ty="$(git cat-file -t "refs/tags/${TAG}")"
@@ -527,11 +520,16 @@ echo "=== Gradle: ./gradlew clean ${TASK} ${GFLAGS} === $(date)"
 ./gradlew --no-daemon --max-workers=2 clean "$TASK" $GFLAGS > /output/gradle-build.log 2>&1
 rc=$?
 tail -60 /output/gradle-build.log
-[[ $rc -ne 0 ]] && { echo "FATAL: gradle build failed (exit ${rc}) - full log at /output/gradle-build.log"; exit 3; }
+if [[ $rc -ne 0 ]]; then
+  L=/output/gradle-build.log
+  (( rc >= 128 )) && { echo "FATAL: gradle killed by signal $((rc - 128))"; exit 6; }
+  grep -qE 'No space left on device|java\.lang\.OutOfMemoryError|daemon disappeared unexpectedly|exit value 137' "$L" && { echo "FATAL: gradle ran out of memory or disk"; exit 6; }
+  grep -qE 'UnknownHostException|Temporary failure in name resolution|Connection (timed out|reset)|Read timed out|Could not (GET|HEAD) .https?://' "$L" && { echo "FATAL: gradle failed on the network"; exit 5; }
+  echo "FATAL: gradle build failed (exit ${rc}) - full log at $L"; exit 3
+fi
 mkdir -p /output/built
 
 if [[ "$MODE" == apk ]]; then
-  # app/build.gradle renames every release output to p.cash.apk (androidComponents.onVariants).
   out="app/build/outputs/apk/release/p.cash.apk"
   [[ -f "$out" ]] || { echo "FATAL: ${out} not found"; find app/build/outputs -name '*.apk' | head; exit 3; }
   cp "$out" /output/built/p.cash.apk
@@ -540,7 +538,6 @@ else
   aab="$(find app/build/outputs/bundle -name '*.aab' | head -1)"
   [[ -n "$aab" ]] || { echo "FATAL: no .aab produced under app/build/outputs/bundle"; exit 3; }
   AAPT2="$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort | tail -1)"
-  # Device-spec from the OFFICIAL split names; a wrong spec surfaces as UNMATCHED, never a false pass.
   ABIS=(); DEN=""
   for f in /official/*.apk; do
     c="$(basename "$f")"; c="${c#*config.}"; c="${c%.apk}"
@@ -552,7 +549,6 @@ else
   done
   [[ ${#ABIS[@]} -eq 0 ]] && ABIS=("arm64-v8a")
   [[ -z "$DEN" ]] && DEN=480
-  # Device API level is a property of the PHONE, not readable from the APKs.
   if [[ -n "${WS_DEVICE_SDK:-}" ]]; then SDK="$WS_DEVICE_SDK"; SDK_SRC="supplied via WS_DEVICE_SDK"
   else SDK=36; SDK_SRC="DEFAULT GUESS -- pass WS_DEVICE_SDK=\$(adb shell getprop ro.build.version.sdk)"; fi
   echo "=== device sdkVersion: ${SDK} (${SDK_SRC}) ==="
@@ -561,13 +557,14 @@ else
     "$ABIJSON" "$DEN" "$SDK" > /output/device-spec.json
   cat /output/device-spec.json
   java -jar /opt/bundletool.jar build-apks --bundle="$aab" --output=/output/built.apks \
-    --device-spec=/output/device-spec.json --aapt2="$AAPT2" --overwrite || { echo "FATAL: bundletool build-apks failed"; exit 3; }
+    --device-spec=/output/device-spec.json --aapt2="$AAPT2" --overwrite || { echo "FATAL: bundletool build-apks failed"; exit 7; }
   mkdir -p /output/bt
-  unzip -q -o /output/built.apks 'splits/*.apk' -d /output/bt
-  cp /output/bt/splits/*.apk /output/built/
+  unzip -q -o /output/built.apks 'splits/*.apk' -d /output/bt && cp /output/bt/splits/*.apk /output/built/ \
+    || { echo "FATAL: could not extract bundletool's splits"; exit 7; }
 fi
 echo "=== built APKs ==="; sha256sum /output/built/*.apk
-grep -q 'assets/dexopt/baseline.prof' <<<"$(unzip -l /output/built/*.apk 2>/dev/null)" && echo "built: baseline.prof present" || echo "built: no baseline.prof"
+np=0; for a in /output/built/*.apk; do grep -q 'assets/dexopt/baseline.prof' <<<"$(unzip -l "$a" 2>/dev/null)" && np=$((np + 1)); done
+echo "built: baseline.prof in ${np} APK(s)"
 
 grep -Eo 'https://jitpack\.io/[^ ]+\.(aar|jar|pom)' /output/gradle-build.log 2>/dev/null | sort -u > /output/jitpack-artifacts.txt
 find "$GRADLE_USER_HOME/caches/modules-2/files-2.1" -path '*com.github.piratecash*' -name '*.aar' -print0 2>/dev/null \
@@ -587,14 +584,16 @@ crun -e "WS_DEVICE_SDK=${WS_DEVICE_SDK:-}" -e "WS_GIT_REVISION=${build_rev}" -e 
 BUILD_RC=${PIPESTATUS[0]}
 
 if [[ $BUILD_RC -ne 0 ]]; then
-  # 1 clone, 2 checkout/dirty tree, 3 gradle/bundletool, 4 revision not found.
-  if [[ $BUILD_RC -eq 4 ]]; then
-    log_error "Cannot pin a revision (${rev_source}). This is a FINDING, not a script fault."
-    fail 1 "${CHANNEL}, ${LINEAGE} lineage: no published source revision found (${rev_source}${build_rev:+: $build_rev}). No build attempted. Official $(basename "$apk_file") SHA-256: ${app_hash}."
-  fi
-  [[ $BUILD_RC -eq 1 ]] && abort "git clone failed (container exit 1). Network, not a build result. No verdict."
-  log_error "Source build failed (exit ${BUILD_RC}: 2 checkout, 3 gradle/bundletool). Log: ${BUILD_DIR}/gradle-build.log"
-  fail 1 "Source build failed for ${APP_ID} $wallet_version, ${CHANNEL} (container exit ${BUILD_RC}). Official $(basename "$apk_file") SHA-256: ${app_hash}."
+  # 3 = gradle failed: the only code that says something about the source.
+  OFF="Official $(basename "$apk_file") SHA-256: ${app_hash}."
+  case $BUILD_RC in
+    3) log_error "Source build failed. Log: ${BUILD_DIR}/gradle-build.log"
+       fail 1 "Source build failed for ${APP_ID} $wallet_version, ${CHANNEL}. $OFF" ;;
+    4) abort "No published source revision found (${rev_source}${build_rev:+: $build_rev}); nothing built. A finding, not a build result. No verdict. $OFF" ;;
+    5) abort "Clone or a download failed on the network. No verdict." ;;
+    6) abort "Build killed or out of memory/disk (raise MEM_LIMIT or free space). No verdict." ;;
+    *) abort "Build container failed outside the build (exit ${BUILD_RC}: checkout, tooling, runtime or stop). No verdict." ;;
+  esac
 fi
 log_success "Source build finished"
 
@@ -615,7 +614,6 @@ if [[ -n "$git_hash" && -n "$built_hash_expect" ]]; then
 fi
 log_info "Release tag: ${tag_info}"
 
-# PHASE 2: no general acceptable-diffs filtering; every raw diff must be EARNED by a class.
 banner "PHASE 2: COMPARISON (per APK / per split)"
 
 cat > "${img_ctx}/compare.sh" <<'CMP_END'
@@ -626,7 +624,6 @@ BT="${ANDROID_HOME}/build-tools/36.0.0"
 AAPT2="$BT/aapt2"
 APKSIGNER="$BT/apksigner"
 
-# Pair by the APK's own split= attribute, never by filename (bundletool names base-X.apk).
 cfg_of() {
   local s
   s="$("$AAPT2" dump badging "$1" 2>/dev/null | sed -n "s/.*split='\([^']*\)'.*/\1/p" | head -1)"
@@ -634,7 +631,6 @@ cfg_of() {
   printf '%s' "${s:-base}"
 }
 
-# Resource-aware (ElementTree) Crashlytics build_ids canonicaliser; every guard fails CLOSED.
 cat > /tmp/cn.py <<'PYEOF'
 import sys, os, re, collections
 import xml.etree.ElementTree as ET
@@ -708,6 +704,15 @@ if sum(K in x for x in lo) != 1 or sum(K in x for x in lb) != 1: die("key not un
 print("sole decoded difference is mapping_file_id %s vs %s" % (mo[1], mb[1]))
 PYEOF
 
+# diff -rq reports a one-sided directory as one line; expand it so every file is judged by name.
+expand_dirs() { local l r d p; while IFS= read -r l; do
+  if [[ "$l" =~ ^Only\ in\ (/tmp/[ob])(/[^:]*)?:\ (.*)$ ]]; then
+    r="${BASH_REMATCH[1]}"; d="${BASH_REMATCH[2]#/}"; p="${d:+$d/}${BASH_REMATCH[3]}"
+    if [[ -d "$r/$p" ]]; then (cd "$r" && find "$p" -type f | sort | sed "s|^|Only in $r: |")
+    else printf 'Only in %s: %s\n' "$r" "$p"; fi
+    continue; fi
+  printf '%s\n' "$l"; done; }
+
 # SourceStamp: EARNED, never filename-excluded. Play injects it post-build.
 stamp_ok() {
   local o="$1" n sz
@@ -721,8 +726,6 @@ stamp_ok() {
   echo "      stamp: 1 root entry, off-only, 32 bytes, apksigner SourceStamp OK"
 }
 
-# AndroidManifest: accepted ONLY if the sole delta is Play's distribution meta-data, off-only.
-# base has 3 entries, config splits only derived.apk.id: blocks must equal allowlisted names.
 manifest_ok() {
   local o="$1" b="$2" c="$3" d left bad n m
   "$AAPT2" dump xmltree --file AndroidManifest.xml "$o" > /tmp/mo.txt 2>/dev/null || return 1
@@ -731,10 +734,9 @@ manifest_ok() {
   printf '%s\n' "$d" > "/out/diff_manifest_${c}.txt"
   grep -q '^>' <<<"$d" && { echo "      manifest: BUILT-only lines present"; return 1; }
   left="$(grep '^<' <<<"$d" | sed 's/^< *//')"
-  bad="$(grep -vE '^E: meta-data|^A: [^ ]*android:name\(0x[0-9a-f]+\)="com\.android\.(stamp\.source|stamp\.type|vending\.derived\.apk\.id)"|^A: [^ ]*android:value\(0x[0-9a-f]+\)="(https://play\.google\.com/store|STAMP_TYPE_DISTRIBUTION_APK)"|^A: [^ ]*android:value\(0x[0-9a-f]+\)=4$' <<<"$left")"
+  bad="$(grep -vE '^E: meta-data|^A: [^ ]*android:name\(0x[0-9a-f]+\)="com\.android\.(stamp\.source|stamp\.type|vending\.derived\.apk\.id)"|^A: [^ ]*android:value\(0x[0-9a-f]+\)="(https://play\.google\.com/store|STAMP_TYPE_DISTRIBUTION_APK)"|^A: [^ ]*android:value\(0x[0-9a-f]+\)=[0-9]+$' <<<"$left")"
   if [[ -n "$(tr -d '[:space:]' <<<"$bad")" ]]; then
-    echo "      manifest: unexpected off-only line(s):"
-    head -3 <<<"$bad" | sed 's/^/        /'
+    echo "      manifest: unexpected off-only line(s), see diff_manifest_${c}.txt"
     return 1
   fi
   n=$(grep -c '^E: meta-data' <<<"$left")
@@ -743,7 +745,6 @@ manifest_ok() {
   echo "      manifest: $n off-only Play meta-data, none built-only"
 }
 
-# resources.arsc: decode both; accepted only when the decoded (or canonicalised) trees are identical.
 ARSC_CLASS=""
 arsc_ok() {
   local o="$1" b="$2" c="$3" rd rd2 pre=""
@@ -752,7 +753,7 @@ arsc_ok() {
     $APKTOOL d -f --no-src --no-debug-info --frame-path /tmp/afw -o "/tmp/d${x%% *}" "${x#* }" >/dev/null 2>&1 || { echo "      arsc: DECODE FAILED (${x%% *})"; return 1; }
   done
   [[ -d /tmp/do/res && -d /tmp/db/res ]] || { echo "      arsc: no res/ after decode"; return 1; }
-  rd="$(diff -r /tmp/do/res /tmp/db/res 2>/dev/null)"
+  rd="$(diff -r /tmp/do/res /tmp/db/res 2>/dev/null)"; (( $? < 2 )) || { echo "      arsc: diff failed"; return 1; }
   printf '%s\n' "$rd" > "/out/diff_resources_decoded_${c}.txt"
   if [[ -z "$(tr -d '[:space:]' <<<"$rd")" ]]; then
     ARSC_CLASS="decoded-identical"; echo "      arsc: decoded res/ tree IDENTICAL (binary packing artifact)"
@@ -760,7 +761,7 @@ arsc_ok() {
   fi
   if python3 /tmp/cn.py /tmp/do/res /tmp/db/res > /tmp/cn.txt 2>&1; then
     sed 's/^/      arsc: /' /tmp/cn.txt
-    rd2="$(diff -r /tmp/do/res /tmp/db/res 2>/dev/null)"
+    rd2="$(diff -r /tmp/do/res /tmp/db/res 2>/dev/null)"; (( $? < 2 )) || { echo "      arsc: diff failed"; return 1; }
     printf '%s\n' "$rd2" > "/out/diff_resources_normalised_${c}.txt"
     if [[ -z "$(tr -d '[:space:]' <<<"$rd2")" ]]; then
       ARSC_CLASS="cl-buildid-order-only"; echo "      arsc: canonicalised FULL decoded res/ IDENTICAL"
@@ -777,7 +778,6 @@ arsc_ok() {
   fi
   sed 's/^/      arsc: /' /tmp/mf.txt
   echo "      arsc: other decoded changes remain -> material"
-  diff -r /tmp/do/res /tmp/db/res 2>/dev/null | head -5 | sed 's/^/        /'
   return 1
 }
 
@@ -785,7 +785,7 @@ declare -A OFF BLT
 for f in /official/*.apk; do OFF["$(cfg_of "$f")"]="$f"; done
 for f in /built/*.apk;    do BLT["$(cfg_of "$f")"]="$f"; done
 
-RAW=0; SIGN=0; STAMP=0; MANI=0; ARSC=0; UNACC=0; MISSING=0
+RAW=0; SIGN=0; STAMP=0; MANI=0; ARSC=0; UNACC=0; MISSING=0; shown=0
 : > /out/summary.txt; : > /out/mapping_id.txt
 
 for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
@@ -799,8 +799,10 @@ for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
   echo "  official: $(basename "$o")  sha256 $(sha256sum "$o" | cut -d' ' -f1)"
   echo "  built:    $(basename "$b")  sha256 $(sha256sum "$b" | cut -d' ' -f1)"
   rm -rf /tmp/o /tmp/b; mkdir -p /tmp/o /tmp/b
-  unzip -q -o "$o" -d /tmp/o
-  unzip -q -o "$b" -d /tmp/b
+  # A failed unzip or diff must never read as "no differences" (exit 3 -> no verdict).
+  unzip -q -o "$o" -d /tmp/o; r1=$?; unzip -q -o "$b" -d /tmp/b; r2=$?
+  (( r1 < 2 && r2 < 2 )) && [[ -n "$(find /tmp/o -type f -print -quit)" && -n "$(find /tmp/b -type f -print -quit)" ]] \
+    || { echo "FATAL: unzip failed (${cfg}: ${r1}/${r2})"; exit 3; }
   echo "  entries: $(find /tmp/o -type f | wc -l) official, $(find /tmp/b -type f | wc -l) built"
 
   while IFS= read -r so; do r="${so#/tmp/o/}"
@@ -808,20 +810,22 @@ for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
     echo "  native $st $r"
   done < <(find /tmp/o -name '*.so' -type f | sort)
 
-  raw="$(diff -rq /tmp/o /tmp/b 2>/dev/null)"
+  raw="$(diff -rq /tmp/o /tmp/b)"; rc=$?; (( rc < 2 )) || { echo "FATAL: diff failed (${cfg}: rc ${rc})"; exit 3; }
+  raw="$(expand_dirs <<<"$raw")" || { echo "FATAL: expand_dirs failed (${cfg})"; exit 3; }
   printf '%s\n' "$raw" > "/out/diff-unzipped-${cfg}.txt"
   n=$(grep -vc '^$' <<<"$raw")
   echo "  raw diffs: ${n}   (full list: diff-unzipped-${cfg}.txt)"
-  [[ "$n" -gt 0 ]] && head -5 <<<"$raw" | sed 's/^/    /'
+  if (( n > 0 && shown < 5 )); then head -$((5 - shown)) <<<"$raw" | sed 's/^/    /'; shown=$((shown + n)); fi
 
-  read -r c_sign c_stamp c_mani c_arsc < <(awk '
-    /\.(SF|RSA|DSA|EC)( |$)|MANIFEST\.MF( |$)/{a++;next}
-    /stamp-cert-sha256/{b++} /AndroidManifest\.xml/{c++} /resources\.arsc/{d++}
-    END{print a+0, b+0, c+0, d+0}' <<<"$raw")
+  # D5: signature files at META-INF's root, official side only. Others must be these exact root files.
+  c_sign=$(grep -cE '^Only in /tmp/o: META-INF/([^/ ]+\.(SF|RSA|DSA|EC)|MANIFEST\.MF)$' <<<"$raw")
+  c_stamp=$(grep -cx 'Only in /tmp/o: stamp-cert-sha256' <<<"$raw")
+  c_mani=$(grep -cx 'Files /tmp/o/AndroidManifest\.xml and /tmp/b/AndroidManifest\.xml differ' <<<"$raw")
+  c_arsc=$(grep -cx 'Files /tmp/o/resources\.arsc and /tmp/b/resources\.arsc differ' <<<"$raw")
   a_sign=0; a_stamp=0; a_mani=0; a_arsc=0
   echo "  accepted-class evidence"
   [[ "$c_sign" -gt 0 ]] && { a_sign=$c_sign
-    echo "      signing: ${c_sign} META-INF entry(ies); the release is signed, the local build unsigned"; }
+    echo "      signing: ${c_sign} official-only root META-INF signature file(s)"; }
   if [[ "$c_stamp" -gt 0 ]]; then
     if stamp_ok "$o"; then a_stamp=$c_stamp; else echo "      stamp: NOT EARNED -> material"; fi
   fi
@@ -837,7 +841,7 @@ for cfg in $(printf '%s\n' "${!OFF[@]}" "${!BLT[@]}" | sort -u); do
     echo "      baseline.prof: NEVER auto-accepted (FDROID.md: non-deterministic) -> material"
 
   acc=$((a_sign + a_stamp + a_mani + a_arsc))
-  un=$((n - acc)); [[ "$un" -lt 0 ]] && un=0
+  un=$((n - acc))
   echo "  result: raw ${n}, accepted ${acc} (signing ${a_sign}, stamp ${a_stamp}, manifest ${a_mani}, arsc ${a_arsc}), unaccounted ${un}"
   echo "${cfg} ${n} ${a_sign} ${a_stamp} ${a_mani} ${a_arsc} ${un}" >> /out/summary.txt
   RAW=$((RAW + n)); SIGN=$((SIGN + a_sign)); STAMP=$((STAMP + a_stamp))
@@ -869,6 +873,7 @@ cat <<EOF
  ${#OFFICIAL_APKS[@]} official APK(s): ${raw_total} raw differences, ${t_acc} earned (sign ${t_sign}, stamp ${t_stamp}, manifest ${t_mani}, arsc ${t_arsc}; mapping_file_id on ${t_mfid})
  UNACCOUNTED: ${t_unacc}, unmatched: ${t_missing}   <- the verdict is judged on these alone
  Full diffs: ${CMP_DIR}/   Gradle log: ${BUILD_DIR}/gradle-build.log
+ Upstream fidelity: CI, GITHUB_ACTIONS unset; 'SKIP' lines in gradle log: $(grep -c SKIP "${BUILD_DIR}/gradle-build.log" 2>/dev/null)
  Per APK (cfg raw sign stamp manifest arsc unaccounted):
 $(sed 's/^/   /' "${CMP_DIR}/summary.txt")
 EOF
@@ -884,7 +889,7 @@ else
   VERDICT="not_reproducible"; EXIT_CODE=1
 fi
 if [[ "$KIND" == play ]]; then SIGNER_NOTE="Play App Signing's key, not the developer key"
-else SIGNER_NOTE="the developer's release key (v2 scheme)"; fi
+else SIGNER_NOTE="the key that signed this APK"; fi
 
 cat <<EOF
 
