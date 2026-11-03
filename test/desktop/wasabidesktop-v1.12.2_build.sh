@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# wasabidesktop-v1.12.1_build.sh - Wasabi Wallet Desktop Reproducible Build Verification
+# wasabidesktop-v1.12.2_build.sh - Wasabi Wallet Desktop Reproducible Build Verification
 # ==============================================================================
-# Version:          v1.12.1
+# Version:          v1.12.2
 # Organization:     WalletScrutiny.com
 # Last modified by: Claude Code for Danny
 # Last modified on: 2026-11-03
@@ -22,7 +22,7 @@
 set -Eeuo pipefail
 
 # ---------- Script Metadata ----------
-SCRIPT_VERSION="v1.12.1"
+SCRIPT_VERSION="v1.12.2"
 APP_NAME="Wasabi Wallet"
 APP_ID="wasabi"
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
@@ -98,6 +98,7 @@ trap on_err ERR
 # container image is built as root internally, while every bind-mounted run is
 # mapped to the invoking user.
 if [ "$(id -u)" -eq 0 ]; then
+  rm -f -- "$(pwd -P)/COMPARISON_RESULTS.yaml"
   abort 2 "Do not run this verifier as root: workspace files must stay removable by the invoking user."
 fi
 
@@ -449,7 +450,8 @@ SDKMAP_EOF
     abort 1 "The runtime-to-SDK lookup against ${RELEASES_URL} produced nothing (see ${WORKSPACE}/sdkmap-error.txt). Building with the pinned ${SDK_VERSION} would produce a known-false not_reproducible."
   fi
 else
-  log_warning "Could not read a runtime version from the official artifact; falling back to SDK $SDK_VERSION"
+  [ -z "$RC_CMD" ] || abort 1 "Could not read a runtime version from the official ${TYPE}. The fallback SDK ${SDK_VERSION} would produce a known-false not_reproducible."
+  log_warning "This artifact type records no readable runtime; falling back to SDK $SDK_VERSION"
 fi
 
 # ---------- Generate Embedded Dockerfile ----------
@@ -642,18 +644,22 @@ log_info "Running Contrib/release.sh from $GIT_TAG with target: $BUILD_TARGET"
 # PathMap. Newer tags carry their own path normalization and are still run
 # unchanged. RUNNER_OS is normally supplied by GitHub Actions.
 BUILD_RC=0
+BUILD_LOG="$WORKSPACE/build-output.log"
 $CONTAINER_CMD run --name "$CONTAINER_NAME" $CONTAINER_RUN_USER_ARGS \
   -e RUNNER_OS=Linux \
   -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
   -v "$WORKSPACE/walletwasabi:/home/runner/work/WalletWasabi/WalletWasabi:Z" \
   -v "$RELEASE_SCRIPT_RUNNER:/workspace/release-under-test.sh:Z,ro" \
   "$IMAGE_NAME" \
-  bash -c "cd /home/runner/work/WalletWasabi/WalletWasabi && bash -x /workspace/release-under-test.sh '$BUILD_TARGET'" || BUILD_RC=$?
+  bash -c "cd /home/runner/work/WalletWasabi/WalletWasabi && bash -x /workspace/release-under-test.sh '$BUILD_TARGET'" 2>&1 | tee "$BUILD_LOG" || BUILD_RC=$?
 case "$BUILD_RC" in
   0) ;;
   125|126|127|130|137|143)
     abort 1 "Build container did not finish (exit ${BUILD_RC}: runtime failure, stop, kill or out of memory)." ;;
   *)
+    if grep -qE 'NU1301|Unable to load the service index|Could not resolve host|Temporary failure in name resolution|Name or service not known|Connection timed out|No space left on device' "$BUILD_LOG"; then
+      abort 1 "Build stopped (exit ${BUILD_RC}) on a network or disk error; see ${BUILD_LOG}."
+    fi
     log_error "Build failed inside container (exit ${BUILD_RC})"
     write_yaml "ftbfs" "  Upstream Contrib/release.sh from ${GIT_TAG} (sha256 ${UPSTREAM_RELEASE_SCRIPT_HASH}) failed to build from source at commit ${ACTUAL_COMMIT} (exit ${BUILD_RC}). Verifier adaptation: ${RELEASE_ADAPTATION}."
     exit 1 ;;
@@ -668,13 +674,14 @@ log_success "Build completed and artifact copied"
 # ---------- Compute Hashes (containerized, no host sha256sum dependency) ----------
 log_info "Computing SHA256 hashes..."
 BUILT_HASH=$($CONTAINER_CMD run --rm $CONTAINER_RUN_USER_ARGS -v "$WORKSPACE:/workspace:Z" -w /workspace \
-  "$IMAGE_NAME" bash -c "sha256sum output/$EXPECTED_FILE | awk '{print \$1}'")
+  "$IMAGE_NAME" bash -c "set -o pipefail; sha256sum output/$EXPECTED_FILE | awk '{print \$1}'")
 OFFICIAL_HASH=$($CONTAINER_CMD run --rm $CONTAINER_RUN_USER_ARGS -v "$WORKSPACE:/workspace:Z" -w /workspace \
-  "$IMAGE_NAME" bash -c "sha256sum official-$EXPECTED_FILE | awk '{print \$1}'")
+  "$IMAGE_NAME" bash -c "set -o pipefail; sha256sum official-$EXPECTED_FILE | awk '{print \$1}'")
 
 echo ""
 log_info "Built file hash:    $BUILT_HASH"
 log_info "Official file hash: $OFFICIAL_HASH"
+[[ "$BUILT_HASH" =~ ^[0-9a-f]{64}$ && "$OFFICIAL_HASH" =~ ^[0-9a-f]{64}$ ]] || abort 1 "Could not hash both files, so they cannot be compared."
 echo ""
 
 if [ "$BUILT_HASH" == "$OFFICIAL_HASH" ]; then
