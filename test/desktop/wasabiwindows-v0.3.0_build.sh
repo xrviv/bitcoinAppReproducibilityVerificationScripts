@@ -1,8 +1,8 @@
 #!/bin/bash
 # wasabiwindows_build.sh - Wasabi Wallet Windows Reproducible Build Verifier (win-x64 zip / MSI)
-# Version: v0.2.0
+# Version: v0.3.0
 # Last modified by: Claude Code for Danny
-# Last modified on: 2026-10-17
+# Last modified on: 2026-11-03
 # Upstream builds the Windows zip and MSI on a GitHub Windows runner with Contrib/release.sh
 # wininstaller (.github/workflows/release.yml). This script runs that same release.sh in a
 # throw-away copy of a Windows Server 2022 VM (dockur/windows, KVM), with the .NET SDK that
@@ -15,13 +15,13 @@
 # MIT License. Provided as-is for reproducible-build verification, without warranty.
 set -euo pipefail
 
-SCRIPT_VERSION="v0.2.0"
+SCRIPT_VERSION="v0.3.0"
 APP_ID="wasabi"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256=""
 RESOLVED_COMMIT="unknown"
 
-HELPER_IMAGE="wasabi-win-helper:0.1"
+HELPER_IMAGE="wasabi-win-helper:0.2"
 DOCKUR_IMAGE="docker.io/dockurr/windows@sha256:16fd7c39a3e48bb946d29c59dc6015942e5b900a1fa5d7e5552053bfc48ee2ea"
 WIN_DIR="${WIN_DIR:-/var/lib/walletscrutiny-windows}"
 VM_NAME=""
@@ -67,10 +67,12 @@ sha256_of() {
   [[ -f "$1" ]] || { echo "N/A"; return 0; }
   sha256sum "$1" | awk '{print $1}'
 }
-# Parameter, environment and input-integrity problems: exit 2 and NO verdict
-# (ABS publishes any YAML it finds).
+# Every stop that says nothing about the source: NO verdict, since ABS publishes any YAML it
+# finds. Exit 2 for parameter, environment and input-integrity problems, else 1.
 die() {
   echo "ERROR: $1" >&2
+  rm -f -- "${execution_dir:-$(pwd -P)}/COMPARISON_RESULTS.yaml"
+  echo "No verdict; no COMPARISON_RESULTS.yaml written." >&2
   exit "${2:-$EXIT_BUILD_FAILED}"
 }
 warn() { echo "WARN: $1" >&2; }
@@ -96,7 +98,7 @@ sanitize_component() {
 build_helper() {
   echo "[INFO] Building helper container..."
   "$DOCKER_CMD" build -t "${HELPER_IMAGE}" - << 'HEOF'
-FROM debian:bookworm-slim
+FROM docker.io/library/debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 RUN apt-get update -qq \
 && apt-get install -y --no-install-recommends curl ca-certificates gnupg unzip p7zip-full python3 openssh-client \
 && rm -rf /var/lib/apt/lists/*
@@ -196,8 +198,8 @@ is_rootless() {
   esac
   [[ "$r" == "true" ]]
 }
-# Hand the workspace back so the caller can delete it without sudo
-# (non-sudo-directories-guideline.md). Rootless, the caller IS container UID 0.
+# Hand the workspace back so the caller can delete it without extra privileges.
+# Rootless, the caller IS container UID 0.
 restore_host_owner() {
   [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" && -n "${DOCKER_CMD}" ]] || return 0
   "$DOCKER_CMD" image inspect "${HELPER_IMAGE}" >/dev/null 2>&1 || return 0
@@ -223,13 +225,16 @@ vm_run() {
   vm_ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\dl\\$1"
 }
 # Streams one file out of the VM, checked against the hash Windows printed for it.
-vm_fetch() {
+vm_copy() {
   local src="$1" dst="$2" want got
   want=$(awk -v n="$(basename "$dst")" '$1 == "HASH" && $3 == n {print $2}' "${WORK_DIR}/logs/vm-build.log")
   vm_ssh "powershell -NoProfile -Command \"\$s=[IO.File]::OpenRead('$src'); \$o=[Console]::OpenStandardOutput(); \$s.CopyTo(\$o); \$o.Flush()\"" \
-    > "$dst" || die "Could not copy $(basename "$dst") out of the VM"
+    > "$dst" || return 1
   got=$(sha256_of "$dst")
-  [[ -n "$want" && "$got" == "$want" ]] || die "$(basename "$dst") copied out of the VM is corrupt (${got} vs ${want:-none})"
+  [[ -n "$want" && "$got" == "$want" ]]
+}
+vm_fetch() {
+  vm_copy "$1" "$2" || die "$(basename "$2") could not be copied out of the VM intact"
 }
 
 # Missing KVM, golden image or key is an environment problem, not a build outcome.
@@ -240,7 +245,7 @@ check_vm_prereqs() {
     [[ -r "${g}/${f}" ]] || die "Golden image file missing: ${g}/${f} (see GitLab #984)" $EXIT_INVALID_PARAMS
   done
   [[ -r "${WIN_DIR}/vm-key/ws-windows-vm" ]] || die "VM key not readable: ${WIN_DIR}/vm-key/ws-windows-vm" $EXIT_INVALID_PARAMS
-  ends=$(sed -n 's/.*evaluation ends ~\([0-9-]*\).*/\1/p' "${g}/GOLDEN-INFO.txt" 2>/dev/null | head -1)
+  ends=$(sed -n 's/.*evaluation ends ~\([0-9-]*\).*/\1/p' "${g}/GOLDEN-INFO.txt" 2>/dev/null | head -1) || true
   [[ -z "$ends" || ! "$(date -u +%F)" > "$ends" ]] || die "Golden image evaluation ended ${ends}; rebuild it" $EXIT_INVALID_PARAMS
   echo "[INFO] Golden image: ${g} (evaluation ends ${ends:-unknown})"
 }
@@ -320,6 +325,7 @@ $ErrorActionPreference='Continue'
 & 'C:\Program Files\Git\bin\bash.exe' -c './Contrib/release.sh wininstaller' 2>&1 | ForEach-Object { "$_" } | Out-File -Encoding utf8 C:\dl\release.log
 $rc=$LASTEXITCODE
 'RELEASE-EXIT=' + $rc
+'HASH ' + (Get-FileHash C:\dl\release.log -Algorithm SHA256).Hash.ToLower() + ' release.log'
 Select-String -Path C:\dl\release.log -Pattern 'stand-in|error' | Select-Object -Last 5 | ForEach-Object { 'LOG ' + $_.Line }
 if ($rc) { throw 'release.sh failed' }
 tar.exe -cf C:\dl\win-x64.tar -C build win-x64
@@ -332,7 +338,28 @@ PSEOF
   wait "$BUILD_PID" || true
   BUILD_PID=""
   grep -E '^(TZ=|SHA512 OK|SHA256 OK|COMMIT=|RELEASE-EXIT=|LOG )' "$log" | sed 's/^/  /' || true
-  grep -qx 'BUILD-OK' "$log" || ftbfs_die "The Windows build failed inside the VM; see logs/vm-build.log"
+  # The full build log goes in the recording, on a failed build too (Danny, 2026-10-17).
+  local relog="${WORK_DIR}/logs/release.log" have_log=false rel
+  if vm_copy 'C:\dl\release.log' "$relog"; then
+    have_log=true
+    echo ""
+    echo "===== Windows build log: release.sh wininstaller, sha256 $(sha256_of "$relog") ====="
+    sed -e '1s/^\xEF\xBB\xBF//' -e 's/\r$//' "$relog"
+    echo "===== End of Windows build log ====="
+    echo ""
+  else
+    warn "The Windows build log could not be copied out of the VM intact."
+  fi
+  if ! grep -qx 'BUILD-OK' "$log"; then
+    rel=$(sed -n 's/^RELEASE-EXIT=//p' "$log" | head -1)
+    [[ "$rel" =~ ^[1-9][0-9]*$ ]] || die "The VM stopped outside release.sh (setup, download, clone or SSH); see logs/vm-build.log"
+    case "$rel" in 130|137|143) die "release.sh was stopped or killed (exit ${rel})" ;; esac
+    if [[ "$have_log" == true ]] && grep -qE 'NU1301|Unable to load the service index|Could not resolve host|Temporary failure in name resolution|Name or service not known|Connection timed out|There is not enough space on the disk|No space left on device' "$relog"; then
+      die "release.sh stopped (exit ${rel}) on a network or disk error; see logs/release.log"
+    fi
+    ftbfs_die "Upstream Contrib/release.sh wininstaller failed to build from source (exit ${rel}); see logs/release.log"
+  fi
+  [[ "$have_log" == true ]] || die "The build worked, but its log could not be copied out of the VM intact"
   local c; c=$(sed -n 's/^COMMIT=//p' "$log" | head -1)
   [[ ! "$c" =~ ^[0-9a-f]{40}$ ]] || RESOLVED_COMMIT="$c"
 }
@@ -348,8 +375,8 @@ cleanup() {
 }
 ftbfs_die() {
   printf 'script_version: %s\nverdict: ftbfs\nnotes: "%s"\n' "$SCRIPT_VERSION" "$1" > "$results_file"
-  cp "$results_file" "$execution_dir/" 2>/dev/null || true
-  die "$1" $EXIT_BUILD_FAILED
+  echo "ERROR: $1" >&2
+  exit $EXIT_BUILD_FAILED
 }
 
 # Every file of the official zip against the built folder (union of both sides).
@@ -447,7 +474,7 @@ def pool(d, who):
     if o + z > len(sd): raise Bad(f'{who}: string {i} past the data')
     strings.append(sd[o:o + z]); refs.append(r); o += z; i += 1
   if o != len(sd): raise Bad(f'{who}: unreferenced string data')
-  return strings, refs, 3 if hdr & 0x80000000 else 2
+  return strings, refs, 3 if hdr & 0x80000000 else 2, hdr & 0x7FFFFFFF
 
 def schema(d, s, who):
   raw = rd(d, '!_Columns')
@@ -491,6 +518,9 @@ def run(A, B):
       NORM.append(f'publisher signature stream {f}: official only (Authenticode)')
     else: DIFF.append(f'stream on one side only: {f}')
   pa, pb = pool(A, 'official'), pool(B, 'built')
+  if pa[3] != pb[3]: DIFF.append(f'string pool codepage differs: {pa[3]} vs {pb[3]}')
+  else: NORM.append(f'string pool codepage: {pa[3]} on both sides')
+  if pa[2] != pb[2]: DIFF.append(f'string pool reference width differs: {pa[2]} vs {pb[2]} bytes')
   sa, sb = schema(A, pa[0], 'official'), schema(B, pb[0], 'built')
   if set(sa) != set(sb): DIFF.append(f'table set differs: {sorted(set(sa) ^ set(sb))}')
   ca, cb = catalog(A, pa, 'official'), catalog(B, pb, 'built')
@@ -531,7 +561,7 @@ def run(A, B):
     other = [s for s, _ in dp if s not in ids]
     if other: DIFF.append(f'string pool: {len(other)} entries differ that no table difference explains, e.g. {other[:3]}')
     else: RAND.append(f'string pool: {sum(dp.values())} entries differ, all of them the GUIDs above')
-  elif rd(A, '!_StringPool') != rd(B, '!_StringPool'): NORM.append('string pool storage order (same entries)')
+  elif rd(A, '!_StringPool')[4:] != rd(B, '!_StringPool')[4:]: NORM.append('string pool storage order (same entries)')
   for f in sorted(fa & fb):
     if f in acc: continue
     x, y = rd(A, f), rd(B, f)
@@ -570,7 +600,7 @@ if __name__ == '__main__':
       else: NORM.append(f'{who} MSI container ({size} B): nothing past the last sector, no data in free sectors')
   except Exception as e: print(f'COMPARATOR ERROR: {type(e).__name__}: {e}', file=sys.stderr); sys.exit(2)
   for title, items in (('OTHER DIFFERENCES', DIFF), ('RANDOM PER-BUILD IDS', RAND),
-                       ('SET ASIDE OR CHECKED (signature, PackageCode, timestamps, cabinet dates, container)', NORM)):
+                       ('SET ASIDE OR CHECKED (signature, PackageCode, timestamps, cabinet dates, codepage, container)', NORM)):
     print(f'  {title}:' + ('' if items else ' none'))
     for m in items: print('    - ' + m)
   sys.exit(1 if DIFF else 3 if RAND else 0)
@@ -581,7 +611,7 @@ compare_msi() {
   local bmsi="${WORK_DIR}/built/Wasabi-${APP_VERSION}.msi"
   write_comparator
   helper_c bash -c "7z x -tCompound '/work/built/Wasabi-${APP_VERSION}.msi' -o/work/ex-built -y >/dev/null" \
-    || ftbfs_die "Could not extract the built MSI"
+    || die "Could not extract the built MSI"
   echo ""
   echo "[INFO] === MSI Comparison (official vs built Wasabi-${APP_VERSION}.msi) ==="
   echo "[INFO] official sha256: $(sha256_of "${WORK_DIR}/official/${OFFICIAL_NAME}")  $(stat -c %s "${WORK_DIR}/official/${OFFICIAL_NAME}") B"
@@ -590,13 +620,14 @@ compare_msi() {
   helper_c python3 /work/msicmp.py /work/ex-official /work/ex-built "/work/official/${OFFICIAL_NAME}" \
     "/work/built/Wasabi-${APP_VERSION}.msi" > "${WORK_DIR}/logs/msi-compare.txt" 2>&1 || MSI_RC=$?
   echo "[INFO] Comparator exit ${MSI_RC}; the full output is printed in full right before the results."
-  [[ "$MSI_RC" -ne 2 ]] || ftbfs_die "MSI comparator failed; this is a tool error, not a verdict"
+  [[ "$MSI_RC" =~ ^[013]$ ]] || die "MSI comparator failed (exit ${MSI_RC}); this is a tool error, not a verdict"
 }
 
 build_and_verify() {
   local version_component
   version_component=$(sanitize_component "$APP_VERSION")
   execution_dir="$(pwd -P)"
+  rm -f -- "${execution_dir}/COMPARISON_RESULTS.yaml"
   RUN_ID="$(date +%s)-$$"
 
   # A new workspace per run in the caller's directory (per-run-workspace-guideline.md).
@@ -606,7 +637,7 @@ build_and_verify() {
     WORK_DIR="${execution_dir}/wasabiwindows_verification_${version_component}_${APP_TYPE}_${RUN_ID}"
     mkdir "$WORK_DIR" || die "Could not create ${WORK_DIR}" $EXIT_INVALID_PARAMS
   fi
-  results_file="${WORK_DIR}/COMPARISON_RESULTS.yaml"
+  results_file="${execution_dir}/COMPARISON_RESULTS.yaml"
   mkdir -p "$WORK_DIR/logs" "$WORK_DIR/official" "$WORK_DIR/built" "$WORK_DIR/official-extracted"
   cd "$WORK_DIR"
   # Cleanup runs on every exit path. A stopped run (130) writes no verdict.
@@ -636,7 +667,7 @@ build_and_verify() {
 
   start_vm
   build_in_vm
-  [[ "$RESOLVED_COMMIT" != "unknown" ]] || ftbfs_die "Could not read the commit the VM built"
+  [[ "$RESOLVED_COMMIT" != "unknown" ]] || die "Could not read the commit the VM built"
   vm_fetch 'C:\dl\win-x64.tar' "${WORK_DIR}/built/win-x64.tar"
   [[ "$APP_TYPE" != "msi" ]] || vm_fetch "D:\\a\\WalletWasabi\\WalletWasabi\\packages\\Wasabi-${APP_VERSION}.msi" \
     "${WORK_DIR}/built/Wasabi-${APP_VERSION}.msi"
@@ -650,6 +681,7 @@ build_and_verify() {
     echo ""
     echo "[INFO] === File Comparison (official zip vs built win-x64 folder) ==="
     compare_files "${WORK_DIR}/official-extracted" "${WORK_DIR}/built/win-x64"
+    [[ "$CMP_TOTAL" -gt 0 ]] || die "No files to compare; this is a tool error, not a verdict"
     echo "[INFO] Not compared: the zip container itself (entry dates = checkout/build time)."
     if [[ "$CMP_BAD" -eq 0 && "$CMP_TOTAL" -gt 0 ]]; then
       verdict="reproducible"
@@ -663,7 +695,7 @@ build_and_verify() {
     compare_msi
     if [[ "$MSI_RC" -eq 0 || ( "$MSI_RC" -eq 3 && "$MSI_ACCEPT_RANDOM_IDS" == "yes" ) ]]; then
       verdict="reproducible"
-      note="${OFFICIAL_NAME}: every table, stream and cabinet file matches the build once the publisher signature, PackageCode, build timestamps and cabinet file dates are set aside$([[ "$MSI_RC" -eq 3 ]] && echo ', and the random per-build IDs')."
+      note="${OFFICIAL_NAME}: every table, stream and cabinet file matches the build once the publisher signature, PackageCode, build timestamps and cabinet file dates are set aside$([[ "$MSI_RC" -ne 3 ]] || echo ', and the random per-build IDs')."
     elif [[ "$MSI_RC" -eq 3 ]]; then
       verdict="not_reproducible"
       note="${OFFICIAL_NAME}: all cabinet files match, but the MSI carries random per-build IDs (ProductCode, component GUIDs) that a rebuild cannot reproduce; listed under RANDOM PER-BUILD IDS."
@@ -673,7 +705,6 @@ build_and_verify() {
     fi
   fi
   printf 'script_version: %s\nverdict: %s\nnotes: |\n  %s\n' "$SCRIPT_VERSION" "$verdict" "$note" > "$results_file"
-  cp "$results_file" "$execution_dir/" 2>/dev/null || true
   display_results
 }
 
@@ -691,7 +722,7 @@ print_hash_legend() {
 }
 emit_verification_summary() {
   local yaml_verdict official_sha match_flag=0 match_word="DOESN'T MATCH" matches=0 mismatches=1 line
-  yaml_verdict=$(grep "^verdict:" COMPARISON_RESULTS.yaml | cut -d' ' -f2)
+  yaml_verdict=$(grep "^verdict:" "$results_file" | cut -d' ' -f2)
   official_sha=$(sha256_of "${WORK_DIR}/official/${OFFICIAL_NAME}")
   if [[ "$yaml_verdict" == "reproducible" ]]; then
     match_flag=1; matches=1; mismatches=0
@@ -756,12 +787,12 @@ display_results() {
   echo "======================================================"
   echo "RESULTS"
   echo "======================================================"
-  cat COMPARISON_RESULTS.yaml
+  cat "$results_file"
   echo ""
   echo "Workspace: ${WORK_DIR}"
   emit_verification_summary
   echo ""
-  if grep -q '^verdict: reproducible' COMPARISON_RESULTS.yaml; then
+  if grep -q '^verdict: reproducible' "$results_file"; then
     echo "✅ VERDICT: REPRODUCIBLE"
     echo "Exit code: $EXIT_SUCCESS"
     exit $EXIT_SUCCESS
@@ -783,7 +814,7 @@ Example: $0 --version 2.8.4 --arch win64 --type msi
 EOF
 }
 parse_arguments() {
-  if [[ $# -eq 0 ]]; then usage; exit $EXIT_INVALID_PARAMS; fi
+  if [[ $# -eq 0 ]]; then usage; die "No parameters given" $EXIT_INVALID_PARAMS; fi
   while [[ $# -gt 0 ]]; do
     case $1 in
       --version) require_value "$1" "${2:-}"; APP_VERSION="${2#v}"; shift 2 ;;
@@ -838,8 +869,7 @@ parse_arguments() {
 main() {
   # Runs as a normal user only; root runs break the ownership guarantees.
   if [[ "${EUID}" -eq 0 ]]; then
-    echo "ERROR: Do not run this script as root; run it as a normal user." >&2
-    exit $EXIT_INVALID_PARAMS
+    die "Do not run this script as root; run it as a normal user." $EXIT_INVALID_PARAMS
   fi
   echo ""
   echo "======================================================"
