@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # P.CASH Terminal reproducible build verification, every channel
-# Version:          v0.9.1
+# Version:          v0.9.2
 # Organization:     WalletScrutiny.com
 # Last modified by: Carol (Buzz), Claude Code for Danny
 # Last modified on: 2026-11-03
@@ -20,7 +20,7 @@
 # Users are responsible for lawful use. Review before running.
 # Exit codes: 0 = identical, 1 = difference or build failure, 2 = wrong input (no YAML).
 
-SCRIPT_VERSION="v0.9.1"
+SCRIPT_VERSION="v0.9.2"
 
 SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
 SCRIPT_HASH="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
@@ -631,6 +631,7 @@ cfg_of() {
   printf '%s' "${s:-base}"
 }
 
+# Evidence only: Crashlytics build_ids order is never accepted (Danny, 2026-11-03).
 cat > /tmp/cn.py <<'PYEOF'
 import sys, os, re, collections
 import xml.etree.ElementTree as ET
@@ -747,7 +748,7 @@ manifest_ok() {
 
 ARSC_CLASS=""
 arsc_ok() {
-  local o="$1" b="$2" c="$3" rd rd2 pre=""
+  local o="$1" b="$2" c="$3" rd rd2
   rm -rf /tmp/do /tmp/db
   for x in "o $o" "b $b"; do
     $APKTOOL d -f --no-src --no-debug-info --frame-path /tmp/afw -o "/tmp/d${x%% *}" "${x#* }" >/dev/null 2>&1 || { echo "      arsc: DECODE FAILED (${x%% *})"; return 1; }
@@ -759,25 +760,22 @@ arsc_ok() {
     ARSC_CLASS="decoded-identical"; echo "      arsc: decoded res/ tree IDENTICAL (binary packing artifact)"
     return 0
   fi
-  if python3 /tmp/cn.py /tmp/do/res /tmp/db/res > /tmp/cn.txt 2>&1; then
-    sed 's/^/      arsc: /' /tmp/cn.txt
-    rd2="$(diff -r /tmp/do/res /tmp/db/res 2>/dev/null)"; (( $? < 2 )) || { echo "      arsc: diff failed"; return 1; }
-    printf '%s\n' "$rd2" > "/out/diff_resources_normalised_${c}.txt"
-    if [[ -z "$(tr -d '[:space:]' <<<"$rd2")" ]]; then
-      ARSC_CLASS="cl-buildid-order-only"; echo "      arsc: canonicalised FULL decoded res/ IDENTICAL"
-      return 0
-    fi
-    pre="cl-buildid-order+"
-  else
-    sed 's/^/      arsc: /' /tmp/cn.txt
-  fi
   if python3 /tmp/mf.py /tmp/do/res /tmp/db/res > /tmp/mf.txt 2>&1; then
     sed 's/^/      arsc: /' /tmp/mf.txt
-    ARSC_CLASS="${pre}mapping-file-id"; echo "$c" >> /out/mapping_id.txt
+    ARSC_CLASS="mapping-file-id"; echo "$c" >> /out/mapping_id.txt
     return 0
   fi
   sed 's/^/      arsc: /' /tmp/mf.txt
-  echo "      arsc: other decoded changes remain -> material"
+  if python3 /tmp/cn.py /tmp/do/res /tmp/db/res > /tmp/cn.txt 2>&1; then
+    sed 's/^/      arsc: evidence: /' /tmp/cn.txt
+    rd2="$(diff -r /tmp/do/res /tmp/db/res 2>/dev/null)"; printf '%s\n' "$rd2" > "/out/diff_resources_normalised_${c}.txt"
+    if [[ -z "$(tr -d '[:space:]' <<<"$rd2")" ]]; then echo "      arsc: only the build_ids order differs -> material"
+    elif python3 /tmp/mf.py /tmp/do/res /tmp/db/res >/dev/null 2>&1; then echo "      arsc: only the build_ids order and mapping_file_id differ -> material"
+    else echo "      arsc: other decoded changes remain -> material"; fi
+  else
+    sed 's/^/      arsc: /' /tmp/cn.txt
+    echo "      arsc: other decoded changes remain -> material"
+  fi
   return 1
 }
 
@@ -921,7 +919,7 @@ depProvenance:   JitPack deps consumed as published binaries, not rebuilt from s
  are never the official hash. signer is ${SIGNER_NOTE}.
 EOF
 
-generate_yaml "${VERDICT}" "${CHANNEL}, ${LINEAGE} lineage detected from contents ($google_signals). Revision ${built_ref:-unknown} from ${rev_source}; tag ${tag_info}. Built ${TASK} ${GRADLE_FLAGS}${FLAG_WHY:+ (${FLAG_WHY})}. ${raw_total} raw difference(s), ${t_acc} earned exclusions: signing ${t_sign}, SourceStamp ${t_stamp}, Play manifest meta-data ${t_mani}, resources.arsc ${t_arsc} (decoded res/ identical, after canonicalising the Crashlytics build_ids triples; on ${t_mfid} APK(s) the sole remaining decoded difference was the random Crashlytics mapping_file_id, approved by Danny 2026-10-12). ${t_unacc} unaccounted, ${t_missing} unmatched; the verdict is judged on these alone. Official $(basename "$apk_file") SHA-256 ${app_hash}. JitPack deps were consumed as published binaries, not rebuilt from source."
+generate_yaml "${VERDICT}" "${CHANNEL}, ${LINEAGE} lineage detected from contents ($google_signals). Revision ${built_ref:-unknown} from ${rev_source}; tag ${tag_info}. Built ${TASK} ${GRADLE_FLAGS}${FLAG_WHY:+ (${FLAG_WHY})}. ${raw_total} raw difference(s), ${t_acc} earned exclusions: signing ${t_sign}, SourceStamp ${t_stamp}, Play manifest meta-data ${t_mani}, resources.arsc ${t_arsc} (accepted only if decoded res/ is identical or the random Crashlytics mapping_file_id is its sole difference, approved by Danny 2026-10-12; that ID on ${t_mfid} APK(s)). Crashlytics build_ids order is never accepted. ${t_unacc} unaccounted, ${t_missing} unmatched; the verdict is judged on these alone. Official $(basename "$apk_file") SHA-256 ${app_hash}. JitPack deps were consumed as published binaries, not rebuilt from source."
 
 echo ""
 echo "Exit code: ${EXIT_CODE}"
