@@ -1,6 +1,6 @@
 #!/bin/bash
 # coinwallet_build.sh — Coin Wallet desktop (Linux Flatpak) reproducible build verification
-# Version: v0.1.6
+# Version: v0.1.7
 # Organization: WalletScrutiny.com
 # Last modified by: Daniel Garcia
 # Last modified on: 2026-11-04
@@ -19,7 +19,7 @@
 # Exit codes: 0 = reproducible, 1 = not_reproducible or ftbfs, 2 = invalid parameters, 130 = stopped.
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.6"
+SCRIPT_VERSION="v0.1.7"
 APP_ID="coinwallet"
 GH_REPO="CoinSpace/CoinSpace"
 REPO_URL="https://github.com/${GH_REPO}.git"
@@ -52,6 +52,7 @@ MONERO_SRC=""
 APP_HASH="N/A"
 APP_COMMIT="N/A"
 OFFICIAL_COMMIT="N/A"
+OFFICIAL_SDE=""
 SCRIPT_HASH="N/A"
 JOB_PID=""
 JOB_TEE=""
@@ -243,12 +244,11 @@ function pins(file) {
   process.stdout.write(rows.map(r => r.join(' ')).join('\n') + '\n');
 }
 
-// manifest.json minus source-date-epoch, which flatpak-builder sets from the build clock.
-function manifest(file) {
-  const m = JSON.parse(fs.readFileSync(file, 'utf8'));
-  console.error(`source-date-epoch=${m['source-date-epoch']}`);
-  delete m['source-date-epoch'];
-  process.stdout.write(JSON.stringify(m, null, 1) + '\n');
+// source-date-epoch recorded in /app/manifest.json.
+function sde(file) {
+  const v = JSON.parse(fs.readFileSync(file, 'utf8'))['source-date-epoch'];
+  if (!/^[0-9]+$/.test(String(v))) throw new Error('manifest has no source-date-epoch');
+  console.log(v);
 }
 
 // Lockfile entries served by npm.pkg.github.com (login required): 'clone' checks out each package's
@@ -282,7 +282,7 @@ try {
   if (cmd === 'asset') asset(...args);
   else if (cmd === 'envobj') envobj(args[0]);
   else if (cmd === 'pins') pins(args[0]);
-  else if (cmd === 'manifest') manifest(args[0]);
+  else if (cmd === 'sde') sde(args[0]);
   else if (cmd === 'pkgs') pkgs(args[0], args[1], args[2]);
   else throw new Error(`unknown helper command ${cmd}`);
 } catch (e) { console.error(`helper: ${e.message}`); process.exit(3); }
@@ -371,7 +371,7 @@ import_bundle() {
         "$side" "$bundle" "$FLATPAK_REF" || return 1
     sed -E -e 's/^(d[0-7]+ [0-9]+ [0-9]+) +[0-9]+ [0-9a-f]{64} ([0-9a-f]{64}) (.*)$/\3\t\1 meta:\2/' \
         -e 's/^([-l][0-7]+ [0-9]+ [0-9]+) +([0-9]+) ([0-9a-f]{64}) (.*)$/\4\t\1 \2 \3/' \
-        "${WORK_DIR}/${side}-tree.raw" | grep -v '^/files/manifest.json'$'\t' | LC_ALL=C sort > "${WORK_DIR}/${side}-tree.list"
+        "${WORK_DIR}/${side}-tree.raw" | LC_ALL=C sort > "${WORK_DIR}/${side}-tree.list"
 }
 
 read_official() {
@@ -379,8 +379,9 @@ read_official() {
     echo "Importing the official Flatpak..."
     import_bundle official "/w/official/${ASSET_NAME}" \
         || die "Could not import ${ASSET_NAME} as a ${FLATPAK_REF} Flatpak bundle; no COMPARISON_RESULTS.yaml written"
-    tool 'node /w/helper.mjs pins /w/official-manifest.json > /w/pins.txt && node /w/helper.mjs envobj /w/official-main.js > /w/official-env.list' \
-        || die "Could not read the Flathub pins or the build variables from the official Flatpak; no COMPARISON_RESULTS.yaml written"
+    tool 'node /w/helper.mjs pins /w/official-manifest.json > /w/pins.txt && node /w/helper.mjs envobj /w/official-main.js > /w/official-env.list && node /w/helper.mjs sde /w/official-manifest.json > /w/official-sde.txt' \
+        || die "Could not read the Flathub pins, build variables or source-date-epoch from the official Flatpak; no COMPARISON_RESULTS.yaml written"
+    OFFICIAL_SDE=$(cat "${WORK_DIR}/official-sde.txt")
     OFFICIAL_COMMIT=$(sed -n 's/^VITE_COMMIT=//p' "${WORK_DIR}/official-env.list")
     echo "Flathub pins from the official manifest.json:"
     sed 's/^/  /' "${WORK_DIR}/pins.txt"
@@ -491,7 +492,9 @@ build_flatpak() {
     # runtimes to Flathub's latest commit.
     printf '#!/bin/sh\n[ "$1" = update ] && { echo "shim: skipped flatpak $*" >&2; exit 0; }\nexec /usr/bin/flatpak "$@"\n' > "${WORK_DIR}/shim/flatpak"
     # rofiles-fuse needs /dev/fuse; it only guards the build dir and does not change the output.
-    printf '#!/bin/sh\n[ "$1" = --version ] && exec /usr/bin/flatpak-builder "$@"\nexec /usr/bin/flatpak-builder --disable-rofiles-fuse "$@"\n' > "${WORK_DIR}/shim/flatpak-builder"
+    # source-date-epoch defaults to the mtime of the manifest the maker writes, so to each build's time
+    # (CoinSpace #90). Copied from the official manifest.json, like the Flathub commits: proves nothing about it.
+    printf '#!/bin/sh\n[ "$1" = --version ] && exec /usr/bin/flatpak-builder "$@"\nexec /usr/bin/flatpak-builder --disable-rofiles-fuse --override-source-date-epoch=%s "$@"\n' "$OFFICIAL_SDE" > "${WORK_DIR}/shim/flatpak-builder"
     chmod +x "${WORK_DIR}/shim/flatpak" "${WORK_DIR}/shim/flatpak-builder"
 
     echo ""
@@ -567,20 +570,20 @@ compare_trees() {
     APP_DIFF=$(grep -cE '^[A-Z_]+ /files/lib/space\.coin\.wallet/' "${WORK_DIR}/filesystem-diff.txt" || true)
     FS_MATCH=true; [[ "$FS_DIFF" -eq 0 ]] || FS_MATCH=false
 
-    local s
-    tool 'set -e; for s in official built; do node /w/helper.mjs manifest "/w/$s-manifest.json" > "/w/$s-manifest.norm" 2> "/w/$s-sde.txt"; done' \
-        || die "Could not read the two manifest.json files"
+    tool 'node /w/helper.mjs sde /w/built-manifest.json > /w/built-sde.txt' \
+        || die "Could not read source-date-epoch from the built manifest.json"
     MANIFEST_MATCH=true
     local drc=0
-    tool 'diff /w/official-manifest.norm /w/built-manifest.norm > /w/manifest-diff.txt' || drc=$?
+    tool 'diff /w/official-manifest.json /w/built-manifest.json > /w/manifest-diff.txt' || drc=$?
     case "$drc" in
         0) ;;
         1) MANIFEST_MATCH=false ;;
         *) die "Could not compare the two manifest.json files; no COMPARISON_RESULTS.yaml written" ;;
     esac
-    SDE="official $(cat "${WORK_DIR}/official-sde.txt"), built $(cat "${WORK_DIR}/built-sde.txt")"
+    SDE="official ${OFFICIAL_SDE}, built $(cat "${WORK_DIR}/built-sde.txt")"
     COMMIT_MATCH=true; [[ "$OFFICIAL_COMMIT" == "$APP_COMMIT" ]] || COMMIT_MATCH=false
     CC_OFF=$(cat "${WORK_DIR}/official-content-checksum.txt"); CC_BLD=$(cat "${WORK_DIR}/built-content-checksum.txt")
+    CONTENT_MATCH=true; [[ -n "$CC_OFF" && "$CC_OFF" == "$CC_BLD" ]] || CONTENT_MATCH=false
 
     echo ""
     echo "Flatpak tree: ${FS_TOTAL} entries compared, ${FS_DIFF} differ (${APP_DIFF} under /files/lib/space.coin.wallet)"
@@ -588,12 +591,12 @@ compare_trees() {
         echo "First differences (full list: ${WORK_DIR}/filesystem-diff.txt):"
         grep -E '^[A-Z_]+ ' "${WORK_DIR}/filesystem-diff.txt" | head -5 | sed 's/^/  /'
     fi
-    echo "manifest.json without source-date-epoch: $([[ "$MANIFEST_MATCH" == true ]] && echo identical || echo "differs (${WORK_DIR}/manifest-diff.txt)")"
-    echo "source-date-epoch (not gated, build clock): ${SDE}"
+    echo "manifest.json, byte for byte: $([[ "$MANIFEST_MATCH" == true ]] && echo identical || echo "differs (${WORK_DIR}/manifest-diff.txt)")"
+    echo "source-date-epoch (built value copied from the official manifest.json): ${SDE}"
     echo "ostree content checksum (includes manifest.json): official ${CC_OFF}, built ${CC_BLD}"
 
     local status=not_reproducible
-    [[ "$FS_MATCH" == true && "$MANIFEST_MATCH" == true && "$COMMIT_MATCH" == true ]] && status=reproducible
+    [[ "$FS_MATCH" == true && "$MANIFEST_MATCH" == true && "$COMMIT_MATCH" == true && "$CONTENT_MATCH" == true ]] && status=reproducible
     cat > "$RESULTS_FILE" << YAML_END
 script_version: ${SCRIPT_VERSION}
 verdict: ${status}
@@ -604,8 +607,9 @@ notes: |
   were read from the official bundle, where they are public; the official bundle names commit ${OFFICIAL_COMMIT}.
   The @coinspace/* modules were packed from their public git tags (upstream installs them from GitHub
   Packages, which needs a login). Compared every entry of both Flatpak trees: path, type, mode, owner,
-  content checksum, link target; manifest.json compared without source-date-epoch (${SDE}).
-  tree=${FS_MATCH} entries=${FS_TOTAL} differ=${FS_DIFF} app_differ=${APP_DIFF} manifest=${MANIFEST_MATCH} official_commit_is_tag=${COMMIT_MATCH}
+  content checksum, link target, and the ostree content checksum. The built source-date-epoch was copied from the
+  official manifest.json with --override-source-date-epoch, so a match proves nothing about it (${SDE}).
+  tree=${FS_MATCH} entries=${FS_TOTAL} differ=${FS_DIFF} app_differ=${APP_DIFF} manifest=${MANIFEST_MATCH} content_checksum=${CONTENT_MATCH} official_commit_is_tag=${COMMIT_MATCH}
 YAML_END
     display_results "$status"
 }
