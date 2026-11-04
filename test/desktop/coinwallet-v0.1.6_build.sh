@@ -1,9 +1,9 @@
 #!/bin/bash
 # coinwallet_build.sh — Coin Wallet desktop (Linux Flatpak) reproducible build verification
-# Version: v0.1.1
+# Version: v0.1.6
 # Organization: WalletScrutiny.com
 # Last modified by: Daniel Garcia
-# Last modified on: 2026-11-03
+# Last modified on: 2026-11-04
 # Project: https://github.com/CoinSpace/CoinSpace
 # Disclaimer: for reproducible-build verification and research only. No warranty; users assume all risk and are responsible for legal compliance; the developers assume no liability for misuse.
 # Steps: take the official Coin.Wallet.flatpak (--binary or the GitHub release, checked against the
@@ -13,13 +13,13 @@
 # them from GitHub Packages, which needs a login), build the web bundle and the Flatpak with upstream's
 # npm scripts and electron-forge maker in an Ubuntu 24.04 container against the same Flathub commits,
 # then compare both Flatpak trees file by file (content, mode, owner, link target), write
-# COMPARISON_RESULTS.yaml next to the caller.
+# COMPARISON_RESULTS.yaml next to the script.
 # Supported: x86_64-linux, type flatpak. macOS dmg/zip are signed and notarized on macOS: not covered.
 # Design notes: script-notes/desktop/coinwallet/changelog.md
 # Exit codes: 0 = reproducible, 1 = not_reproducible or ftbfs, 2 = invalid parameters, 130 = stopped.
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.1"
+SCRIPT_VERSION="v0.1.6"
 APP_ID="coinwallet"
 GH_REPO="CoinSpace/CoinSpace"
 REPO_URL="https://github.com/${GH_REPO}.git"
@@ -30,7 +30,7 @@ FLATHUB_URL="https://dl.flathub.org/repo/flathub.flatpakrepo"
 UBUNTU_IMAGE="docker.io/library/ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852"
 NODE_IMAGE="docker.io/library/node:22.23.3-bookworm@sha256:69a5713e7f4997e96d579aafd78734810e0dac0dd5ee4621d72c27a2891a4088"
 GIT_IMAGE="docker.io/alpine/git:v2.54.0@sha256:ac6c828f15d82775d204d3d75112e1d34af8945da80ccf922713c9891ba68e7a"
-# monero-core-js's Dockerfile says FROM emscripten/emsdk:2.0.20; pinned and fully qualified here.
+# monero-core-js's CI uses emscripten/emsdk:2.0.20; pinned and fully qualified here.
 EMSDK_IMAGE="docker.io/emscripten/emsdk:2.0.20@sha256:052d71743ca6d4be41b87a3b2fdff9622e4ab7cdfb6d1c3205385ddfc238c08a"
 
 EXIT_SUCCESS=0
@@ -44,11 +44,11 @@ APP_TYPE=""
 BINARY_PATH=""
 KEEP_IMAGE=false
 EXEC_DIR="$(pwd -P)"
-RESULTS_FILE="${EXEC_DIR}/COMPARISON_RESULTS.yaml"
+RESULTS_FILE="$(dirname "$(readlink -f "$0")")/COMPARISON_RESULTS.yaml"
 WORK_DIR=""
 SUFFIX=""
 TOOL_IMAGE=""
-EMCC_IMAGE=""
+MONERO_SRC=""
 APP_HASH="N/A"
 APP_COMMIT="N/A"
 OFFICIAL_COMMIT="N/A"
@@ -109,11 +109,11 @@ cleanup() {
         kill -KILL "$JOB_PID" 2>/dev/null
     fi
     [[ -n "$JOB_TEE" ]] && kill "$JOB_TEE" 2>/dev/null
+    restore_monero_owner
     # flatpak and ostree leave read-only directories; make the workspace deletable again.
     [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]] && chmod -R u+w "$WORK_DIR" 2>/dev/null
     [[ -n "$DOCKER_CMD" && "$KEEP_IMAGE" != true ]] || return 0
     [[ -n "$TOOL_IMAGE" ]] && "$DOCKER_CMD" rmi -f "$TOOL_IMAGE" >/dev/null 2>&1
-    [[ -n "$EMCC_IMAGE" ]] && "$DOCKER_CMD" rmi -f "$EMCC_IMAGE" >/dev/null 2>&1
     return 0
 }
 
@@ -128,6 +128,7 @@ detect_container_cmd() {
         fi
     fi
     # Every container runs as the caller, so every file in the workspace stays the caller's.
+    # monero-core-js is the exception: see build_monero_core and restore_monero_owner.
     if [[ "$(basename "$DOCKER_CMD")" == podman* ]]; then
         USER_FLAGS=(--userns=keep-id)
     else
@@ -289,13 +290,14 @@ HELPER_END
 }
 
 # Ubuntu 24.04 like the CI runner, with flatpak tooling and Node from the pinned node image.
+# librsvg2-common: flatpak build-export validates the SVG icon and needs this loader.
 build_tool_image() {
     mkdir -p "${WORK_DIR}/toolctx"
     cat > "${WORK_DIR}/toolctx/Containerfile" << EOF
 FROM ${NODE_IMAGE} AS node
 FROM ${UBUNTU_IMAGE}
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\
-      flatpak flatpak-builder ostree elfutils binutils git ca-certificates curl \\
+      flatpak flatpak-builder librsvg2-common ostree elfutils binutils git ca-certificates curl \\
       build-essential python3 patch unzip xz-utils bzip2 \\
     && rm -rf /var/lib/apt/lists/*
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
@@ -425,41 +427,56 @@ pack_coinspace_modules() {
     sed 's/^/  /' "${WORK_DIR}/coinspace-pkgs.txt"
 }
 
+# Docker only: the monero-core-js containers run as root. Under rootless Podman, root is the caller.
+restore_monero_owner() {
+    [[ -n "$MONERO_SRC" && "$(basename "${DOCKER_CMD:-podman}")" != podman* ]] || return 0
+    "$DOCKER_CMD" run --rm -v "${MONERO_SRC}:/src:z" --entrypoint chown "$EMSDK_IMAGE" -R "$(id -u):$(id -g)" /src >/dev/null 2>&1 \
+        || warn "Could not restore ownership of ${MONERO_SRC}"
+}
+
+monero_run() {
+    local log="$1" rc=0
+    shift
+    JOB_CTR="coinwallet-monero-${SUFFIX}"
+    job "$log" no "$DOCKER_CMD" run --rm --name "$JOB_CTR" -e EMSCRIPTEN=/emsdk/upstream/emscripten "$@" || rc=$?
+    JOB_CTR=""
+    return "$rc"
+}
+
 # @coinspace/monero-core-js publishes build/MoneroCoreJS{.js,.wasm,.asm.js}, compiled with Emscripten
-# and not in git. Build them with the package's own Dockerfile and CMake, BUILD=production.
+# and not in git. Same steps as its .github/workflows/ci.yml: one container per step, as root, source
+# mounted at /src. Source paths are compiled into the wasm, so the mount point reaches the output.
 build_monero_core() {
     local m="${WORK_DIR}/coinspace-pkgs/src-monero-core-js"
     [[ -d "$m" ]] || return 0
     echo ""
-    echo "Compiling @coinspace/monero-core-js (wasm and asm.js) with Emscripten 2.0.20..."
-    sed -E "s#^FROM[[:space:]]+(docker\.io/)?emscripten/emsdk:2\.0\.20[[:space:]]*\$#FROM ${EMSDK_IMAGE}#" "$m/Dockerfile" > "${WORK_DIR}/emcc.Containerfile"
-    grep -q "^FROM ${EMSDK_IMAGE}\$" "${WORK_DIR}/emcc.Containerfile" || die "monero-core-js Dockerfile no longer starts FROM emscripten/emsdk:2.0.20; update this script"
-    EMCC_IMAGE="localhost/coinwallet-verify-emcc:${SUFFIX}"
-    job "${WORK_DIR}/emcc-image.log" no "$DOCKER_CMD" build -q -t "$EMCC_IMAGE" -f "${WORK_DIR}/emcc.Containerfile" "$m" \
-        || { tail -20 "${WORK_DIR}/emcc-image.log"; die "monero-core-js toolchain image failed to build; no COMPARISON_RESULTS.yaml written"; }
-    # Boost is built into the image's working directory; CMake expects it at <source>/build/boost.
+    echo "Compiling @coinspace/monero-core-js (wasm and asm.js) with Emscripten 2.0.20, source at /src as in its CI..."
+    MONERO_SRC="$m"
+    local -a at_src=(-v "${m}:/src:z" "$EMSDK_IMAGE")
     local rc=0
-    JOB_CTR="coinwallet-monero-${SUFFIX}"
-    job "${WORK_DIR}/monero-core-js.log" no "$DOCKER_CMD" run --rm --name "$JOB_CTR" "${USER_FLAGS[@]}" -e HOME=/w/home -e EM_CACHE=/w/emcache -e BUILD=production \
-        -v "${WORK_DIR}:/w:z" "$EMCC_IMAGE" sh -c '
-        set -e
-        boost=$(for d in "$(pwd)/build/boost" /src/build/boost /build/boost; do [ -d "$d/lib" ] && echo "$d" && break; done)
-        [ -n "$boost" ] || { echo "boost not found in the toolchain image" >&2; exit 4; }
-        cd /w/coinspace-pkgs/src-monero-core-js
-        mkdir -p build && ln -sfn "$boost" build/boost
-        WASM=1 ./bin/build-emcpp.sh
-        rm -rf build/CMakeCache.txt build/CMakeFiles
-        WASM=0 ./bin/build-emcpp.sh
-        ls -l build/MoneroCoreJS.js build/MoneroCoreJS.wasm build/MoneroCoreJS.asm.js
-    ' || rc=$?
-    JOB_CTR=""
+    monero_run "${WORK_DIR}/monero-boost-download.log" "${at_src[@]}" sh -c '
+        wget --progress=dot:mega https://archives.boost.io/release/1.76.0/source/boost_1_76_0.tar.gz
+        mkdir -p ./contrib/boost-sdk
+        tar zxf boost_1_76_0.tar.gz -C ./contrib/boost-sdk --strip-components=1
+    ' || { tail -20 "${WORK_DIR}/monero-boost-download.log"; restore_monero_owner; die "Boost download failed; no COMPARISON_RESULTS.yaml written"; }
+    monero_run "${WORK_DIR}/monero-boost.log" "${at_src[@]}" ./bin/build-boost-emscripten.sh \
+        || { tail -20 "${WORK_DIR}/monero-boost.log"; restore_monero_owner; die "Boost build failed; no COMPARISON_RESULTS.yaml written"; }
+    monero_run "${WORK_DIR}/monero-core-js-wasm.log" -e BUILD=production -e WASM=1 "${at_src[@]}" ./bin/build-emcpp.sh || rc=$?
+    local log="${WORK_DIR}/monero-core-js-wasm.log"
+    if [[ "$rc" -eq 0 ]]; then
+        log="${WORK_DIR}/monero-core-js-asm.log"
+        monero_run "$log" -e BUILD=production -e WASM=0 "${at_src[@]}" ./bin/build-emcpp.sh || rc=$?
+    fi
+    restore_monero_owner
     if [[ "$rc" -ne 0 ]]; then
-        tail -20 "${WORK_DIR}/monero-core-js.log"
-        if has_compile_error "${WORK_DIR}/monero-core-js.log"; then
-            write_ftbfs "@coinspace/monero-core-js failed to compile from source; see monero-core-js.log."
+        tail -20 "$log"
+        if has_compile_error "$log"; then
+            write_ftbfs "@coinspace/monero-core-js failed to compile from source; see $(basename "$log")."
         fi
         die "monero-core-js build failed with no compile error (network, memory or tooling); no COMPARISON_RESULTS.yaml written"
     fi
+    # emcc leaves the wasm executable; at 0644 npm pack gives the sha512 in upstream's lockfile. Mode only.
+    chmod 644 "$m/build/MoneroCoreJS.wasm"
     sha256sum "$m"/build/MoneroCoreJS.{js,wasm,asm.js} | sed "s#${m}/##; s/^/  /"
 }
 
@@ -491,9 +508,11 @@ build_flatpak() {
         export PATH=/w/shim:$PATH
         git config --global protocol.file.allow always
         /usr/bin/flatpak remote-add --user --if-not-exists flathub "$FLATHUB_URL"
+        # The parental controls check in Flatpak for app/ refs needs a system bus; this container has none.
+        # This variable is the skip built into Flatpak. Without it BaseApp fails with: Could not connect.
         while read -r ref commit; do
-            /usr/bin/flatpak install --user -y --noninteractive --no-deps flathub "$ref" < /dev/null
-            /usr/bin/flatpak update --user -y --noninteractive --no-deps --commit="$commit" "$ref" < /dev/null
+            FLATPAK_SYSTEM_HELPER_ON_SESSION=1 /usr/bin/flatpak install --user -y --noninteractive --no-deps flathub "$ref" < /dev/null
+            FLATPAK_SYSTEM_HELPER_ON_SESSION=1 /usr/bin/flatpak update --user -y --noninteractive --no-deps --commit="$commit" "$ref" < /dev/null
             got=$(/usr/bin/flatpak info --user --show-commit "$ref")
             [ "$got" = "$commit" ] || { echo "PIN_FAILED $ref is $got, wanted $commit"; exit 3; }
         done < /w/pins.txt
@@ -509,7 +528,9 @@ build_flatpak() {
         npm --prefix web run build
         find electron/dist -name "*.map" -delete
         cd electron
-        npm run make -- --platform=linux --arch=x64
+        # The bundler sends flatpak and flatpak-builder output to debug only; without this a failure
+        # shows just a status code. Logging only.
+        DEBUG=@malept/flatpak-bundler npm run make -- --platform=linux --arch=x64
     ' || rc=$?
     JOB_CTR=""
     if [[ "$rc" -ne 0 ]]; then
@@ -550,7 +571,13 @@ compare_trees() {
     tool 'set -e; for s in official built; do node /w/helper.mjs manifest "/w/$s-manifest.json" > "/w/$s-manifest.norm" 2> "/w/$s-sde.txt"; done' \
         || die "Could not read the two manifest.json files"
     MANIFEST_MATCH=true
-    diff "${WORK_DIR}/official-manifest.norm" "${WORK_DIR}/built-manifest.norm" > "${WORK_DIR}/manifest-diff.txt" || MANIFEST_MATCH=false
+    local drc=0
+    tool 'diff /w/official-manifest.norm /w/built-manifest.norm > /w/manifest-diff.txt' || drc=$?
+    case "$drc" in
+        0) ;;
+        1) MANIFEST_MATCH=false ;;
+        *) die "Could not compare the two manifest.json files; no COMPARISON_RESULTS.yaml written" ;;
+    esac
     SDE="official $(cat "${WORK_DIR}/official-sde.txt"), built $(cat "${WORK_DIR}/built-sde.txt")"
     COMMIT_MATCH=true; [[ "$OFFICIAL_COMMIT" == "$APP_COMMIT" ]] || COMMIT_MATCH=false
     CC_OFF=$(cat "${WORK_DIR}/official-content-checksum.txt"); CC_BLD=$(cat "${WORK_DIR}/built-content-checksum.txt")
