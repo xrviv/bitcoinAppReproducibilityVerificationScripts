@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# shapeshift-v0.1.2_build.sh - ShapeShift (Android) Reproducible Build Verification
+# shapeshift-v0.1.3_build.sh - ShapeShift (Android) Reproducible Build Verification
 # ==============================================================================
-# Version:          v0.1.2
+# Version:          v0.1.3
 # Organization:     WalletScrutiny.com
 # Last modified by: Daniel Garcia
 # Last modified on: 2026-11-05
@@ -47,7 +47,7 @@
 # Exit codes: 0 = reproducible, 1 = differences / build failure / other failure, 2 = invalid parameters.
 # ==============================================================================
 
-SCRIPT_VERSION="v0.1.2"
+SCRIPT_VERSION="v0.1.3"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_HASH="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
 echo "$(basename "$SCRIPT_PATH") $SCRIPT_VERSION sha256:${SCRIPT_HASH:-N/A}"
@@ -346,7 +346,7 @@ else
   else echo "FATAL: no commit on main declares version ${V} in app.json"; exit 4; fi
 fi
 git checkout -q "$c" || exit 2
-{ echo "COMMIT=$(git rev-parse HEAD)"; echo "SOURCE=${src}"; echo "APP_VERSION=$(appv HEAD)"
+{ echo "COMMIT=$(git rev-parse HEAD)"; echo "COMMIT_TIME=$(git log -1 --format=%ct)"; echo "SOURCE=${src}"; echo "APP_VERSION=$(appv HEAD)"
   echo "TAGS=$(git tag --points-at HEAD | paste -sd, -)"; } > /out/src.env
 git log -1 --format='  built: %H %ci %s'; echo "  source: ${src}"
 [[ "$(appv HEAD)" == "$V" ]] || echo "  WARNING: app.json declares $(appv HEAD), not ${V}"
@@ -471,9 +471,8 @@ fi
 
 phase "PHASE 2: COMPARISON"
 # Every raw diff must be EARNED by a class with printed evidence: root signature files, Play
-# SourceStamp and manifest meta-data (Play splits only), an apktool-decoded-identical resources.arsc,
-# or an expo-updates app.manifest that differs only in its random per-build id.
-# Everything else (dex, JS bundle, native libs, assets, baseline.prof) is material.
+# SourceStamp and manifest meta-data (Play splits only), or an apktool-decoded-identical resources.arsc.
+# Everything else (dex, JS bundle, native libs, assets, baseline.prof, expo-updates' app.manifest) is material.
 cat > "${CTX}/compare.sh" <<'CMP_END'
 #!/bin/bash
 set -uo pipefail
@@ -509,7 +508,7 @@ echo "  native libs ${nsm}/${nso} identical; dex differing: ${dx:-none}; JS: ${j
 c_sign=$(printf '%s\n' "$raw" | grep -cE '^Only in /tmp/o: META-INF/([^/ ]+\.(SF|RSA|DSA|EC)|MANIFEST\.MF)$')
 c_stamp=$(grep -cx 'Only in /tmp/o: stamp-cert-sha256' <<<"$raw"); c_mani=$(grep -c '^Files /tmp/o/AndroidManifest\.xml ' <<<"$raw")
 c_arsc=$(grep -c '^Files /tmp/o/resources\.arsc ' <<<"$raw"); c_upd=$(grep -c '^Files /tmp/o/assets/app\.manifest ' <<<"$raw")
-a_sign=$c_sign; a_stamp=0; a_mani=0; a_arsc=0; a_upd=0
+a_sign=$c_sign; a_stamp=0; a_mani=0; a_arsc=0; only_id=0
 [[ $c_sign -gt 0 ]] && echo "      signing: ${c_sign} official-only root META-INF signature entr(ies)"
 if [[ $c_stamp -gt 0 ]]; then
   if [[ "$mode" == splits && ! -e /tmp/b/stamp-cert-sha256 && "$(stat -c%s /tmp/o/stamp-cert-sha256 2>/dev/null)" == "32" ]] && grep -q 'Verified for SourceStamp: true' <<<"$("$BT/apksigner" verify --verbose "$o" 2>/dev/null)"; then
@@ -548,20 +547,23 @@ if [[ $c_arsc -gt 0 ]]; then
   else echo "      arsc: NOT EARNED (apktool decode failed) -> material"; fi
 fi
 if [[ $c_upd -gt 0 ]]; then
-  # expo-updates' createManifest stamps a random UUID (crypto.randomUUID) into every embedded manifest; no rebuild
-  # can repeat it. commitTime is pinned at build time, so here it must match like every other field.
+  # expo-updates hard-codes crypto.randomUUID() in createManifestForBuildAsync.js. No rebuild can repeat it, but
+  # upstream can derive it from the bundle, so it counts. This only says whether it is the sole change in the file.
   strip='const m=JSON.parse(require("fs").readFileSync(process.argv[1]));if(!/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(m.id))process.exit(1);delete m.id;process.stdout.write(JSON.stringify(m))'
+  idof='console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).id)'
   so="$(node -e "$strip" /tmp/o/assets/app.manifest 2>/dev/null)"; sb="$(node -e "$strip" /tmp/b/assets/app.manifest 2>/dev/null)"
-  if [[ -n "$so" && "$so" == "$sb" ]]; then a_upd=$c_upd; echo "      app.manifest: identical except expo-updates' random per-build id"
-  else echo "      app.manifest: NOT EARNED (differs beyond a UUID id) -> material"; fi
+  if [[ -n "$so" && "$so" == "$sb" ]]; then only_id=1
+    echo "      app.manifest: only expo-updates' random id differs -> material (upstream can fix it)"
+    echo "        official id $(node -e "$idof" /tmp/o/assets/app.manifest 2>/dev/null), built id $(node -e "$idof" /tmp/b/assets/app.manifest 2>/dev/null)"
+  else echo "      app.manifest: differs beyond the id -> material"; fi
 fi
 printf '%s\n' "$raw" | grep -q 'baseline\.prof' && echo "      baseline.prof: never auto-accepted (embeds dex checksums) -> material"
-acc=$((a_sign+a_stamp+a_mani+a_arsc+a_upd)); un=$((n-acc)); (( un >= 0 )) || { echo "FATAL: accepted ${acc} exceeds raw ${n} ($tag)"; exit 3; }
-echo "TOTALS ${n} ${acc} ${un}" > "$out/summary_${tag}.txt"
+acc=$((a_sign+a_stamp+a_mani+a_arsc)); un=$((n-acc)); (( un >= 0 )) || { echo "FATAL: accepted ${acc} exceeds raw ${n} ($tag)"; exit 3; }
+echo "TOTALS ${n} ${acc} ${un} $(( un == 1 && only_id == 1 ? 1 : 0 ))" > "$out/summary_${tag}.txt"
 echo "  raw ${n}, accepted ${acc}, unaccounted ${un}  (full list: diff_${tag}.txt)"
 printf '%s\n' "$raw" | grep -v '^$' | head -n "$preview" | cut -c1-200 | sed 's/^/    /'
 CMP_END
-tot_raw=0; tot_acc=0; tot_un=0; pair_notes=""; files_lines=""; shown=0   # at most 5 diff lines in the terminal, whole run
+tot_raw=0; tot_acc=0; tot_un=0; pair_notes=""; files_lines=""; id_only=0; shown=0   # at most 5 diff lines in the terminal, whole run
 for p in "${PAIRS[@]}"; do
   o="${p%%|*}"; b="${p#*|}"; tag="$(basename "$o" .apk)"
   section "Comparing $(basename "$o") <-> $( [[ -n "$b" ]] && basename "$b" || echo '<no counterpart>' )"
@@ -571,11 +573,28 @@ for p in "${PAIRS[@]}"; do
   fi
   crun -v "${o}:/official.apk:ro" -v "${b}:/built.apk:ro" -v "${CMP}:/out" -v "${CTX}/compare.sh:/compare.sh:ro" \
     "$IMG" bash /compare.sh "$tag" "$MODE" "$((5-shown))" 2>&1 | tee -a "${CMP}/comparison.log"
-  read -r _ r a u < "${CMP}/summary_${tag}.txt" 2>/dev/null || abort "Comparison stage failed for ${tag}"
+  read -r _ r a u i < "${CMP}/summary_${tag}.txt" 2>/dev/null || abort "Comparison stage failed for ${tag}"
+  id_only=$((id_only+${i:-0}))
   shown=$(( shown+r < 5 ? shown+r : 5 ))
   tot_raw=$((tot_raw+r)); tot_acc=$((tot_acc+a)); tot_un=$((tot_un+u)); pair_notes+="${tag}: raw ${r}, accepted ${a}, unaccounted ${u}; "
   files_lines+="$(basename "$o") - ${tag} - $(sha256of "$b") - $([[ "$u" -eq 0 ]] && echo '1 (MATCHES)' || echo "0 (DOESN'T MATCH)")"$'\n'
 done
+
+# The copied commitTime is unverified, and a far-future value would beat every OTA update in the launcher. It must at
+# least fall between the built commit and this run; the real build and release times are not in the APK.
+ct_note="no commitTime in the official APK"
+if [[ -n "$commit_time" ]]; then
+  ct_s=$((commit_time/1000)); commit_ts="$(envv COMMIT_TIME)"
+  if [[ "$commit_ts" =~ ^[0-9]+$ ]] && (( ct_s >= commit_ts && ct_s <= $(date +%s) )); then
+    ct_note="commitTime ${commit_time} is $(( (ct_s-commit_ts)/60 )) min after the built commit"
+  else
+    ct_note="commitTime ${commit_time} is NOT between the built commit (${commit_ts:-unknown}) and this run"
+    tot_raw=$((tot_raw+1)); tot_un=$((tot_un+1))
+  fi
+fi
+log_info "${ct_note}"
+id_note=""
+[[ "$tot_un" -eq 1 && "$id_only" -eq 1 ]] && id_note="The only counted difference is expo-updates' random id in assets/app.manifest; upstream can fix it. Every other file matches or is an accepted signing or Play change, so the dex and JS bundle match."$'\n'
 
 section "RESULT"
 rel_ws="${WS#"$(pwd -P)"/}"
@@ -590,11 +609,12 @@ EOF
 if [[ "$tot_un" -eq 0 ]]; then verdict="reproducible"; rc=0; head_line="BUILDS MATCH BINARIES"
 else verdict="not_reproducible"; rc=1; head_line="BUILDS DO NOT MATCH BINARIES"; fi
 generate_yaml "$verdict" "${APP_ID} ${vname} (versionCode ${vcode}; ${MODE}) built from ${commit} (${rev_source}); no release tag.
-EAS-like build; versionCode, expo-updates commitTime and dev-server IPv4 copied from the official APK, so a match proves nothing about those values; update channel from eas.json profile ${PROFILE}; .env from the public .env.template.
+EAS-like build; versionCode, expo-updates commitTime and dev-server IPv4 copied from the official APK, so a match proves nothing about those values; upstream could also fix commitTime; update channel from eas.json profile ${PROFILE}; .env from the public .env.template.
+${ct_note}; the commit choice rests on that same value, and the dex and JS bundle comparison is what confirms the commit.
 Official ${main} SHA-256 ${app_hash}, signer ${signer:-unknown}.
 ${pair_notes}
 Totals: raw ${tot_raw}, accepted ${tot_acc}, unaccounted ${tot_un}.
-The APK is a WebView shell: the wallet UI runs from https://app.shapeshift.com and is not covered by this build. The shell stores mnemonics for that page, and an over-the-air update could replace the shell's JS without changing the APK."
+${id_note}The APK is a WebView shell: the wallet UI runs from https://app.shapeshift.com and is not covered by this build. The shell stores mnemonics for that page, and an over-the-air update could replace the shell's JS without changing the APK."
 echo ""
 echo "===== Begin Results ====="
 echo "appId:          ${APP_ID}"
