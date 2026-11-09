@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# onekeymobile-v0.1.5_build.sh - OneKey Wallet (Android) Reproducible Build Verification
+# onekeymobile-v0.1.6_build.sh - OneKey Wallet (Android) Reproducible Build Verification
 # ==============================================================================
-# Version:          v0.1.5
+# Version:          v0.1.6
 # Organization:     WalletScrutiny.com
 # Last modified by: Daniel Garcia
 # Last modified on: 2026-11-09
@@ -48,7 +48,7 @@
 # Exit codes: 0 = reproducible, 1 = differences / build failure / other failure, 2 = invalid parameters.
 # ==============================================================================
 
-SCRIPT_VERSION="v0.1.5"
+SCRIPT_VERSION="v0.1.6"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_HASH="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
 echo "$(basename "$SCRIPT_PATH") $SCRIPT_VERSION sha256:${SCRIPT_HASH:-N/A}"
@@ -210,27 +210,27 @@ ENV DEBIAN_FRONTEND=noninteractive TZ=UTC LANG=C.UTF-8 LC_ALL=C.UTF-8
 RUN apt-get update && apt-get install -y --no-install-recommends git unzip zip curl ca-certificates binutils gnupg rsync \\
   && rm -rf /var/lib/apt/lists/*
 # Bun as on the EAS image (react-native-video's postinstall runs it).
-RUN cd /tmp && curl -fsSL -o bun.zip https://github.com/oven-sh/bun/releases/download/bun-v1.2.20/bun-linux-x64.zip \\
+RUN cd /tmp && curl -fsSL --retry 5 --retry-delay 15 -obun.zip https://github.com/oven-sh/bun/releases/download/bun-v1.2.20/bun-linux-x64.zip \\
   && echo "4e9edc4cba0c7c1623a288be01e53bbde11a4d073f2cf339cab026627858b548  bun.zip" | sha256sum -c - \\
   && unzip -q bun.zip && install -m 0755 bun-linux-x64/bun /usr/local/bin/bun && rm -rf bun.zip bun-linux-x64
-RUN cd /tmp && curl -fsSL -o jdk.tar.gz "https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.19%2B10/OpenJDK17U-jdk_x64_linux_hotspot_17.0.19_10.tar.gz" \\
+RUN cd /tmp && curl -fsSL --retry 5 --retry-delay 15 -ojdk.tar.gz "https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.19%2B10/OpenJDK17U-jdk_x64_linux_hotspot_17.0.19_10.tar.gz" \\
   && echo "d8afc263758141a66e0e3aafc321e783f7016696f4eaea067d340a269037d331  jdk.tar.gz" | sha256sum -c - \\
   && mkdir -p /opt/jdk17 && tar -xzf jdk.tar.gz -C /opt/jdk17 --strip-components=1 && rm jdk.tar.gz
 # EAS keeps the SDK in ~/Android/Sdk; the NDK path is hashed into the build IDs of the native libs.
 ENV JAVA_HOME=/opt/jdk17 ANDROID_HOME=${EAS_HOME}/Android/Sdk ANDROID_SDK_ROOT=${EAS_HOME}/Android/Sdk
 ENV PATH=/opt/jdk17/bin:${EAS_HOME}/Android/Sdk/cmdline-tools/latest/bin:${EAS_HOME}/Android/Sdk/platform-tools:\$PATH
 RUN mkdir -p \$ANDROID_HOME/cmdline-tools && cd \$ANDROID_HOME/cmdline-tools \\
-  && curl -fsSL -o ct.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \\
+  && curl -fsSL --retry 5 --retry-delay 15 -oct.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \\
   && echo "2d2d50857e4eb553af5a6dc3ad507a17adf43d115264b1afc116f95c92e5e258  ct.zip" | sha256sum -c - \\
   && unzip -q ct.zip && rm ct.zip && mv cmdline-tools latest
 RUN yes | sdkmanager --licenses >/dev/null && sdkmanager "platforms;android-36" "build-tools;36.0.0" \\
     "platform-tools" "ndk;27.1.12297006" "cmake;3.22.1" >/dev/null && chmod -R a+rwX \$ANDROID_HOME
-RUN cd /opt && curl -fsSL -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar \\
+RUN cd /opt && curl -fsSL --retry 5 --retry-delay 15 -oapktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar \\
   && echo "${APKTOOL_SHA256}  apktool.jar" | sha256sum -c - \\
-  && curl -fsSL -o bundletool.jar https://github.com/google/bundletool/releases/download/${BUNDLETOOL_VERSION}/bundletool-all-${BUNDLETOOL_VERSION}.jar \\
+  && curl -fsSL --retry 5 --retry-delay 15 -obundletool.jar https://github.com/google/bundletool/releases/download/${BUNDLETOOL_VERSION}/bundletool-all-${BUNDLETOOL_VERSION}.jar \\
   && echo "${BUNDLETOOL_SHA256}  bundletool.jar" | sha256sum -c - && chmod 0644 apktool.jar bundletool.jar
 # hermes-dec (pure Python) disassembles the official Hermes bundle to read the inlined BUILD_TIME values.
-RUN cd /tmp && curl -fsSL -o hd.whl https://files.pythonhosted.org/packages/79/46/4db716ac625ba3cf40c666fb83450c310b7c400e682ecc9b26b02eea0a32/hermes_dec-0.1.8-py3-none-any.whl \\
+RUN cd /tmp && curl -fsSL --retry 5 --retry-delay 15 -ohd.whl https://files.pythonhosted.org/packages/79/46/4db716ac625ba3cf40c666fb83450c310b7c400e682ecc9b26b02eea0a32/hermes_dec-0.1.8-py3-none-any.whl \\
   && echo "6be7858a11edc3bc27d37abad65c80a36b51683283eed6331cd5c7d3fb399a4c  hd.whl" | sha256sum -c - && mkdir -p /opt/hd && unzip -q hd.whl -d /opt/hd && rm hd.whl
 RUN mkdir -p ${EAS_HOME}/workingdir /tmp/afw && chmod 0777 ${EAS_HOME} ${EAS_HOME}/workingdir ${EAS_HOME}/Android /tmp/afw
 WORKDIR ${EAS_HOME}/workingdir
@@ -245,9 +245,9 @@ if [[ -z "$MODE" ]]; then
 #!/bin/bash
 V="$1"; FPR="$2"; U="https://github.com/OneKeyHQ/app-monorepo/releases/download/v${V}/OneKey-Wallet-${V}-android.apk"
 cd /dl || exit 1
-curl -fsSL -o key.js "https://raw.githubusercontent.com/OneKeyHQ/app-monorepo/v${V}/apps/desktop/app/constant/gpg.js" || { echo "no gpg.js at v${V}"; exit 1; }
-curl -fsSL -o sums.asc "${U}.SHA256SUMS.asc" || { echo "no SHA256SUMS.asc for ${V}"; exit 4; }
-curl -fsSL --retry 3 -o "OneKey-Wallet-${V}-android.apk" "$U" || { echo "APK download failed"; exit 1; }
+curl -fsSL --retry 5 --retry-delay 15 -okey.js "https://raw.githubusercontent.com/OneKeyHQ/app-monorepo/v${V}/apps/desktop/app/constant/gpg.js" || { echo "no gpg.js at v${V}"; exit 1; }
+curl -fsSL --retry 5 --retry-delay 15 -osums.asc "${U}.SHA256SUMS.asc" || { echo "no SHA256SUMS.asc for ${V}"; exit 4; }
+curl -fsSL --retry 5 --retry-delay 15 -o "OneKey-Wallet-${V}-android.apk" "$U" || { echo "APK download failed"; exit 1; }
 export GNUPGHOME="$(mktemp -d)"
 sed -n '/BEGIN PGP PUBLIC/,/END PGP PUBLIC/p' key.js | sed 's/^.*\(-----BEGIN\)/\1/; s/\(BLOCK-----\)`.*$/\1/' | gpg -q --import 2>/dev/null
 gpg --status-fd 1 --verify sums.asc 2>/dev/null > gpg.txt
