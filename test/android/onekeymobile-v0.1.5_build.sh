@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# onekeymobile-v0.1.1_build.sh - OneKey Wallet (Android) Reproducible Build Verification
+# onekeymobile-v0.1.5_build.sh - OneKey Wallet (Android) Reproducible Build Verification
 # ==============================================================================
-# Version:          v0.1.1
+# Version:          v0.1.5
 # Organization:     WalletScrutiny.com
 # Last modified by: Daniel Garcia
-# Last modified on: 2026-11-06
+# Last modified on: 2026-11-09
 # App ID:           so.onekey.app.wallet
 # Project:          https://github.com/OneKeyHQ/app-monorepo
 # Play Store:       https://play.google.com/store/apps/details?id=so.onekey.app.wallet
@@ -40,13 +40,15 @@
 # repo in /home/expo/workingdir/build, env from eas.json, yarn install --immutable, gradle. The values
 # CI injects from secrets or the clock are copied from the official APK, so a match proves nothing
 # about them: versionCode (BUILD_NUMBER), BUNDLE_VERSION and JPUSH_APPKEY (manifest), the React Native
-# Sentry DSN (BuildConfig) and the Firebase values google-services.json generates (resources).
+# Sentry DSN (BuildConfig), the Firebase values google-services.json generates (resources), the web Sentry
+# DSN and BUILD_TIME (web-embed JS), the two native BUILD_TIMEs (Hermes disassembly of common.bundle), the
+# React Native dev-server IP (the CI machine's address, a resource) and the sentry-debug-meta.properties date.
 # Every raw difference must be earned by a named check; everything else is material.
 #
 # Exit codes: 0 = reproducible, 1 = differences / build failure / other failure, 2 = invalid parameters.
 # ==============================================================================
 
-SCRIPT_VERSION="v0.1.1"
+SCRIPT_VERSION="v0.1.5"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_HASH="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
 echo "$(basename "$SCRIPT_PATH") $SCRIPT_VERSION sha256:${SCRIPT_HASH:-N/A}"
@@ -109,6 +111,7 @@ Usage: $(basename "$SCRIPT_PATH") [--binary <apk | dir-of-Play-splits>] [--versi
  --arch           Checked against the official split set or APK (mismatch exits 2). --type: accepted, ignored.
  WS_DEVICE_SDK    env: device-spec API level for Play splits (default 36; use the SDK of the phone they came from).
  MEM_LIMIT        env: container memory limit (default 14g; empty = none).
+ BUILD_CPUS       env: CPUs for the build container (default 6; Metro starts one worker per CPU, EAS uses 8 vCPU).
 
 Exit codes: 0 = reproducible, 1 = not reproducible / ftbfs / failure, 2 = invalid parameters.
 USAGE
@@ -226,6 +229,9 @@ RUN cd /opt && curl -fsSL -o apktool.jar https://github.com/iBotPeaches/Apktool/
   && echo "${APKTOOL_SHA256}  apktool.jar" | sha256sum -c - \\
   && curl -fsSL -o bundletool.jar https://github.com/google/bundletool/releases/download/${BUNDLETOOL_VERSION}/bundletool-all-${BUNDLETOOL_VERSION}.jar \\
   && echo "${BUNDLETOOL_SHA256}  bundletool.jar" | sha256sum -c - && chmod 0644 apktool.jar bundletool.jar
+# hermes-dec (pure Python) disassembles the official Hermes bundle to read the inlined BUILD_TIME values.
+RUN cd /tmp && curl -fsSL -o hd.whl https://files.pythonhosted.org/packages/79/46/4db716ac625ba3cf40c666fb83450c310b7c400e682ecc9b26b02eea0a32/hermes_dec-0.1.8-py3-none-any.whl \\
+  && echo "6be7858a11edc3bc27d37abad65c80a36b51683283eed6331cd5c7d3fb399a4c  hd.whl" | sha256sum -c - && mkdir -p /opt/hd && unzip -q hd.whl -d /opt/hd && rm hd.whl
 RUN mkdir -p ${EAS_HOME}/workingdir /tmp/afw && chmod 0777 ${EAS_HOME} ${EAS_HOME}/workingdir ${EAS_HOME}/Android /tmp/afw
 WORKDIR ${EAS_HOME}/workingdir
 DOCKERFILE_END
@@ -283,11 +289,11 @@ for d in /tmp/x/classes*.dex; do
 done | head -1 > /m/dsn.txt
 r="$("$BT/aapt2" dump resources "$A" 2>/dev/null)"
 s() { printf '%s\n' "$r" | grep -A1 " string/$1\$" | sed -n 's/^ *() "\(.*\)"$/\1/p' | head -1; }
-P="$(s project_id)"; N="$(s gcm_defaultSenderId)"; K="$(s google_api_key)"; I="$(s google_app_id)"; S="$(s google_storage_bucket)"; W="$(s default_web_client_id)"
+P="$(s project_id)"; N="$(s gcm_defaultSenderId)"; K="$(s google_api_key)"; I="$(s google_app_id)"; S="$(s google_storage_bucket)"; W="$(s default_web_client_id)"; U="$(s firebase_database_url)"
 [[ -n "$P" && -n "$N" && -n "$K" && -n "$I" ]] || exit 0
 cat > /m/google-services.json <<GS
 {
-  "project_info": { "project_number": "$N", "project_id": "$P", "storage_bucket": "$S" },
+  "project_info": { "project_number": "$N", $([[ -n "$U" ]] && echo "\"firebase_url\": \"$U\",") "project_id": "$P", "storage_bucket": "$S" },
   "client": [ {
     "client_info": { "mobilesdk_app_id": "$I", "android_client_info": { "package_name": "so.onekey.app.wallet" } },
     "oauth_client": [ $([[ -n "$W" ]] && echo "{ \"client_id\": \"$W\", \"client_type\": 3 }") ],
@@ -297,6 +303,22 @@ cat > /m/google-services.json <<GS
 }
 GS
 echo "[META] Firebase project ${P}, app ${I}; Sentry DSN $(cut -c1-40 /m/dsn.txt)..."
+# Clock values CI bakes in: BUILD_TIME (Date.now() per bundler process: once in web-embed, once per Babel
+# worker for platformEnv.ts and systemTimeUtils.ts in common.bundle), the web Sentry DSN and the
+# sentry-debug-meta.properties date. Any that cannot be read unambiguously stay unpinned.
+rm -rf /tmp/p && mkdir /tmp/p && unzip -q -o "$A" assets/common.bundle 'assets/web-embed/web-embed.*.js' assets/sentry-debug-meta.properties -d /tmp/p 2>/dev/null
+we="$(grep -l 'buildTime:Number("' /tmp/p/assets/web-embed/web-embed.*.js 2>/dev/null)"
+one() { [[ "$(printf '%s\n' "$1" | grep -c .)" == 1 ]] && printf '%s' "$1"; }
+WBT="$(one "$(grep -aoE 'buildTime:Number\("[0-9]+"\)' $we 2>/dev/null | grep -oE '[0-9]+' | sort -u)")"
+WDSN="$(one "$(grep -aoE 'sdk_init\(\{dsn:"[^"]*"' /tmp/p/assets/web-embed/web-embed.*.js 2>/dev/null | sed 's/.*dsn:"//; s/"$//' | sort -u)")"
+SDATE="$(sed -n '2s/^#\([A-Z][a-z][a-z] [A-Z][a-z][a-z] [0-9 ][0-9] [0-9:]\{8\} [A-Z]* [0-9]\{4\}\)$/\1/p' /tmp/p/assets/sentry-debug-meta.properties 2>/dev/null)"
+# platformEnv: Number("t") stored into the env object; systemTimeUtils: Math.max(Number("t"), <constant>).
+PYTHONPATH=/opt/hd timeout 30m python3 -m hermes_dec.disassembly.hbc_disassembler /tmp/p/assets/common.bundle /tmp/c.dis >/dev/null 2>&1
+read -r EBT SBT < <(awk '/<LoadConstString>.*String: .[0-9]+. \(String\)/ { v=$0; sub(/.*String: ./,"",v); sub(/. \(String\).*/,"",v); if (length(v) == 13) k=2; next }
+  k && --k == 0 { if ($0 ~ /<LoadConstDouble>/) s[++ns]=v; else if ($0 ~ /<PutOwnBySlotIdx>|<PutById>|<PutNewOwnById/) e[++ne]=v }
+  END { if (ne == 1 && ns == 1) print e[1], s[1] }' /tmp/c.dis 2>/dev/null)
+printf 'WEB_BUILD_TIME=%s\nWEB_DSN=%s\nENV_BUILD_TIME=%s\nSYS_BUILD_TIME=%s\nSENTRY_DATE=%s\nDEV_SERVER_IP=%s\n' "$WBT" "$WDSN" "$EBT" "$SBT" "$SDATE" "$(s react_native_dev_server_ip)" > /m/pins.env
+sed 's/^/[META]   pin /' /m/pins.env
 META_END
 : > "${META}/apks.txt"
 MOUNTS=(); for f in "${OFFICIAL[@]}"; do MOUNTS+=(-v "${f}:/official/$(basename "$f"):ro"); done
@@ -325,6 +347,7 @@ cat > "${CTX}/build.sh" <<'BUILD_END'
 set -uo pipefail
 umask 022
 TAG="$1"; VCODE="$2"; BV="$3"; JPK="$4"; PROFILE="$5"; DSN="$(cat /m/dsn.txt)"
+pv() { sed -n "s/^$1=//p" /m/pins.env 2>/dev/null; }
 git config --global --add safe.directory '*'
 git clone -q --depth 1 --branch "$TAG" "$REPO_URL" "$EAS_PATH" || { echo "FATAL: no tag ${TAG} (clone failed)"; exit 4; }
 cd "$EAS_PATH" || exit 1
@@ -347,21 +370,49 @@ console.log(["GRADLE_CMD","EAS_NODE","EAS_IMAGE","EAS_NDK"].map((k,i)=>k+"="+JSO
 # Secrets not shipped in the APK stay empty; GITHUB_TAG is the workflow branch, not inlined in the app.
 { echo "GITHUB_SHA=${C}"; echo "GITHUB_TAG=${TAG}"; echo "CI_BUILD_APP_VERSION=${V}"; echo "CI_BUILD_NUMBER=${VCODE}"
   echo "BUNDLE_VERSION=${BV}"; echo "COVALENT_KEY="; echo "SENTRY_AUTH_TOKEN="; echo "SENTRY_TOKEN="; echo "SENTRY_PROJECT="
-  echo "SENTRY_RELEASE_NAME=${TAG}-${VCODE}"; for s in EXT DESKTOP MAS SNAP WINMS WEB; do echo "SENTRY_DSN_${s}="; done
+  echo "SENTRY_RELEASE_NAME=${TAG}-${VCODE}"; for s in EXT DESKTOP MAS SNAP WINMS; do echo "SENTRY_DSN_${s}="; done; echo "SENTRY_DSN_WEB=$(pv WEB_DSN)"
   echo "SENTRY_DSN_REACT_NATIVE=${DSN}"; echo "ONEKEY_ALLOW_SKIP_GPG_VERIFICATION=false"; echo "NO_FLIPPER=1"
-  echo "SENTRY_DISABLE_AUTO_UPLOAD=true"; echo "JPUSH_KEY=${JPK}"; } >> .env.expo
+  echo "SENTRY_DISABLE_AUTO_UPLOAD=false"; echo "JPUSH_KEY=${JPK}"; } >> .env.expo
 echo "BUILD_NUMBER=${VCODE}" >> .env.version
 G=apps/mobile/android/app/build.gradle
 sed -i "0,/versionCode.*/s//versionCode ${VCODE}/" "$G"; sed -i "0,/versionName \".*\"/s//versionName \"${V}\"/" "$G"
 grep -qE "^\s*versionCode ${VCODE}$" "$G" && grep -qE "^\s*versionName \"${V}\"$" "$G" || { echo "FATAL: version injection failed"; exit 5; }
 cp /m/google-services.json apps/mobile/android/app/google-services.json
-export CI=1 EAS_BUILD=true EAS_BUILD_PLATFORM=android EAS_BUILD_PROFILE="$PROFILE" NODE_ENV=production GRADLE_USER_HOME="${HOME}/.gradle"
-mkdir -p "$GRADLE_USER_HOME" && echo "org.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=2g" > "$GRADLE_USER_HOME/gradle.properties"
+# development/env.js inlines BUILD_TIME=Date.now() per bundler process. The values read from the official
+# bundles go into its two readers: web-embed's during yarn install, then the native ones for gradle.
+BT_FILES=(packages/shared/src/platformEnv.ts packages/shared/src/utils/systemTimeUtils.ts)
+pin_bt() { local f="$1" from="$2" to="$3"
+  [[ "$(grep -cF "Number(${from})" "$f")" == 1 ]] || { echo "FATAL: ${f} has no single Number(${from})"; exit 5; }
+  sed -i "s/Number(${from//./\\.})/Number(\"${to}\")/" "$f"; }
+WBT="$(pv WEB_BUILD_TIME)"; EBT="$(pv ENV_BUILD_TIME)"; SBT="$(pv SYS_BUILD_TIME)"
+if [[ -n "$WBT" && -n "$EBT" && -n "$SBT" ]]; then
+  for f in "${BT_FILES[@]}"; do pin_bt "$f" process.env.BUILD_TIME "$WBT"; done
+  echo "  BUILD_TIME pinned: web-embed ${WBT}, then platformEnv ${EBT}, systemTimeUtils ${SBT} (from the official APK)"
+else echo "  WARNING: BUILD_TIME not pinned (not readable from the official APK)"; fi
+SD="$(pv SENTRY_DATE)"
+if [[ -n "$SD" ]]; then
+  # The Sentry plugin writes java.util.Properties, whose first comment is the wall clock; copied like versionCode.
+  cat >> "$G" <<GRADLE
+tasks.matching { it.name.startsWith("injectSentryDebugMetaPropertiesIntoAssets") }.configureEach { t ->
+    t.doLast { t.outputs.files.asFileTree.matching { include "**/sentry-debug-meta.properties" }.each { f ->
+        f.text = f.text.replaceFirst(/(?m)^#[A-Z][a-z]{2} [A-Z][a-z]{2} .*\$/, "#${SD}") } }
+}
+GRADLE
+  echo "  sentry-debug-meta.properties date pinned to ${SD} (from the official APK)"
+fi
+# React Native stores the build machine's first IPv4 as a resource (debug dev server only); copied like versionCode.
+DIP="$(pv DEV_SERVER_IP)"; DIPA=()
+if [[ "$DIP" =~ ^[0-9.]+$ ]]; then DIPA=("-PreactNativeDevServerIp=${DIP}"); echo "  react_native_dev_server_ip pinned to ${DIP} (from the official APK)"
+else echo "  WARNING: react_native_dev_server_ip not pinned (not readable from the official APK)"; fi
+# sentry.gradle reads this from the environment; without the CI token the upload task fails. Uploads only.
+export SENTRY_DISABLE_AUTO_UPLOAD=true CI=1 EAS_BUILD=true EAS_BUILD_PLATFORM=android EAS_BUILD_PROFILE="$PROFILE" NODE_ENV=production GRADLE_USER_HOME="${HOME}/.gradle"
+mkdir -p "$GRADLE_USER_HOME" && echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g" > "$GRADLE_USER_HOME/gradle.properties"
 echo "  node $(node --version), $(java -version 2>&1 | head -1)"
 run() { echo "=== $1 === $(date)"; shift; "$@" > /out/step.log 2>&1 || { tail -40 /out/step.log; cat /out/step.log >> /out/build.log; cp /out/step.log /out/fail.log; echo "FATAL: step failed"; exit 3; }; cat /out/step.log >> /out/build.log; }
 run "yarn install --immutable" yarn install --immutable
+if [[ -n "$WBT" && -n "$EBT" && -n "$SBT" ]]; then pin_bt "${BT_FILES[0]}" "\"${WBT}\"" "$EBT"; pin_bt "${BT_FILES[1]}" "\"${WBT}\"" "$SBT"; fi
 cd apps/mobile/android || exit 1
-run "gradle ${GRADLE_CMD}" timeout 5h ./gradlew "$GRADLE_CMD" --no-daemon --max-workers=4
+run "gradle ${GRADLE_CMD}" timeout 5h ./gradlew "$GRADLE_CMD" "${DIPA[@]}" --no-daemon --max-workers=4
 if [[ "$GRADLE_CMD" == *bundle* ]]; then f="$(find app/build/outputs/bundle -name '*.aab' | head -1)"; cp "$f" /out/app-release.aab || { echo "FATAL: no .aab"; exit 3; }
 else f="$(find app/build/outputs/apk -name '*.apk' | head -1)"; cp "$f" /out/app-release.apk || { echo "FATAL: no .apk"; exit 3; }; fi
 echo "  output: ${f}"; echo "=== build complete $(date) ==="
@@ -371,10 +422,13 @@ log_info "Release inputs from ${main}: versionCode ${vcode}, BUNDLE_VERSION ${bu
 log_info "Container build (typically 60-120 min)"
 # A job, so a stop interrupts wait at once; the EXIT trap removes the named container.
 # The source tree and gradle home live in the workspace (tens of GB), at EAS's paths inside the container.
+# CPU affinity (taskset; rootless podman often lacks the cpuset controller) sizes Metro's worker pool.
 mkdir -p "${WS}/eas" "${WS}/gradle" || abort "Cannot create ${WS}/eas"
+ncpu="$(nproc)"; BUILD_CPUS="${BUILD_CPUS:-6}"; [[ "$BUILD_CPUS" =~ ^[1-9][0-9]*$ ]] || die_invalid "BUILD_CPUS must be a positive number"
+(( BUILD_CPUS > ncpu )) && BUILD_CPUS="$ncpu"; log_info "Build container: ${BUILD_CPUS} of ${ncpu} CPUs, memory ${MEM_LIMIT:-unlimited}"
 crun --name "$BUILD_CTR" -e "EAS_PATH=${EAS_PATH}" -e "REPO_URL=${REPO_URL}" -v "${WS}/eas:${EAS_HOME}/workingdir" -v "${WS}/gradle:${EAS_HOME}/.gradle" \
   -v "${BLD}:/out" -v "${META}:/m:ro" -v "${CTX}/build.sh:/build.sh:ro" "$IMG" \
-  timeout 5h bash /build.sh "v${version_arg}" "$vcode" "$bundle_version" "$jpush_key" "$PROFILE" > >(tee "${BLD}/container.log") 2>&1 &
+  taskset -c "0-$((BUILD_CPUS-1))" timeout 5h bash /build.sh "v${version_arg}" "$vcode" "$bundle_version" "$jpush_key" "$PROFILE" > >(tee "${BLD}/container.log") 2>&1 &
 wait "$!"; BRC=$?; sleep 1
 case $BRC in
   0) ;;
@@ -382,6 +436,7 @@ case $BRC in
   3) has_compile_error "${BLD}/fail.log" && ftbfs "${APP_ID} ${vname} (${vcode}): the source failed to build (see built/fail.log). Official ${main} SHA-256 ${app_hash}."
      abort "Build failed with no source error (network, memory, disk or tooling); see built/container.log" ;;
   5) abort "This script cannot reproduce this release as written (see built/container.log); nothing was compared" ;;
+  137) abort "The build container was killed (out of memory? try a lower BUILD_CPUS or a higher MEM_LIMIT)" ;;
   *) abort "Source preparation failed (container exit ${BRC})" ;;
 esac
 envv() { sed -n "s/^$1=//p" "${BLD}/src.env"; }
@@ -550,8 +605,8 @@ EOF
 if [[ "$tot_un" -eq 0 ]]; then verdict="reproducible"; rc=0; head_line="BUILDS MATCH BINARIES"
 else verdict="not_reproducible"; rc=1; head_line="BUILDS DO NOT MATCH BINARIES"; fi
 generate_yaml "$verdict" "${APP_ID} ${vname} (versionCode ${vcode}; ${MODE}) built from tag v${vname} (${tag_type:-?}) at ${commit}.
-EAS-like build, eas.json profile ${PROFILE}. Copied from the official APK, so a match proves nothing about them: versionCode, BUNDLE_VERSION ${bundle_version}, JPUSH_APPKEY, the React Native Sentry DSN and the Firebase strings (google-services.json is a CI secret).
-Secrets the APK does not expose (Covalent key, other Sentry DSNs) are left empty.
+EAS-like build, eas.json profile ${PROFILE}. Copied from the official APK, so a match proves nothing about them: versionCode, BUNDLE_VERSION ${bundle_version}, JPUSH_APPKEY, the React Native and web Sentry DSNs, the Firebase strings (google-services.json is a CI secret), the React Native dev-server IP, the three BUILD_TIME clock values inlined into the JS and the sentry-debug-meta.properties date.
+Secrets the APK does not expose (Covalent key, other Sentry DSNs, KEY_SECRET for libkeys.so) are left empty.
 Official ${main} SHA-256 ${app_hash}, signer ${signer:-unknown}.
 ${pair_notes}
 Totals: raw ${tot_raw}, accepted ${tot_acc}, unaccounted ${tot_un}.
