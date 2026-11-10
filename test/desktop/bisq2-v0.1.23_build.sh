@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # bisq2_build.sh - Bisq2 Desktop Reproducible Build Verification
-# Version:       v0.1.22
+# Version:       v0.1.23
 # Organization:  WalletScrutiny.com
 # Last Modified: 2026-11-10
 # Project:       https://github.com/bisq-network/bisq2
 # License:       MIT
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.22"
+SCRIPT_VERSION="v0.1.23"
 REPO_URL="https://github.com/bisq-network/bisq2"
 GH_REPO="xrviv/WalletScrutinyCom"
 GH_WORKFLOW="bisq2-windows-build.yml"
@@ -678,6 +678,7 @@ print_results() {
     echo ""
     echo "Diff (first 5 lines):"
     head -5 "$DIFF_BRIEF"
+    [[ -s "${MODE_DIFF:-}" ]] && head -5 "$MODE_DIFF"
     echo "===== End Results ====="
     echo "Exit code: 0"
 }
@@ -824,6 +825,16 @@ if [[ "$BUILD_TYPE" == "rpm" ]]; then
     (cd "$EXTRACT_BLT" && rpm2cpio "$BUILT_DEB"    | cpio -idm --quiet) \
         || fail "Failed to extract built RPM"
 
+    q='[%{FILEMODES:octal} %{FILEUSERNAME}:%{FILEGROUPNAME} %{FILENAMES}\n]'
+    MODE_DIFF="$OUTPUT/diff_rpm_modes.txt"; HDR_DIFF="$OUTPUT/diff_rpm_header.txt"
+    diff <(rpm -qp --qf "$q" "$OFFICIAL_DEB" 2>/dev/null) <(rpm -qp --qf "$q" "$BUILT_DEB" 2>/dev/null) >"$MODE_DIFF" || true
+    MODE_DIFF_COUNT=$(grep -c '^[<>]' "$MODE_DIFF" || true)
+    h="--requires --provides --scripts"
+    diff <(rpm -qip $h "$OFFICIAL_DEB" 2>/dev/null) <(rpm -qip $h "$BUILT_DEB" 2>/dev/null) >"$HDR_DIFF" || true
+    HDR_DIFF_COUNT=$(grep -c '^<' "$HDR_DIFF" || true)
+    echo "[INFO] RPM mode/owner diff lines: $MODE_DIFF_COUNT"; cat "$MODE_DIFF"
+    echo "[INFO] RPM header lines differing (not in verdict): $HDR_DIFF_COUNT"; cat "$HDR_DIFF"
+
     EXTRACT_OFF_SIZE=$(du -sb "$EXTRACT_OFF" | cut -f1)
     EXTRACT_BLT_SIZE=$(du -sb "$EXTRACT_BLT" | cut -f1)
     EXTRACT_SIZE_DIFF=$((EXTRACT_BLT_SIZE - EXTRACT_OFF_SIZE))
@@ -942,20 +953,21 @@ if [[ "$BUILD_TYPE" == "rpm" ]]; then
     RPM_PAYLOAD_DIFF_COUNT="$DIFF_BRIEF_COUNT"
     echo "[INFO] Extracted RPM payload differences: ${RPM_PAYLOAD_DIFF_COUNT}"
 
-    if [[ "$RPM_PAYLOAD_DIFF_COUNT" -eq 0 ]]; then
+    RPM_MODE_NOTE="File mode/owner diff lines: ${MODE_DIFF_COUNT}. RPM header lines differing: ${HDR_DIFF_COUNT}."
+    if [[ "$RPM_PAYLOAD_DIFF_COUNT" -eq 0 && "$MODE_DIFF_COUNT" -eq 0 ]]; then
         RESULT_VERDICT="reproducible"
         RESULT_LABEL="reproducible"
         VERDICT_NOTES="${ARTIFACT_NOTES_BASE}
 Hashes match: false.
-Extracted RPM payload differences: 0.
+Extracted RPM payload differences: 0. ${RPM_MODE_NOTE}
 RPM payload is reproducible. RPM header and package wrapper differences are excluded from the verdict."
     else
         RESULT_VERDICT="not_reproducible"
         RESULT_LABEL="differences found"
         VERDICT_NOTES="${ARTIFACT_NOTES_BASE}
 Hashes match: false.
-Extracted RPM payload differences: ${RPM_PAYLOAD_DIFF_COUNT}.
-RPM payload differs. See diff files in work directory.
+Extracted RPM payload differences: ${RPM_PAYLOAD_DIFF_COUNT}. ${RPM_MODE_NOTE}
+RPM payload or file modes differ. See diff files in work directory.
 Class files examined: ${CLASS_DIFF_TOTAL}. Class disassembly differences: ${BYTECODE_DIFF_COUNT}."
     fi
 
