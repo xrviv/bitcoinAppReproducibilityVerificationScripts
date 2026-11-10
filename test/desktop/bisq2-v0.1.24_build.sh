@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # bisq2_build.sh - Bisq2 Desktop Reproducible Build Verification
-# Version:       v0.1.23
+# Version:       v0.1.24
 # Organization:  WalletScrutiny.com
 # Last Modified: 2026-11-10
 # Project:       https://github.com/bisq-network/bisq2
 # License:       MIT
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.23"
+SCRIPT_VERSION="v0.1.24"
 REPO_URL="https://github.com/bisq-network/bisq2"
 GH_REPO="xrviv/WalletScrutinyCom"
 GH_WORKFLOW="bisq2-windows-build.yml"
@@ -79,7 +79,6 @@ Usage: $(basename "$0") --version <version> [options]
   --version <version>  Bisq2 version, e.g. 2.1.11 [required]
   --arch <arch>        x86_64-linux-gnu (default), x86_64-windows
   --type <type>        deb (default), rpm, exe
-                       NOTE: type is NOT auto-detected from --binary filename.
   --binary <file>      Path to official DEB/RPM/EXE; skips download
   --no-cache           Force fresh image build
   --keep-container     Keep container after build
@@ -813,6 +812,8 @@ fi
 echo "[WARN] Hashes differ — proceeding with diff analysis"
 SIZE_DIFF=$((BUILT_SIZE - OFFICIAL_SIZE))
 echo "[INFO] Compressed size delta: ${SIZE_DIFF} bytes (built - official)"
+MODE_DIFF="$OUTPUT/diff_modes.txt"
+pd(){ diff <("${@:2}" "$OFFICIAL_DEB" 2>/dev/null) <("${@:2}" "$BUILT_DEB" 2>/dev/null) >"$1" || true; cat "$1" >&2; grep -c '^[<>]' "$1" || true; }
 
 if [[ "$BUILD_TYPE" == "rpm" ]]; then
     EXTRACT_OFF="$OUTPUT/extracted-official"
@@ -826,14 +827,10 @@ if [[ "$BUILD_TYPE" == "rpm" ]]; then
         || fail "Failed to extract built RPM"
 
     q='[%{FILEMODES:octal} %{FILEUSERNAME}:%{FILEGROUPNAME} %{FILENAMES}\n]'
-    MODE_DIFF="$OUTPUT/diff_rpm_modes.txt"; HDR_DIFF="$OUTPUT/diff_rpm_header.txt"
-    diff <(rpm -qp --qf "$q" "$OFFICIAL_DEB" 2>/dev/null) <(rpm -qp --qf "$q" "$BUILT_DEB" 2>/dev/null) >"$MODE_DIFF" || true
-    MODE_DIFF_COUNT=$(grep -c '^[<>]' "$MODE_DIFF" || true)
-    h="--requires --provides --scripts"
-    diff <(rpm -qip $h "$OFFICIAL_DEB" 2>/dev/null) <(rpm -qip $h "$BUILT_DEB" 2>/dev/null) >"$HDR_DIFF" || true
-    HDR_DIFF_COUNT=$(grep -c '^<' "$HDR_DIFF" || true)
-    echo "[INFO] RPM mode/owner diff lines: $MODE_DIFF_COUNT"; cat "$MODE_DIFF"
-    echo "[INFO] RPM header lines differing (not in verdict): $HDR_DIFF_COUNT"; cat "$HDR_DIFF"
+    MODE_DIFF_COUNT=$(pd "$MODE_DIFF" rpm -qp --qf "$q")
+    echo "[INFO] RPM mode/owner diff lines: $MODE_DIFF_COUNT"
+    HDR_DIFF_COUNT=$(pd "$OUTPUT/diff_rpm_header.txt" rpm -qip --requires --provides --scripts)
+    echo "[INFO] RPM header diff lines (not in verdict): $HDR_DIFF_COUNT"
 
     EXTRACT_OFF_SIZE=$(du -sb "$EXTRACT_OFF" | cut -f1)
     EXTRACT_BLT_SIZE=$(du -sb "$EXTRACT_BLT" | cut -f1)
@@ -983,6 +980,9 @@ mkdir -p "$EXTRACT_OFF" "$EXTRACT_BLT"
 echo "[INFO] Extracting DEBs..."
 dpkg-deb -R "$OFFICIAL_DEB" "$EXTRACT_OFF" || fail "Failed to extract official DEB"
 dpkg-deb -R "$BUILT_DEB"    "$EXTRACT_BLT" || fail "Failed to extract built DEB"
+dm(){ dpkg-deb --fsys-tarfile "$1" | tar -tv --numeric-owner | awk '{o=$1" "$2;$1=$2=$3=$4=$5="";print o$0}' | sort -k3; }
+MODE_DIFF_COUNT=$(pd "$MODE_DIFF" dm)
+echo "[INFO] DEB mode/owner diff lines: $MODE_DIFF_COUNT"
 
 EXTRACT_OFF_SIZE=$(du -sb "$EXTRACT_OFF" | cut -f1)
 EXTRACT_BLT_SIZE=$(du -sb "$EXTRACT_BLT" | cut -f1)
@@ -991,7 +991,7 @@ EXTRACT_SIZE_DIFF=$((EXTRACT_BLT_SIZE - EXTRACT_OFF_SIZE))
 echo "[INFO] Extracted sizes:"
 echo "       Official: ${EXTRACT_OFF_SIZE} bytes"
 echo "       Built:    ${EXTRACT_BLT_SIZE} bytes"
-echo "       Delta:    ${EXTRACT_SIZE_DIFF} bytes (note: opposite sign from compressed delta is normal)"
+echo "       Delta:    ${EXTRACT_SIZE_DIFF} bytes"
 
 DIFF_BRIEF="$OUTPUT/diff_brief.txt"
 DIFF_FULL="$OUTPUT/diff_full.txt"
@@ -1148,12 +1148,12 @@ echo "[INFO] JRE entries differing:     ${JRE_DIFF_COUNT}"
 echo "[INFO] Class files examined:      ${CLASS_DIFF_TOTAL}"
 echo "[INFO] Class disassembly differences:      ${BYTECODE_DIFF_COUNT}"
 
-if [[ "$PAYLOAD_DIFF_COUNT" -eq 0 ]] && [[ "$PACKAGING_UNREVIEWED_DIFF_COUNT" -eq 0 ]]; then
+if [[ "$PAYLOAD_DIFF_COUNT" -eq 0 && "$PACKAGING_UNREVIEWED_DIFF_COUNT" -eq 0 && "$MODE_DIFF_COUNT" -eq 0 ]]; then
     RESULT_VERDICT="reproducible"
     RESULT_LABEL="reproducible"
     VERDICT_NOTES="${ARTIFACT_NOTES_BASE}
 Hashes match: false.
-Installed payload differences: ${PAYLOAD_DIFF_COUNT}.
+Installed payload differences: ${PAYLOAD_DIFF_COUNT}. File mode/owner diff lines: ${MODE_DIFF_COUNT}.
 DEBIAN metadata differences: ${PACKAGING_DIFF_COUNT}.
 Payload reproducible. Excluded diffs: DEBIAN/md5sums, changelog, Build-Date in control."
 else
@@ -1161,9 +1161,9 @@ else
     RESULT_LABEL="differences found"
     VERDICT_NOTES="${ARTIFACT_NOTES_BASE}
 Hashes match: false.
-Installed payload differences: ${PAYLOAD_DIFF_COUNT}.
+Installed payload differences: ${PAYLOAD_DIFF_COUNT}. File mode/owner diff lines: ${MODE_DIFF_COUNT}.
 DEBIAN metadata differences: ${PACKAGING_DIFF_COUNT}. Unreviewed DEBIAN metadata differences: ${PACKAGING_UNREVIEWED_DIFF_COUNT}.
-Payload or package-control content differs. See diff files in work directory.
+Payload, file modes or package-control content differ. See diff files in work directory.
 Class files examined: ${CLASS_DIFF_TOTAL}. Class disassembly differences: ${BYTECODE_DIFF_COUNT}."
 fi
 
