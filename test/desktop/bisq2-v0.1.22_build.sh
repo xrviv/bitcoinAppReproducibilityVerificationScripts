@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # bisq2_build.sh - Bisq2 Desktop Reproducible Build Verification
-# Version:       v0.1.21
+# Version:       v0.1.22
 # Organization:  WalletScrutiny.com
-# Last Modified: 2026-09-18
+# Last Modified: 2026-11-10
 # Project:       https://github.com/bisq-network/bisq2
 # License:       MIT
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.21"
+SCRIPT_VERSION="v0.1.22"
 REPO_URL="https://github.com/bisq-network/bisq2"
 GH_REPO="xrviv/WalletScrutinyCom"
 GH_WORKFLOW="bisq2-windows-build.yml"
@@ -519,16 +519,16 @@ RUN printf '#!/bin/sh\nexec "$@"\n' > /usr/local/bin/fakeroot \
 
 RUN apt-get update && apt-get install -y tor && rm -rf /var/lib/apt/lists/*
 
-ENV ZULU_JDK_ARCHIVE_SHA256=bc5e3383431cb7f1dce8c262dd474501ee9bd7569f1c59a8b6fe5c1589aa4a58
+ENV ZULU_JDK_ARCHIVE_SHA256=abe544103f1c4f0cc4b8997c0cac847eb1e842382eef57ce361c982fb0a3de11
 
-RUN wget -q https://cdn.azul.com/zulu/bin/zulu21.50.19-ca-jdk21.0.11-linux_x64.tar.gz \
+RUN wget -q https://cdn.azul.com/zulu/bin/zulu21.54.109-ca-jdk21.0.13.0.3-linux_x64.tar.gz \
         -O /tmp/zulu21.tar.gz \
     && echo "${ZULU_JDK_ARCHIVE_SHA256}  /tmp/zulu21.tar.gz" | sha256sum -c - \
     && mkdir -p /usr/lib/jvm \
     && tar -xzf /tmp/zulu21.tar.gz -C /usr/lib/jvm \
     && rm /tmp/zulu21.tar.gz
 
-ENV JAVA_HOME=/usr/lib/jvm/zulu21.50.19-ca-jdk21.0.11-linux_x64
+ENV JAVA_HOME=/usr/lib/jvm/zulu21.54.109-ca-jdk21.0.13.0.3-linux_x64
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 RUN java -version
 
@@ -700,6 +700,7 @@ cd /build/bisq2
 git fetch --tags --force || fail "git fetch --tags failed"
 git checkout "$GIT_TAG" || fail "git checkout failed"
 git describe --tags --exact-match >/dev/null 2>&1 || fail "checked out commit is not exactly $GIT_TAG"
+git submodule update --init --recursive || fail "git submodule update failed"
 
 git config core.abbrev 10
 
