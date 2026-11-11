@@ -1,6 +1,6 @@
 #!/bin/bash
 # coinwallet_build.sh — Coin Wallet desktop (Linux Flatpak) reproducible build verification
-# Version: v0.1.8
+# Version: v0.1.9
 # Organization: WalletScrutiny.com
 # Last modified by: Daniel Garcia
 # Last modified on: 2026-11-11
@@ -19,7 +19,7 @@
 # Exit codes: 0 = reproducible, 1 = not_reproducible or ftbfs, 2 = invalid parameters, 130 = stopped.
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.8"
+SCRIPT_VERSION="v0.1.9"
 APP_ID="coinwallet"
 GH_REPO="CoinSpace/CoinSpace"
 REPO_URL="https://github.com/${GH_REPO}.git"
@@ -589,7 +589,7 @@ compare_trees() {
     echo "Flatpak tree: ${FS_TOTAL} entries compared, ${FS_DIFF} differ (${APP_DIFF} under /files/lib/space.coin.wallet)"
     if [[ "$FS_DIFF" -gt 0 ]]; then
         echo "First differences (full list: ${WORK_DIR}/filesystem-diff.txt):"
-        grep -E '^[A-Z_]+ ' "${WORK_DIR}/filesystem-diff.txt" | head -5 | sed 's/^/  /'
+        awk '/^[A-Z_]+ / && n++ < 5 { print "  " $0 }' "${WORK_DIR}/filesystem-diff.txt"
     fi
     echo "manifest.json, byte for byte: $([[ "$MANIFEST_MATCH" == true ]] && echo identical || echo "differs (${WORK_DIR}/manifest-diff.txt)")"
     echo "source-date-epoch (built value copied from the official manifest.json): ${SDE}"
@@ -636,7 +636,7 @@ display_results() {
     echo ""
     echo "Diff:"
     if [[ -s "${WORK_DIR}/filesystem-diff.txt" ]]; then
-        grep -E '^[A-Z_]+ ' "${WORK_DIR}/filesystem-diff.txt" | head -5
+        awk '/^[A-Z_]+ / && n++ < 5' "${WORK_DIR}/filesystem-diff.txt"
     else
         echo "${flags:-$verdict}"
     fi
