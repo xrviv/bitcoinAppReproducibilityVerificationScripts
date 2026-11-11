@@ -1,9 +1,9 @@
 #!/bin/bash
 # coinwallet_build.sh — Coin Wallet desktop (Linux Flatpak) reproducible build verification
-# Version: v0.1.7
+# Version: v0.1.8
 # Organization: WalletScrutiny.com
 # Last modified by: Daniel Garcia
-# Last modified on: 2026-11-04
+# Last modified on: 2026-11-11
 # Project: https://github.com/CoinSpace/CoinSpace
 # Disclaimer: for reproducible-build verification and research only. No warranty; users assume all risk and are responsible for legal compliance; the developers assume no liability for misuse.
 # Steps: take the official Coin.Wallet.flatpak (--binary or the GitHub release, checked against the
@@ -19,16 +19,16 @@
 # Exit codes: 0 = reproducible, 1 = not_reproducible or ftbfs, 2 = invalid parameters, 130 = stopped.
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.7"
+SCRIPT_VERSION="v0.1.8"
 APP_ID="coinwallet"
 GH_REPO="CoinSpace/CoinSpace"
 REPO_URL="https://github.com/${GH_REPO}.git"
 ASSET_NAME="Coin.Wallet.flatpak"
 FLATPAK_REF="app/space.coin.wallet/x86_64/stable"
 FLATHUB_URL="https://dl.flathub.org/repo/flathub.flatpakrepo"
-# CI: ubuntu-24.04 runner, setup-node 22 (22.23.3 was current when v6.31.0 was built on 2026-10-19).
+# CI: ubuntu-24.04 runner, setup-node 22 (v6.31.0 got 22.23.3 on 2026-10-19, v6.32.0 got 22.23.4 on 2026-11-09).
 UBUNTU_IMAGE="docker.io/library/ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852"
-NODE_IMAGE="docker.io/library/node:22.23.3-bookworm@sha256:69a5713e7f4997e96d579aafd78734810e0dac0dd5ee4621d72c27a2891a4088"
+NODE_IMAGE="docker.io/library/node:22.23.4-bookworm@sha256:7702d8aa4d5910871692af4480eb3ba86f23047a6417a44d857d06c95d060d3f"
 GIT_IMAGE="docker.io/alpine/git:v2.54.0@sha256:ac6c828f15d82775d204d3d75112e1d34af8945da80ccf922713c9891ba68e7a"
 # monero-core-js's CI uses emscripten/emsdk:2.0.20; pinned and fully qualified here.
 EMSDK_IMAGE="docker.io/emscripten/emsdk:2.0.20@sha256:052d71743ca6d4be41b87a3b2fdff9622e4ab7cdfb6d1c3205385ddfc238c08a"
@@ -305,7 +305,7 @@ COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \\
     && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 EOF
-    echo "Building the tool image (Ubuntu 24.04, flatpak-builder, Node 22.23.3)..."
+    echo "Building the tool image (Ubuntu 24.04, flatpak-builder, Node 22.23.4)..."
     job "${WORK_DIR}/tool-image.log" no "$DOCKER_CMD" build -q -t "$TOOL_IMAGE" -f "${WORK_DIR}/toolctx/Containerfile" "${WORK_DIR}/toolctx" \
         || { tail -20 "${WORK_DIR}/tool-image.log"; die "Tool image build failed; no COMPARISON_RESULTS.yaml written"; }
 }
@@ -602,7 +602,7 @@ script_version: ${SCRIPT_VERSION}
 verdict: ${status}
 notes: |
   Built tag v${APP_VERSION} (${APP_COMMIT}) as ${ASSET_NAME} with upstream's npm scripts and
-  electron-forge maker-flatpak in Ubuntu 24.04 with Node 22.23.3, against the Flathub runtime, SDK and
+  electron-forge maker-flatpak in Ubuntu 24.04 with Node 22.23.4, against the Flathub runtime, SDK and
   BaseApp commits recorded in the official manifest.json, open-file limit raised to 65536. Build variables (API hosts, Sentry DSN, keys)
   were read from the official bundle, where they are public; the official bundle names commit ${OFFICIAL_COMMIT}.
   The @coinspace/* modules were packed from their public git tags (upstream installs them from GitHub
