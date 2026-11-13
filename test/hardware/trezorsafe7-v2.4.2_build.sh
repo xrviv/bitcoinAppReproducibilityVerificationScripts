@@ -153,6 +153,18 @@ download_official() {
   done
 }
 
+# The docker build context is ci/. Rootless podman's API rejects a context symlink that points
+# out of it (ci/hardware_tests/README.md -> ../../docs/ci/jobs.md, "invalid symlink"); the docker
+# daemon accepts it. ci/Dockerfile copies none of them, so on podman (the only path that sets
+# DOCKER_BUILDKIT=0) list them in ci/.dockerignore. The image and the build are unchanged.
+ignore_escaping_symlinks() {
+  [[ "${DOCKER_BUILDKIT:-}" == "0" ]] || return 0
+  local l
+  while IFS= read -r l; do
+    case "$(realpath -m -- "$l")" in "$PWD/ci/"*) ;; *) echo "${l#ci/}" >> ci/.dockerignore ;; esac
+  done < <(find ci -type l)
+}
+
 build_firmware() {
   cd "$workDir/trezor-firmware"
 
@@ -183,6 +195,7 @@ build_firmware() {
   # Step 1, environment only (upstream --init-only): Alpine tarball, Nix image, source clone,
   # submodules, uv and cargo dependencies. Downloads only, so a failure is not a verdict.
   echo "Preparing the build environment (downloads only)..."
+  ignore_escaping_symlinks
   if ! logged ./build-docker.sh "${buildArgs[@]}" --init-only "$tagRef"; then
     no_verdict "build-docker.sh --init-only failed (environment or dependency download)"
   fi
@@ -349,7 +362,7 @@ build_parts() {
     else
       args=(--models T3W1 --targets "$part" --skip-bitcoinonly); built="${dir}/build/core-T3W1/${part}/${part}.bin"
     fi
-    ( cd "$dir" && mkdir -p build/core-T3W1 build/core-T3W1-bitcoinonly build/nrf \
+    ( cd "$dir" && mkdir -p build/core-T3W1 build/core-T3W1-bitcoinonly build/nrf && ignore_escaping_symlinks \
       && export CONTAINER_NAME="$cn" && logged ./build-docker.sh "${args[@]}" "${P_TAG[$part]}" ) \
       || no_verdict "${part} build at ${P_TAG[$part]} failed (that tag's build-docker.sh has no download-only step, so network and source failures cannot be told apart; check the log)"
     P_BUILT[$part]=$(sha256_of "$built")
