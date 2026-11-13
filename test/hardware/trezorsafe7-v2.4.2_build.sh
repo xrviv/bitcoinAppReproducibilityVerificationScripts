@@ -1,8 +1,8 @@
 #!/bin/bash
 # trezorsafe7_build.sh - Trezor Safe 7 (T3W1) firmware reproducible build verification
-# Version: v2.4.1 · Organization: WalletScrutiny.com · License: MIT
+# Version: v2.4.2 · Organization: WalletScrutiny.com · License: MIT
 # Last modified by: Claude Code for Danny
-# Last modified on: 2026-10-23
+# Last modified on: 2026-11-13
 # Disclaimer: for reproducible-build verification only; no warranty; runs containers and
 #   downloads source; you are responsible for lawful use. Read the script before running it.
 # Steps: build the firmware from core/v<version> (build-docker.sh) and compare it with the official
@@ -15,7 +15,7 @@
 set -eE
 
 # ---- Globals (bash parameter expansion only; no host dirname/readlink) -------
-SCRIPT_VERSION="v2.4.1"
+SCRIPT_VERSION="v2.4.2"
 _src="${BASH_SOURCE[0]}"
 if [[ "$_src" == */* ]]; then _srcDir="${_src%/*}"; else _srcDir="."; fi
 SCRIPT_DIR="$(cd "$_srcDir" && pwd -P)"
@@ -271,7 +271,8 @@ compare_firmware() {
 #   bootloader  bootloaders/bootloader_T3W1.bin  TRZQ header: zero [auth_size, header_size) (PQ/EC
 #               signatures, Merkle proof; core/embed/sec/image/inc/sec/boot_header.h). Tag core/bl<version>.
 #   secmon      secmon/secmon.bin  TSEC header: zero the 65-byte sigmask + signature at hdrlen-65.
-#               Tag: the secmon/* tag on the commit named in "Built from <commit>" (git log of the file).
+#               Tag: the secmon/* tag on the commit named in "Built from <commit>" (git log of the file);
+#               if that line is missing (core/v2.13.1), secmon/v<header version> (bytes 12-14).
 #   ble         trezor-ble.bin  MCUboot image: zero the two 64-byte signature TLVs (0x00A0, 0x00A1) that
 #               nordic/trezor/scripts/insert_signatures.py appends. Tag nordic/trezor-ble/v<version>.
 PARTS=(bootloader secmon ble)
@@ -321,6 +322,7 @@ part_source() {   # sets P_VER and P_TAG for a part from the committed file (or 
       sha=$(git -C trezor-firmware log -1 --format=%B "core/v${normalizedVersion}" -- "core/embed/models/T3W1/${P_FILE[$part]}" \
             | awk '/Built from/{print $3; exit}' | tr -d '.')
       [[ -n "$sha" ]] && P_TAG[$part]=$(git -C trezor-firmware tag --points-at "$sha" 'secmon/*' | head -1)
+      [[ -n "${P_TAG[$part]:-}" ]] || P_TAG[$part]="secmon/v$(od -An -tu1 -j12 -N3 "$f" | awk '{print $1"."$2"."$3}')"
       P_VER[$part]="${P_TAG[$part]#secmon/v}" ;;
     ble) P_VER[$part]="$(od -An -tu1 -j20 -N2 "$f" | awk '{print $1"."$2}').$(u16 "$f" 22)"; P_TAG[$part]="nordic/trezor-ble/v${P_VER[$part]}" ;;
   esac
