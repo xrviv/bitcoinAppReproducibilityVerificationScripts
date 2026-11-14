@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
-# keycardshell-v0.2.2_build.sh - reproducible-build check of Keycard Shell firmware
-# Version: v0.2.2
+# keycardshell-v0.2.3_build.sh - reproducible-build check of Keycard Shell firmware
+# Version: v0.2.3
 # Organization: WalletScrutiny.com
 # Last modified by: Claude Code for Danny
-# Last modified on: 2026-11-02
+# Last modified on: 2026-11-14
 # Project: https://github.com/keycard-tech/keycard-shell
 # App ID: keycard-shell
 #
 # Verifies Keycard Shell firmware (shellos-YYYYMMDD-X.Y.Z.bin) AND bootloader
 # (shellos-bootloader-YYYYMMDD-X.Y.Z.bin, published from v1.4.0) and, where the
-# release publishes it, the Bitcoin-only firmware (shellos-experimental-YYYYMMDD-X.Y.Z-btc-only.bin,
+# release publishes it, the Bitcoin-only firmware (shellos-[experimental-]YYYYMMDD-X.Y.Z-btc-only.bin,
 # from v1.5.2; target shellos-btc.elf) against the official GitHub release binaries. Hardware: STM32H573VITX, Cortex-M33.
 # Build system: CMake + Ninja + ARM GNU Toolchain 15.2.rel1.
 #
@@ -31,10 +31,10 @@
 #   bootloader-perso.py          -> ${WORK_DIR}/tools/ (COPY into container)
 #
 # Usage:
-#   keycardshell-v0.2.2_build.sh --version 1.5.2
-#   keycardshell-v0.2.2_build.sh --binary /path/to/shellos-YYYYMMDD-X.Y.Z.bin
-#   keycardshell-v0.2.2_build.sh --binary /path/to/shellos-bootloader-YYYYMMDD-X.Y.Z.bin
-#   keycardshell-v0.2.2_build.sh --binary /path/to/shellos-experimental-YYYYMMDD-X.Y.Z-btc-only.bin
+#   keycardshell-v0.2.3_build.sh --version 1.5.2
+#   keycardshell-v0.2.3_build.sh --binary /path/to/shellos-YYYYMMDD-X.Y.Z.bin
+#   keycardshell-v0.2.3_build.sh --binary /path/to/shellos-bootloader-YYYYMMDD-X.Y.Z.bin
+#   keycardshell-v0.2.3_build.sh --binary /path/to/shellos-experimental-YYYYMMDD-X.Y.Z-btc-only.bin
 #   (--binary may also be a directory; the binaries not supplied are downloaded)
 #
 # Host requirements: Bash, curl, tar and Podman or Docker. Run as a normal user.
@@ -45,7 +45,7 @@
 
 set -eEo pipefail
 
-SCRIPT_VERSION="v0.2.2"
+SCRIPT_VERSION="v0.2.3"
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="${SCRIPT_PATH%/*}"
 SCRIPT_HASH="$(sha256sum "${SCRIPT_PATH}" | cut -d' ' -f1)"
@@ -166,21 +166,23 @@ done
 
 # --binary: the main firmware (shellos-YYYYMMDD-X.Y.Z.bin), the bootloader
 # (shellos-bootloader-YYYYMMDD-X.Y.Z.bin), the Bitcoin-only firmware
-# (shellos-experimental-YYYYMMDD-X.Y.Z-btc-only.bin; upstream CI names it shellos-btc-*),
+# (shellos-experimental-YYYYMMDD-X.Y.Z-btc-only.bin in v1.5.2, shellos-YYYYMMDD-X.Y.Z-btc-only.bin
+# from v1.5.3; upstream CI names it shellos-btc-*),
 # or a directory holding any of them. Whatever is not supplied is downloaded from the
 # release. appHash is the supplied file (firmware, else bootloader, else Bitcoin-only).
 FW_BIN=""
 BL_BIN=""
 BTC_BIN=""
-pick_one() {  # dir pattern label → PICKED
-    local found
-    mapfile -t found < <(find "$1" -maxdepth 1 -type f -name "$2" | sort)
+pick_one() {  # dir pattern label [exclude] → PICKED
+    local found not=()
+    [[ -n "${4:-}" ]] && not=(! -name "$4")
+    mapfile -t found < <(find "$1" -maxdepth 1 -type f -name "$2" "${not[@]}" | sort)
     [[ ${#found[@]} -le 1 ]] || invalid "More than one $3 in $1."
     PICKED="${found[0]:-}"
 }
 if [[ -n "${BINARY}" ]]; then
     if [[ -d "${BINARY}" ]]; then
-        pick_one "${BINARY}" 'shellos-[0-9]*.bin' firmware;           FW_BIN="${PICKED}"
+        pick_one "${BINARY}" 'shellos-[0-9]*.bin' firmware '*btc*';   FW_BIN="${PICKED}"
         pick_one "${BINARY}" 'shellos-bootloader-*.bin' bootloader;   BL_BIN="${PICKED}"
         pick_one "${BINARY}" 'shellos-*btc*.bin' "Bitcoin-only firmware"; BTC_BIN="${PICKED}"
         [[ -n "${FW_BIN}${BL_BIN}${BTC_BIN}" ]] || invalid "No shellos-*.bin in ${BINARY}."
@@ -245,7 +247,8 @@ if [[ -z "${FW_BIN}" || -z "${BL_BIN}" || -z "${BTC_BIN}" ]]; then
             | sed -E 's/.*"(https:[^"]+)"$/\1/' | head -1 || true
     }
     if [[ -z "${FW_BIN}" ]]; then
-        URL="$(asset_url "shellos-[0-9]{8}-[^\"/]*\\.bin")"
+        # Exact name: from v1.5.3 the Bitcoin-only file is shellos-YYYYMMDD-X.Y.Z-btc-only.bin.
+        URL="$(asset_url "shellos-[0-9]{8}-${VERSION//./[.]}[.]bin")"
         [[ -n "${URL}" ]] || abort "No shellos-YYYYMMDD-${VERSION}.bin asset in release v${VERSION}"
         FW_BIN="${WORK_DIR}/official/$(basename "${URL}")"
         log_info "Downloading $(basename "${URL}")..."
