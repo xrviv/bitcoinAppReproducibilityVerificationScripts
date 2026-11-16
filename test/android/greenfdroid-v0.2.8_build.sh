@@ -1,16 +1,16 @@
 #!/bin/bash
 # greenfdroid_build.sh - Blockstream Green F-Droid reproducible build verification. License: MIT
-# Version: v0.2.7
+# Version: v0.2.8
 # Organization: WalletScrutiny.com | Project: https://github.com/Blockstream/green_android
 # Last modified by: Claude Code for Danny
-# Last modified on: 2026-10-14
+# Last modified on: 2026-11-16
 # Disclaimer: build verification only, not a security audit; as-is, no warranty. Use lawfully, at your own risk.
 # Builds fdroiddata's recipe commit in F-Droid's env (Trixie, vagrant, F-Droid paths); compares with apksigcopier.
 
 set -euo pipefail
 
 # --- Constants ---
-SCRIPT_VERSION="v0.2.7"
+SCRIPT_VERSION="v0.2.8"
 APP_ID="com.greenaddress.greenbits_android_wallet"
 REPO_URL="https://github.com/Blockstream/green_android.git"
 GDK_REPO_URL="https://github.com/Blockstream/gdk.git"
@@ -20,6 +20,8 @@ FDROID_RECIPE_URL="https://gitlab.com/fdroid/fdroiddata/-/raw/master/metadata/co
 EXPECTED_RECIPE_SHA256="bd2b5c1324b1cebfb17591b7bf79ff247f9ad14eff58dd1eb2a6ab7356cd4baf"
 ENV_VALIDATED_THROUGH_CODE="22000527"  # newest env-validated versionCode
 APP_COMMIT=""                          # resolved at runtime from the F-Droid recipe
+# F-Droid's signing cert for this app (index-v2.json); other signers get exit 2, no YAML.
+FDROID_SIGNER_SHA256="376ef6f4b01bb8c54d941b471280485c70c27d108f7eaaa3a2233b7d70b50a59"
 
 EXIT_SUCCESS=0
 EXIT_FAILED=1
@@ -263,8 +265,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN sed -i -E "s#http://deb.debian.org/(debian(-security)?)\$#http://snapshot.debian.org/archive/\1/${APT_SNAPSHOT}#" \
         /etc/apt/sources.list.d/debian.sources \
-    && apt-get -o Acquire::Check-Valid-Until=false update \
-    && apt-get install -y --no-install-recommends \
+    && apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 update \
+    && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
         autoconf automake bison build-essential ca-certificates clang cmake \
         curl file flex gettext git gperf jq libffi-dev libtool make \
         ninja-build openjdk-21-jdk patch perl pkg-config python3 python3-dev \
@@ -340,6 +342,17 @@ _pkg_name="$(echo "${_badge}" | sed "s/^package: name='\\([^']*\\)'.*/\\1/")"
 if [[ "${_pkg_name}" != "${APP_ID}" ]]; then
   die_invalid "APK package '${_pkg_name}' does not match expected '${APP_ID}'."
 fi
+
+# Refuse non-F-Droid APKs (Play, GitHub) before building, so ABS tries the next script.
+_signer="$(${CONTAINER_CMD} run --rm \
+  --volume "${apk_dir}:/apk${VOLUME_RO_SUFFIX}" \
+  "${_staging_tag}" \
+  apksigner verify --print-certs "/apk/${apk_file}" 2>/dev/null \
+  | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -1 || true)"
+if [[ "${_signer}" != "${FDROID_SIGNER_SHA256}" ]]; then
+  die_invalid "APK signer '${_signer:-none}' is not F-Droid's (${FDROID_SIGNER_SHA256}). This script verifies the F-Droid build only."
+fi
+log_info "Signer is F-Droid's: ${_signer}"
 
 _apk_version_name="$(echo "${_badge}" | sed "s/.*versionName='\\([^']*\\)'.*/\\1/")"
 _apk_version_code="$(echo "${_badge}" | sed "s/.*versionCode='\\([^']*\\)'.*/\\1/")"

@@ -69,7 +69,7 @@ leaves them behind in the shared `/tmp`.
 
 | Script | Version | Current workspace | Deletes an existing workspace | Chown-back | Size (cap 48,235) |
 |---|---|---|---|---|---|
-| ~~`android/greenfdroid-v0.2.6_build.sh`~~ | v0.2.6 | **fixed in v0.2.7 (2026-10-14, committed `0d8e6cb`; build host 5.7.0 `reproducible`, published; workspace 191M, 0 foreign-owned files)**: `$(pwd -P)/greenfdroid_verification_<v>_<epoch>-<pid>`, EXIT-trap hand-back | no | yes | 48,154 (81 B left) |
+| ~~`android/greenfdroid-v0.2.6_build.sh`~~ | v0.2.6 | **fixed in v0.2.7 (2026-10-14, committed `0d8e6cb`; build host 5.7.0 `reproducible`, published; workspace 191M, 0 foreign-owned files); v0.2.8 (2026-11-16) refuses non-F-Droid signers with exit 2 and no YAML**: `$(pwd -P)/greenfdroid_verification_<v>_<epoch>-<pid>`, EXIT-trap hand-back | no | yes | 36,680 |
 | `android/trustless_build.sh` (**low priority**, Danny 2026-10-14: app is `custodial`) | v0.1.7 | `/tmp/trustless_build_<v>_<pid>` | yes (its own) | not found | 18,947 |
 | ~~`hardware/keycardshell-v0.1.1_build.sh`~~ **fixed in v0.2.0 (2026-10-14, `770fa47`): `$(pwd -P)/keycardshell_verification_<v>_<epoch>-<pid>`, EXIT-trap hand-back; build host 1.4.0 `reproducible`, 0 foreign-owned** | v0.1.1 | `/tmp/keycardshell_<v>_<pid>` | no | not found | 24,439 |
 
