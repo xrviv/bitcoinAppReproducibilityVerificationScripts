@@ -1,9 +1,9 @@
 #!/bin/bash
-# bitbanana-v0.8.0_build.sh — BitBanana (app.michaelwuensch.bitbanana) Android reproducible build verification
-# Version:          v0.8.0
+# bitbanana-v0.9.3_build.sh — BitBanana (app.michaelwuensch.bitbanana) Android reproducible build verification
+# Version:          v0.9.3
 # Organization:     WalletScrutiny.com
-# Last modified by: Bob (WalletScrutiny agent)
-# Last modified on: 2026-10-05
+# Last modified by: Claude Code for Danny
+# Last modified on: 2026-11-19
 # Project:          https://github.com/michaelWuensch/BitBanana
 # Scope: one script for all four distribution channels; the input kind is read from the APK
 #        manifest, never from flags or file names (ABS stores uploads as base.apk or <hash>.bin).
@@ -13,135 +13,203 @@
 #        - GitHub / F-Droid / Obtainium fat APK (one file, all ABIs): upstream docs/REPRODUCE_GITHUB.md,
 #          gradle assembleRelease under disorderfs, unsigned output compared with the supplied file.
 #        - A lone Play base.apk or config split is refused: the full set is needed.
-#        Every tool runs in containers (podman or docker). No smartphone, no adb, no sudo.
+#        Every tool runs in containers (podman or docker). No smartphone, no adb, no root.
+# Shared steps (engine pick, workspace, traps, YAML, results block, cleanup) come from the
+# WalletScrutiny library ws-rb-core, pinned by sha256 below (GitLab #1023).
+# Offline: WS_LIB_FILE=/path/to/ws-rb-core-1.0.0.sh.
+# After the build, ws-buildlock.sh (WS repo, pinned commit + sha256; GitLab #1000) records what
+# Gradle fetched in <workspace>/build-lock/build-lock.json. It never changes the verdict.
+# Exit codes: 0 reproducible; 1 not reproducible, ftbfs or no verdict;
+# 2 invalid parameters or library unavailable; 130 stopped.
 # License: MIT. No warranty. For security research only. Use at your own risk.
 set -euo pipefail
-EXEC_DIR="$(pwd)"
-readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.8.0"
-readonly SCRIPT_NAME="bitbanana-v0.8.0_build.sh"
+readonly SCRIPT_VERSION="v0.9.3"
+readonly SCRIPT_NAME="bitbanana-v0.9.3_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 readonly SCRIPT_PATH
-SCRIPT_SHA256=""
+
+# ---- Self-identification (first action, before arguments or any network) -----
+SCRIPT_SHA256="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | cut -d' ' -f1)" || true
+SCRIPT_SHA256="${SCRIPT_SHA256:-N/A}"
+echo "Script:  $(basename "$SCRIPT_PATH") ${SCRIPT_VERSION}"
+echo "         sha256: ${SCRIPT_SHA256}"
+echo
+
+# ---- WalletScrutiny library (GitLab #1023), pinned by sha256 ------------------
+# Goes in each build script right after its self-hash line, before anything else.
+# Source: WS_LIB_FILE (offline, must match), else the cache, else GitLab by
+# commit. Nothing else. A wrong hash is rejected whichever source sent it.
+# No matching copy, or a different version inside: no verdict, no YAML, exit 2.
+# First, before anything can fail: no earlier verdict may survive this run. A run
+# that holds this folder's lock is still writing its own; that one stays, and the
+# library refuses this run when it takes the lock.
+WS_LIB_DIR0="$(dirname "$(readlink -f "$0")")"
+if command -v flock >/dev/null 2>&1; then
+  flock -n "$WS_LIB_DIR0/.comparison_results.lock" true 2>/dev/null && rm -f -- "$WS_LIB_DIR0/COMPARISON_RESULTS.yaml"
+else
+  WS_LIB_P="$(cat "$WS_LIB_DIR0/.comparison_results.lock.d/pid" 2>/dev/null || true)"
+  case "$WS_LIB_P" in ''|*[!0-9]*) WS_LIB_P="";; esac
+  { [ -n "$WS_LIB_P" ] && kill -0 "$WS_LIB_P" 2>/dev/null; } || rm -f -- "$WS_LIB_DIR0/COMPARISON_RESULTS.yaml"
+fi
+WS_LIB=ws-rb-core WS_LIB_VERSION=1.0.0
+WS_LIB_REV=3581020196b35eefa501a19ed0abb43e96f4db42 WS_LIB_SHA256=d321b7c6937bbfc4a42db273c3fb6ec02c58e930c7c2b962492b8966188a0fcf
+ws_lib_load() {
+  local c f u t=""
+  ws_lib_ok() { [ "$(sha256sum "$1" 2>/dev/null | cut -d' ' -f1)" = "$WS_LIB_SHA256" ]; }
+  if [ -n "${WS_LIB_FILE:-}" ]; then
+    f="$WS_LIB_FILE"
+    ws_lib_ok "$f" || { echo "[FAIL] WS_LIB_FILE $f is not sha256 $WS_LIB_SHA256: no verdict" >&2; exit 2; }
+  else
+    # Cache in XDG_CACHE_HOME or HOME; with neither, or no way to create it, a
+    # temporary folder for this run only. Every copy is hash-checked either way.
+    c="${XDG_CACHE_HOME:-${HOME:+$HOME/.cache}}"
+    if [ -n "$c" ] && mkdir -p "$c/ws-rb-lib" 2>/dev/null; then c="$c/ws-rb-lib"
+    else t="$(mktemp -d 2>/dev/null)" || { echo "[FAIL] no folder to fetch $WS_LIB into: no verdict" >&2; exit 2; }; c="$t"; fi
+    f="$c/$WS_LIB_SHA256.sh"
+    if ! ws_lib_ok "$f"; then
+      u="https://gitlab.com/walletscrutiny/walletScrutinyCom/-/raw/$WS_LIB_REV/scripts/rb/lib/$WS_LIB-$WS_LIB_VERSION.sh"
+      curl -fsSL --max-time 60 -o "$f.$$" "$u" 2>/dev/null && ws_lib_ok "$f.$$" && mv -f "$f.$$" "$f"
+      rm -f "$f.$$"
+    fi
+  fi
+  ws_lib_ok "$f" || { [ -z "$t" ] || rm -rf -- "$t"; echo "[FAIL] $WS_LIB $WS_LIB_VERSION ($WS_LIB_SHA256) unavailable or altered: no verdict" >&2; exit 2; }
+  . "$f"
+  [ -z "$t" ] || rm -rf -- "$t"
+  [ "${WS_LIB_LOADED_VERSION:-}" = "$WS_LIB_VERSION" ] || { echo "[FAIL] $f holds ${WS_LIB_LOADED_VERSION:-no version}, not $WS_LIB_VERSION: no verdict" >&2; exit 2; }
+  echo "Library: $WS_LIB $WS_LIB_VERSION sha256: $WS_LIB_SHA256"
+}
+ws_lib_load
+
 readonly APP_ID="app.michaelwuensch.bitbanana"
 readonly REPO_URL="https://github.com/michaelWuensch/BitBanana"
 readonly WS_CONTAINER="docker.io/walletscrutiny/android:5"
+# The utility image (not removed at exit) hands docker-written files back to the caller.
+WS_CHOWN_IMAGE="${WS_CONTAINER}"
 # bundletool decides split naming and packaging, so it is a build input: pinned by hash.
 readonly BUNDLETOOL_VERSION="1.18.0"
 readonly BUNDLETOOL_SHA256="78343764d2e79c8f55710378b04981fcb1e46daebfc3b5dc577778082e6a98fd"
+# Build record helper (#1000), pinned by commit and sha256.
+readonly BUILDLOCK_REV="6eb3c49f860de9b6fbe152cb0c71dd9a4413a979"
+readonly BUILDLOCK_SHA256="fc1d41a45cd1fb455edab9478078c827937761c85966272f4487930f718f8812"
 
 VERSION=""; ARCH=""; TYPE=""; BINARY=""
-WORK_DIR=""; IMAGE_NAME=""; CONTAINER_RUNTIME=""
+WORK_DIR=""; IMAGE_NAME=""
 OFFICIAL_DIR=""; OFFICIAL_FILE=""; OFFICIAL_BASE=""; OFFICIAL_NAME=""; OFFICIAL_APP_HASH=""
 INPUT_KIND=""
 APP_ID_FROM_APK=""; APK_VERSION_NAME=""; APK_VERSION_CODE=""; SIGNER_SHA256=""; COMMIT_HASH=""
 SPEC_ABIS=""; SPEC_DENSITY=""; SPEC_LOCALES=""; SPEC_SDK=""
 DIFF_COUNT=0; MISSING_NOTE=""; ARSC_SUMMARY=""; ACCEPTED_SUMMARY=""
 LOCALE_ALIGN=true
+BUILD_LOCK_FILE=""
+declare -a YAML_HASHES=()
 # The only AndroidManifest.xml entries Google Play may add. Anything else, or ANY entry
 # present only on the built side, stays counted as a real difference.
 readonly PLAY_MANIFEST_KEYS='com\.android\.stamp\.source|com\.android\.stamp\.type|com\.android\.vending\.derived\.apk\.id'
 declare -A ARSC_STATE=()
 declare -A MF_STATE=()
-RESULT_DONE=false
-RESULT_EXIT_CODE=1
 declare -a OFFICIAL_SPLITS=()
 APKTOOL_MANIFEST=""
 APKTOOL_YML=""
 
-sha256_local() {
-    [[ -f "$1" ]] || { echo "N/A"; return 0; }
-    sha256sum "$1" | awk '{print $1}'
-}
-
-log_info() { echo "[INFO] $1"; }
-log_pass() { echo "[PASS] $1"; }
+log_info() { ws_info "$1"; }
+log_pass() { ws_ok "$1"; }
 log_fail() { echo "[FAIL] $1"; }
-log_warn() { echo "[WARNING] $1"; }
-
-sanitize_tag() {
-    printf '%s' "$1" | tr '/:@ ' '____' | tr -c 'A-Za-z0-9_.-' '_'
-}
+log_warn() { ws_warn "$1"; }
 
 usage() {
     cat << EOF
-Usage: ${SCRIPT_NAME} --binary <file|dir> [--version <version>]
+Usage: ${SCRIPT_NAME} --binary <file|dir> [--version <version>] | --version <version>
   --binary <path>      Official artifact. Either a directory holding the Google Play split set
                        (base.apk plus split_config.*.apk; a path to that base.apk is accepted),
                        or one file: the GitHub / F-Droid / Obtainium release APK under any name
                        (base.apk, <hash>.bin). The kind is detected from the APK manifest.
-                       Alias: --apk. Required: Play splits cannot be downloaded.
+                       Alias: --apk. Play splits cannot be downloaded, so they need --binary.
   --version <version>  Release tag to build (e.g. 1.1.0). Omitted: read from the APK.
-  --arch, --type       Accepted for ABS compatibility; the ABI set comes from the artifact.
+                       Without --binary: the GitHub release APK of that version is downloaded.
+  --arch <abi>         Checked against the artifact (arm64-v8a, armeabi-v7a, x86, x86_64); mismatch exits 2.
+  --type               Accepted for ABS compatibility.
   --no-locale-align    Play split set only: run bundletool WITHOUT -Djava.locale.useOldISOCodes=true.
                        Default ON because Google Play's split generator emits the legacy language
                        codes (iw/in/ji). The app build itself never receives this property.
   --script-version     Print script version and exit.
-  Requires: podman or docker. No smartphone, no adb, no sudo.
-  Exit: 0=reproducible 1=not_reproducible/ftbfs 2=invalid parameters
+  Requires: podman or docker, curl, sha256sum. No smartphone, no adb, no root.
+  Exit: 0=reproducible 1=not_reproducible/ftbfs/no verdict 2=invalid parameters 130=stopped
 EOF
     exit 0
 }
 
-show_disclaimer() {
-    log_warn "This script is provided as-is. Review before running. Use at your own risk."
-}
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --version) ws_require_value "$1" "${2:-}"; VERSION="$2"; shift 2 ;;
+            --arch)    ws_require_value "$1" "${2:-}"; ARCH="$2";    shift 2 ;;
+            --type)    ws_require_value "$1" "${2:-}"; TYPE="$2";    shift 2 ;;
+            --binary|--apk) ws_require_value "$1" "${2:-}"; BINARY="$2"; shift 2 ;;
+            --no-locale-align) LOCALE_ALIGN=false; shift ;;
+            --script-version) echo "${SCRIPT_NAME} ${SCRIPT_VERSION}"; exit 0 ;;
+            -h|--help) usage ;;
+            *) ws_unknown_arg "$@"; shift "${WS_SHIFT}" ;;
+        esac
+    done
 
-detect_container_runtime() {
-    if command -v podman >/dev/null 2>&1; then
-        CONTAINER_RUNTIME="podman"
-    elif command -v docker >/dev/null 2>&1; then
-        CONTAINER_RUNTIME="docker"
+    [[ -n "$BINARY" || -n "$VERSION" ]] \
+        || ws_invalid "Provide --binary <file|dir> (Play split set or release APK), or --version to download the GitHub release APK. Run '${SCRIPT_NAME} --help' for usage."
+    if [[ -n "$VERSION" && ! "$VERSION" =~ ^[0-9A-Za-z._-]+$ ]]; then
+        ws_invalid "invalid --version '${VERSION}'"
+    fi
+    if [[ -z "$BINARY" ]]; then
+        log_info "No --binary: the GitHub release APK of v${VERSION} will be downloaded."
+    elif [[ -d "$BINARY" ]]; then
+        OFFICIAL_DIR="$(readlink -f "$BINARY")"
+    elif [[ -f "$BINARY" ]]; then
+        OFFICIAL_FILE="$(readlink -f "$BINARY")"
+        OFFICIAL_DIR="$(dirname "$OFFICIAL_FILE")"
     else
-        log_fail "Neither podman nor docker found. Install one of them."
-        exit 1
+        ws_invalid "--binary not found: $BINARY"
     fi
-    log_info "Using ${CONTAINER_RUNTIME} as container runtime"
 }
 
-require_non_root() {
-    if [[ "$(id -u)" -eq 0 ]]; then
-        log_fail "Do not run this script as root."
-        exit 2
-    fi
+# Every container is named bitbanana-<run id>-..., so the exit trap stops it if the run ends early.
+# Containers started inside $(...) are not in the parent's list; ws_cleanup_hook finds them by name.
+CN=0
+crun() { local n="bitbanana-${WS_RUN_ID}-${BASHPID}-$((++CN))"; ws_track_container "$n"; ws_ctr run --rm --name "$n" "$@"; }
+ws_cleanup_hook() {
+    [[ -n "$WS_ENGINE" && "$WS_KEEP" != 1 ]] || return 0
+    local id
+    for id in $(ws_ctr ps -aq --filter "name=bitbanana-${WS_RUN_ID}-" 2>/dev/null); do
+        ws_ctr rm -f "$id" &>/dev/null || true
+    done
 }
 
 # Utility container: apktool, apksigner, keytool, unzip. No aapt/aapt2 in that image.
 ws_run() {
-    ${CONTAINER_RUNTIME} run --rm -v "${WORK_DIR}:/work" -w /work "${WS_CONTAINER}" bash -c "$1"
+    crun -v "${WORK_DIR}:/work" -w /work "${WS_CONTAINER}" bash -c "$1"
 }
 
-# COMPARISON_RESULTS.yaml: script_version, verdict, notes only. Every notes line is
-# indented, because the per-split summaries are multi-line block scalars.
-generate_yaml() {
-    local verdict="$1" notes="${2:-}"
-    if [[ -n "$INPUT_KIND" && -n "$notes" ]]; then notes="inputKind: ${INPUT_KIND}. ${notes}"; fi
-    local content="script_version: ${SCRIPT_VERSION}
-verdict: ${verdict}"
-    if [[ -n "$notes" ]]; then
-        content="${content}
-notes: |
-$(printf '%s\n' "$notes" | sed 's/^/  /')"
-    fi
-    printf '%s\n' "$content" > "${EXEC_DIR}/COMPARISON_RESULTS.yaml"
-    if [[ -n "${WORK_DIR:-}" && -d "${WORK_DIR}" ]]; then
-        printf '%s\n' "$content" > "${WORK_DIR}/COMPARISON_RESULTS.yaml"
-    fi
+# YAML notes start with the input kind.
+yaml_notes() {
+    if [[ -n "$INPUT_KIND" && -n "$1" ]]; then printf 'inputKind: %s. %s' "$INPUT_KIND" "$1"; else printf '%s' "$1"; fi
 }
 
-# Log, write the ftbfs YAML and leave. $2 = exit code (default 2, invalid input).
+# A --version-only run (no --binary) downloaded the official APK: its hash goes in the YAML.
+yaml_hashes() {
+    if [[ -z "$BINARY" && -n "$OFFICIAL_APP_HASH" ]]; then YAML_HASHES=("$OFFICIAL_APP_HASH"); else YAML_HASHES=(); fi
+}
+
+# The source failed to build: log, write the ftbfs YAML and leave with exit 1.
 fail_ftbfs() {
     log_fail "$1"
-    generate_yaml "ftbfs" "$1"
-    exit "${2:-2}"
+    yaml_hashes
+    ws_write_yaml ftbfs "$(yaml_notes "$1")" ${YAML_HASHES[@]+"${YAML_HASHES[@]}"}
+    exit "$WS_EXIT_FAIL"
 }
 
 decode_official() {
     APKTOOL_MANIFEST="${WORK_DIR}/comparison/meta/AndroidManifest.xml"
     APKTOOL_YML="${WORK_DIR}/comparison/meta/apktool.yml"
     ws_run "set -e; rm -rf comparison/meta; apktool d -f -s -o comparison/meta $1" \
-        || fail_ftbfs "apktool could not decode the supplied APK (${OFFICIAL_NAME})."
-    [[ -f "$APKTOOL_MANIFEST" ]] || fail_ftbfs "apktool produced no AndroidManifest.xml."
+        || ws_no_verdict "apktool could not decode the supplied APK (${OFFICIAL_NAME})."
+    [[ -f "$APKTOOL_MANIFEST" ]] || ws_no_verdict "apktool produced no AndroidManifest.xml."
 }
 
 # Anchored to the manifest's own package attribute (a greedy name= match picks up other attributes).
@@ -172,81 +240,18 @@ apk_signer() {
     printf ''
 }
 
-sha256_of() {
-    ws_run "sha256sum \"$1\" | awk '{print \$1}'"
+# No --binary: fetch the GitHub release APK (bitbanana-<v>-release.apk). A failed download is
+# no verdict, never ftbfs.
+fetch_official() {
+    local name="bitbanana-${VERSION}-release.apk"
+    local url="${REPO_URL}/releases/download/v${VERSION}/${name}"
+    mkdir -p "${WORK_DIR}/download"
+    log_info "Downloading ${url}"
+    ws_fetch "$url" "${WORK_DIR}/download/${name}"
+    OFFICIAL_FILE="${WORK_DIR}/download/${name}"
+    OFFICIAL_DIR="${WORK_DIR}/download"
+    log_info "Downloaded ${name}, sha256 $(ws_sha256 "$OFFICIAL_FILE")"
 }
-
-parse_arguments() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --version) VERSION="${2:-}"; shift 2 ;;
-            --arch)    ARCH="${2:-}";    shift 2 ;;
-            --type)    TYPE="${2:-}";    shift 2 ;;
-            --binary|--apk) BINARY="${2:-}"; shift 2 ;;
-            --no-locale-align) LOCALE_ALIGN=false; shift ;;
-            --script-version) echo "${SCRIPT_NAME} ${SCRIPT_VERSION}"; exit 0 ;;
-            -h|--help) usage ;;
-            *) log_warn "Ignoring unknown parameter: $1"; shift ;;
-        esac
-    done
-
-    if [[ -z "$BINARY" ]]; then
-        log_fail "Provide --binary <file|dir>: the Play split set directory, or the GitHub/F-Droid/Obtainium APK."
-        echo "Run '${SCRIPT_NAME} --help' for usage."
-        exit 2
-    fi
-    if [[ -d "$BINARY" ]]; then
-        OFFICIAL_DIR="$(readlink -f "$BINARY")"
-    elif [[ -f "$BINARY" ]]; then
-        OFFICIAL_FILE="$(readlink -f "$BINARY")"
-        OFFICIAL_DIR="$(dirname "$OFFICIAL_FILE")"
-    else
-        log_fail "--binary not found: $BINARY"
-        exit 2
-    fi
-
-    local v_safe t_safe a_safe s_safe run_id
-    v_safe=$(sanitize_tag "${VERSION:-provided}")
-    t_safe=$(sanitize_tag "${TYPE:-default}")
-    a_safe=$(sanitize_tag "${ARCH:-auto}")
-    s_safe=$(sanitize_tag "$SCRIPT_VERSION")
-    run_id="$(date +%s)-$$"
-    # Per run, in the caller's directory: a fixed /tmp path is shared by every user (ABS included).
-    WORK_DIR="$(pwd -P)/bitbanana_verification_${v_safe}_${a_safe}_${t_safe}_${run_id}"
-    IMAGE_NAME="bitbanana-${v_safe}-${a_safe}-${t_safe}-${s_safe}-${run_id}"
-    log_info "Work directory: ${WORK_DIR}"
-    log_info "Container image tag: ${IMAGE_NAME}"
-}
-
-# Leave nothing the invoking user cannot delete. The build server has no sudo.
-normalize_ownership() {
-    [[ -n "${WORK_DIR:-}" && -d "${WORK_DIR}" && -n "${CONTAINER_RUNTIME:-}" ]] || return 0
-    if [[ "${CONTAINER_RUNTIME}" == "podman" ]]; then
-        podman unshare chown -R 0:0 "${WORK_DIR}" 2>/dev/null \
-            || log_warn "Could not normalize ownership under ${WORK_DIR}"
-    else
-        docker run --rm --user 0:0 -v "${WORK_DIR}:/work" "${WS_CONTAINER}" \
-            chown -R "$(id -u):$(id -g)" /work >/dev/null 2>&1 \
-            || log_warn "Could not normalize ownership under ${WORK_DIR}"
-    fi
-    chmod -R u+rwX "${WORK_DIR}" 2>/dev/null || true
-    if find "${WORK_DIR}" ! -uid "$(id -u)" -print -quit 2>/dev/null | grep -q .; then
-        log_warn "Files under ${WORK_DIR} are not owned by $(id -un); manual cleanup may need the container runtime."
-    fi
-}
-
-on_exit() {
-    local code=$?
-    if [[ $code -ne 0 && "${RESULT_DONE}" != "true" ]]; then
-        log_warn "Script failed with exit code: ${code}"
-        [[ -n "${WORK_DIR:-}" ]] && log_warn "Work directory preserved: ${WORK_DIR}"
-        [[ -f "${EXEC_DIR}/COMPARISON_RESULTS.yaml" ]] || generate_yaml "ftbfs" "Script aborted before a comparison was produced (exit ${code})."
-    fi
-    normalize_ownership
-    if [[ -n "${IMAGE_NAME:-}" && -n "${CONTAINER_RUNTIME:-}" ]]; then ${CONTAINER_RUNTIME} rmi "${IMAGE_NAME}" >/dev/null 2>&1 || true; fi
-    return 0
-}
-trap on_exit EXIT
 
 # Upstream reproducible-builds/Dockerfile (identical from v1.0.1 through v1.1.0), plus the clone
 # of the tag and the pinned bundletool. Re-check the version strings against the tag on every bump.
@@ -350,7 +355,7 @@ derive_device_spec() {
         esac
     done
 
-    [[ -n "$abis" ]] || fail_ftbfs "Supplied splits contain no split_config.<abi>.apk; cannot derive a device spec."
+    [[ -n "$abis" ]] || ws_invalid "Supplied splits contain no split_config.<abi>.apk; cannot derive a device spec."
     [[ -z "$density" ]] && { density=480; log_warn "No density split supplied; defaulting to 480 dpi (xxhdpi)."; }
     # Upstream sets bundle { language.enableSplit = false }; en-US keeps the spec valid.
     [[ -z "$locales" ]] && locales='"en-US"'
@@ -387,9 +392,13 @@ classify_single() {
 
 prepare() {
     log_info "=== PREPARATION PHASE ==="
-    mkdir "${WORK_DIR}" || fail_ftbfs "Workspace already exists: ${WORK_DIR}"
-    mkdir -p "${WORK_DIR}"/{official,built/splits,comparison}
-    chmod 777 "${WORK_DIR}" "${WORK_DIR}/built" "${WORK_DIR}/built/splits" "${WORK_DIR}/comparison"
+    # Per-run workspace in the caller's directory (exclusive mkdir, never reused).
+    ws_workspace bitbanana "${VERSION:-provided}" "${ARCH:-auto}-${TYPE:-default}"
+    WORK_DIR="${WS_WORKDIR}"
+    mkdir -p "${WORK_DIR}"/{official,built/splits,build-lock,comparison}
+    chmod 777 "${WORK_DIR}" "${WORK_DIR}/built" "${WORK_DIR}/built/splits" "${WORK_DIR}/build-lock" "${WORK_DIR}/comparison"
+    # No --binary: the script downloads the official artifact itself (sets OFFICIAL_FILE/OFFICIAL_DIR).
+    [[ -n "$BINARY" ]] || fetch_official
 
     shopt -s nullglob
     local sib=("${OFFICIAL_DIR}"/split_config.*.apk) supplied=()
@@ -403,7 +412,7 @@ prepare() {
         supplied=("${OFFICIAL_DIR}"/*.apk "${OFFICIAL_DIR}"/*.bin)
     fi
     shopt -u nullglob
-    [[ ${#supplied[@]} -gt 0 ]] || fail_ftbfs "No .apk or .bin file found at ${BINARY}."
+    [[ ${#supplied[@]} -gt 0 ]] || ws_invalid "No .apk or .bin file found at ${BINARY}."
 
     local single=false
     if [[ ${#supplied[@]} -eq 1 ]]; then
@@ -420,7 +429,7 @@ prepare() {
         shopt -u nullglob
         OFFICIAL_BASE="${WORK_DIR}/official/base.apk"
         OFFICIAL_NAME="base.apk"
-        [[ -f "$OFFICIAL_BASE" ]] || fail_ftbfs "Several APKs supplied but no base.apk; a Play split set must include it."
+        [[ -f "$OFFICIAL_BASE" ]] || ws_invalid "Several APKs supplied but no base.apk; a Play split set must include it."
         INPUT_KIND="play-split-set"
         log_info "Official splits supplied: ${#OFFICIAL_SPLITS[@]}"
         local f
@@ -430,33 +439,33 @@ prepare() {
     rel="official/$(basename "$OFFICIAL_BASE")"
 
     # appHash is the official artifact exactly as supplied: base.apk of a split set, or the one APK.
-    OFFICIAL_APP_HASH="$(sha256_of "$rel")"
+    OFFICIAL_APP_HASH="$(ws_sha256 "$OFFICIAL_BASE")"
     log_info "Official ${OFFICIAL_NAME} SHA256 (as supplied): ${OFFICIAL_APP_HASH}"
 
     decode_official "$rel"
-    APP_ID_FROM_APK="$(manifest_package)"
+    APP_ID_FROM_APK="$(manifest_package || true)"
     APK_VERSION_NAME="$(yml_field versionName)"
     APK_VERSION_CODE="$(yml_field versionCode)"
     SPEC_SDK="$(yml_field targetSdkVersion)"
     SIGNER_SHA256="$(apk_signer "$rel")"
 
-    [[ -n "$APP_ID_FROM_APK" ]] || fail_ftbfs "Package name unreadable from the supplied APK."
+    [[ -n "$APP_ID_FROM_APK" ]] || ws_invalid "Package name unreadable from the supplied APK."
     log_info "versionName=${APK_VERSION_NAME:-unset} versionCode=${APK_VERSION_CODE:-unset} targetSdk=${SPEC_SDK:-unset}"
-    [[ "$APP_ID_FROM_APK" == "$APP_ID" ]] || fail_ftbfs "Wrong APK: package is '${APP_ID_FROM_APK}', expected '${APP_ID}'."
+    [[ "$APP_ID_FROM_APK" == "$APP_ID" ]] || ws_invalid "Wrong APK: package is '${APP_ID_FROM_APK}', expected '${APP_ID}'."
     log_pass "Package ID verified: ${APP_ID_FROM_APK}"
 
     if [[ "$single" == "true" ]]; then
         classify_single
         if [[ "$INPUT_KIND" != "fat-apk" ]]; then
             log_fail "inputKind: ${INPUT_KIND}"
-            fail_ftbfs "The supplied file is one Google Play APK (${INPUT_KIND}), which cannot be verified alone. Upload the full split set: base.apk plus every split_config.*.apk."
+            ws_invalid "The supplied file is one Google Play APK (${INPUT_KIND}), which cannot be verified alone. Upload the full split set: base.apk plus every split_config.*.apk."
         fi
     fi
     log_info "inputKind: ${INPUT_KIND}"
 
     if [[ -z "$VERSION" ]]; then
         VERSION="${APK_VERSION_NAME}"
-        [[ -n "$VERSION" ]] || fail_ftbfs "Cannot detect the version from the APK; pass --version."
+        [[ "$VERSION" =~ ^[0-9A-Za-z._-]+$ ]] || ws_invalid "Cannot detect the version from the APK; pass --version."
         log_info "Version detected from the APK: ${VERSION}"
     elif [[ -n "$APK_VERSION_NAME" && "$APK_VERSION_NAME" != "$VERSION" ]]; then
         log_warn "The APK reports ${APK_VERSION_NAME}, --version says ${VERSION}. Building ${VERSION}."
@@ -466,21 +475,62 @@ prepare() {
     SIGNER_SHA256="${SIGNER_SHA256:-unknown}"
 
     if [[ "$INPUT_KIND" == "play-split-set" ]]; then derive_device_spec; fi
+    check_arch
     log_pass "Preparation complete"
+}
+
+# --arch against the supplied artifact (the ABS passes none for Android). Split set: the ABI split
+# Play delivered. Fat APK: its lib/<abi>/ folders; an APK with no native code fits any ABI.
+check_arch() {
+    [[ -n "${ARCH:-}" ]] || return 0
+    local want="$ARCH"
+    case "$want" in
+        aarch64|arm64) want="arm64-v8a" ;;
+        armv7|armv7l|arm) want="armeabi-v7a" ;;
+        amd64) want="x86_64" ;;
+    esac
+    case "$want" in
+        arm64-v8a|armeabi-v7a|x86|x86_64) ;;
+        *) log_warn "Unknown --arch '${ARCH}'; not checked."; return 0 ;;
+    esac
+    if [[ "$INPUT_KIND" == "play-split-set" ]]; then
+        [[ "$SPEC_ABIS" == *"\"${want}\""* ]] \
+            || ws_invalid "--arch ${ARCH} does not match the supplied ABI split(s): ${SPEC_ABIS}."
+    else
+        local abis
+        abis="$(ws_run "unzip -Z1 official/app.apk 'lib/*' 2>/dev/null | cut -d/ -f2 | sort -u | tr '\n' ' '" || true)"
+        if [[ -n "${abis// /}" && " ${abis} " != *" ${want} "* ]]; then
+            ws_invalid "--arch ${ARCH} is not in the APK's native libraries: ${abis}"
+        fi
+    fi
+    log_pass "--arch ${ARCH} matches the supplied artifact"
+}
+
+# Gradle failed: "infra: <line>" for network, disk or memory; "source" only for a compiler or resource
+# diagnostic (Kotlin e:, javac error, AAPT, script compile); else "unknown". A bare task failure is unknown.
+gradle_failure_kind() {
+    local log="$1" hit
+    [[ -s "$log" ]] || { echo unknown; return; }
+    hit="$(grep -m1 -E 'Could not (resolve|GET|HEAD|download)|Connect(ion)? (refused|timed out|reset)|Read timed out|UnknownHostException|SSLHandshake|Received status code [45][0-9][0-9]|No space left on device|OutOfMemoryError|Java heap space|Metaspace|Failed to install the following' "$log" || true)"
+    if [[ -n "$hit" ]]; then echo "infra: ${hit:0:160}"
+    elif grep -qE '^e: (file:|/)|\.(java|kt):[0-9]+: error:|Compilation failed; see the compiler error|Script compilation error|AAPT: error:|Android resource linking failed' "$log"; then echo source
+    else echo unknown; fi
 }
 
 build() {
     log_info "=== BUILD PHASE ==="
     create_dockerfile "${WORK_DIR}/Dockerfile"
+    IMAGE_NAME="localhost/bitbanana-build:$(ws_sanitize "$VERSION")-${WS_RUN_ID}"
 
     log_info "Building container image (no cache): ${IMAGE_NAME}"
-    ${CONTAINER_RUNTIME} build --no-cache \
+    ws_track_image "${IMAGE_NAME}"
+    ws_ctr build --no-cache \
         --build-arg VERSION="${VERSION}" \
         --build-arg REPO_URL="${REPO_URL}" \
         --build-arg BUNDLETOOL_VERSION="${BUNDLETOOL_VERSION}" \
         --build-arg BUNDLETOOL_SHA256="${BUNDLETOOL_SHA256}" \
         -t "${IMAGE_NAME}" -f "${WORK_DIR}/Dockerfile" "${WORK_DIR}" \
-        || fail_ftbfs "Container image build failed for v${VERSION} (clone of the tag, SDK or bundletool download)." 1
+        || ws_no_verdict "Container image build failed for v${VERSION} (clone of the tag, SDK or bundletool download)."
 
     # Both upstream playbooks build through disorderfs with sorted directory entries; that
     # ordering is the reproducibility mechanism and is reproduced here unchanged.
@@ -490,12 +540,21 @@ cp /commit.txt /out/commit.txt
 mkdir -p /app
 disorderfs --sort-dirents=yes --reverse-dirents=no /app-src/ /app/
 cd /app
+# Gradle output goes live to the cast and to /out/gradle.log. Exit 90 = the log could not be written.
+run_gradle() {
+  set +e; gradle "$@" --no-daemon 2>&1 | tee /out/gradle.log; local st=("${PIPESTATUS[@]}"); set -e
+  [ "${st[1]}" -eq 0 ] || { echo "[ERROR] tee exit ${st[1]}: Gradle log not written"; exit 90; }
+  [ "${st[0]}" -eq 0 ] || exit "${st[0]}"
+  touch /out/.gradle-ok
+}
+touch /out/.gradle-started
 '
     if [[ "$INPUT_KIND" == "fat-apk" ]]; then
         log_info "Running build in container (disorderfs + gradle assembleRelease, per docs/REPRODUCE_GITHUB.md)"
-        cmd+='gradle clean assembleRelease --no-daemon
+        cmd+='run_gradle clean assembleRelease
 apk="$(find app/build/outputs/apk/release -name "*-release-unsigned.apk" | head -n1)"
 [ -n "$apk" ] || { echo "No unsigned release APK produced"; exit 1; }
+touch /out/.gradle-done
 echo "APK: $apk"
 cp "$apk" /out/splits/app.apk
 ls -la /out/splits/'
@@ -511,9 +570,10 @@ ls -la /out/splits/'
             log_warn "Locale alignment OFF: bundletool may emit he/id/yi where Play emits iw/in/ji"
         fi
         log_info "Running build in container (disorderfs + gradle bundleRelease + bundletool, per docs/REPRODUCE_PLAYSTORE.md)"
-        cmd+='gradle clean bundleRelease --no-daemon
+        cmd+='run_gradle clean bundleRelease
 aab="$(find app/build/outputs/bundle/release -name "*.aab" | head -n1)"
 [ -n "$aab" ] || { echo "No AAB produced"; exit 1; }
+touch /out/.gradle-done
 echo "AAB: $aab"
 cp "$aab" /out/
 java ${BT_LOCALE_OPTS:-} -jar /opt/bundletool.jar build-apks \
@@ -530,23 +590,63 @@ for f in /tmp/built-apks/splits/*.apk; do
 done
 ls -la /out/splits/'
     fi
+    # Build record (#1000), after the APKs are in /out/splits: reads the Gradle cache this build
+    # filled (fresh in every container) and the checkout's committed binaries. Never changes the
+    # build output or the verdict.
+    cmd+='
+if curl -fsSL --max-time 60 -o /tmp/ws-buildlock.sh "https://gitlab.com/walletscrutiny/walletScrutinyCom/-/raw/${BL_REV}/scripts/rb/ws-buildlock.sh" \
+   && echo "${BL_SHA}  /tmp/ws-buildlock.sh" | sha256sum -c --quiet -; then
+  bash /tmp/ws-buildlock.sh --out /build-lock --gradle-home "${GRADLE_USER_HOME:-$HOME/.gradle}" --src /app-src \
+    --app-id "${BL_APP_ID}" --version "${BL_VERSION}" --platform android --commit "$(cat /commit.txt)" \
+    || echo "[WARN] ws-buildlock.sh failed; no build-lock.json, verdict unaffected"
+else
+  echo "[WARN] build-lock skipped: could not fetch ws-buildlock.sh with the expected sha256"
+fi'
+    run_args+=(-v "${WORK_DIR}/build-lock:/build-lock")
+    run_args+=(-e "BL_REV=${BUILDLOCK_REV}" -e "BL_SHA=${BUILDLOCK_SHA256}" -e "BL_APP_ID=${APP_ID}" -e "BL_VERSION=${VERSION}")
 
-    ${CONTAINER_RUNTIME} run --rm \
+    local rc=0
+    crun \
         --device /dev/fuse --cap-add SYS_ADMIN \
         -v "${WORK_DIR}/built:/out" \
         ${run_args[@]+"${run_args[@]}"} \
-        "${IMAGE_NAME}" bash -c "$cmd" \
-        || fail_ftbfs "Build failed for v${VERSION} (${INPUT_KIND})." 1
+        "${IMAGE_NAME}" bash -c "$cmd" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        # 125-127: the engine could not start the container; 137/143: killed (memory, stop).
+        case "$rc" in
+            125|126|127|137|143) ws_no_verdict "Build container failed (exit ${rc}): engine or host problem, not the source." ;;
+            90) ws_no_verdict "Gradle log could not be written (tee failed); Gradle's result is unknown." ;;
+        esac
+        [[ -f "${WORK_DIR}/built/.gradle-started" ]] \
+            || ws_no_verdict "Build container failed (exit ${rc}) before Gradle started (disorderfs or setup)."
+        [[ ! -f "${WORK_DIR}/built/.gradle-done" ]] \
+            || ws_no_verdict "Build container failed (exit ${rc}) after Gradle succeeded (bundletool or copy step)."
+        # Gradle exited 0 but left no APK/AAB: the source's build config, not the host.
+        [[ ! -f "${WORK_DIR}/built/.gradle-ok" ]] \
+            || fail_ftbfs "Gradle succeeded but produced no ${INPUT_KIND} output for v${VERSION}."
+        local kind; kind="$(gradle_failure_kind "${WORK_DIR}/built/gradle.log")"
+        case "$kind" in
+            source) fail_ftbfs "Build failed for v${VERSION} (${INPUT_KIND}): Gradle task or compile error, exit ${rc}." ;;
+            infra*) ws_no_verdict "Gradle failed (exit ${rc}) on a host or network problem: ${kind#infra: }" ;;
+            *)      ws_no_verdict "Gradle failed (exit ${rc}) with no recognised cause; check ${WORK_DIR}/built/gradle.log." ;;
+        esac
+    fi
 
     shopt -s nullglob
     local built=("${WORK_DIR}/built/splits"/*.apk)
     shopt -u nullglob
-    [[ ${#built[@]} -gt 0 ]] || fail_ftbfs "The build produced no APK." 1
+    [[ ${#built[@]} -gt 0 ]] || fail_ftbfs "The build produced no APK."
 
     if [[ -f "${WORK_DIR}/built/commit.txt" ]]; then
         IFS= read -r COMMIT_HASH < "${WORK_DIR}/built/commit.txt"
     fi
     COMMIT_HASH="${COMMIT_HASH:-unknown}"
+    if [[ -f "${WORK_DIR}/build-lock/build-lock.json" ]]; then
+        BUILD_LOCK_FILE="${WORK_DIR}/build-lock/build-lock.json"
+        log_pass "build-lock.json: ${BUILD_LOCK_FILE} (sha256 $(ws_sha256 "$BUILD_LOCK_FILE"))"
+    else
+        log_warn "No build-lock.json produced; the verdict is unaffected."
+    fi
 
     log_pass "Build complete: ${#built[@]} APK(s)"
     local f
@@ -702,7 +802,8 @@ compare() {
             unzip -qo official/${name} -d comparison/official-unzipped/${tag}
             unzip -qo built/splits/${name} -d comparison/built-unzipped/${tag}
             diff -qr comparison/official-unzipped/${tag} comparison/built-unzipped/${tag} \
-                > comparison/diff_${tag}.txt 2>&1 || true"
+                > comparison/diff_${tag}.txt 2>&1 || true" \
+            || ws_no_verdict "could not unzip or diff ${name}"
 
         local brief="${WORK_DIR}/comparison/diff_${tag}.txt"
         local filtered="${WORK_DIR}/comparison/filtered_${tag}.txt"
@@ -771,46 +872,12 @@ compare() {
     log_info "Total unaccounted differences: ${DIFF_COUNT}"
 }
 
-print_results_block() {
-    local verdict="$1"
+# Text under "Diff:" in the results block: 5 lines of the full diff and its path, then the
+# accepted classes, the resources.arsc evidence and the revision.
+diff_section() {
     local aggregate="${WORK_DIR}/comparison/diff_all.txt"
-    echo ""
-    echo "===== Begin Results ====="
-    echo "appId:          ${APP_ID_FROM_APK:-$APP_ID}"
-    echo "inputKind:      ${INPUT_KIND:-unknown}"
-    echo "signer:         ${SIGNER_SHA256}"
-    echo "apkVersionName: ${APK_VERSION_NAME}"
-    echo "apkVersionCode: ${APK_VERSION_CODE}"
-    echo "verdict:        ${verdict}"
-    echo "appHash:        ${OFFICIAL_APP_HASH:-N/A}"
-    echo "commit:         ${COMMIT_HASH}"
-    echo "scriptVersion:  ${SCRIPT_VERSION}"
-    echo "scriptHash:     ${SCRIPT_SHA256}"
-    if [[ "$INPUT_KIND" == "fat-apk" ]]; then
-        echo "splitGenFlags:  n/a (fat APK: gradle assembleRelease, no bundletool)"
-    elif [[ "$LOCALE_ALIGN" == "true" ]]; then
-        echo "splitGenFlags:  -Djava.locale.useOldISOCodes=true (bundletool only; Gradle build unmodified)"
-    else
-        echo "splitGenFlags:  none (locale alignment disabled)"
-    fi
-    echo ""
-    echo "Official APK hashes (as supplied):"
-    local f n
-    for f in "${OFFICIAL_SPLITS[@]}"; do
-        n="$(basename "$f")"; [[ "$n" == "app.apk" ]] && n="${OFFICIAL_NAME} (copied to app.apk)"
-        echo "  ${n}  $(sha256_local "$f")"
-    done
-    echo ""
-    echo "Built APK hashes (unsigned):"
-    shopt -s nullglob
-    for f in "${WORK_DIR}/built/splits"/*.apk; do
-        echo "  $(basename "$f")  $(sha256_local "$f")"
-    done
-    shopt -u nullglob
-    echo ""
-    echo "Diff:"
     if [[ -s "$aggregate" ]]; then
-        cat "$aggregate"
+        ws_diff_preview "$aggregate"
     else
         echo "(no comparison performed)"
     fi
@@ -823,25 +890,49 @@ print_results_block() {
     else
         echo "  all splits: root META-INF/ (signing material; the built splits are unsigned)"
     fi
-    echo ""
     if [[ -n "$ARSC_SUMMARY" ]]; then
+        echo ""
         echo "resources.arsc (decoded, per APK):"
         printf '%s' "$ARSC_SUMMARY"
-        echo ""
     fi
+    echo ""
     echo "Revision, tag (and its signature):"
     echo "Built from tag v${VERSION} at commit ${COMMIT_HASH}."
     echo "No git tag signature check is performed by this script."
     if [[ -n "$MISSING_NOTE" ]]; then
         echo ""
-        echo "===== Also ===="
-        echo "${MISSING_NOTE}"
+        echo "Also: ${MISSING_NOTE}"
     fi
+}
+
+print_results_block() {
+    local verdict="$1" f n
     echo ""
-    echo "===== End Results ====="
+    ws_results_block "${APP_ID_FROM_APK:-$APP_ID}" "${SIGNER_SHA256}" "${APK_VERSION_NAME}" \
+        "${APK_VERSION_CODE}" "${verdict}" "${OFFICIAL_APP_HASH:-N/A}" "${COMMIT_HASH}" "$(diff_section)"
     echo ""
+    echo "inputKind:      ${INPUT_KIND:-unknown}"
+    if [[ "$INPUT_KIND" == "fat-apk" ]]; then
+        echo "splitGenFlags:  n/a (fat APK: gradle assembleRelease, no bundletool)"
+    elif [[ "$LOCALE_ALIGN" == "true" ]]; then
+        echo "splitGenFlags:  -Djava.locale.useOldISOCodes=true (bundletool only; Gradle build unmodified)"
+    else
+        echo "splitGenFlags:  none (locale alignment disabled)"
+    fi
+    echo "Official APK hashes (as supplied):"
+    for f in "${OFFICIAL_SPLITS[@]}"; do
+        n="$(basename "$f")"; [[ "$n" == "app.apk" ]] && n="${OFFICIAL_NAME} (copied to app.apk)"
+        echo "  ${n}  $(ws_sha256 "$f")"
+    done
+    echo "Built APK hashes (unsigned):"
+    shopt -s nullglob
+    for f in "${WORK_DIR}/built/splits"/*.apk; do
+        echo "  $(basename "$f")  $(ws_sha256 "$f")"
+    done
+    shopt -u nullglob
     echo "Hash legend: appHash is the official artifact exactly as supplied (base.apk of a split set, or"
     echo "the single APK) and is the value to publish. Built APKs are unsigned: upstream declares no signingConfig."
+    echo "libVersion/libHash: the shared library this run loaded."
     printf 'Run a full\ndiff --recursive %s/comparison/official-unzipped %s/comparison/built-unzipped\nmeld %s/comparison/official-unzipped %s/comparison/built-unzipped\nor\ndiffoscope "%s" "%s"\nfor more details.\n' \
         "${WORK_DIR}" "${WORK_DIR}" "${WORK_DIR}" "${WORK_DIR}" \
         "${OFFICIAL_BASE}" "${WORK_DIR}/built/splits/$(basename "$OFFICIAL_BASE")"
@@ -849,16 +940,12 @@ print_results_block() {
 
 result() {
     log_info "=== RESULTS ==="
-    local verdict_label yaml_verdict
+    local verdict rc
     if [[ "${DIFF_COUNT}" -eq 0 ]]; then
-        verdict_label="reproducible"
-        yaml_verdict="reproducible"
-        RESULT_EXIT_CODE=0
+        verdict="reproducible"; rc="$WS_EXIT_OK"
         log_pass "VERDICT: REPRODUCIBLE"
     else
-        verdict_label="differences found"
-        yaml_verdict="not_reproducible"
-        RESULT_EXIT_CODE=1
+        verdict="not_reproducible"; rc="$WS_EXIT_FAIL"
         log_warn "VERDICT: NOT REPRODUCIBLE (${DIFF_COUNT} differences)"
     fi
 
@@ -875,32 +962,28 @@ result() {
         notes="${notes}Google Play AAB path per docs/REPRODUCE_PLAYSTORE.md: gradle bundleRelease, splits materialised with bundletool ${BUNDLETOOL_VERSION} against a device spec derived from the supplied Play splits, not from a connected device. ${env_note}Only root-level META-INF/ is excluded up front (Leo's 2025-10-30 rule); Play SourceStamp (stamp-cert-sha256), the three com.android.stamp/vending manifest meta-data entries and resources.arsc are excluded only with decode evidence and listed below for the report. "
     fi
     notes="${notes}Built APKs are unsigned because upstream declares no signingConfig. ${ACCEPTED_SUMMARY:+Accepted differences excluded from the verdict: ${ACCEPTED_SUMMARY}}${MISSING_NOTE}${ARSC_SUMMARY:+ resources.arsc decoded: ${ARSC_SUMMARY}}"
-    generate_yaml "${yaml_verdict}" "${notes}"
-    RESULT_DONE=true
-    log_info "Generated COMPARISON_RESULTS.yaml"
+    yaml_hashes
+    ws_write_yaml "${verdict}" "$(yaml_notes "${notes}")" ${YAML_HASHES[@]+"${YAML_HASHES[@]}"}
 
-    print_results_block "${verdict_label}"
+    print_results_block "${verdict}"
 
-    ${CONTAINER_RUNTIME} rmi "${IMAGE_NAME}" >/dev/null 2>&1 || true
     log_info "Workspace preserved: ${WORK_DIR}"
-    echo "Exit code: ${RESULT_EXIT_CODE}"
+    if [[ -n "$BUILD_LOCK_FILE" ]]; then
+        echo "Upload with the verification: ${BUILD_LOCK_FILE} (sha256 $(ws_sha256 "$BUILD_LOCK_FILE"))"
+    fi
+    exit "$rc"
 }
 
 main() {
-    log_info "Starting ${SCRIPT_NAME} script version ${SCRIPT_VERSION}"
-    SCRIPT_SHA256="$(sha256_local "$SCRIPT_PATH")"
-    log_info "Script:  $(basename "$SCRIPT_PATH") ${SCRIPT_VERSION}"
-    log_info "         sha256: ${SCRIPT_SHA256}"
-    show_disclaimer
-    require_non_root
-    detect_container_runtime
+    ws_warn "This script is provided as-is. Review before running. Use at your own risk."
+    ws_refuse_root
+    ws_install_traps
     parse_arguments "$@"
+    ws_results_init        # one run per script folder; stale COMPARISON_RESULTS.yaml removed
+    ws_engine
     prepare
     build
     compare
     result
-    trap - EXIT
-    normalize_ownership
-    exit "${RESULT_EXIT_CODE}"
 }
 main "$@"
