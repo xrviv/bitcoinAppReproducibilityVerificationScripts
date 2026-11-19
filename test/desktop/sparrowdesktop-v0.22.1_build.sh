@@ -1,208 +1,157 @@
 #!/bin/bash
 # sparrowdesktop_build.sh — Sparrow Desktop (Linux tarball/deb/rpm) reproducible build verification
-# Version: v0.21.1
+# Version: v0.22.1
 # Organization: WalletScrutiny.com
 # Last modified by: Daniel Garcia
-# Last modified on: 2026-10-30
+# Last modified on: 2026-11-18
 # Project: https://github.com/sparrowwallet/sparrow
 # Disclaimer: for reproducible-build verification and research only. No warranty; users assume all risk and are responsible for legal compliance; the developers assume no liability for misuse.
-# Steps: clone the tag in a container, build with upstream's JDK (./gradlew jpackage, plus packageTarDistribution or the deb repack), take the official artifact (--binary or GitHub release), compare extracted contents file by file, write COMPARISON_RESULTS.yaml next to the caller.
+# Steps: clone the tag in a container, build with upstream's JDK (./gradlew jpackage, plus packageTarDistribution or the deb repack), take the official artifact (--binary or GitHub release), compare extracted contents file by file, write COMPARISON_RESULTS.yaml next to this script.
+# Shared steps (engine pick, workspace, traps, results block) come from the WalletScrutiny library ws-rb-core, pinned by sha256 below (GitLab #1023). Offline: WS_LIB_FILE=/path/to/ws-rb-core-1.0.0.sh.
 # Windows (msi/zip): sparrowwindows_build.sh. Design notes: script-notes/desktop/sparrow/changelog.md
-# Exit codes: 0 = reproducible, 1 = not_reproducible or ftbfs, 2 = invalid parameters, 130 = stopped.
+# Exit codes: 0 = reproducible, 1 = not_reproducible, ftbfs or a failure with no verdict, 2 = invalid parameters or library unavailable, 130 = stopped.
 set -euo pipefail
 
-SCRIPT_VERSION="v0.21.1"
-APP_ID="sparrow"
+SCRIPT_VERSION="v0.22.1"
+SCRIPT_SHA256=$(sha256sum "$0" 2>/dev/null | cut -d' ' -f1) || true
+SCRIPT_SHA256="${SCRIPT_SHA256:-N/A}"
+echo "$(basename "$0") ${SCRIPT_VERSION} sha256: ${SCRIPT_SHA256}"
+echo ""
 
-EXIT_SUCCESS=0
-EXIT_BUILD_FAILED=1
-EXIT_INVALID_PARAMS=2
+WS_ENGINE="${WS_ENGINE:-${DOCKER_CMD:-}}"   # DOCKER_CMD kept as the old name
+# ---- WalletScrutiny library (GitLab #1023), pinned by sha256 ------------------
+# Goes in each build script right after its self-hash line, before anything else.
+# Source: WS_LIB_FILE (offline, must match), else the cache, else GitLab by
+# commit. Nothing else. A wrong hash is rejected whichever source sent it.
+# No matching copy, or a different version inside: no verdict, no YAML, exit 2.
+# First, before anything can fail: no earlier verdict may survive this run. A run
+# that holds this folder's lock is still writing its own; that one stays, and the
+# library refuses this run when it takes the lock.
+WS_LIB_DIR0="$(dirname "$(readlink -f "$0")")"
+if command -v flock >/dev/null 2>&1; then
+  flock -n "$WS_LIB_DIR0/.comparison_results.lock" true 2>/dev/null && rm -f -- "$WS_LIB_DIR0/COMPARISON_RESULTS.yaml"
+else
+  WS_LIB_P="$(cat "$WS_LIB_DIR0/.comparison_results.lock.d/pid" 2>/dev/null || true)"
+  case "$WS_LIB_P" in ''|*[!0-9]*) WS_LIB_P="";; esac
+  { [ -n "$WS_LIB_P" ] && kill -0 "$WS_LIB_P" 2>/dev/null; } || rm -f -- "$WS_LIB_DIR0/COMPARISON_RESULTS.yaml"
+fi
+WS_LIB=ws-rb-core WS_LIB_VERSION=1.0.0
+WS_LIB_REV=3581020196b35eefa501a19ed0abb43e96f4db42 WS_LIB_SHA256=d321b7c6937bbfc4a42db273c3fb6ec02c58e930c7c2b962492b8966188a0fcf
+ws_lib_load() {
+  local c f u t=""
+  ws_lib_ok() { [ "$(sha256sum "$1" 2>/dev/null | cut -d' ' -f1)" = "$WS_LIB_SHA256" ]; }
+  if [ -n "${WS_LIB_FILE:-}" ]; then
+    f="$WS_LIB_FILE"
+    ws_lib_ok "$f" || { echo "[FAIL] WS_LIB_FILE $f is not sha256 $WS_LIB_SHA256: no verdict" >&2; exit 2; }
+  else
+    # Cache in XDG_CACHE_HOME or HOME; with neither, or no way to create it, a
+    # temporary folder for this run only. Every copy is hash-checked either way.
+    c="${XDG_CACHE_HOME:-${HOME:+$HOME/.cache}}"
+    if [ -n "$c" ] && mkdir -p "$c/ws-rb-lib" 2>/dev/null; then c="$c/ws-rb-lib"
+    else t="$(mktemp -d 2>/dev/null)" || { echo "[FAIL] no folder to fetch $WS_LIB into: no verdict" >&2; exit 2; }; c="$t"; fi
+    f="$c/$WS_LIB_SHA256.sh"
+    if ! ws_lib_ok "$f"; then
+      u="https://gitlab.com/walletscrutiny/walletScrutinyCom/-/raw/$WS_LIB_REV/scripts/rb/lib/$WS_LIB-$WS_LIB_VERSION.sh"
+      curl -fsSL --max-time 60 -o "$f.$$" "$u" 2>/dev/null && ws_lib_ok "$f.$$" && mv -f "$f.$$" "$f"
+      rm -f "$f.$$"
+    fi
+  fi
+  ws_lib_ok "$f" || { [ -z "$t" ] || rm -rf -- "$t"; echo "[FAIL] $WS_LIB $WS_LIB_VERSION ($WS_LIB_SHA256) unavailable or altered: no verdict" >&2; exit 2; }
+  . "$f"
+  [ -z "$t" ] || rm -rf -- "$t"
+  [ "${WS_LIB_LOADED_VERSION:-}" = "$WS_LIB_VERSION" ] || { echo "[FAIL] $f holds ${WS_LIB_LOADED_VERSION:-no version}, not $WS_LIB_VERSION: no verdict" >&2; exit 2; }
+  echo "Library: $WS_LIB $WS_LIB_VERSION sha256: $WS_LIB_SHA256"
+}
+ws_lib_load
+
+APP_ID="sparrow"
 
 # Upstream's JDK for 2.5.6 (.github/workflows/package.yaml java-version); the build refuses a tag that asks for another.
 JDK_VERSION="25.0.5+8"
 JDK_SHA256="68982529869257d0ee6b824ec5aa270ff8b118bb438670da0b97ebdab178d7fb"
-DOCKER_CMD="${DOCKER_CMD:-}"
 
 APP_VERSION=""
 APP_ARCH=""
 APP_TYPE=""
-WORK_DIR=""
 CUSTOM_WORK_DIR=""
 NO_CACHE=false
-KEEP_CONTAINER=false
 BINARY_PATH=""
-EXEC_DIR="$(pwd -P)"
-RESULTS_FILE="${EXEC_DIR}/COMPARISON_RESULTS.yaml"
 CONTAINER_NAME=""
 IMAGE_NAME=""
 APP_HASH="N/A"
 APP_COMMIT="N/A"
 
-die() {
-    echo "ERROR: $1" >&2
-    exit "${2:-$EXIT_BUILD_FAILED}"
-}
-
-warn() {
-    echo "WARN: $1" >&2
-}
-
-# A COMPARISON_RESULTS.yaml already here may belong to another script run from the same folder;
-# rename it so ABS never reads it and nothing is lost.
-keep_existing_results() {
-    [[ -e "$RESULTS_FILE" ]] || return 0
-    local kept
-    kept="${EXEC_DIR}/COMPARISON_RESULTS-kept-$(date -u -r "$RESULTS_FILE" +%Y%m%dT%H%M%SZ)-$$.yaml"
-    mv -n "$RESULTS_FILE" "$kept" || die "Could not move the existing COMPARISON_RESULTS.yaml aside" $EXIT_BUILD_FAILED
-    warn "Existing COMPARISON_RESULTS.yaml renamed to $(basename "$kept")"
-}
-
-cleanup() {
-    [[ -n "$IMAGE_NAME" && "$KEEP_CONTAINER" != true ]] || return 0
-    "$DOCKER_CMD" rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-    "$DOCKER_CMD" rmi -f "$IMAGE_NAME" >/dev/null 2>&1 || true
-}
-
-detect_container_cmd() {
-    if [[ -n "$DOCKER_CMD" ]]; then
-        return
-    fi
-    if command -v podman >/dev/null 2>&1; then
-        DOCKER_CMD="podman"
-    elif command -v docker >/dev/null 2>&1; then
-        DOCKER_CMD="docker"
-    else
-        die "Neither podman nor docker was found in PATH" $EXIT_INVALID_PARAMS
-    fi
-}
-
-require_value() {
-    local flag="$1"
-    local value="${2:-}"
-    if [[ -z "$value" || "$value" == --* ]]; then
-        die "Missing value for parameter: $flag" $EXIT_INVALID_PARAMS
-    fi
-}
-
-sanitize_component() {
-    local input="$1"
-    input=$(echo "$input" | tr '[:upper:]' '[:lower:]')
-    input=$(echo "$input" | sed -E 's/[^a-z0-9]+/-/g')
-    input="${input#-}"
-    input="${input%-}"
-    if [[ -z "$input" ]]; then
-        input="na"
-    fi
-    echo "$input"
-}
-
 parse_arguments() {
     if [[ $# -eq 0 ]]; then
         echo "Usage: $0 --version VERSION --arch x86_64-linux-gnu --type tarball|deb|rpm [--binary FILE]"
-        exit $EXIT_INVALID_PARAMS
+        exit "$WS_EXIT_INVALID"
     fi
 
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --version)
-                require_value "$1" "${2:-}"
-                APP_VERSION="$2"
-                shift 2
-                ;;
-            --arch)
-                require_value "$1" "${2:-}"
-                APP_ARCH="$2"
-                shift 2
-                ;;
-            --type)
-                require_value "$1" "${2:-}"
-                APP_TYPE="$2"
-                shift 2
-                ;;
-            --binary)
-                require_value "$1" "${2:-}"
-                BINARY_PATH="$2"
-                shift 2
-                ;;
-            --work-dir)
-                require_value "$1" "${2:-}"
-                CUSTOM_WORK_DIR="$2"
-                shift 2
-                ;;
-            --no-cache)
-                NO_CACHE=true
-                shift
-                ;;
-            --keep-container)
-                KEEP_CONTAINER=true
-                shift
-                ;;
-            *)
-                warn "Ignoring unknown parameter: $1"
-                if [[ $# -ge 2 && "${2:-}" != --* ]]; then
-                    shift 2
-                else
-                    shift
-                fi
-                ;;
+            --version)  ws_require_value "$1" "${2:-}"; APP_VERSION="$2"; shift 2 ;;
+            --arch)     ws_require_value "$1" "${2:-}"; APP_ARCH="$2"; shift 2 ;;
+            --type)     ws_require_value "$1" "${2:-}"; APP_TYPE="$2"; shift 2 ;;
+            --binary)   ws_require_value "$1" "${2:-}"; BINARY_PATH="$2"; shift 2 ;;
+            --work-dir) ws_require_value "$1" "${2:-}"; CUSTOM_WORK_DIR="$2"; shift 2 ;;
+            --no-cache) NO_CACHE=true; shift ;;
+            --keep-container) WS_KEEP=1; shift ;;
+            *) ws_unknown_arg "$1" "${2:-}"; shift "$WS_SHIFT" ;;
         esac
     done
 
-    if [[ -z "$APP_VERSION" ]]; then
-        die "Missing required parameter: --version" $EXIT_INVALID_PARAMS
-    fi
+    [[ -n "$APP_VERSION" ]] || ws_invalid "Missing required parameter: --version"
     case "${APP_ARCH:-x86_64-linux-gnu}" in
         x86_64-linux-gnu|x86_64-linux|x86_64) APP_ARCH="x86_64-linux-gnu" ;;
         x86_64-windows|win-x64|win64|windows)
-            die "Windows (msi/zip) is verified by sparrowwindows_build.sh, not this script" $EXIT_INVALID_PARAMS ;;
-        *) die "Unsupported --arch '$APP_ARCH' (this script builds x86_64-linux-gnu)" $EXIT_INVALID_PARAMS ;;
+            ws_invalid "Windows (msi/zip) is verified by sparrowwindows_build.sh, not this script" ;;
+        *) ws_invalid "Unsupported --arch '$APP_ARCH' (this script builds x86_64-linux-gnu)" ;;
     esac
-    if [[ -z "$APP_TYPE" ]]; then
-        die "Missing required parameter: --type" $EXIT_INVALID_PARAMS
-    fi
-    if [[ "$APP_TYPE" != "tarball" ]] && [[ "$APP_TYPE" != "deb" ]] && [[ "$APP_TYPE" != "rpm" ]]; then
-        die "Invalid type: $APP_TYPE (must be tarball, deb, or rpm)" $EXIT_INVALID_PARAMS
-    fi
-    if [[ -n "$BINARY_PATH" && ! -f "$BINARY_PATH" ]]; then
-        die "--binary path does not exist: $BINARY_PATH" $EXIT_INVALID_PARAMS
-    fi
+    [[ -n "$APP_TYPE" ]] || ws_invalid "Missing required parameter: --type"
+    case "$APP_TYPE" in
+        tarball|deb|rpm) ;;
+        *) ws_invalid "Invalid type: $APP_TYPE (must be tarball, deb, or rpm)" ;;
+    esac
     if [[ -n "$BINARY_PATH" ]]; then
+        [[ -f "$BINARY_PATH" ]] || ws_invalid "--binary path does not exist: $BINARY_PATH"
         BINARY_PATH=$(realpath "$BINARY_PATH")
         local bname
         bname=$(basename "$BINARY_PATH")
         case "$APP_TYPE" in
-            tarball) [[ "$bname" == *.tar.gz ]] || die "--binary '$bname' does not look like a tarball; expected .tar.gz for --type tarball" $EXIT_INVALID_PARAMS ;;
-            deb)     [[ "$bname" == *.deb ]]    || die "--binary '$bname' does not look like a deb; expected .deb for --type deb" $EXIT_INVALID_PARAMS ;;
-            rpm)     [[ "$bname" == *.rpm ]]    || die "--binary '$bname' does not look like an rpm; expected .rpm for --type rpm" $EXIT_INVALID_PARAMS ;;
+            tarball) [[ "$bname" == *.tar.gz ]] || ws_invalid "--binary '$bname' does not look like a tarball; expected .tar.gz for --type tarball" ;;
+            deb)     [[ "$bname" == *.deb ]]    || ws_invalid "--binary '$bname' does not look like a deb; expected .deb for --type deb" ;;
+            rpm)     [[ "$bname" == *.rpm ]]    || ws_invalid "--binary '$bname' does not look like an rpm; expected .rpm for --type rpm" ;;
         esac
     fi
 }
 
 build_and_verify() {
-    local version_component arch_component type_component suffix
-    version_component=$(sanitize_component "$APP_VERSION")
-    arch_component=$(sanitize_component "$APP_ARCH")
-    type_component=$(sanitize_component "$APP_TYPE")
-    suffix="$(date +%s)-$$"
-
-    CONTAINER_NAME="sparrow-verify-${version_component}-${arch_component}-${type_component}-${suffix}"
-    IMAGE_NAME="localhost/sparrow-verifier:${version_component}-${arch_component}-${type_component}-${suffix}"
-    WORK_DIR="${CUSTOM_WORK_DIR:-${EXEC_DIR}/sparrow_verification_${version_component}_${arch_component}_${type_component}_${suffix}}"
+    local tag
+    tag="$(ws_sanitize "$APP_VERSION")-$(ws_sanitize "$APP_ARCH")-$(ws_sanitize "$APP_TYPE")-${WS_RUN_ID}"
+    CONTAINER_NAME="sparrow-verify-${tag}"
+    IMAGE_NAME="localhost/sparrow-verifier:${tag}"
+    ws_track_container "$CONTAINER_NAME"
+    ws_track_image "$IMAGE_NAME"
 
     # Exclusive: never reuse or delete a workspace another run may own.
-    mkdir "$WORK_DIR" || die "Cannot create a new workspace at $WORK_DIR" $EXIT_INVALID_PARAMS
-    cd "$WORK_DIR"
-    echo "Workspace: $WORK_DIR"
+    if [[ -n "$CUSTOM_WORK_DIR" ]]; then
+        mkdir "$CUSTOM_WORK_DIR" 2>/dev/null || ws_invalid "Cannot create a new workspace at $CUSTOM_WORK_DIR"
+        WS_WORKDIR="$(cd "$CUSTOM_WORK_DIR" && pwd -P)"
+        echo "Workspace: $WS_WORKDIR"
+    else
+        ws_workspace sparrow "$APP_VERSION" "${APP_ARCH}_${APP_TYPE}"
+    fi
+    cd "$WS_WORKDIR"
 
     # Always create sparrow_official_binary so the Dockerfile COPY succeeds; empty
     # unless --binary was given, in which case the container's wget path is skipped.
     local binary_flag="0"
     if [[ -n "$BINARY_PATH" ]]; then
-        cp "$BINARY_PATH" "${WORK_DIR}/sparrow_official_binary"
+        cp "$BINARY_PATH" "${WS_WORKDIR}/sparrow_official_binary"
         binary_flag="1"
         echo "Using provided binary: $(basename "$BINARY_PATH")"
     else
-        touch "${WORK_DIR}/sparrow_official_binary"
+        touch "${WS_WORKDIR}/sparrow_official_binary"
     fi
 
     echo "======================================================"
@@ -212,12 +161,11 @@ build_and_verify() {
 
     create_verify_script
     create_dockerfile
-
     local -a cache_flag=()
     [[ "$NO_CACHE" == true ]] && cache_flag=(--no-cache)
     local jdk_file="OpenJDK25U-jdk_x64_linux_hotspot_${JDK_VERSION/+/_}.tar.gz"
 
-    if ! "$DOCKER_CMD" build "${cache_flag[@]}" \
+    if ! ws_ctr build "${cache_flag[@]}" \
         --build-arg SPARROW_VERSION="$APP_VERSION" \
         --build-arg BUILD_TYPE="$APP_TYPE" \
         --build-arg BUILD_ARCH="$APP_ARCH" \
@@ -232,24 +180,24 @@ build_and_verify() {
         echo ""
         # ftbfs only when the source itself failed to build; any other failure writes no YAML.
         if grep -q "BUILD FAILED" build.log; then
-            keep_existing_results
-            printf 'script_version: %s\nverdict: ftbfs\nnotes: "./gradlew failed for tag %s; see the build log."\n' \
-                "$SCRIPT_VERSION" "$APP_VERSION" > "$RESULTS_FILE"
+            ws_write_yaml ftbfs "./gradlew failed for tag ${APP_VERSION}; see the build log."
             display_results
         fi
-        die "Container build failed before a verdict; no COMPARISON_RESULTS.yaml written" $EXIT_BUILD_FAILED
+        ws_no_verdict "Container build failed before a verdict; no COMPARISON_RESULTS.yaml written"
     fi
 
     echo ""
     echo "Extracting results..."
-    "$DOCKER_CMD" rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-    "$DOCKER_CMD" create --name "$CONTAINER_NAME" "$IMAGE_NAME" > /dev/null
-    "$DOCKER_CMD" cp "$CONTAINER_NAME:/output/file-comparison.txt" ./ 2>/dev/null || true
-    APP_HASH=$("$DOCKER_CMD" run --rm "$IMAGE_NAME" cat /output/app_hash 2>/dev/null) || APP_HASH="N/A"
-    APP_COMMIT=$("$DOCKER_CMD" run --rm "$IMAGE_NAME" cat /output/commit 2>/dev/null) || APP_COMMIT="N/A"
-    keep_existing_results
-    "$DOCKER_CMD" cp "$CONTAINER_NAME:/output/COMPARISON_RESULTS.yaml" "$RESULTS_FILE" 2>/dev/null || \
-        die "Failed to extract YAML results" $EXIT_BUILD_FAILED
+    ws_ctr rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    ws_ctr create --name "$CONTAINER_NAME" "$IMAGE_NAME" > /dev/null
+    ws_ctr cp "$CONTAINER_NAME:/output/file-comparison.txt" ./ 2>/dev/null || true
+    APP_HASH=$(ws_ctr run --rm "$IMAGE_NAME" cat /output/app_hash 2>/dev/null) || APP_HASH="N/A"
+    APP_COMMIT=$(ws_ctr run --rm "$IMAGE_NAME" cat /output/commit 2>/dev/null) || APP_COMMIT="N/A"
+    # The verdict and notes are written inside the container (verify.sh). Copy them to a
+    # staging name first; ws_install_yaml checks the file and installs it in one step.
+    ws_ctr cp "$CONTAINER_NAME:/output/COMPARISON_RESULTS.yaml" "$WS_WORKDIR/results-from-container.yaml" 2>/dev/null || \
+        ws_no_verdict "Failed to extract YAML results"
+    ws_install_yaml "$WS_WORKDIR/results-from-container.yaml"
 
     display_results
 }
@@ -782,59 +730,37 @@ DOCKERFILE_END
 
 display_results() {
     local verdict flags
-    verdict=$(grep "^verdict:" "$RESULTS_FILE" | cut -d' ' -f2)
-    flags=$(grep -E '^  critical_binaries=' "$RESULTS_FILE" | sed 's/^ *//' || true)
+    verdict=$(grep "^verdict:" "$WS_RESULTS_FILE" | cut -d' ' -f2)
+    flags=$(grep -E '^  critical_binaries=' "$WS_RESULTS_FILE" | sed 's/^ *//' || true)
 
     echo ""
     echo "======================================================"
     echo "RESULTS"
     echo "======================================================"
-    cat "$RESULTS_FILE"
+    cat "$WS_RESULTS_FILE"
     echo ""
-    echo "===== Begin Results ====="
-    echo "appId:          ${APP_ID}"
-    echo "signer:         N/A"
-    echo "apkVersionName: ${APP_VERSION}"
-    echo "apkVersionCode: N/A"
-    echo "verdict:        ${verdict}"
-    echo "appHash:        ${APP_HASH}"
-    echo "commit:         ${APP_COMMIT}"
-    echo "scriptVersion:  ${SCRIPT_VERSION}"
-    echo "scriptHash:     ${SCRIPT_HASH}"
-    echo ""
-    echo "Diff:"
-    echo "${flags:-${verdict}}"
-    echo ""
-    echo "===== End Results ====="
+    ws_results_block "$APP_ID" N/A "$APP_VERSION" N/A "$verdict" "$APP_HASH" "$APP_COMMIT" "${flags:-${verdict}}"
     echo "appHash = SHA-256 of the official ${APP_TYPE} as downloaded (or given with --binary); publish this one."
-    echo "Full comparison: ${WORK_DIR}/build.log and ${WORK_DIR}/file-comparison.txt"
-    echo "YAML: $RESULTS_FILE"
+    echo "libHash = SHA-256 of the shared library this run loaded; never publish it as the app's hash."
+    echo "Full comparison: ${WS_WORKDIR}/build.log and ${WS_WORKDIR}/file-comparison.txt"
+    echo "YAML: $WS_RESULTS_FILE"
     echo ""
 
     if [[ "$verdict" == "reproducible" ]]; then
         echo "✅ VERDICT: REPRODUCIBLE"
-        echo "Exit code: $EXIT_SUCCESS"
-        exit $EXIT_SUCCESS
+        exit "$WS_EXIT_OK"
     else
         echo "❌ VERDICT: ${verdict^^}"
-        echo "Exit code: $EXIT_BUILD_FAILED"
-        exit $EXIT_BUILD_FAILED
+        exit "$WS_EXIT_FAIL"
     fi
 }
 
 main() {
-    SCRIPT_HASH=$(sha256sum "$0" 2>/dev/null | cut -d' ' -f1) || true
-    SCRIPT_HASH="${SCRIPT_HASH:-N/A}"
-    echo "$(basename "$0") ${SCRIPT_VERSION} sha256: ${SCRIPT_HASH}"
-    echo ""
-
-    [[ "$(id -u)" -ne 0 ]] || die "Refusing to run as root; run as a normal user" $EXIT_INVALID_PARAMS
-    trap cleanup EXIT
-    trap 'exit 130' INT TERM
-
+    ws_refuse_root
+    ws_install_traps
+    ws_results_init
     parse_arguments "$@"
-    detect_container_cmd
-    keep_existing_results
+    ws_engine
     build_and_verify
 }
 
