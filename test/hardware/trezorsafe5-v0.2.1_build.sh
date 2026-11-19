@@ -2,10 +2,10 @@
 # ==============================================================================
 # trezorsafe5_build.sh - Trezor Safe 5 (T3T1) Firmware Reproducible Build Verification
 # ==============================================================================
-# Version:           v0.1.3
+# Version:           v0.2.1
 # Organization:      WalletScrutiny.com
 # Last modified by:  Claude Code for Danny
-# Last modified on:  2026-10-22
+# Last modified on:  2026-11-18
 # Project:           https://github.com/trezor/trezor-firmware
 # Usage:             trezorsafe5_build.sh --version VERSION [--type TYPE] [--binary PATH]
 #                    [--arch ARCH]
@@ -54,24 +54,22 @@
 #   downloaded) and writes COMPARISON_RESULTS.yaml next to this script
 # - Exit codes: 0 reproducible; 1 not reproducible, ftbfs or a failure with no verdict;
 #   2 invalid parameters; 130 stopped. A YAML is written only for a real verdict.
+# - Shared steps (engine pick, workspace, traps, YAML, results block, cleanup) come from the
+#   WalletScrutiny library ws-rb-core, pinned by sha256 below (GitLab #1023). Offline:
+#   WS_LIB_FILE=/path/to/ws-rb-core-1.0.0.sh. A missing or altered library: exit 2, no YAML.
+# - Engine: podman if it works, else docker; WS_ENGINE=docker forces docker. build-docker.sh
+#   gets the choice through $DOCKER.
 # ==============================================================================
 
 set -eE
 
 # ---- Globals (paths captured before any cd) ---------------------------------
-SCRIPT_VERSION="v0.1.3"
+SCRIPT_VERSION="v0.2.1"
 SCRIPT_PATH="$(readlink -f "$0")"
-SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 SCRIPT_SHA256=""
-RESULTS_FILE="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
-CALLER_DIR="$(pwd -P)"
-RUN_ID="$(date +%s)-$$"
-RESULTS_WRITTEN=0
 workDir=""
-CONTAINER_CMD=""
 CONTAINER_NAME=""
 SNAPSHOT_NAME=""
-EXTRA_IMAGES=()   # bootloader build images of this run, removed at exit
 repo="https://github.com/trezor/trezor-firmware.git"
 firmwareType="standard"
 version=""
@@ -94,11 +92,6 @@ GREEN='\033[1;32m'
 RED='\033[1;31m'
 NC='\033[0m'
 
-sha256_of() {
-  [[ -f "$1" ]] || { echo "N/A"; return 0; }
-  sha256sum "$1" | awk '{print $1}'
-}
-
 rev_label() {
   case "$1" in
     T3T1) echo "Safe 5" ;;
@@ -106,90 +99,6 @@ rev_label() {
   esac
 }
 
-# ---- Results writer (single-line notes; minimal 3-field YAML) ---------------
-write_results() {
-  local verdict="$1"
-  local notes="$2"
-  # Neutralize characters that would break a double-quoted single-line YAML scalar.
-  notes="${notes//\\/ }"
-  notes="${notes//\"/\'}"
-  notes="${notes//$'\n'/ }"
-  notes="${notes//$'\r'/ }"
-  cat > "$RESULTS_FILE" << EOF
-script_version: ${SCRIPT_VERSION}
-verdict: ${verdict}
-notes: "${notes}"
-EOF
-  RESULTS_WRITTEN=1
-  echo -e "${GREEN}Results written to: $RESULTS_FILE${NC}"
-  # Per-run copy inside this run's workspace. Deliberately NOT named COMPARISON_RESULTS.yaml:
-  # ABS searches its build directory recursively for that name.
-  if [[ -n "$workDir" && -d "$workDir" ]]; then
-    cp -p "$RESULTS_FILE" "$workDir/results_${RUN_ID}.yaml" 2>/dev/null || true
-  fi
-}
-
-# no_verdict: a failure that says nothing about the source (runtime, host tools, network,
-# a missing tag, an official file of the wrong shape). Writes no YAML, so ABS publishes nothing.
-no_verdict() {
-  echo -e "${RED}Error: $1${NC}"
-  echo -e "${RED}No verdict written (this is not a build failure of the source).${NC}"
-  exit "$EXIT_FAIL"
-}
-
-# Any unguarded command failure is a script/infrastructure problem, never a verdict.
-handle_err() {
-  local rc=$?
-  trap - ERR
-  no_verdict "unexpected error (exit ${rc}) during verification"
-}
-trap handle_err ERR
-
-# ---- Exit cleanup: ownership hand-back, then this run's images --------------
-# build-docker.sh runs its build as root inside the container and chowns /build back to the
-# directory owner at the end. Under docker a part-way failure can leave root-owned files; under
-# rootless podman that chown maps to a subuid. Either way the (non-root) caller could not
-# delete them. Hand everything under the workspace back to the caller, then remove the
-# per-run environment image and snapshot. Best effort: never changes the exit code.
-cleanup() {
-  local rc=$?
-  if [[ -n "$workDir" && -d "$workDir" ]]; then
-    if [[ "$CONTAINER_CMD" == "podman" ]]; then
-      podman unshare chown -R 0:0 "$workDir" &>/dev/null || true
-    elif [[ "$CONTAINER_CMD" == "docker" && -n "$CONTAINER_NAME" ]] \
-         && [[ -n "$(find "$workDir" ! -uid "$(id -u)" -print -quit 2>/dev/null)" ]] \
-         && docker image inspect "$CONTAINER_NAME" &>/dev/null; then
-      echo "Restoring ownership of files left by the build container..."
-      docker run --rm -v "$workDir:/w" --entrypoint chown "$CONTAINER_NAME" \
-        -R "$(id -u):$(id -g)" /w &>/dev/null || true
-    fi
-    if [[ -n "$(find "$workDir" ! -uid "$(id -u)" -print -quit 2>/dev/null)" ]]; then
-      echo -e "${YELLOW}[WARN] Some files under $workDir are not owned by $(id -un).${NC}"
-    fi
-  fi
-  if [[ -n "$CONTAINER_CMD" && -n "$CONTAINER_NAME" ]]; then
-    "$CONTAINER_CMD" rm -f "$SNAPSHOT_NAME" &>/dev/null || true
-    "$CONTAINER_CMD" rmi -f "$SNAPSHOT_NAME" "$CONTAINER_NAME" &>/dev/null || true
-  fi
-  local img
-  for img in "${EXTRA_IMAGES[@]}"; do
-    "$CONTAINER_CMD" rm -f "$img" &>/dev/null || true
-    "$CONTAINER_CMD" rmi -f "$img" &>/dev/null || true
-  done
-  [[ "$RESULTS_WRITTEN" == "1" ]] || echo -e "${YELLOW}[WARN] No COMPARISON_RESULTS.yaml written for this run.${NC}"
-  echo "Exit code: ${rc}"
-}
-trap cleanup EXIT
-trap 'exit 130' INT TERM
-
-# Refuse to run as root (WS rule: runs as a normal user, never with elevated privileges).
-# Never write the privilege-escalation command's name as a word anywhere in this file: the
-# build server refuses any script whose text contains it (scriptContainsSudo in
-# external/build_server/utils.mjs).
-if [[ "$(id -u)" -eq 0 ]]; then
-  echo -e "${RED}Error: do not run this script as root.${NC}"
-  exit "$EXIT_INVALID"
-fi
 
 usage() {
   echo 'NAME
@@ -232,46 +141,70 @@ echo -e "${NC}"
 sleep 2
 echo
 
-# ---- Self-identification (first action after the disclaimer, before any ----
+# ---- Self-identification (first action after the disclaimer, before the library, any
 # container-runtime detection or network/build work; joins app version -> script bytes)
-SCRIPT_SHA256="$(sha256_of "$SCRIPT_PATH")"
+SCRIPT_SHA256="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | cut -d' ' -f1)" || true
+SCRIPT_SHA256="${SCRIPT_SHA256:-N/A}"
 echo "Script:  $(basename "$SCRIPT_PATH") ${SCRIPT_VERSION}"
 echo "         sha256: ${SCRIPT_SHA256}"
 echo
 
-# One run at a time per script directory: every run writes the same COMPARISON_RESULTS.yaml
-# next to the script (where ABS reads it), so two parallel runs from one folder would overwrite
-# each other's verdict. flock releases on any exit, so a crash never leaves a stale lock. ABS gives
-# each job its own directory, so this never triggers there. Refusing writes no verdict.
-if command -v flock &>/dev/null; then
-  exec 9>"${SCRIPT_DIR}/.comparison_results.lock"
-  if ! flock -n 9; then
-    echo -e "${RED}Error: another verification is already running from ${SCRIPT_DIR} (it shares COMPARISON_RESULTS.yaml). Run this one after it, or from a copy of the script in another folder.${NC}"
-    echo -e "${RED}No verdict written.${NC}"
-    exit "$EXIT_FAIL"
+# ---- WalletScrutiny library (GitLab #1023), pinned by sha256 ------------------
+# Goes in each build script right after its self-hash line, before anything else.
+# Source: WS_LIB_FILE (offline, must match), else the cache, else GitLab by
+# commit. Nothing else. A wrong hash is rejected whichever source sent it.
+# No matching copy, or a different version inside: no verdict, no YAML, exit 2.
+# First, before anything can fail: no earlier verdict may survive this run. A run
+# that holds this folder's lock is still writing its own; that one stays, and the
+# library refuses this run when it takes the lock.
+WS_LIB_DIR0="$(dirname "$(readlink -f "$0")")"
+if command -v flock >/dev/null 2>&1; then
+  flock -n "$WS_LIB_DIR0/.comparison_results.lock" true 2>/dev/null && rm -f -- "$WS_LIB_DIR0/COMPARISON_RESULTS.yaml"
+else
+  WS_LIB_P="$(cat "$WS_LIB_DIR0/.comparison_results.lock.d/pid" 2>/dev/null || true)"
+  case "$WS_LIB_P" in ''|*[!0-9]*) WS_LIB_P="";; esac
+  { [ -n "$WS_LIB_P" ] && kill -0 "$WS_LIB_P" 2>/dev/null; } || rm -f -- "$WS_LIB_DIR0/COMPARISON_RESULTS.yaml"
+fi
+WS_LIB=ws-rb-core WS_LIB_VERSION=1.0.0
+WS_LIB_REV=3581020196b35eefa501a19ed0abb43e96f4db42 WS_LIB_SHA256=d321b7c6937bbfc4a42db273c3fb6ec02c58e930c7c2b962492b8966188a0fcf
+ws_lib_load() {
+  local c f u t=""
+  ws_lib_ok() { [ "$(sha256sum "$1" 2>/dev/null | cut -d' ' -f1)" = "$WS_LIB_SHA256" ]; }
+  if [ -n "${WS_LIB_FILE:-}" ]; then
+    f="$WS_LIB_FILE"
+    ws_lib_ok "$f" || { echo "[FAIL] WS_LIB_FILE $f is not sha256 $WS_LIB_SHA256: no verdict" >&2; exit 2; }
+  else
+    # Cache in XDG_CACHE_HOME or HOME; with neither, or no way to create it, a
+    # temporary folder for this run only. Every copy is hash-checked either way.
+    c="${XDG_CACHE_HOME:-${HOME:+$HOME/.cache}}"
+    if [ -n "$c" ] && mkdir -p "$c/ws-rb-lib" 2>/dev/null; then c="$c/ws-rb-lib"
+    else t="$(mktemp -d 2>/dev/null)" || { echo "[FAIL] no folder to fetch $WS_LIB into: no verdict" >&2; exit 2; }; c="$t"; fi
+    f="$c/$WS_LIB_SHA256.sh"
+    if ! ws_lib_ok "$f"; then
+      u="https://gitlab.com/walletscrutiny/walletScrutinyCom/-/raw/$WS_LIB_REV/scripts/rb/lib/$WS_LIB-$WS_LIB_VERSION.sh"
+      curl -fsSL --max-time 60 -o "$f.$$" "$u" 2>/dev/null && ws_lib_ok "$f.$$" && mv -f "$f.$$" "$f"
+      rm -f "$f.$$"
+    fi
   fi
-else
-  echo -e "${YELLOW}[WARN] flock not found; parallel runs from this folder would share COMPARISON_RESULTS.yaml.${NC}"
-fi
+  ws_lib_ok "$f" || { [ -z "$t" ] || rm -rf -- "$t"; echo "[FAIL] $WS_LIB $WS_LIB_VERSION ($WS_LIB_SHA256) unavailable or altered: no verdict" >&2; exit 2; }
+  . "$f"
+  [ -z "$t" ] || rm -rf -- "$t"
+  [ "${WS_LIB_LOADED_VERSION:-}" = "$WS_LIB_VERSION" ] || { echo "[FAIL] $f holds ${WS_LIB_LOADED_VERSION:-no version}, not $WS_LIB_VERSION: no verdict" >&2; exit 2; }
+  echo "Library: $WS_LIB $WS_LIB_VERSION sha256: $WS_LIB_SHA256"
+}
+ws_lib_load
 
-# Remove a previous verdict before this invocation can fail, so ABS can never pick up a
-# stale COMPARISON_RESULTS.yaml from an earlier run.
-rm -f -- "$RESULTS_FILE"
+# Names the rest of this script uses, kept so the verification steps below are unchanged.
+RUN_ID="$WS_RUN_ID"
+no_verdict()    { ws_no_verdict "$1"; }
+sha256_of()     { ws_sha256 "$1"; }
+write_results() { ws_write_yaml "$1" "$2"; }
 
-# ---- Container runtime detection (actually wired into build-docker.sh) ------
-# build-docker.sh reads $DOCKER (default "docker"); export the detected runtime
-# so a podman-only host genuinely uses podman instead of silently failing.
-if command -v docker &>/dev/null && docker info &>/dev/null; then
-  CONTAINER_CMD="docker"
-elif command -v podman &>/dev/null; then
-  CONTAINER_CMD="podman"
-elif command -v docker &>/dev/null; then
-  no_verdict "docker is installed but its daemon is not responding, and podman is unavailable"
-else
-  no_verdict "neither docker nor podman found; install one of them"
-fi
-export DOCKER="$CONTAINER_CMD"
-echo "Container runtime: $CONTAINER_CMD"
+ws_refuse_root
+ws_install_traps
+ws_results_init        # one run per script folder; stale COMPARISON_RESULTS.yaml removed
+ws_engine
+export DOCKER="$WS_ENGINE"   # Trezor's build-docker.sh reads $DOCKER (default "docker")
 
 # ---- Argument parsing (unknown args warn and continue; never fatal) ---------
 while [[ "$#" -gt 0 ]]; do
@@ -322,6 +255,7 @@ if [[ "$firmwareType" == "bitcoin-only" ]]; then editionSuffix="-bitcoinonly"; e
 # ---- --revision (Safe 3 option; the Safe 5 has one model) ------------------
 revisionModel=""
 [[ -z "$REVISION_ARG" ]] || echo -e "${YELLOW}[WARN] Ignoring --revision '$REVISION_ARG': the Safe 5 has one model (T3T1)${NC}"
+
 
 # Read a firmware file's header: prints "<magicHex> <vhLen> <fwMagicHex> <hwModel>".
 read_header() {
@@ -400,12 +334,8 @@ fi
 # Per-run workspace in the caller's directory: version + type + revision(s) + epoch-PID, created
 # with an exclusive mkdir. Never reused, renamed or deleted, so concurrent runs (same or other
 # users, e.g. ABS) cannot touch each other's files.
-wd="${CALLER_DIR}/trezorSafe5_verification_${version}_${firmwareType}_${revTag}_${RUN_ID}"
-if ! mkdir -- "$wd"; then
-  echo -e "${RED}Error: work directory already exists or cannot be created: $wd${NC}"
-  exit "$EXIT_INVALID"
-fi
-workDir="$wd"
+ws_workspace "$APP_ID" "$version" "${firmwareType}_${revTag}"
+workDir="$WS_WORKDIR"
 
 echo
 echo "Verifying ${PRODUCT} firmware v$version ($firmwareType)"
@@ -475,6 +405,11 @@ build_firmware() {
   local tagRef="core/v${normalizedVersion}"
   SNAPSHOT_NAME="${CONTAINER_NAME}__${tagRef//[^a-zA-Z0-9]/_}"   # same rule as build-docker.sh
   modelsCsv=$(IFS=,; echo "${MODELS[*]}")
+  # Removed at exit by the library: snapshot container, then (after the ownership hand-back,
+  # which uses the environment image) the snapshot and environment images.
+  ws_track_container "$SNAPSHOT_NAME"
+  ws_track_image "$SNAPSHOT_NAME"; ws_track_image "$CONTAINER_NAME"
+  WS_CHOWN_IMAGE="$CONTAINER_NAME"
 
   # Only the firmware target, as upstream CI does (.github/workflows/common.yml:
   # --targets 'firmware'). T3T1 has no secmon (no `secmon` key in model.toml); the default list
@@ -636,7 +571,7 @@ build_bootloaders() {
       echo "Building bootloader ${v} from ${tag} (${BL_COMMIT[$m]})..."
       git clone -q --depth 1 --branch "$tag" "$repo" "$dir" || no_verdict "failed to clone ${tag}"
       cn="trezor-bl-env-${v//./_}-${RUN_ID}.nix"; sn="${cn}__${tag//[^a-zA-Z0-9]/_}"
-      EXTRA_IMAGES+=("$sn" "$cn")
+      ws_track_container "$sn"; ws_track_container "$cn"; ws_track_image "$sn"; ws_track_image "$cn"
       local blModels; blModels=$(IFS=,; echo "${MODELS[*]}")
       ( cd "$dir" && for x in "${MODELS[@]}"; do mkdir -p "build/core-${x}" "build/core-${x}-bitcoinonly"; done \
         && CONTAINER_NAME="$cn" ./build-docker.sh --models "$blModels" --targets bootloader --skip-bitcoinonly "$tag" ) \
@@ -667,6 +602,7 @@ build_firmware
 compare_firmware
 build_bootloaders
 
+
 print_hash_legend() {
   echo
   echo "----- What these hashes mean -----"
@@ -686,27 +622,12 @@ print_hash_legend() {
   echo "----------------------------------"
 }
 
-# One standard 9-field results block per revision: each revision is a separate official file.
-print_results_block() {
+# One results block per revision: each revision is a separate official file. The library
+# prints the fields; the Diff section below is this script's.
+diff_section() {
   local m="$1" flag blflag n lines=()
   if [[ "${MATCH[$m]}" == "1" ]]; then flag="1 (MATCHES)"; else flag="0 (DOESN'T MATCH)"; fi
   if [[ "${BL_MATCH[$m]:-0}" == "1" ]]; then blflag="1 (MATCHES)"; else blflag="0 (DOESN'T MATCH)"; fi
-  echo "===== Begin Results ====="
-  echo "appId:          ${APP_ID}"
-  echo "signer:         N/A"
-  echo "apkVersionName: ${normalizedVersion}"
-  echo "apkVersionCode: N/A"
-  if [[ "${MATCH[$m]}" == "1" && "${BL_MATCH[$m]:-0}" == "1" ]]; then
-    echo "verdict:        reproducible"
-  else
-    echo "verdict:        not_reproducible"
-  fi
-  echo "appHash:        ${OFFICIAL_HASH[$m]}"
-  echo "commit:         ${commit}"
-  echo "scriptVersion:  ${SCRIPT_VERSION}"
-  echo "scriptHash:     ${SCRIPT_SHA256}"
-  echo
-  echo "Diff:"
   echo "BUILDS MATCH BINARIES"
   echo "trezor-${m,,}-${normalizedVersion}${editionSuffix}.bin - ${m}-${firmwareType} - ${BUILT_HASH[$m]} - ${flag}"
   echo "bootloader_${m}.bin ${BL_VER[$m]:-?} - ${m} - ${BL_BUILT_HASH[$m]:-N/A} - ${blflag}"
@@ -721,7 +642,12 @@ print_results_block() {
   echo "Revision, tag (and its signature):"
   echo "Tag type: ${tagType} (core/v${normalizedVersion} -> ${commit})"
   echo "[INFO] Tag signature not verified by this script."
-  echo "===== End Results ====="
+}
+
+print_results_block() {
+  local m="$1" v="not_reproducible"
+  [[ "${MATCH[$m]}" == "1" && "${BL_MATCH[$m]:-0}" == "1" ]] && v="reproducible"
+  ws_results_block "$APP_ID" N/A "$normalizedVersion" N/A "$v" "${OFFICIAL_HASH[$m]}" "$commit" "$(diff_section "$m")"
 }
 
 print_hash_legend
