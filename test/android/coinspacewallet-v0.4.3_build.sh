@@ -2,39 +2,91 @@
 # ==============================================================================
 # coinspacewallet_build.sh - Coin Wallet Android Reproducible Build Verification
 # ==============================================================================
-# Version:       v0.3.13
-# Organization:  WalletScrutiny.com
-# Last Modified: 2026-03-24
-# App:           Coin Wallet Android
-# App ID:        com.coinspace.app
-# Project:       https://github.com/CoinSpace/CoinSpace
+# Version:          v0.4.3
+# Organization:     WalletScrutiny.com
+# Last modified by: Claude Code for Danny
+# Last modified on: 2026-11-18
+# App:              Coin Wallet Android (com.coinspace.app)
+# Project:          https://github.com/CoinSpace/CoinSpace
+# Disclaimer: for reproducible-build verification and research only. No warranty;
+# users assume all risk and are responsible for legal compliance.
+# Steps: copy the official split APKs (--binary), build the Cordova app as an AAB
+# in a container (the tag is cloned there too), cut split APKs with bundletool,
+# compare each split unzipped, write COMPARISON_RESULTS.yaml next to this script.
+# Shared steps (engine pick, workspace, traps, YAML, results block, cleanup) come
+# from the WalletScrutiny library ws-rb-core, pinned by sha256 below (GitLab #1023).
+# Offline: WS_LIB_FILE=/path/to/ws-rb-core-1.0.0.sh.
+# Needs GITHUB_TOKEN (read:packages) for the @coinspace/* packages on GitHub's
+# npm registry. Only prerequisite on the host: podman or docker.
+# Exit codes: 0 reproducible; 1 not reproducible, ftbfs or no verdict;
+# 2 invalid parameters or library unavailable; 130 stopped.
 # ==============================================================================
-# LICENSE: MIT License
-# Changelog: ~/work/ws-notes/script-notes/android/com.coinspace.app/changelog.md
-# Requires: --github-token (GitHub PAT with read:packages) for @coinspace/* GPR deps.
-# Only prerequisite on the host: docker or podman.
-# ==============================================================================
 
-set -euo pipefail
+set -eo pipefail
 
-# Capture execution directory before anything can change CWD.
-# COMPARISON_RESULTS.yaml is always written here (build server picks it up).
-EXEC_DIR="$(pwd)"
-readonly EXEC_DIR
-readonly WORK_DIR_PREFIX="workdir"
+SCRIPT_VERSION="v0.4.3"
+SCRIPT_NAME="coinspacewallet_build.sh"
+SCRIPT_PATH="$(readlink -f "$0")"
 
-# ------------------------------------------------------------------------------
-# Script metadata
-# ------------------------------------------------------------------------------
-readonly SCRIPT_VERSION="v0.3.13"
-readonly SCRIPT_NAME="coinspacewallet_build.sh"
+# ---- Self-identification (first action, before arguments or any network) -----
+SCRIPT_SHA256="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | cut -d' ' -f1)" || true
+SCRIPT_SHA256="${SCRIPT_SHA256:-N/A}"
+echo "Script:  $(basename "$SCRIPT_PATH") ${SCRIPT_VERSION}"
+echo "         sha256: ${SCRIPT_SHA256}"
+echo
+
+# ---- WalletScrutiny library (GitLab #1023), pinned by sha256 ------------------
+# Goes in each build script right after its self-hash line, before anything else.
+# Source: WS_LIB_FILE (offline, must match), else the cache, else GitLab by
+# commit. Nothing else. A wrong hash is rejected whichever source sent it.
+# No matching copy, or a different version inside: no verdict, no YAML, exit 2.
+# First, before anything can fail: no earlier verdict may survive this run. A run
+# that holds this folder's lock is still writing its own; that one stays, and the
+# library refuses this run when it takes the lock.
+WS_LIB_DIR0="$(dirname "$(readlink -f "$0")")"
+if command -v flock >/dev/null 2>&1; then
+  flock -n "$WS_LIB_DIR0/.comparison_results.lock" true 2>/dev/null && rm -f -- "$WS_LIB_DIR0/COMPARISON_RESULTS.yaml"
+else
+  WS_LIB_P="$(cat "$WS_LIB_DIR0/.comparison_results.lock.d/pid" 2>/dev/null || true)"
+  case "$WS_LIB_P" in ''|*[!0-9]*) WS_LIB_P="";; esac
+  { [ -n "$WS_LIB_P" ] && kill -0 "$WS_LIB_P" 2>/dev/null; } || rm -f -- "$WS_LIB_DIR0/COMPARISON_RESULTS.yaml"
+fi
+WS_LIB=ws-rb-core WS_LIB_VERSION=1.0.0
+WS_LIB_REV=3581020196b35eefa501a19ed0abb43e96f4db42 WS_LIB_SHA256=d321b7c6937bbfc4a42db273c3fb6ec02c58e930c7c2b962492b8966188a0fcf
+ws_lib_load() {
+  local c f u t=""
+  ws_lib_ok() { [ "$(sha256sum "$1" 2>/dev/null | cut -d' ' -f1)" = "$WS_LIB_SHA256" ]; }
+  if [ -n "${WS_LIB_FILE:-}" ]; then
+    f="$WS_LIB_FILE"
+    ws_lib_ok "$f" || { echo "[FAIL] WS_LIB_FILE $f is not sha256 $WS_LIB_SHA256: no verdict" >&2; exit 2; }
+  else
+    # Cache in XDG_CACHE_HOME or HOME; with neither, or no way to create it, a
+    # temporary folder for this run only. Every copy is hash-checked either way.
+    c="${XDG_CACHE_HOME:-${HOME:+$HOME/.cache}}"
+    if [ -n "$c" ] && mkdir -p "$c/ws-rb-lib" 2>/dev/null; then c="$c/ws-rb-lib"
+    else t="$(mktemp -d 2>/dev/null)" || { echo "[FAIL] no folder to fetch $WS_LIB into: no verdict" >&2; exit 2; }; c="$t"; fi
+    f="$c/$WS_LIB_SHA256.sh"
+    if ! ws_lib_ok "$f"; then
+      u="https://gitlab.com/walletscrutiny/walletScrutinyCom/-/raw/$WS_LIB_REV/scripts/rb/lib/$WS_LIB-$WS_LIB_VERSION.sh"
+      curl -fsSL --max-time 60 -o "$f.$$" "$u" 2>/dev/null && ws_lib_ok "$f.$$" && mv -f "$f.$$" "$f"
+      rm -f "$f.$$"
+    fi
+  fi
+  ws_lib_ok "$f" || { [ -z "$t" ] || rm -rf -- "$t"; echo "[FAIL] $WS_LIB $WS_LIB_VERSION ($WS_LIB_SHA256) unavailable or altered: no verdict" >&2; exit 2; }
+  . "$f"
+  [ -z "$t" ] || rm -rf -- "$t"
+  [ "${WS_LIB_LOADED_VERSION:-}" = "$WS_LIB_VERSION" ] || { echo "[FAIL] $f holds ${WS_LIB_LOADED_VERSION:-no version}, not $WS_LIB_VERSION: no verdict" >&2; exit 2; }
+  echo "Library: $WS_LIB $WS_LIB_VERSION sha256: $WS_LIB_SHA256"
+}
+ws_lib_load
+
 readonly APP_ID="com.coinspace.app"
 readonly REPO_URL="https://github.com/CoinSpace/CoinSpace.git"
 readonly WS_CONTAINER="docker.io/walletscrutiny/android:5"
-readonly COINSPACE_BUILD_IMAGE="coinspacewallet_build_env:4"
 readonly BUNDLETOOL_VERSION="1.17.2"
+# Per run, removed at exit by the library.
+readonly COINSPACE_BUILD_IMAGE="localhost/coinspacewallet-build-env:${WS_RUN_ID}"
 
-# Exit codes
 readonly EXIT_SUCCESS=0
 readonly EXIT_FAILED=1
 readonly EXIT_INVALID=2
@@ -55,16 +107,13 @@ VOLUME_RW=""
 github_token=""
 REQUESTED_TAG=""
 GITHUB_RUN_NUMBER=""  # optional override; auto-computed from versionCode if not provided
-should_cleanup=false
 
 # Set during prepare/build
 VERSION_SAFE=""
-ARCH_SAFE=""
 OFFICIAL_APK=""       # canonical path in WORK_DIR to the input split APK
 OFFICIAL_BASE_APK=""  # path to base.apk in official-split-apks/ (for metadata)
 BUILT_AAB=""          # path to the AAB produced by the build
 GIT_TAG=""            # resolved git tag (e.g. "v6.24.0")
-RESULT_DONE=false     # set true by result() after writing COMPARISON_RESULTS.yaml
 TOTAL_DIFFS=1         # default to "failed" until compare_split_apks() runs cleanly
 
 # ------------------------------------------------------------------------------
@@ -74,115 +123,21 @@ log_info()  { echo "[INFO] $*"; }
 log_pass()  { echo "[PASS] $*"; }
 log_fail()  { echo "[FAIL] $*"; }
 log_warn()  { echo "[WARNING] $*"; }
-
-work_dir_path() {
-    local version_part="$1"
-    local arch_part="$2"
-    printf '%s/%s_%s_%s_%s\n' \
-        "${EXEC_DIR}" \
-        "${WORK_DIR_PREFIX}" \
-        "${APP_ID}" \
-        "${version_part}" \
-        "${arch_part}"
-}
-
-# Runs grep safely; returns "0" on no-match instead of failing the script.
-# Used to avoid set -e killing the script when grep finds nothing.
-safe_grep_count() {
-    local grep_output
-    grep_output="$("$@" 2>/dev/null || true)"
-    grep_output="${grep_output//$'\n'/}"
-    [[ -n "${grep_output}" ]] && printf '%s\n' "${grep_output}" || printf '0\n'
-}
+# Each container is named and tracked, so the exit trap stops it if the run ends early.
+CN=0
+crun() { local n="csw-${WS_RUN_ID}-${BASHPID}-$((++CN))"; ws_track_container "$n"; ${CONTAINER_CMD} run --rm --name "$n" "$@"; }
 
 # ------------------------------------------------------------------------------
-# YAML output helpers
+# Container runtime: the library picks it (podman if it works, else docker).
 # ------------------------------------------------------------------------------
-write_yaml_outputs() {
-    local content="$1"
-    printf '%s\n' "$content" > "${EXEC_DIR}/COMPARISON_RESULTS.yaml"
-    if [[ -n "${WORK_DIR:-}" && -d "${WORK_DIR}" ]]; then
-        printf '%s\n' "$content" > "${WORK_DIR}/COMPARISON_RESULTS.yaml" || true
-    fi
-}
-
-generate_error_yaml() {
-    local status="$1"
-    local notes="${2:-}"
-    if [[ -n "${notes}" ]]; then
-        write_yaml_outputs "script_version: ${SCRIPT_VERSION}
-verdict: ${status}
-notes: |
-  ${notes}"
+set_container_runtime() {
+    ws_engine
+    CONTAINER_CMD="ws_ctr"
+    CONTAINER_RUN_EXTRA="$(ws_user_flags)"
+    if [[ "${WS_ENGINE}" == "podman" ]]; then
+        VOLUME_RO=":ro,Z"; VOLUME_RW=":Z"
     else
-        write_yaml_outputs "script_version: ${SCRIPT_VERSION}
-verdict: ${status}"
-    fi
-}
-
-generate_comparison_yaml() {
-    local verdict="$1"
-    local notes="$2"
-    write_yaml_outputs "script_version: ${SCRIPT_VERSION}
-verdict: ${verdict}
-notes: |
-  ${notes}"
-    log_info "Generated COMPARISON_RESULTS.yaml (verdict: ${verdict})"
-}
-
-# ------------------------------------------------------------------------------
-# Error handling — dual trap pattern (ERR + EXIT)
-# ------------------------------------------------------------------------------
-on_error() {
-    local exit_code=$?
-    local line_no=$1
-    set +e
-    log_fail "Script failed at line ${line_no} (exit code ${exit_code})"
-    if [[ "${RESULT_DONE}" != "true" ]]; then
-        generate_error_yaml "ftbfs" || true
-    fi
-    echo "Exit code: ${EXIT_FAILED}"
-    exit "${EXIT_FAILED}"
-}
-
-cleanup_on_error() {
-    local exit_code=$?
-    if [[ "${exit_code}" -ne 0 && "${RESULT_DONE}" != "true" && -n "${WORK_DIR:-}" ]]; then
-        log_warn "Script failed with exit code: ${exit_code}"
-        log_warn "Work directory preserved: ${WORK_DIR}"
-        generate_error_yaml "ftbfs" || true
-    fi
-}
-
-trap 'on_error $LINENO' ERR
-trap 'cleanup_on_error'  EXIT
-
-# ------------------------------------------------------------------------------
-# Container runtime detection (prefer podman, fall back to docker)
-# ------------------------------------------------------------------------------
-detect_container_runtime() {
-    if command -v podman >/dev/null 2>&1; then
-        CONTAINER_CMD="podman"
-        VOLUME_RO=":ro,Z"
-        VOLUME_RW=":Z"
-        CONTAINER_RUN_EXTRA="--userns=keep-id"
-        log_info "Using podman as container runtime"
-    elif command -v docker >/dev/null 2>&1; then
-        CONTAINER_CMD="docker"
-        VOLUME_RO=":ro"
-        VOLUME_RW=""
-        CONTAINER_RUN_EXTRA="--user $(id -u):$(id -g)"
-        log_info "Using docker as container runtime"
-    else
-        cat > "${EXEC_DIR}/COMPARISON_RESULTS.yaml" <<EOF
-script_version: ${SCRIPT_VERSION}
-verdict: ftbfs
-notes: |
-  Neither podman nor docker found on host. Install one to continue.
-EOF
-        echo "[ERROR] Neither podman nor docker is available."
-        echo "Exit code: ${EXIT_FAILED}"
-        exit "${EXIT_FAILED}"
+        VOLUME_RO=":ro"; VOLUME_RW=""
     fi
 }
 
@@ -191,7 +146,7 @@ EOF
 # ------------------------------------------------------------------------------
 container_exec() {
     local cmd="$1"
-    ${CONTAINER_CMD} run --rm \
+    crun \
         ${CONTAINER_RUN_EXTRA} \
         -v "${WORK_DIR}:/work${VOLUME_RW}" \
         -w /work \
@@ -201,7 +156,7 @@ container_exec() {
 
 ws_exec() {
     local cmd="$1"
-    ${CONTAINER_CMD} run --rm \
+    crun \
         ${CONTAINER_RUN_EXTRA} \
         -v "${WORK_DIR}:/work${VOLUME_RW}" \
         -w /work \
@@ -211,7 +166,7 @@ ws_exec() {
 
 container_sha256() {
     local file_path="$1"
-    ${CONTAINER_CMD} run --rm \
+    crun \
         -v "$(dirname "$file_path"):/data${VOLUME_RO}" \
         "${WS_CONTAINER}" \
         sh -c "sha256sum /data/$(basename "$file_path") | awk '{print \$1}'"
@@ -219,7 +174,7 @@ container_sha256() {
 
 container_signer() {
     local apk_path="$1"
-    ${CONTAINER_CMD} run --rm \
+    crun \
         -v "$(dirname "$apk_path"):/apk${VOLUME_RO}" \
         "${WS_CONTAINER}" \
         sh -c "apksigner verify --print-certs /apk/$(basename "$apk_path") 2>/dev/null \
@@ -232,7 +187,7 @@ container_aapt_version() {
     local apk_dir apk_name
     apk_dir="$(dirname "${apk_path}")"
     apk_name="$(basename "${apk_path}")"
-    ${CONTAINER_CMD} run --rm \
+    crun \
         -v "${apk_dir}:/apk${VOLUME_RO}" \
         "${WS_CONTAINER}" \
         sh -c '
@@ -320,7 +275,7 @@ extract_split_apks_from_aab() {
 
     log_info "Running bundletool to extract split APKs from $(basename "${aab_path}")..."
 
-    ${CONTAINER_CMD} run --rm \
+    crun \
         ${CONTAINER_RUN_EXTRA} \
         -v "${WORK_DIR}:/work${VOLUME_RW}" \
         -w /work \
@@ -366,29 +321,19 @@ extract_split_apks_from_aab() {
     done
 }
 
-# ------------------------------------------------------------------------------
-# Unzip an APK into a directory using the WS container.
-# Uses the WS reference container (lighter than the build image) for this
-# simple extraction task; provides unzip, chmod.
-# ------------------------------------------------------------------------------
+# Unzip an APK in the WS container. unzip exit >1 = no verdict.
 unzip_apk_in_container() {
     local apk_path="$1"
     local out_dir="$2"
     local apk_rel out_rel
     apk_rel="${apk_path#"${WORK_DIR}/"}"
     out_rel="${out_dir#"${WORK_DIR}/"}"
-    ws_exec "mkdir -p '${out_rel}' && unzip -qq '${apk_rel}' -d '${out_rel}' 2>/dev/null || true && chmod -R a+rwX '${out_rel}' 2>/dev/null || true"
+    ws_exec "mkdir -p '${out_rel}' && { unzip -qq '${apk_rel}' -d '${out_rel}'; [ \$? -le 1 ]; } && { chmod -R a+rwX '${out_rel}' 2>/dev/null; true; }" \
+        || ws_no_verdict "could not unzip ${apk_path}"
 }
 
-# ------------------------------------------------------------------------------
-# Compare one official split APK against one built split APK.
-# Unzips both into WORK_DIR/comparison/, runs diff -r, applies Leo's
-# META-INF filter (2025-10-30 policy). Full diff written to file; max 5 lines
-# printed to terminal. Accumulates into global TOTAL_DIFFS counter.
-#
-# Leo's filter: only excludes root-level META-INF entries. Nested META-INF
-# (e.g. inside a zip within the APK) still counts as a real difference.
-# ------------------------------------------------------------------------------
+# Compare one split: diff -rq of both unzipped trees; see the exclusions below.
+# diff exit >1 = no verdict.
 compare_apks() {
     local official_apk="$1"
     local built_apk="$2"
@@ -410,8 +355,8 @@ compare_apks() {
     built_rel="${built_unzip#"${WORK_DIR}/"}"
     diff_rel="${diff_file#"${WORK_DIR}/"}"
 
-    ws_exec "diff -r '${official_rel}' '${built_rel}' \
-        > '${diff_rel}' 2>&1 || true"
+    ws_exec "diff -rq '${official_rel}' '${built_rel}' > '${diff_rel}' 2>&1; [ \$? -le 1 ]" \
+        || ws_no_verdict "diff failed on ${split_label}: see ${diff_file}"
     chmod -R a+rwX "${results_dir}" 2>/dev/null || true
 
     local total_lines=0
@@ -419,11 +364,24 @@ compare_apks() {
 
     if [[ -s "${diff_file}" ]]; then
         total_lines="$(wc -l < "${diff_file}")"
-        non_meta_count="$(grep -E '^Only in |^Files ' "${diff_file}" \
-            | grep -cvE \
-              '^Only in [^:]+: META-INF$|^Only in [^:]+/META-INF:|^Files [^:]+/META-INF/|^Only in [^:]+: stamp-cert-sha256$' \
-            || true)"
-        non_meta_count="${non_meta_count:-0}"
+        # Every line diff -rq prints counts, except Play signing only in the official
+        # split's root: stamp-cert-sha256, a plain file in META-INF, or a META-INF
+        # holding only plain files (diff names a one-sided folder once).
+        local line p o
+        while IFS= read -r line; do
+            if [[ "${line}" =~ ^Only\ in\ (comparison/official_[^/:]+)(/META-INF)?:\ (.+)$ ]]; then
+                p="${WORK_DIR}/${BASH_REMATCH[1]}${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
+                case "${BASH_REMATCH[2]}:${BASH_REMATCH[3]}" in
+                    :stamp-cert-sha256|/META-INF:*) [[ -f "${p}" && ! -L "${p}" ]] && continue ;;
+                    :META-INF)
+                        if [[ -d "${p}" && ! -L "${p}" ]]; then
+                            o="$(find "${p}" -mindepth 1 ! -type f -print -quit)" || ws_no_verdict "cannot read ${p}"
+                            [[ -z "${o}" ]] && continue
+                        fi ;;
+                esac
+            fi
+            non_meta_count=$(( non_meta_count + 1 ))
+        done < "${diff_file}"
     fi
 
     TOTAL_DIFFS=$(( TOTAL_DIFFS + non_meta_count ))
@@ -442,12 +400,7 @@ compare_apks() {
     decode_and_diff_binaries "${official_apk}" "${built_apk}" "${split_label}" "${diff_file}"
 }
 
-# ------------------------------------------------------------------------------
-# Decoded diffs for known binary files: AndroidManifest.xml, resources.arsc.
-# Called from compare_apks() after the main diff when either file differs.
-# Uses aapt to produce human-readable text then diffs the output.
-# Saves to diff_manifest_<label>.txt and diff_resources_<label>.txt.
-# ------------------------------------------------------------------------------
+# aapt-decoded diffs of AndroidManifest.xml and resources.arsc (evidence only).
 decode_and_diff_binaries() {
     local official_apk="$1"
     local built_apk="$2"
@@ -456,9 +409,9 @@ decode_and_diff_binaries() {
     local results_dir="${WORK_DIR}/comparison"
 
     local has_manifest=0 has_resources=0
-    grep -q 'Binary files.*AndroidManifest\.xml.*differ' "${main_diff_file}" 2>/dev/null \
+    grep -q 'AndroidManifest\.xml and .* differ' "${main_diff_file}" 2>/dev/null \
         && has_manifest=1 || true
-    grep -q 'Binary files.*resources\.arsc.*differ' "${main_diff_file}" 2>/dev/null \
+    grep -q 'resources\.arsc and .* differ' "${main_diff_file}" 2>/dev/null \
         && has_resources=1 || true
 
     if [[ "${has_manifest}" -eq 0 && "${has_resources}" -eq 0 ]]; then
@@ -534,112 +487,84 @@ decode_and_diff_binaries() {
     done
 }
 
+
 # ------------------------------------------------------------------------------
-# Print the verification results block to stdout.
+# Results block: the library prints the fields; the Diff section is this script's.
 # ------------------------------------------------------------------------------
-print_results_block() {
-    local verdict="$1"
-    local meta_apk="${OFFICIAL_BASE_APK:-${OFFICIAL_APK}}"
-
-    local version_name version_code signer app_hash commit tag_info
-    version_name="$(container_aapt_version "${meta_apk}" "versionName" || true)"
-    version_code="$(container_aapt_version "${meta_apk}" "versionCode" || true)"
-    signer="$(container_signer "${OFFICIAL_APK}" || true)"
-    app_hash="$(container_sha256 "${OFFICIAL_APK}" || true)"
-
-    commit=""
-    if [[ -f "${WORK_DIR}/built-output/commit.txt" ]]; then
-        commit="$(cat "${WORK_DIR}/built-output/commit.txt")"
-    fi
-
-    tag_info=""
-    if [[ -f "${WORK_DIR}/built-output/tag_verify.txt" ]]; then
-        tag_info="$(cat "${WORK_DIR}/built-output/tag_verify.txt")"
-    fi
-
-    echo ""
-    echo "===== Begin Results ====="
-    echo "appId:          ${APP_ID}"
-    echo "signer:         ${signer:-unknown}"
-    echo "apkVersionName: ${version_name:-${VERSION_SAFE}}"
-    echo "apkVersionCode: ${version_code:-unknown}"
-    echo "verdict:        ${verdict}"
-    echo "appHash:        ${app_hash:-unknown}"
-    echo "commit:         ${commit:-unknown}"
-    echo ""
-
-    local results_dir="${WORK_DIR}/comparison"
-
-    _print_diff_section() {
-        local heading="$1"; shift
-        local shown=0
-        echo "${heading}"
-        for diff_file in "$@"; do
-            [[ -f "${diff_file}" ]] || continue
-            local label lines
-            label="$(basename "${diff_file}" .txt)"
-            if [[ -s "${diff_file}" ]]; then
-                lines="$(wc -l < "${diff_file}")"
-                echo "  ${label} (first 5 lines — full diff: ${diff_file}):"
-                head -5 "${diff_file}" | while IFS= read -r line; do echo "    ${line}"; done
-                if [[ "${lines}" -gt 5 ]]; then
-                    echo "    ... (${lines} lines total)"
-                fi
-            else
-                echo "  ${label}: no differences"
+_print_diff_section() {
+    local heading="$1"; shift
+    local shown=0
+    [[ -z "${heading}" ]] || echo "${heading}"
+    for diff_file in "$@"; do
+        [[ -f "${diff_file}" ]] || continue
+        local label lines
+        label="$(basename "${diff_file}" .txt)"
+        if [[ -s "${diff_file}" ]]; then
+            lines="$(wc -l < "${diff_file}")"
+            echo "  ${label} (first 5 lines — full diff: ${diff_file}):"
+            head -5 "${diff_file}" | while IFS= read -r line; do echo "    ${line}"; done
+            if [[ "${lines}" -gt 5 ]]; then
+                echo "    ... (${lines} lines total)"
             fi
-            shown=$(( shown + 1 ))
-        done
-        if [[ "${shown}" -eq 0 ]]; then
-            echo "  (none)"
+        else
+            echo "  ${label}: no differences"
         fi
-    }
+        shown=$(( shown + 1 ))
+    done
+    if [[ "${shown}" -eq 0 ]]; then
+        echo "  (none)"
+    fi
+}
 
-    # Main diffs (raw diff -r output per split)
-    local main_diffs=()
+diff_section() {
+    local results_dir="${WORK_DIR}/comparison" f bn
+    local main_diffs=() decoded_diffs=()
     if [[ -d "${results_dir}" ]]; then
         while IFS= read -r f; do
-            local bn; bn="$(basename "${f}")"
-            [[ "${bn}" == diff_manifest_* || "${bn}" == diff_resources_* || "${bn}" == diff_stamp_* ]] && continue
-            main_diffs+=("${f}")
+            bn="$(basename "${f}")"
+            case "${bn}" in
+                diff_manifest_*|diff_resources_*|diff_stamp_*) decoded_diffs+=("${f}") ;;
+                *) main_diffs+=("${f}") ;;
+            esac
         done < <(find "${results_dir}" -maxdepth 1 -name "diff_*.txt" | sort)
     fi
-    _print_diff_section "Diff:" "${main_diffs[@]:-}"
-
-    # Decoded diffs (AndroidManifest.xml, resources.arsc)
-    local decoded_diffs=()
-    if [[ -d "${results_dir}" ]]; then
-        while IFS= read -r f; do
-            decoded_diffs+=("${f}")
-        done < <(find "${results_dir}" -maxdepth 1 \
-            \( -name "diff_manifest_*.txt" -o -name "diff_resources_*.txt" \
-            -o -name "diff_stamp_*.txt" \) | sort)
-    fi
+    _print_diff_section "" "${main_diffs[@]:-}"
     if [[ "${#decoded_diffs[@]}" -gt 0 ]]; then
         echo ""
         _print_diff_section "Decoded Diffs:" "${decoded_diffs[@]}"
     fi
-
     echo ""
     echo "Revision, tag (and its signature):"
-    if [[ -n "${tag_info}" ]]; then
-        echo "${tag_info}"
+    if [[ -f "${WORK_DIR}/built-output/tag_verify.txt" ]]; then
+        cat "${WORK_DIR}/built-output/tag_verify.txt"
     else
         echo "  (tag verification not available)"
     fi
+}
 
-    echo "===== End Results ====="
+print_results_block() {
+    local verdict="$1"
+    local meta_apk="${OFFICIAL_BASE_APK:-${OFFICIAL_APK}}"
+    local version_name version_code signer app_hash commit=""
+    version_name="$(container_aapt_version "${meta_apk}" "versionName" || true)"
+    version_code="$(container_aapt_version "${meta_apk}" "versionCode" || true)"
+    signer="$(container_signer "${OFFICIAL_APK}" || true)"
+    app_hash="$(container_sha256 "${OFFICIAL_APK}" || true)"
+    [[ -f "${WORK_DIR}/built-output/commit.txt" ]] && commit="$(cat "${WORK_DIR}/built-output/commit.txt")"
+
     echo ""
-
-    if [[ "${should_cleanup}" != "true" ]]; then
-        echo "Work directory: ${WORK_DIR}"
-        echo "Diff files:     ${WORK_DIR}/comparison/"
-        echo ""
-        echo "For deeper analysis:"
-        echo "  diffoscope '${WORK_DIR}/official-split-apks/$(basename "${OFFICIAL_APK:-base.apk}")' \\"
-        echo "             '${WORK_DIR}/built-split-apks/splits/$(basename "${OFFICIAL_APK:-base.apk}")'"
-        echo "  meld '${WORK_DIR}/comparison'"
-    fi
+    ws_results_block "${APP_ID}" "${signer:-unknown}" "${version_name:-${VERSION_SAFE}}" \
+        "${version_code:-unknown}" "${verdict}" "${app_hash:-unknown}" "${commit:-unknown}" \
+        "$(diff_section)"
+    echo "appHash: sha256 of the official $(basename "${OFFICIAL_APK}") as given (publish this one)."
+    echo "libVersion/libHash: the shared library this run loaded."
+    echo ""
+    echo "Work directory: ${WORK_DIR}"
+    echo "Diff files:     ${WORK_DIR}/comparison/"
+    echo "For deeper analysis:"
+    echo "  diffoscope '${WORK_DIR}/official-split-apks/$(basename "${OFFICIAL_APK:-base.apk}")' \\"
+    echo "             '${WORK_DIR}/built-split-apks/splits/$(basename "${OFFICIAL_APK:-base.apk}")'"
+    echo "  meld '${WORK_DIR}/comparison'"
 }
 
 # ------------------------------------------------------------------------------
@@ -647,73 +572,29 @@ print_results_block() {
 # ------------------------------------------------------------------------------
 usage() {
     cat <<EOF
-NAME
-       ${SCRIPT_NAME} - Coin Wallet Android reproducible build verification
+Usage: ${SCRIPT_NAME} --binary <split.apk|dir> [--arch ABI] [--version V] [OPTIONS]
 
-SYNOPSIS
-       ${SCRIPT_NAME} --binary <split.apk> [OPTIONS]
-       ${SCRIPT_NAME} --binary <dir/> [OPTIONS]
-       ${SCRIPT_NAME} --apk <split.apk> [OPTIONS]
-       ${SCRIPT_NAME} --help
+Builds Coin Wallet Android from source in a container and compares it with the
+official Google Play split APKs, split by split.
 
-DESCRIPTION
-       Builds Coin Wallet Android from source in a container and compares
-       against official split APKs from Google Play.
+  --binary, --apk <file|dir>  One official split APK (its sibling base.apk is used
+                              for metadata), or a directory: every *.apk in it is
+                              compared. Required.
+  --version <v>               Version (e.g. 6.24.0). Default: read from base.apk.
+  --arch <abi>                ABI for device-spec.json. Default: arm64-v8a.
+  --type <type>               Accepted for the build server; unused.
+  --github-run-number <n>     GITHUB_RUN_NUMBER for versionCode.
+                              Default: versionCode - 2530 from the official APK.
+  --tag <ref>                 Git tag. Default: v<version>, then <version>.
+  --github-token <token>      Prefer GITHUB_TOKEN in the environment: a token on
+                              the command line is visible to other users.
+  --script-version, --help
 
-       --binary <file> (or --apk <file>):
-         Accepts one official split APK from Google Play (e.g. base.apk or
-         split_config.en.apk). All sibling splits in the same directory are
-         automatically discovered and copied for comparison.
-         Version is auto-detected from APK metadata unless --version is provided.
-         Builds AAB via Cordova (android-play distribution), extracts splits
-         with bundletool + device-spec.json, and compares each split.
+GITHUB_TOKEN (read:packages) is required: the @coinspace/* packages are only on
+npm.pkg.github.com. Coin Wallet tags are v-prefixed (v6.24.0).
 
-REQUIRED
-       --github-token <token>   GitHub PAT with read:packages scope.
-                                Alias: GITHUB_TOKEN env var.
-                                Required for @coinspace/* packages on GPR.
-
-OPTIONS
-       --binary <file|dir>      Single APK file: compare only that split.
-                                Directory: compare all *.apk files in it.
-                                Alias: --apk.
-       --version <version>      Version to verify (e.g. 6.24.0). Optional;
-                                auto-detected from APK metadata if omitted.
-       --arch <arch>            Target ABI for device-spec.json.
-                                Default: arm64-v8a.
-       --type <type>            Accepted for build server compatibility; unused.
-       --github-run-number <n>  Override GITHUB_RUN_NUMBER used for versionCode.
-                                Default: auto-computed from official APK versionCode
-                                as GITHUB_RUN_NUMBER = versionCode - 2530.
-       --tag <ref>              Override git tag (default: v<version>).
-       --cleanup                Remove work directory after completion.
-       --script-version         Print script version and exit.
-       --help                   Show this help and exit.
-
-EXIT CODES
-       0    Reproducible (only META-INF differences after filtering, or identical)
-       1    Differences found or build failure
-       2    Invalid parameters
-
-ENVIRONMENT
-       GITHUB_TOKEN     GitHub PAT with read:packages scope (required)
-
-EXAMPLES
-       export GITHUB_TOKEN=ghp_yourtoken
-       ${SCRIPT_NAME} --binary ~/Downloads/base.apk
-
-       ${SCRIPT_NAME} --binary ~/Downloads/base.apk \\
-           --version 6.24.0 --arch arm64-v8a --github-token ghp_xxxx
-
-       ${SCRIPT_NAME} --binary ~/Downloads/split_config.en.apk \\
-           --github-run-number 1632 --github-token ghp_xxxx
-
-NOTES
-       Only prerequisite on the host: docker or podman.
-       Everything else runs inside the container.
-       Coin Wallet uses v-prefixed tags (e.g. v6.24.0).
-       The Play Store APK is served via AAB -> split APKs (base.apk,
-       split_config.en.apk, split_config.xxhdpi.apk, etc.).
+Exit codes: 0 reproducible; 1 not reproducible, ftbfs or no verdict;
+2 invalid parameters; 130 stopped.
 EOF
 }
 
@@ -724,55 +605,37 @@ parse_arguments() {
     while [[ "$#" -gt 0 ]]; do
         case "$1" in
             --version)
-                VERSION="${2:-}"; shift ;;
+                ws_require_value "$1" "${2:-}"; VERSION="$2"; shift 2 ;;
             --apk|--binary)
-                APK_INPUT="${2:-}"; shift ;;
+                ws_require_value "$1" "${2:-}"; APK_INPUT="$2"; shift 2 ;;
             --arch)
-                ARCH="${2:-}"; shift ;;
+                ws_require_value "$1" "${2:-}"; ARCH="$2"; shift 2 ;;
             --type)
-                TYPE="${2:-}"; shift
-                log_warn "--type '${TYPE:-}' accepted but unused (split APK mode)" ;;
+                ws_require_value "$1" "${2:-}"; TYPE="$2"; shift 2
+                log_warn "--type '${TYPE}' accepted but unused (split APK mode)" ;;
             --github-token)
-                github_token="${2:-}"; shift ;;
+                ws_require_value "$1" "${2:-}"; github_token="$2"; shift 2
+                log_warn "--github-token is visible to other users; prefer GITHUB_TOKEN" ;;
             --github-run-number)
-                GITHUB_RUN_NUMBER="${2:-}"; shift ;;
+                ws_require_value "$1" "${2:-}"; GITHUB_RUN_NUMBER="$2"; shift 2 ;;
             --tag)
-                REQUESTED_TAG="${2:-}"; shift ;;
+                ws_require_value "$1" "${2:-}"; REQUESTED_TAG="$2"; shift 2 ;;
             --cleanup)
-                should_cleanup=true ;;
+                log_warn "--cleanup is ignored: each run has its own workspace"; shift ;;
             --script-version)
-                echo "${SCRIPT_NAME} ${SCRIPT_VERSION}"
-                echo "Exit code: ${EXIT_SUCCESS}"
-                exit "${EXIT_SUCCESS}" ;;
+                echo "${SCRIPT_NAME} ${SCRIPT_VERSION}"; exit "${EXIT_SUCCESS}" ;;
             --help|-h)
-                usage
-                echo "Exit code: ${EXIT_SUCCESS}"
-                exit "${EXIT_SUCCESS}" ;;
+                usage; exit "${EXIT_SUCCESS}" ;;
             *)
-                # Unknown parameter: log and continue. Never fatal (ABS rule).
-                log_warn "Ignoring unknown argument: $1" ;;
+                # Unknown parameter: warn and continue. Never fatal (ABS rule).
+                ws_unknown_arg "$@"; shift "${WS_SHIFT}" ;;
         esac
-        [[ "$#" -gt 0 ]] && shift
     done
-
-    if [[ "$(id -u)" -eq 0 ]]; then
-        echo "[ERROR] Do not run this script as root."
-        echo "Exit code: ${EXIT_INVALID}"
-        exit "${EXIT_INVALID}"
-    fi
 
     [[ -z "${github_token}" && -n "${GITHUB_TOKEN:-}" ]] && github_token="${GITHUB_TOKEN}"
 
-    if [[ -z "${APK_INPUT}" ]]; then
-        echo "[ERROR] --binary <split.apk|dir> is required."
-        echo "        Single file: compare only that split APK."
-        echo "        Directory:   compare all *.apk files in that directory."
-        echo "        Pass --github-token <PAT> or set GITHUB_TOKEN env var."
-        echo "Exit code: ${EXIT_INVALID}"
-        exit "${EXIT_INVALID}"
-    fi
-
-    [[ "${APK_INPUT}" != /* ]] && APK_INPUT="${EXEC_DIR}/${APK_INPUT}"
+    [[ -n "${APK_INPUT}" ]] || ws_invalid "--binary <split.apk|dir> is required"
+    [[ "${APK_INPUT}" != /* ]] && APK_INPUT="${WS_CALLER_DIR}/${APK_INPUT}"
 
     if [[ -d "${APK_INPUT}" ]]; then
         INPUT_IS_DIR=true
@@ -780,9 +643,7 @@ parse_arguments() {
     elif [[ -f "${APK_INPUT}" ]]; then
         INPUT_IS_DIR=false
     else
-        echo "[ERROR] --binary path not found: ${APK_INPUT}"
-        echo "Exit code: ${EXIT_INVALID}"
-        exit "${EXIT_INVALID}"
+        ws_invalid "--binary path not found: ${APK_INPUT}"
     fi
     ARCH="${ARCH:-arm64-v8a}"
     case "${ARCH}" in
@@ -792,31 +653,18 @@ parse_arguments() {
             ARCH="arm64-v8a"
             ;;
     esac
-
-    if [[ -z "${github_token}" ]]; then
-        cat > "${EXEC_DIR}/COMPARISON_RESULTS.yaml" <<EOF
-script_version: ${SCRIPT_VERSION}
-verdict: ftbfs
-notes: |
-  GitHub token not provided. Coin Wallet depends on @coinspace/cs-* wallet
-  libraries hosted exclusively on npm.pkg.github.com (GitHub Package Registry).
-  The web/.npmrc routes the @coinspace scope to GPR and reads the token from
-  NPM_READ_TOKEN. A GitHub Personal Access Token with read:packages scope is
-  required for npm ci to succeed.
-  Pass --github-token <PAT> or set the GITHUB_TOKEN environment variable.
-EOF
-        RESULT_DONE=true
-        echo "[ERROR] GitHub token required for @coinspace/* GPR dependency."
-        echo "        Pass --github-token <PAT> or set GITHUB_TOKEN env var."
-        echo "Exit code: ${EXIT_FAILED}"
-        exit "${EXIT_FAILED}"
+    if [[ -n "${VERSION}" && ! "${VERSION}" =~ ^[0-9][0-9A-Za-z._-]*$ ]]; then
+        ws_invalid "invalid --version '${VERSION}'"
+    fi
+    if [[ -n "${GITHUB_RUN_NUMBER}" && ! "${GITHUB_RUN_NUMBER}" =~ ^[0-9]+$ ]]; then
+        ws_invalid "--github-run-number must be a number"
     fi
 
-    VERSION_SAFE="${VERSION:-provided}"
-    ARCH_SAFE="${ARCH//-/_}"
-    WORK_DIR="$(work_dir_path "${VERSION_SAFE}" "${ARCH_SAFE}")"
+    [[ -n "${github_token}" ]] || ws_invalid "GITHUB_TOKEN (read:packages) is required: Coin Wallet's @coinspace/* packages are only on npm.pkg.github.com"
+    # Passed to the build container by name only (-e NAME), never as a value on a command line.
+    export NPM_READ_TOKEN="${github_token}" NODE_AUTH_TOKEN="${github_token}"
 
-    log_info "Work directory: ${WORK_DIR}"
+    VERSION_SAFE="${VERSION:-provided}"
     log_info "Arch: ${ARCH}"
     log_info "APK input: ${APK_INPUT}"
 }
@@ -825,13 +673,8 @@ EOF
 # Build image management
 # ------------------------------------------------------------------------------
 ensure_build_image() {
-    if ${CONTAINER_CMD} image inspect "${COINSPACE_BUILD_IMAGE}" >/dev/null 2>&1; then
-        log_info "Build image ${COINSPACE_BUILD_IMAGE} already exists, skipping build."
-        return 0
-    fi
-
     log_info "Building ${COINSPACE_BUILD_IMAGE} from inline Dockerfile..."
-    log_info "Installs: Node 20, JDK 17 (Zulu), Android SDK, build-tools 35.0.0, Gradle 8.13, Cordova 12, bundletool ${BUNDLETOOL_VERSION}."
+    log_info "Installs: Node 20, JDK 17 (Zulu), Android SDK, build-tools 35.0.0 and 36.0.0, Gradle 8.13, Cordova 12, bundletool ${BUNDLETOOL_VERSION}."
     log_info "Estimated time: 10-20 minutes depending on network speed."
 
     local dockerfile_path="${WORK_DIR}/Dockerfile.build"
@@ -876,7 +719,7 @@ RUN mkdir -p "${ANDROID_HOME}" /root/.android && \
     unzip -q /tmp/sdk.zip -d "${ANDROID_HOME}" && \
     rm -f /tmp/sdk.zip
 
-ENV PATH="${ANDROID_HOME}/cmdline-tools/bin:${ANDROID_HOME}/platform-tools:${ANDROID_HOME}/build-tools/35.0.0:${JAVA_HOME}/bin:${PATH}"
+ENV PATH="${ANDROID_HOME}/cmdline-tools/bin:${ANDROID_HOME}/platform-tools:${ANDROID_HOME}/build-tools/36.0.0:${JAVA_HOME}/bin:${PATH}"
 
 RUN yes | "${ANDROID_HOME}/cmdline-tools/bin/sdkmanager" \
         --sdk_root="${ANDROID_HOME}" --licenses && \
@@ -884,7 +727,9 @@ RUN yes | "${ANDROID_HOME}/cmdline-tools/bin/sdkmanager" \
         --sdk_root="${ANDROID_HOME}" \
         "platform-tools" \
         "platforms;android-35" \
-        "build-tools;35.0.0"
+        "build-tools;35.0.0" \
+        "platforms;android-36" \
+        "build-tools;36.0.0"
 
 ARG GRADLE_VERSION=8.13
 RUN curl -fL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" \
@@ -907,6 +752,7 @@ RUN curl -fL "https://github.com/google/bundletool/releases/download/${BUNDLETOO
 CMD ["bash"]
 DOCKERFILE_END
 
+    ws_track_image "${COINSPACE_BUILD_IMAGE}"
     ${CONTAINER_CMD} build \
         --no-cache \
         --tag "${COINSPACE_BUILD_IMAGE}" \
@@ -916,26 +762,24 @@ DOCKERFILE_END
     log_pass "Build image ${COINSPACE_BUILD_IMAGE} ready."
 }
 
+
 # ------------------------------------------------------------------------------
-# Git tag resolution
+# Git tag resolution, inside the build image (no git on the host)
 # ------------------------------------------------------------------------------
 resolve_git_tag() {
-    local version="$1"
-    local candidates=("v${version}" "${version}")
-
-    log_info "Resolving git tag for version ${version}..."
-    for candidate in "${candidates[@]}"; do
-        if git ls-remote --tags --exit-code "${REPO_URL}" \
-                "refs/tags/${candidate}" >/dev/null 2>&1; then
+    local candidate rc
+    for candidate in "$@"; do
+        rc=0
+        crun "${COINSPACE_BUILD_IMAGE}" \
+            git ls-remote --tags --exit-code "${REPO_URL}" "refs/tags/${candidate}" >/dev/null 2>&1 || rc=$?
+        if [[ "${rc}" -eq 0 ]]; then
             log_info "Found tag: ${candidate}"
             GIT_TAG="${candidate}"
             return 0
         fi
+        [[ "${rc}" -eq 2 ]] || ws_no_verdict "cannot reach ${REPO_URL} to look up tag ${candidate} (git exit ${rc})"
         log_info "  Tag ${candidate}: not found"
     done
-
-    log_fail "Could not find git tag for version ${version}"
-    log_fail "Tried: ${candidates[*]}"
     return 1
 }
 
@@ -945,8 +789,9 @@ resolve_git_tag() {
 prepare() {
     log_info "=== PREPARE PHASE ==="
 
-    rm -rf "${WORK_DIR}"
-    mkdir -p "${WORK_DIR}"
+    # Per-run workspace in the caller's directory (exclusive mkdir, never reused).
+    ws_workspace coinspacewallet "${VERSION:-auto}" "${ARCH}"
+    WORK_DIR="${WS_WORKDIR}"
     mkdir -p "${WORK_DIR}/official-split-apks"
     mkdir -p "${WORK_DIR}/built-output"
     # Ensure the build output dir is world-writable so the container can write.
@@ -985,7 +830,7 @@ prepare() {
             for _candidate in "${input_dir}/base.apk" "${input_dir}/base-master.apk"; do
                 if [[ -f "${_candidate}" ]]; then
                     # Copy to metadata-base.apk (not official-split-apks/) so it
-                    # survives the WORK_DIR rename but is NOT compared by extract_and_compare().
+                    # is NOT compared by extract_and_compare().
                     cp "${_candidate}" "${WORK_DIR}/metadata-base.apk"
                     OFFICIAL_BASE_APK="${WORK_DIR}/metadata-base.apk"
                     log_info "Using sibling $(basename "${_candidate}") for metadata extraction."
@@ -1007,33 +852,9 @@ prepare() {
         log_info "Auto-detecting version from APK content..."
         VERSION="$(container_aapt_version "${OFFICIAL_BASE_APK}" "versionName" || true)"
         [[ "${VERSION}" == "null" ]] && VERSION=""
-        if [[ -z "${VERSION}" ]]; then
-            log_fail "Could not detect version from APK. Pass --version explicitly."
-            generate_error_yaml "ftbfs" \
-                "Could not auto-detect versionName from APK. Pass --version explicitly."
-            RESULT_DONE=true
-            exit "${EXIT_INVALID}"
-        fi
+        [[ -n "${VERSION}" ]] || ws_invalid "could not read versionName from the APK; pass --version"
         log_info "Version detected: ${VERSION}"
         VERSION_SAFE="${VERSION}"
-
-        local new_work_dir
-        new_work_dir="$(work_dir_path "${VERSION_SAFE}" "${ARCH_SAFE}")"
-        if [[ "${new_work_dir}" != "${WORK_DIR}" ]]; then
-            rm -rf "${new_work_dir}"
-            mv "${WORK_DIR}" "${new_work_dir}"
-            WORK_DIR="${new_work_dir}"
-            OFFICIAL_APK="${WORK_DIR}/official-split-apks/${canonical_name}"
-            if [[ -f "${WORK_DIR}/metadata-base.apk" ]]; then
-                OFFICIAL_BASE_APK="${WORK_DIR}/metadata-base.apk"
-            else
-                OFFICIAL_BASE_APK="$(find_official_base_apk || true)"
-                if [[ -z "${OFFICIAL_BASE_APK}" ]]; then
-                    OFFICIAL_BASE_APK="${OFFICIAL_APK}"
-                fi
-            fi
-            log_info "Work directory updated: ${WORK_DIR}"
-        fi
     fi
 
     if [[ -z "${GITHUB_RUN_NUMBER}" ]]; then
@@ -1076,23 +897,12 @@ build_image() {
 build() {
     log_info "=== BUILD PHASE ==="
 
-    # Resolve git tag, preferring REQUESTED_TAG override if provided.
-    GIT_TAG="${REQUESTED_TAG:-}"
-    if [[ -z "${GIT_TAG}" ]]; then
-        if ! resolve_git_tag "${VERSION_SAFE}"; then
-            echo ""
-            echo "======================================================"
-            echo "  SOURCE NOT FOUND FOR VERSION ${VERSION_SAFE}"
-            echo "  Tried tags: v${VERSION_SAFE}, ${VERSION_SAFE}"
-            echo "  Repository: ${REPO_URL}"
-            echo "======================================================"
-            echo ""
-            generate_comparison_yaml "ftbfs" \
-                "Tag not found for version ${VERSION_SAFE}. Tried: v${VERSION_SAFE}, ${VERSION_SAFE}. Source code for this version has not been tagged in the CoinSpace repository."
-            RESULT_DONE=true
-            echo "Exit code: ${EXIT_FAILED}"
-            exit "${EXIT_FAILED}"
-        fi
+    if [[ -n "${REQUESTED_TAG}" ]]; then
+        [[ "${REQUESTED_TAG}" =~ ^[A-Za-z0-9._/-]+$ ]] || ws_invalid "invalid --tag '${REQUESTED_TAG}'"
+        resolve_git_tag "${REQUESTED_TAG}" || ws_invalid "tag ${REQUESTED_TAG} not found in ${REPO_URL}"
+    else
+        resolve_git_tag "v${VERSION_SAFE}" "${VERSION_SAFE}" \
+            || ws_invalid "no source tag for version ${VERSION_SAFE} in ${REPO_URL} (tried v${VERSION_SAFE}, ${VERSION_SAFE})"
     fi
 
     log_info "Git tag: ${GIT_TAG}"
@@ -1101,7 +911,9 @@ build() {
     log_info "Cloning + building in container. May take 20-60 minutes."
     log_info "NOTE: Vite embeds VITE_* API keys; empty values expected vs official build."
 
-    ${CONTAINER_CMD} run --rm \
+    # A failure here is not a verdict: npm and Gradle download during the build, so a
+    # network failure cannot be told from a compile failure. Check the log.
+    crun \
         ${CONTAINER_RUN_EXTRA} \
         -v "${WORK_DIR}/built-output:/workspace${VOLUME_RW}" \
         -e "HOME=/workspace" \
@@ -1109,8 +921,8 @@ build() {
         -e "GRADLE_USER_HOME=/workspace/.gradle" \
         -e "GRADLE_OPTS=-Dorg.gradle.native=false" \
         -e "ANDROID_PREFS_ROOT=/workspace" \
-        -e "NPM_READ_TOKEN=${github_token}" \
-        -e "NODE_AUTH_TOKEN=${github_token}" \
+        -e NPM_READ_TOKEN \
+        -e NODE_AUTH_TOKEN \
         -e "NODE_ENV=production" \
         -e "NODE_OPTIONS=--max-old-space-size=3575" \
         -e "VITE_BUILD_TYPE=phonegap" \
@@ -1194,6 +1006,7 @@ build() {
         log_fail "Unsigned release AAB not found after build."
         log_info "All .aab files found under built-output:"
         find "${WORK_DIR}/built-output" -name "*.aab" 2>/dev/null | head -10 || true
+        ws_write_yaml ftbfs "Coin Wallet ${VERSION_SAFE}: the build finished but produced no app-release.aab."
         exit "${EXIT_FAILED}"
     fi
 
@@ -1246,20 +1059,14 @@ extract_and_compare() {
     done < <(find "${official_splits_dir}" -name "*.apk" 2>/dev/null | sort)
 
     if [[ "${compared}" -eq 0 ]]; then
-        log_fail "No official splits were compared. Check official-split-apks directory."
-        exit "${EXIT_FAILED}"
+        ws_no_verdict "no official split was compared; check official-split-apks"
     fi
 
     log_info "Total splits compared: ${compared}"
     log_info "Total non-META-INF diffs (across all splits): ${TOTAL_DIFFS}"
 }
 
-# ==============================================================================
-# Phase 5: Result
-# Determines verdict from TOTAL_DIFFS (0 = reproducible, >0 = not_reproducible).
-# Writes COMPARISON_RESULTS.yaml (minimal 3-field format per 2026-03-12 spec).
-# Prints Begin/End Results block. Sets RESULT_DONE. Exits 0 or 1.
-# ==============================================================================
+# Phase 5: verdict from TOTAL_DIFFS, YAML, results block; exits 0 or 1.
 result() {
     log_info "=== RESULT PHASE ==="
 
@@ -1274,28 +1081,16 @@ result() {
 
     local notes
     notes="Cordova/Vue3 hybrid app. Builds VITE_DISTRIBUTION=android-play to produce an AAB,
-  then bundletool extracts split APKs compared against official Play Store splits.
-  Expected differences (do not affect reproducibility verdict):
-  - META-INF/*: signing artifacts (Play Store signed; built APK is unsigned)
-  - assets/www/assets/js/*.js: production VITE_* secrets (API keys, partner refs)
-    are embedded in the official bundle but absent in the unsigned build"
+  then bundletool cuts split APKs, compared unzipped against the official Play splits.
+  Not counted: META-INF, its files and stamp-cert-sha256 only in an official
+  split's root (Play signing). Every other difference counts."
 
-    generate_comparison_yaml "${verdict}" "${notes}"
+    ws_write_yaml "${verdict}" "${notes}"
     print_results_block "${verdict}"
-    RESULT_DONE=true
-
-    if [[ "${should_cleanup}" == "true" ]]; then
-        log_info "Cleaning up ${WORK_DIR}..."
-        rm -rf "${WORK_DIR}"
-    else
-        log_info "Work directory preserved: ${WORK_DIR}"
-    fi
 
     if [[ "${verdict}" == "reproducible" ]]; then
-        echo "Exit code: ${EXIT_SUCCESS}"
         exit "${EXIT_SUCCESS}"
     else
-        echo "Exit code: ${EXIT_FAILED}"
         exit "${EXIT_FAILED}"
     fi
 }
@@ -1304,11 +1099,11 @@ result() {
 # Main
 # ==============================================================================
 main() {
-    log_info "Starting ${SCRIPT_NAME} ${SCRIPT_VERSION}"
-    log_warn "This script is provided as-is. Review before running. Use at your own risk."
-
-    detect_container_runtime
+    ws_refuse_root
+    ws_install_traps
+    ws_results_init        # one run per script folder; stale COMPARISON_RESULTS.yaml removed
     parse_arguments "$@"
+    set_container_runtime
     prepare
     build_image
     build
