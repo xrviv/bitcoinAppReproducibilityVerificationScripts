@@ -1,8 +1,8 @@
 #!/bin/bash
-# bitbox02_build.sh v3.15.0 - WalletScrutiny verification script for BitBox02
+# bitbox02_build.sh v3.16.0 - WalletScrutiny verification script for BitBox02
 # Organization: WalletScrutiny.com
-# Last modified by: Bob (WalletScrutiny verification agent)
-# Last modified on: 2026-10-08
+# Last modified by: Claude Code for Danny
+# Last modified on: 2026-11-23
 # Usage: bitbox02_build.sh --version VERSION [--type TYPE] [--binary PATH] [--arch ARCH]
 #
 # Verifies BitBox02 firmware reproducibility: builds from source via the upstream
@@ -13,7 +13,7 @@
 set -eE
 
 # ---- Globals ----------------------------------------------------------------
-SCRIPT_VERSION="v3.15.0"
+SCRIPT_VERSION="v3.16.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # readlink -f, not $0: a relative or symlinked invocation would otherwise hash nothing.
 SCRIPT_PATH="$(readlink -f "$0")"
@@ -285,6 +285,21 @@ else
   SIGNED_FILENAME="firmware-bitbox02-multi.v${version}.signed.bin"
   # Product id per src/bootloader/bootloader_product.h (magic 0x653f362b).
   EXPECTED_PRODUCT_ID=1
+fi
+
+# From v9.28.0 upstream builds with `make firmware EDITION=...` into
+# build-bitbox02-cmake-relwithdebinfo/bin/ (releases/README.md, "Releases from
+# v9.28.0 onwards"); the firmware-btc target and build/bin/ output are gone.
+IFS=. read -r _maj _min _ <<< "${version%%[-_]*}"
+if (( 10#${_maj:-0} > 9 || (10#${_maj:-0} == 9 && 10#${_min:-0} >= 28) )); then
+  NEW_BUILD_DIR="build-bitbox02-cmake-relwithdebinfo/bin"
+  if [[ "$firmwareType" == "btc" ]]; then
+    MAKE_COMMAND="make firmware EDITION=btc-only"
+    BUILT_FIRMWARE_PATH="${NEW_BUILD_DIR}/firmware-btc.bin"
+  else
+    MAKE_COMMAND="make firmware EDITION=multi"
+    BUILT_FIRMWARE_PATH="${NEW_BUILD_DIR}/firmware.bin"
+  fi
 fi
 
 DOWNLOAD_URL="${repo}/releases/download/firmware%2Fv${version}/${SIGNED_FILENAME}"
