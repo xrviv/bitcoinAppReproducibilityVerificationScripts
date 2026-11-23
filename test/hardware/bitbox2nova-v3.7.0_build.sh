@@ -1,25 +1,38 @@
 #!/bin/bash
-# bitbox2nova_build.sh v3.6.0 - WalletScrutiny verification script for BitBox02 Nova
+# bitbox2nova_build.sh v3.7.0 - WalletScrutiny verification script for BitBox02 Nova
+# Version: v3.7.0
 # Organization: WalletScrutiny.com
-# Last modified by: Dan-Opus-5.5 (WalletScrutiny agent)
-# Last modified on: 2026-10-09
+# Last modified by: Claude Code for Danny
+# Last modified on: 2026-11-23
 # Usage: bitbox2nova_build.sh --version VERSION [--type TYPE] [--binary PATH] [--arch ARCH]
 #
 # Verifies BitBox02 Nova firmware reproducibility: builds from source via the upstream
 # Dockerfile at the release tag, then compares the locally-built unsigned firmware
 # against the official signed binary with its first 588 bytes (header + signatures) stripped.
 # Host requirements: docker or podman only.
+#
+# Steps: clone the release tag in a container; build upstream's Dockerfile; download the
+# official signed firmware (or use --binary); make the firmware; compare hashes; write
+# COMPARISON_RESULTS.yaml only for a real verdict (reproducible, not_reproducible, ftbfs).
+#
+# DISCLAIMER: examine this script yourself before running it. It is provided as-is,
+# without warranty, and may contain bugs or security vulnerabilities. Use at your own risk.
 
 set -eE
 
 # ---- Globals ----------------------------------------------------------------
-SCRIPT_VERSION="v3.6.0"
+SCRIPT_VERSION="v3.7.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # readlink -f, not $0: a relative or symlinked invocation would otherwise hash nothing.
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256=""
 RESULTS_FILE="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
 repo="https://github.com/BitBoxSwiss/bitbox02-firmware"
+# Fully qualified: podman refuses short image names without a prompt (ABS compliance B4).
+ALPINE_IMAGE="docker.io/library/alpine:latest"
+# Lines that mark a network/download failure in docker, apt, git, wget, curl, cargo or go
+# output. Checked in the last 40 lines of a failed step: such a failure is no verdict.
+NETWORK_ERROR_PATTERN='Temporary failure (in name resolution|resolving)|Could not resolve|Failed to fetch|Connection (timed out|refused|reset)|Network is unreachable|Could not connect|SSL error|TLS handshake|received early EOF|unable to access|curl: \([0-9]+\)|failed to download|error sending request|spurious network error|dial tcp|i/o timeout|unexpected EOF|failed to resolve source metadata|toomanyrequests'
 
 firmwareType="btc"
 version=""
@@ -64,7 +77,8 @@ write_results() {
   notes="${notes//$'\n'/ }"
   notes="${notes//$'\r'/ }"
   # Written to a temp file and renamed, so a reader never sees a half-written file.
-  # Parallel runs from one directory still share this file; a copy stays in the workspace.
+  # Parallel runs from one directory still share this file. No copy goes into the
+  # workspace: ABS searches its build dir recursively (ABS compliance B6).
   local tmp="${RESULTS_FILE}.$$"
   cat > "$tmp" << EOY
 script_version: ${SCRIPT_VERSION}
@@ -72,9 +86,24 @@ verdict: ${verdict}
 notes: "${notes}"
 EOY
   mv -f "$tmp" "$RESULTS_FILE"
-  if [[ -n "$workDir" && -d "$workDir" ]]; then cp "$RESULTS_FILE" "$workDir/COMPARISON_RESULTS.yaml" 2>/dev/null || true; fi
   VERDICT_WRITTEN=1
   echo -e "${GREEN}Results written to: $RESULTS_FILE${NC}"
+}
+
+# No verdict: invalid input, missing runtime, network or other infrastructure failure,
+# a stop, or an official file that cannot be used. ABS publishes any YAML it finds, so
+# none is written; the EXIT trap reports it (ABS compliance B5/B7).
+no_verdict() {
+  local code="$1"; shift
+  echo -e "${RED}Error: $*${NC}"
+  exit "$code"
+}
+
+# True when the last 40 lines of a step's log show a network/download error.
+network_failure_in() {
+  sleep 1  # let tee flush the last lines
+  [[ -s "$1" ]] && tail -n 40 "$1" | grep -Eqi "$NETWORK_ERROR_PATTERN" || return 1
+  echo -e "${RED}Matched network error: $(tail -n 40 "$1" | grep -Eim1 "$NETWORK_ERROR_PATTERN")${NC}"
 }
 
 # ---- Ownership helpers ------------------------------------------------------
@@ -103,7 +132,7 @@ hand_back_workspace() {
   if [[ "$CONTAINER_CMD" == "podman" ]]; then
     podman unshare chown -R 0:0 "$workDir" 2>/dev/null || true
   elif [[ "$CONTAINER_CMD" == "docker" ]]; then
-    docker run --rm --volume "$workDir:/w" alpine \
+    docker run --rm --volume "$workDir:/w" "$ALPINE_IMAGE" \
       chown -R "${HOST_UID}:${HOST_GID}" /w >/dev/null 2>&1 || true
   fi
   local stray
@@ -135,11 +164,11 @@ finish() {
   fi
   hand_back_workspace
   if [[ "$VERDICT_WRITTEN" -eq 0 ]]; then
-    write_results "ftbfs" "BitBox02 Nova v${version:-?} (${firmwareType}): run ended without a verdict (exit ${rc})."
+    echo -e "${RED}No verdict: COMPARISON_RESULTS.yaml not written (exit ${rc}).${NC}"
   fi
   case "$rc" in
-    0|1|2) exit "$rc" ;;
-    *)     exit "$EXIT_FAIL" ;;
+    0|1|2|130|143) exit "$rc" ;;
+    *)             exit "$EXIT_FAIL" ;;
   esac
 }
 trap finish EXIT
@@ -149,16 +178,20 @@ trap 'echo; echo "Terminated (SIGTERM)."; exit 143' TERM
 # ---- ERR trap ---------------------------------------------------------------
 handle_err() {
   local rc=$?
-  echo -e "${RED}Unexpected error (exit ${rc}).${NC}"
-  write_results "ftbfs" "BitBox02 Nova v${version:-?} (${firmwareType}): unexpected error (exit ${rc}) during verification."
+  echo -e "${RED}Unexpected error (exit ${rc}); not a source build result.${NC}"
   exit "$EXIT_FAIL"
 }
 trap handle_err ERR
 
 # Runs a container in the background and waits for it, so INT/TERM reach the
 # traps immediately instead of after the container finishes.
+# With CTR_LOG set, output is also appended there so a failure can be classified.
 ctr_run() {
-  $CONTAINER_CMD run --name "$CTR_NAME" "$@" &
+  if [[ -n "${CTR_LOG:-}" ]]; then
+    $CONTAINER_CMD run --name "$CTR_NAME" "$@" > >(tee -a "$CTR_LOG") 2>&1 &
+  else
+    $CONTAINER_CMD run --name "$CTR_NAME" "$@" &
+  fi
   CTR_PID=$!
   wait "$CTR_PID"
   local rc=$?
@@ -169,7 +202,7 @@ ctr_run() {
 # ---- Root check -------------------------------------------------------------
 if [[ "$(id -u)" -eq 0 ]]; then
   echo -e "${RED}Error: do not run this script as root.${NC}"
-  exit "$EXIT_FAIL"
+  exit "$EXIT_INVALID"
 fi
 
 # ---- Disclaimer -------------------------------------------------------------
@@ -203,13 +236,9 @@ if command -v docker &>/dev/null && docker info &>/dev/null; then
 elif command -v podman &>/dev/null; then
   CONTAINER_CMD="podman"
 elif command -v docker &>/dev/null; then
-  echo -e "${RED}Error: docker is installed but its daemon is not responding, and podman is unavailable.${NC}"
-  write_results "ftbfs" "BitBox02 Nova: docker daemon not responding and podman unavailable."
-  exit "$EXIT_FAIL"
+  no_verdict "$EXIT_FAIL" "docker is installed but its daemon is not responding, and podman is unavailable."
 else
-  echo -e "${RED}Error: neither docker nor podman found. Install one of them.${NC}"
-  write_results "ftbfs" "BitBox02 Nova: no container runtime (docker/podman) available on host."
-  exit "$EXIT_FAIL"
+  no_verdict "$EXIT_FAIL" "neither docker nor podman found. Install one of them."
 fi
 echo "Container runtime: $CONTAINER_CMD"
 
@@ -250,16 +279,12 @@ done
 
 # ---- Validate inputs --------------------------------------------------------
 if [[ -z "$version" ]]; then
-  echo -e "${RED}Error: --version is required.${NC}"
   usage
-  write_results "ftbfs" "BitBox02 Nova: --version is required."
-  exit "$EXIT_INVALID"
+  no_verdict "$EXIT_INVALID" "--version is required."
 fi
 
 if ! [[ "$version" =~ ^[0-9]+(\.[0-9]+)*([._-][A-Za-z0-9]+)?$ ]]; then
-  echo -e "${RED}Error: --version '${version}' contains unsafe characters.${NC}"
-  write_results "ftbfs" "BitBox02 Nova: --version '${version}' contains unsafe characters."
-  exit "$EXIT_INVALID"
+  no_verdict "$EXIT_INVALID" "--version '${version}' contains unsafe characters."
 fi
 
 # bitBox2Nova.md's `types:` key is "btc-only"; ABS passes it verbatim. Unknown
@@ -269,9 +294,7 @@ case "${firmwareType,,}" in
   btc|btc-only|btconly|bitcoin-only|bitcoinonly|bitcoin) firmwareType="btc" ;;
   multi|multicoin)                                       firmwareType="multi" ;;
   *)
-    echo -e "${RED}Error: --type '${firmwareType}' is invalid. Must be: btc or multi.${NC}"
-    write_results "ftbfs" "BitBox02 Nova: --type '${firmwareType}' is invalid. Must be: btc or multi."
-    exit "$EXIT_INVALID"
+    no_verdict "$EXIT_INVALID" "--type '${firmwareType}' is invalid. Must be: btc or multi."
     ;;
 esac
 
@@ -310,16 +333,12 @@ if [[ -n "$binaryPath" && -d "$binaryPath" ]]; then
     if [[ "${#matches[@]}" -eq 1 ]]; then
       binaryPath="${matches[0]}"
     else
-      echo -e "${RED}Error: expected one ${SIGNED_GLOB} in ${binDir}, found ${#matches[@]}.${NC}"
-      write_results "ftbfs" "BitBox02 Nova: expected one ${SIGNED_GLOB} in the --binary directory, found ${#matches[@]}."
-      exit "$EXIT_INVALID"
+      no_verdict "$EXIT_INVALID" "expected one ${SIGNED_GLOB} in ${binDir}, found ${#matches[@]}."
     fi
   fi
 fi
 if [[ -n "$binaryPath" && ! -f "$binaryPath" ]]; then
-  echo -e "${RED}Error: binary file not found: $binaryPath${NC}"
-  write_results "ftbfs" "BitBox02 Nova: binary file not found: ${binaryPath}."
-  exit "$EXIT_INVALID"
+  no_verdict "$EXIT_INVALID" "binary file not found: $binaryPath"
 fi
 if [[ -n "$binaryPath" ]] && ! [[ "$binaryPath" =~ ^/ ]]; then
   binaryPath="$PWD/$binaryPath"
@@ -349,9 +368,7 @@ for _attempt in 1 2 3; do
   sleep 1
 done
 if [[ -z "$workDir" ]]; then
-  echo -e "${RED}Error: could not create a fresh workspace under ${WORK_BASE}.${NC}"
-  write_results "ftbfs" "BitBox02 Nova v${version} (${firmwareType}): could not create a fresh workspace (exists or not writable)."
-  exit "$EXIT_FAIL"
+  no_verdict "$EXIT_FAIL" "could not create a fresh workspace under ${WORK_BASE}."
 fi
 mkdir "$workDir/official" "$workDir/out"
 IMAGE_TAG="bitbox02nova-firmware_${version}_${firmwareType}_${RUN_ID}"
@@ -367,7 +384,7 @@ retry_count=0
 while [[ $retry_count -lt $MAX_RETRIES ]]; do
   if ctr_run --rm \
     --volume "$workDir:/work" \
-    alpine \
+    "$ALPINE_IMAGE" \
     sh -c "
       set -e
       trap '${INNER_CHOWN} /work 2>/dev/null || true' EXIT
@@ -390,10 +407,8 @@ while [[ $retry_count -lt $MAX_RETRIES ]]; do
   fi
   retry_count=$(( retry_count + 1 ))
   if [[ $retry_count -eq $MAX_RETRIES ]]; then
-    echo -e "${RED}Failed to clone repository after $MAX_RETRIES attempts.${NC}"
     repair_ownership "$workDir"
-    write_results "ftbfs" "BitBox02 Nova v${version} (${firmwareType}): failed to clone repository."
-    exit "$EXIT_FAIL"
+    no_verdict "$EXIT_FAIL" "failed to clone ${repo} at the release tag after $MAX_RETRIES attempts (network, or tag not found)."
   fi
   echo "Clone failed, retrying in 5 seconds..."
   sleep 5
@@ -418,12 +433,31 @@ if grep -q "firmware-nova" "$workDir/src/Makefile" 2>/dev/null; then
   echo "Nova-specific make targets detected: using $MAKE_COMMAND"
 fi
 
+# From v9.28.0 upstream builds with `make firmware EDITION=...` into
+# build-bitbox02-cmake-relwithdebinfo/bin/ (releases/README.md, "Releases from
+# v9.28.0 onwards"); the firmware-btc target and build/bin/ output are gone. The
+# unsigned binary is the same for BitBox02 and Nova (same README), so the default
+# PRODUCT=bitbox02 build is the one to compare; the edition check below still
+# requires the Nova magic.
+IFS=. read -r _maj _min _ <<< "${version%%[-_]*}"
+if (( 10#${_maj:-0} > 9 || (10#${_maj:-0} == 9 && 10#${_min:-0} >= 28) )); then
+  NEW_BUILD_DIR="build-bitbox02-cmake-relwithdebinfo/bin"
+  if [[ "$firmwareType" == "btc" ]]; then
+    MAKE_COMMAND="make firmware EDITION=btc-only"
+    BUILT_FIRMWARE_PATH="${NEW_BUILD_DIR}/firmware-btc.bin"
+  else
+    MAKE_COMMAND="make firmware EDITION=multi"
+    BUILT_FIRMWARE_PATH="${NEW_BUILD_DIR}/firmware.bin"
+  fi
+  echo "v9.28.0+ build system: using $MAKE_COMMAND"
+fi
+
 # ---- Patch Dockerfile inside container (no host sed required) ---------------
 cp "$workDir/src/Dockerfile" "$workDir/Dockerfile.orig"
 
 ctr_run --rm \
   --volume "$workDir/src:/src" \
-  alpine \
+  "$ALPINE_IMAGE" \
   sh -c "
     set -e
     if [ '${GIT_TAG}' = 'firmware/v9.15.0' ] || [ '${GIT_TAG}' = 'firmware-btc-only/v9.15.0' ]; then
@@ -438,18 +472,22 @@ repair_ownership "$workDir/src/Dockerfile"
 # ---- Build Docker image -----------------------------------------------------
 # Backgrounded + wait so a signal can cancel the build through the trap.
 echo "Building Docker image (this may take 10-20 minutes)..."
+IMAGE_LOG="$workDir/out/image-build.log"
 $CONTAINER_CMD build \
   --pull \
   --platform linux/amd64 \
   --force-rm \
   --no-cache \
   --tag "$IMAGE_TAG" \
-  "$workDir/src" &
+  "$workDir/src" > >(tee -a "$IMAGE_LOG") 2>&1 &
 CTR_PID=$!
 if ! wait "$CTR_PID"; then
   CTR_PID=""
   echo -e "${RED}Docker build failed!${NC}"
-  write_results "ftbfs" "BitBox02 Nova v${version} (${firmwareType}): Docker image build failed."
+  if network_failure_in "$IMAGE_LOG"; then
+    no_verdict "$EXIT_FAIL" "upstream build image failed on a network/download error, not a source build failure."
+  fi
+  write_results "ftbfs" "BitBox02 Nova v${version} (${firmwareType}): upstream Dockerfile build environment failed to build (no network error found)."
   exit "$EXIT_FAIL"
 fi
 CTR_PID=""
@@ -469,7 +507,7 @@ else
   while [[ $retry_count -lt $MAX_RETRIES ]]; do
     if ctr_run --rm \
       --volume "$workDir/official:/out" \
-      alpine \
+      "$ALPINE_IMAGE" \
       sh -c "
         set -e
         trap '${INNER_CHOWN} /out 2>/dev/null || true' EXIT
@@ -480,10 +518,8 @@ else
     fi
     retry_count=$(( retry_count + 1 ))
     if [[ $retry_count -eq $MAX_RETRIES ]]; then
-      echo -e "${RED}Failed to download firmware after $MAX_RETRIES attempts.${NC}"
       repair_ownership "$workDir/official"
-      write_results "ftbfs" "BitBox02 Nova v${version} (${firmwareType}): failed to download official firmware."
-      exit "$EXIT_FAIL"
+      no_verdict "$EXIT_FAIL" "failed to download the official firmware after $MAX_RETRIES attempts."
     fi
     echo "Download failed, retrying in 5 seconds..."
     sleep 5
@@ -492,9 +528,7 @@ else
 fi
 
 if [[ ! -s "$workDir/official/$SIGNED_FILENAME" ]]; then
-  echo -e "${RED}Firmware file missing or empty.${NC}"
-  write_results "ftbfs" "BitBox02 Nova v${version} (${firmwareType}): firmware file missing or empty."
-  exit "$EXIT_FAIL"
+  no_verdict "$EXIT_FAIL" "official firmware file missing or empty."
 fi
 
 # ---- Build firmware + compare (all inside build container) ------------------
@@ -503,6 +537,11 @@ fi
 #   /official = official signed binary (read-only input)
 #   /out      = all comparison outputs (hash files, diagnostics, stripped binary)
 echo "Building firmware ($MAKE_COMMAND) and running comparison..."
+# /out/stage records how far the container got, so a failure is classified correctly:
+# none = setup (dirty tree), building = make failed, no-output = make made no firmware,
+# compare = hashing/edition check (an edition mismatch also writes /out/edition_mismatch).
+BUILD_LOG="$workDir/out/firmware-build.log"
+CTR_LOG="$BUILD_LOG"
 if ! ctr_run --rm \
   --platform linux/amd64 \
   --volume "$workDir/src:/bb02" \
@@ -528,10 +567,17 @@ if ! ctr_run --rm \
       exit 1
     fi
 
+    echo building > /out/stage
     ${MAKE_COMMAND}
 
     SIGNED='/official/${SIGNED_FILENAME}'
     BUILT='/bb02/${BUILT_FIRMWARE_PATH}'
+    if [[ ! -s \"\$BUILT\" ]]; then
+      echo no-output > /out/stage
+      echo \"ABORT: make succeeded but \$BUILT is missing or empty\" >&2
+      exit 1
+    fi
+    echo compare > /out/stage
 
     sha256sum \"\$SIGNED\" | awk '{print \$1}' > /out/hash_signed.txt
     sha256sum \"\$BUILT\"  | awk '{print \$1}' > /out/hash_built.txt
@@ -572,16 +618,16 @@ if len(firmware) != built_size:
     # byte-identical, a wrong-edition --binary would otherwise still compare equal and yield a
     # false 'Nova reproducible'.
     #
-    # The hash the device shows at boot is bootloader-dependent. Bootloader v1.2.2 (shipped by
-    # firmware 9.26.2, the mandatory intermediate upgrade) computes
-    # sha256(product_id_le16 + version + padded_firmware) -- see src/bootloader/bootloader.c
-    # _firmware_hash()/_maybe_show_hash(). Firmware monotonic version >= 50 implies that
-    # bootloader is present, which is why upstream branches on 50.
-    # Older bootloaders use the legacy sha256d(version + padded_firmware).
+    # The hash the device shows at boot depends on the monotonic firmware version. Cutoffs mirror
+    # upstream releases/describe_signed_firmware.py and releases/README.md at firmware/v9.29.0:
+    #   through 50: sha256d(version + padded_firmware)
+    #   51 to 56:   sha256(product_id_le16 + version + padded_firmware)
+    #   from 57:    sha256(0x01 + product_id_le16 + version + padded_firmware)
     python3 -c \"
 import hashlib, struct, sys
 MAGIC_LEN = 4; SIGDATA_LEN = 584; VERSION_OFF = 392; MAX_FIRMWARE_SIZE = 884736
-NEW_SIGHASH_VERSION_CUTOFF = 50
+NEW_SIGHASH_VERSION_CUTOFF = 51
+VERSIONED_SIGHASH_VERSION_CUTOFF = 57
 # magic -> (product_id, label); product ids per src/bootloader/bootloader_product.h
 EDITIONS = {
     '653f362b': (1, 'BitBox02 Multi'),
@@ -594,22 +640,27 @@ data = open(sys.argv[1], 'rb').read()
 magic = data[:MAGIC_LEN].hex()
 if magic not in EDITIONS:
     print('ABORT: unrecognized firmware edition magic 0x' + magic, file=sys.stderr)
+    open('/out/edition_mismatch', 'w').write(magic + '\\n')
     sys.exit(1)
 product_id, label = EDITIONS[magic]
 if product_id != expected_pid:
     print('ABORT: edition mismatch -- binary is ' + label + ' (magic 0x' + magic +
           '), but this run targets product id ' + str(expected_pid), file=sys.stderr)
+    open('/out/edition_mismatch', 'w').write(magic + '\\n')
     sys.exit(1)
 version = data[VERSION_OFF:VERSION_OFF + 4]
 firmware = data[MAGIC_LEN + SIGDATA_LEN:]
 padded = firmware + b'\\xff' * (MAX_FIRMWARE_SIZE - len(firmware))
 monotonic = struct.unpack('<I', version)[0]
-if monotonic >= NEW_SIGHASH_VERSION_CUTOFF:
+if monotonic >= VERSIONED_SIGHASH_VERSION_CUTOFF:
+    device_hash = hashlib.sha256(b'\\x01' + struct.pack('<H', product_id) + version + padded).hexdigest()
+    scheme = 'sha256(0x01 + product_id_le16 + version + padded), version >= 57'
+elif monotonic >= NEW_SIGHASH_VERSION_CUTOFF:
     device_hash = hashlib.sha256(struct.pack('<H', product_id) + version + padded).hexdigest()
-    scheme = 'sha256(product_id_le16 + version + padded), bootloader >= v1.2.2'
+    scheme = 'sha256(product_id_le16 + version + padded), version 51-56'
 else:
     device_hash = hashlib.sha256(hashlib.sha256(version + padded).digest()).hexdigest()
-    scheme = 'legacy sha256d(version + padded)'
+    scheme = 'legacy sha256d(version + padded), version <= 50'
 open('/out/hash_device.txt', 'w').write(device_hash + '\\n')
 open('/out/edition.txt', 'w').write(label + '\\n')
 open('/out/monotonic.txt', 'w').write(str(monotonic) + '\\n')
@@ -623,12 +674,32 @@ print('device hash scheme: ' + scheme)
   # The container's own EXIT trap already ran chown/no-op as appropriate; podman's
   # rootless case still needs the host-side unshare repair, and needs it on this
   # failure path too -- a crashed build is exactly when leftovers matter most.
+  CTR_LOG=""
   repair_ownership "$workDir/src"
   repair_ownership "$workDir/out"
   echo -e "${RED}Build or comparison failed!${NC}"
-  write_results "ftbfs" "BitBox02 Nova v${version} (${firmwareType}): firmware build or in-container comparison failed."
-  exit "$EXIT_FAIL"
+  stage="$(cat "$workDir/out/stage" 2>/dev/null || echo none)"
+  case "$stage" in
+    building)
+      if network_failure_in "$BUILD_LOG"; then
+        no_verdict "$EXIT_FAIL" "firmware build stopped on a network/download error, not a source build failure."
+      fi
+      write_results "ftbfs" "BitBox02 Nova v${version} (${firmwareType}): ${MAKE_COMMAND} failed at ${GIT_TAG}."
+      exit "$EXIT_FAIL" ;;
+    no-output)
+      write_results "ftbfs" "BitBox02 Nova v${version} (${firmwareType}): ${MAKE_COMMAND} produced no ${BUILT_FIRMWARE_PATH}."
+      exit "$EXIT_FAIL" ;;
+    compare)
+      if [[ -e "$workDir/out/edition_mismatch" ]]; then
+        no_verdict "$([[ -n "$binaryPath" ]] && echo "$EXIT_INVALID" || echo "$EXIT_FAIL")" \
+          "official file is not the ${firmwareType} BitBox02 Nova edition; nothing to compare."
+      fi
+      no_verdict "$EXIT_FAIL" "hashing or edition check failed after a successful build." ;;
+    *)
+      no_verdict "$EXIT_FAIL" "build container setup failed before make (for example a dirty source tree)." ;;
+  esac
 fi
+CTR_LOG=""
 repair_ownership "$workDir/src"
 repair_ownership "$workDir/out"
 
