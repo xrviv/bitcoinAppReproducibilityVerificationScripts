@@ -1,5 +1,5 @@
 #!/bin/bash
-# bitbox02_build.sh v3.16.0 - WalletScrutiny verification script for BitBox02
+# bitbox02_build.sh v3.16.1 - WalletScrutiny verification script for BitBox02
 # Organization: WalletScrutiny.com
 # Last modified by: Claude Code for Danny
 # Last modified on: 2026-11-23
@@ -13,7 +13,7 @@
 set -eE
 
 # ---- Globals ----------------------------------------------------------------
-SCRIPT_VERSION="v3.16.0"
+SCRIPT_VERSION="v3.16.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # readlink -f, not $0: a relative or symlinked invocation would otherwise hash nothing.
 SCRIPT_PATH="$(readlink -f "$0")"
@@ -536,16 +536,16 @@ if len(firmware) != built_size:
     # The 4-byte magic identifies the edition; it must match the edition this run targets,
     # otherwise a wrong-edition --binary would be compared against the wrong build.
     #
-    # The hash the device shows at boot is bootloader-dependent. Bootloader v1.2.2 (shipped by
-    # firmware 9.26.2, the mandatory intermediate upgrade) computes
-    # sha256(product_id_le16 + version + padded_firmware) -- see src/bootloader/bootloader.c
-    # _firmware_hash()/_maybe_show_hash(). Firmware monotonic version >= 50 implies that
-    # bootloader is present, which is why upstream branches on 50.
-    # Older bootloaders use the legacy sha256d(version + padded_firmware).
+    # The hash the device shows at boot depends on the monotonic firmware version. Cutoffs mirror
+    # upstream releases/describe_signed_firmware.py and releases/README.md at firmware/v9.29.0:
+    #   through 50: sha256d(version + padded_firmware)
+    #   51 to 56:   sha256(product_id_le16 + version + padded_firmware)
+    #   from 57:    sha256(0x01 + product_id_le16 + version + padded_firmware)
     python3 -c \"
 import hashlib, struct, sys
 MAGIC_LEN = 4; SIGDATA_LEN = 584; VERSION_OFF = 392; MAX_FIRMWARE_SIZE = 884736
-NEW_SIGHASH_VERSION_CUTOFF = 50
+NEW_SIGHASH_VERSION_CUTOFF = 51
+VERSIONED_SIGHASH_VERSION_CUTOFF = 57
 # magic -> (product_id, label); product ids per src/bootloader/bootloader_product.h
 EDITIONS = {
     '653f362b': (1, 'BitBox02 Multi'),
@@ -568,12 +568,15 @@ version = data[VERSION_OFF:VERSION_OFF + 4]
 firmware = data[MAGIC_LEN + SIGDATA_LEN:]
 padded = firmware + b'\\xff' * (MAX_FIRMWARE_SIZE - len(firmware))
 monotonic = struct.unpack('<I', version)[0]
-if monotonic >= NEW_SIGHASH_VERSION_CUTOFF:
+if monotonic >= VERSIONED_SIGHASH_VERSION_CUTOFF:
+    device_hash = hashlib.sha256(b'\\x01' + struct.pack('<H', product_id) + version + padded).hexdigest()
+    scheme = 'sha256(0x01 + product_id_le16 + version + padded), version >= 57'
+elif monotonic >= NEW_SIGHASH_VERSION_CUTOFF:
     device_hash = hashlib.sha256(struct.pack('<H', product_id) + version + padded).hexdigest()
-    scheme = 'sha256(product_id_le16 + version + padded), bootloader >= v1.2.2'
+    scheme = 'sha256(product_id_le16 + version + padded), version 51-56'
 else:
     device_hash = hashlib.sha256(hashlib.sha256(version + padded).digest()).hexdigest()
-    scheme = 'legacy sha256d(version + padded)'
+    scheme = 'legacy sha256d(version + padded), version <= 50'
 open('/out/hash_device.txt', 'w').write(device_hash + '\\n')
 open('/out/edition.txt', 'w').write(label + '\\n')
 open('/out/monotonic.txt', 'w').write(str(monotonic) + '\\n')
