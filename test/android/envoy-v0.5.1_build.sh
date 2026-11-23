@@ -1,6 +1,6 @@
 #!/bin/bash
-# envoy-v0.5.0_build.sh — Envoy (com.foundationdevices.envoy) Android reproducible build verification
-# Version:          v0.5.0
+# envoy-v0.5.1_build.sh — Envoy (com.foundationdevices.envoy) Android reproducible build verification
+# Version:          v0.5.1
 # Last modified by: Claude Code for Danny
 # Last modified on: 2026-11-23
 # Organization:     WalletScrutiny.com
@@ -18,8 +18,8 @@ set -euo pipefail
 
 EXEC_DIR="$(pwd -P)"
 readonly EXEC_DIR
-readonly SCRIPT_VERSION="v0.5.0"
-readonly SCRIPT_NAME="envoy-v0.5.0_build.sh"
+readonly SCRIPT_VERSION="v0.5.1"
+readonly SCRIPT_NAME="envoy-v0.5.1_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 readonly SCRIPT_PATH
 SCRIPT_SHA256="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | cut -d' ' -f1)" || true
@@ -442,10 +442,10 @@ BL_SH="${WORK_DIR}/tools/ws-buildlock.sh"; bl_rc=0
 if curl -fsSL --max-time 60 -o "$BL_SH" "https://gitlab.com/walletscrutiny/walletScrutinyCom/-/raw/${BUILDLOCK_REV}/scripts/rb/ws-buildlock.sh" < /dev/null \
    && [[ "$(ws_sha256 "$BL_SH")" == "$BUILDLOCK_SHA256" ]]; then
     mkdir -p "${WORK_DIR}/build-lock" || bl_rc=$?
-    [[ "$bl_rc" -ne 0 ]] || crun "$WORK_DIR" bash "$BL_SH" --out "${WORK_DIR}/build-lock" --gradle-home /tmp/envoy-reproducible-cache/gradle \
+    [[ "$bl_rc" -ne 0 ]] || nixrun bash "$BL_SH" --out "${WORK_DIR}/build-lock" --gradle-home /tmp/envoy-reproducible-cache/gradle \
         --src "${WORK_DIR}/canonical/${COMMIT_HASH}/project" --app-id "$APP_ID" --version "$VERSION_NAME" \
         --platform android --commit "$COMMIT_HASH" > "${WORK_DIR}/build-lock.log" 2>&1 || bl_rc=$?
-    if [[ "$bl_rc" -eq 0 && -s "${WORK_DIR}/build-lock/build-lock.json" ]]; then
+    if [[ "$bl_rc" -eq 0 && -s "${WORK_DIR}/build-lock/build-lock.json" ]] && ! grep -q 'nothing recorded' "${WORK_DIR}/build-lock.log"; then
         BUILD_LOCK_FILE="${WORK_DIR}/build-lock/build-lock.json"
         ws_ok "build-lock.json: ${BUILD_LOCK_FILE} (sha256 $(ws_sha256 "$BUILD_LOCK_FILE"))"
     else
