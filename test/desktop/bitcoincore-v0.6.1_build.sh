@@ -2,10 +2,10 @@
 # ==============================================================================
 # bitcoincore_build.sh - Bitcoin Core Reproducible Build Verification
 # ==============================================================================
-# Version:          v0.6.0
+# Version:          v0.6.1
 # Organization:     WalletScrutiny.com
-# Last Modified:    2026-07-27
-# Last modified by: Danny Garcia
+# Last Modified:    2026-11-23
+# Last modified by: Claude Code for Danny
 # Project:       https://github.com/bitcoin/bitcoin
 # ==============================================================================
 # LICENSE: MIT License
@@ -52,7 +52,9 @@ sleep 2
 echo
 
 # Script metadata
-SCRIPT_VERSION="v0.6.0"
+SCRIPT_VERSION="v0.6.1"
+# Lines that mark a network/download failure in Guix, git, curl or wget output.
+NETWORK_ERROR_PATTERN='Git error|SSL error|TLS (handshake|error)|received early EOF|Could not resolve host|Temporary failure in name resolution|Connection (timed out|refused|reset)|Failed to connect|Network is unreachable|curl: \([0-9]+\)|unable to access|download failed|failed to download|while fetching|HTTP error [0-9]+'
 SCRIPT_NAME="bitcoincore_build.sh"
 APP_NAME="Bitcoin Core"
 APP_ID="bitcoincore"
@@ -334,9 +336,7 @@ map_arch_to_guix() {
             echo "powerpc64le-linux-gnu"
             ;;
         *)
-            log_error "Unsupported architecture: $bs_arch"
-            generate_error_yaml "ftbfs"
-            exit 1
+            no_verdict 2 "Unsupported architecture: $bs_arch"
             ;;
     esac
 }
@@ -362,6 +362,18 @@ generate_error_yaml() {
     } > "${execution_dir}/COMPARISON_RESULTS.yaml"
 }
 
+# No verdict: invalid input, missing runtime, network or other infrastructure
+# failure, or nothing official to compare against. ABS publishes any YAML it
+# finds, so none is written (the stale one was removed at start).
+# Exit 2 = invalid parameters, 1 = failure (ABS compliance B5/B7).
+no_verdict() {
+    local code="$1"; shift
+    log_error "$*"
+    log_error "No verdict: COMPARISON_RESULTS.yaml not written."
+    echo "Exit code: ${code}"
+    exit "$code"
+}
+
 # Generate comparison YAML
 generate_comparison_yaml() {
     local verdict="$1"
@@ -377,6 +389,9 @@ EOF
 
 # ---------- Parameter Parsing ----------
 execution_dir="$(pwd)"
+# Remove a stale results file so a run that ends without a verdict cannot leave
+# an earlier run's verdict for ABS to publish (ABS compliance B6).
+rm -f "${execution_dir}/COMPARISON_RESULTS.yaml"
 version=""
 arch=""
 build_type=""
@@ -432,18 +447,14 @@ done
 
 # Validate required parameters
 if [[ -z "$version" ]]; then
-  log_error "Missing required parameter: --version"
-  generate_error_yaml "ftbfs"
   usage
-  exit 1
+  no_verdict 2 "Missing required parameter: --version"
 fi
 
 # Auto-detect arch and type from --binary if not explicitly provided
 if [[ -n "$binary_file" && ( -z "$arch" || -z "$build_type" ) ]]; then
     if [[ ! -f "$binary_file" ]]; then
-        log_error "--binary file not found: $binary_file"
-        generate_error_yaml "ftbfs"
-        exit 1
+        no_verdict 2 "--binary file not found: $binary_file"
     fi
     log_info "Auto-detecting arch/type from binary: $(basename "$binary_file")"
     detect_from_binary "$binary_file"
@@ -458,17 +469,13 @@ if [[ -n "$binary_file" && ( -z "$arch" || -z "$build_type" ) ]]; then
 fi
 
 if [[ -z "$arch" ]]; then
-  log_error "Missing required parameter: --arch (could not be auto-detected from --binary)"
-  generate_error_yaml "ftbfs"
   usage
-  exit 1
+  no_verdict 2 "Missing required parameter: --arch (could not be auto-detected from --binary)"
 fi
 
 if [[ -z "$build_type" ]]; then
-  log_error "Missing required parameter: --type (could not be auto-detected from --binary)"
-  generate_error_yaml "ftbfs"
   usage
-  exit 1
+  no_verdict 2 "Missing required parameter: --type (could not be auto-detected from --binary)"
 fi
 
 # Validate against supported combos from bitcoincore.md builds array
@@ -483,31 +490,23 @@ if ! validate_supported_combo "$arch" "$build_type"; then
     log_error "  ppc64le-linux    / tarball"
     log_error "  x86_64-windows   / zip"
     log_error "  x86_64-windows   / setup"
-    generate_error_yaml "ftbfs"
-    echo "Exit code: 1"
-    exit 1
+    no_verdict 2 "Unsupported arch/type combination: ${arch}/${build_type}"
 fi
 
 # Validate build type per arch
 case "$arch" in
   x86_64-windows|win64)
     if [[ "$build_type" != "zip" && "$build_type" != "setup" && "$build_type" != "unsigned-zip" && "$build_type" != "unsigned-setup" ]]; then
-      log_error "Unsupported type for ${arch}: ${build_type}. Use --type zip, --type unsigned-zip, --type setup, or --type unsigned-setup"
-      generate_error_yaml "ftbfs"
-      exit 1
+      no_verdict 2 "Unsupported type for ${arch}: ${build_type}. Use --type zip, --type unsigned-zip, --type setup, or --type unsigned-setup"
     fi
     ;;
   x86_64-linux|x86_64-linux-gnu|aarch64-linux|arm-linux|riscv64-linux|ppc64-linux|ppc64le-linux)
     if [[ "$build_type" != "tarball" ]]; then
-      log_error "Unsupported type for ${arch}: ${build_type}. Use --type tarball"
-      generate_error_yaml "ftbfs"
-      exit 1
+      no_verdict 2 "Unsupported type for ${arch}: ${build_type}. Use --type tarball"
     fi
     ;;
   *)
-    log_error "Unsupported architecture/type combo: ${arch}/${build_type}"
-    generate_error_yaml "ftbfs"
-    exit 1
+    no_verdict 2 "Unsupported architecture/type combo: ${arch}/${build_type}"
     ;;
 esac
 
@@ -519,9 +518,7 @@ fi
 # Guard against shell/git-argument injection: $version is interpolated into
 # container-exec bash -c strings (git checkout $version, etc.) below
 if [[ ! "$version" =~ ^v[0-9]+(\.[0-9]+){1,2}(rc[0-9]+)?$ ]]; then
-  log_error "Invalid --version format: ${version} (expected e.g. 31.1, v31.1, or v30.0rc1)"
-  generate_error_yaml "ftbfs"
-  exit 1
+  no_verdict 2 "Invalid --version format: ${version} (expected e.g. 31.1, v31.1, or v30.0rc1)"
 fi
 
 # Generate unique container/image names for this invocation
@@ -537,10 +534,7 @@ check_dependencies() {
     elif command -v docker >/dev/null 2>&1; then
         container_cmd="docker"
     else
-        log_error "Neither podman nor docker found. Please install one of them."
-        generate_error_yaml "ftbfs"
-        echo "Exit code: 1"
-        exit 1
+        no_verdict 1 "Neither podman nor docker found. Please install one of them."
     fi
 
     log_info "Using container runtime: ${container_cmd}"
@@ -657,9 +651,7 @@ build_container() {
     log_info "This may take 5-15 minutes depending on network speed..."
 
     if ! ${container_cmd} build --pull --no-cache --ulimit nofile=65536:65536 -t "$IMAGE_NAME" - < "$imagefile_path"; then
-        log_error "Container build failed"
-        generate_error_yaml "ftbfs"
-        exit 1
+        no_verdict 1 "Container build failed (Alpine/Guix image setup or repository clone; infrastructure, not the Bitcoin Core source)"
     fi
 
     log_success "Container built successfully: $IMAGE_NAME"
@@ -676,9 +668,7 @@ start_container() {
     fi
 
     if ! ${container_cmd} run -d --name "$CONTAINER_NAME" --privileged --ulimit nofile=65536:65536 "$IMAGE_NAME"; then
-        log_error "Failed to start container"
-        generate_error_yaml "ftbfs"
-        exit 1
+        no_verdict 1 "Failed to start container"
     fi
 
     # Wait a moment for daemon to start
@@ -701,15 +691,16 @@ prepare_bitcoin_build() {
 
     # Update repository and checkout version
     log_info "Fetching latest Bitcoin Core repository..."
-        ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git fetch --all --tags"
+        if ! ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git fetch --all --tags"; then
+            no_verdict 1 "git fetch of the Bitcoin Core repository failed (network)"
+        fi
 
     log_info "Checking out version: $version"
         if ! ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git checkout \"$version\""; then
         log_error "Failed to checkout version: $version"
         log_error "Available tags:"
-        ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git tag | grep -E '^v[0-9]' | tail -10"
-        generate_error_yaml "not_reproducible"
-        exit 1
+        ${container_cmd} exec "$CONTAINER_NAME" bash -c "cd /bitcoin && git tag | grep -E '^v[0-9]' | tail -10" || true
+        no_verdict 2 "Tag not found: $version"
     fi
 
     # Verify GPG signature. Note: contrib/verify-commits/trusted-keys is the
@@ -726,10 +717,7 @@ prepare_bitcoin_build() {
     if [[ "$verify_status" -eq 0 ]]; then
         log_success "GPG signature verified for $version"
     elif echo "$verify_output" | grep -qi "bad signature"; then
-        log_error "GPG signature verification FAILED for $version: signature does NOT match tag content"
-        generate_error_yaml "ftbfs" "Git tag signature is bad for ${version}; refusing to build from this tag."
-        echo "Exit code: 1"
-        exit 1
+        no_verdict 1 "GPG signature verification FAILED for $version: signature does NOT match tag content; refusing to build from this tag"
     elif echo "$verify_output" | grep -qi "no public key"; then
         log_warn "GPG signature verification failed for $version: signer's key unavailable (not in contrib/verify-commits/trusted-keys, or all keyservers unreachable)"
     else
@@ -754,11 +742,19 @@ execute_build() {
     # Execute the build (guix-build always produces a debug tarball; it is not compared and is discarded)
     local build_cmd="cd /bitcoin && time BASE_CACHE='/base_cache' SOURCE_PATH='/sources' SDK_PATH='/SDKs' HOSTS='$arch' ./contrib/guix/guix-build"
 
-    if ${container_cmd} exec "$CONTAINER_NAME" bash -c "$build_cmd"; then
+    # Output is also kept in the workspace so a failure can be classified: a
+    # network/download error in the last 40 lines (where the run stopped) is no
+    # verdict, anything else is ftbfs. Earlier retried warnings do not count.
+    local build_log="${workspace}/guix-build.log"
+    if ${container_cmd} exec "$CONTAINER_NAME" bash -c "$build_cmd" 2>&1 | tee "$build_log"; then
         local end_time=$(date +%s)
         local duration=$((end_time - start_time))
         log_success "Build completed successfully in $duration seconds"
     else
+        if tail -n 40 "$build_log" | grep -Eqi "$NETWORK_ERROR_PATTERN"; then
+            log_error "Matched network error: $(tail -n 40 "$build_log" | grep -Eim1 "$NETWORK_ERROR_PATTERN")"
+            no_verdict 1 "Guix build stopped on a network/download error, not a source build failure"
+        fi
         log_error "Build failed"
         generate_error_yaml "ftbfs"
         exit 1
@@ -885,9 +881,7 @@ verify_checksums() {
         if [[ -n "$binary_file" ]]; then
             log_info "Using provided binary: $binary_file"
             if [[ ! -f "$binary_file" ]]; then
-                log_error "--binary file not found: $binary_file"
-                generate_error_yaml "ftbfs"
-                exit 1
+                no_verdict 2 "--binary file not found: $binary_file"
             fi
             cp "$binary_file" "${official_dir}/${main_artifact}"
             log_success "Copied provided binary as official artifact"
@@ -978,11 +972,8 @@ verify_checksums() {
                     log_warn "Attested:  ${official_hash}"
                 fi
             else
-                generate_error_yaml "not_reproducible"
-                diff_count=$((diff_count + 1))
-                verdict="not_reproducible"
-                log_warn "Neither an official SHA256SUMS entry nor a guix.sigs attestation found - manual verification required"
                 log_info "Built hash: ${built_hash}"
+                no_verdict 1 "Neither an official SHA256SUMS entry nor a guix.sigs attestation found - nothing to compare against"
             fi
         else
             generate_error_yaml "ftbfs"
@@ -1013,16 +1004,8 @@ verify_checksums() {
             # No official to compare - just report built hash
             if [[ -f "${built_dir}/${main_artifact}" ]]; then
                 built_hash=$(sha256sum "${built_dir}/${main_artifact}" | awk '{print $1}')
-                no_official_release=true
-                generate_error_yaml "not_reproducible" "No official release artifact found at ${official_url}/${main_artifact} - comparison could not be performed. This is NOT a hash mismatch."
-                uncompared_count=$((uncompared_count + 1))
-                verdict="not_reproducible"
-                log_warn "########################################################"
-                log_warn "# NO OFFICIAL RELEASE FOUND - comparison NOT performed  #"
-                log_warn "# verdict below reflects inability to compare,          #"
-                log_warn "# NOT a genuine hash mismatch                           #"
-                log_warn "########################################################"
                 log_info "Built hash: ${built_hash}"
+                no_verdict 1 "No official release artifact found at ${official_url}/${main_artifact} (missing or download failed) - comparison not performed"
             else
                 generate_error_yaml "ftbfs"
                 verdict="not_reproducible"
