@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # nunchukwindows_build.sh - Nunchuk Desktop Windows Reproducible Build Verifier
-# Version: v0.2.0
+# Version: v0.2.1
 # Last modified by: Danny Garcia, Carol (Buzz), Claude Code
 # Last modified on: 2026-11-24
 # Organization: WalletScrutiny.com
@@ -24,7 +24,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.2.0"
+SCRIPT_VERSION="v0.2.1"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | cut -d' ' -f1)" || true
 SCRIPT_SHA256="${SCRIPT_SHA256:-N/A}"
@@ -234,9 +234,8 @@ OPTIONAL ENVIRONMENT:
 
 REQUIREMENTS:
   podman (or docker), read/write /dev/kvm, read access to the golden image and the VM key.
-  Run as a normal user, not root. Tools missing from the golden image (VS Build Tools 17.14.41/45,
-  pwsh 7.6.6, Python 3.12.10, NASM 3.02, Strawberry Perl 5.32.1.1) are installed per run,
-  hash-checked; their versions are asserted either way.
+  Run as a normal user. Tools missing from the golden image are installed per run, hash-checked;
+  their versions are asserted either way.
 
 EXIT CODES:
   0  Identical (the selected file is byte-for-byte equal)
@@ -516,7 +515,7 @@ if ($Phase -eq 'build') {
             '--add', 'Microsoft.VisualStudio.Component.VC.CoreBuildTools', '--add', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', `
             '--add', 'Microsoft.VisualStudio.Component.VC.CMake.Project', `
             '--add', 'Microsoft.VisualStudio.Component.VC.Redist.14.Latest', '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.22621', `
-            '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.26100'
+            '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.26100', '--add', 'Microsoft.VisualStudio.Component.Windows10SDK.19041'
         Need ($p.ExitCode -in 0, 3010) "VS Build Tools installer exit code $($p.ExitCode)"
         # Ports built with MSBuild (sqlite3) need the C++ build targets, not only cl.exe.
         Need (VsPath) "VS Build Tools installed without the VC.CoreBuildTools / VC.CMake.Project components"
@@ -545,14 +544,15 @@ if ($Phase -eq 'build') {
     Need ((& python --version) -eq 'Python 3.12.10') "python $(& python --version), want 3.12.10"
     Need ((& nasm -v) -match '^NASM version 3\.02 ') "nasm $(& nasm -v), want 3.02"
     Need ((& perl -e 'print $^V') -eq 'v5.32.1') "perl $(& perl -e 'print $^V'), want v5.32.1"
-    # windeployqt copies these from the folder the newest SDK fills: 10.0.26100 on the runner.
+    # windeployqt copies these; MSI keeps the highest version of SDKs 19041/22621/26100, as on the runner.
     $d3d = "${env:ProgramFiles(x86)}\Windows Kits\10\Redist\D3D\x64"
     $d3dv = foreach ($n in 'd3dcompiler_47.dll', 'dxcompiler.dll', 'dxil.dll') { if (Test-Path "$d3d\$n") { "$n $((Get-Item "$d3d\$n").VersionInfo.FileVersion)" } else { "$n missing" } }
     Write-Host "D3D redist: $($d3dv -join ', ')"
     Need (-not ($d3dv -like '* missing')) "D3D redist incomplete ($($d3dv -join ', '))"
-    Need ((Test-Path "$d3d\d3dcompiler_47.dll") -and (Get-Item "$d3d\d3dcompiler_47.dll").VersionInfo.FileVersion -like '10.0.26100.*') "d3dcompiler_47.dll is not from SDK 10.0.26100 ($($d3dv[0]))"
+    Need ((Get-Item "$d3d\dxcompiler.dll").VersionInfo.FileVersion -like '10.0.19041.*') "dxcompiler.dll is not from SDK 10.0.19041 ($($d3dv[1]))"
+    Need ((Get-Item "$d3d\d3dcompiler_47.dll").VersionInfo.FileVersion -like '10.0.26100.*') "d3dcompiler_47.dll is not from SDK 10.0.26100 ($($d3dv[0]))"
     Lap 'tool install'
-    Write-Host "Toolchain: PASS (cl $Arg3, VCTools 14.44.35207, SDK 10.0.22621.0, d3dcompiler_47 10.0.26100.*, CRT 14.44.35211.0, pwsh 7.6.6, Python 3.12.10, NASM 3.02, Perl 5.32.1)"
+    Write-Host "Toolchain: PASS (cl $Arg3, VCTools 14.44.35207, SDK 10.0.22621.0, D3D 26100/19041, CRT 14.44.35211.0, pwsh 7.6.6, Python 3.12.10, NASM 3.02, Perl 5.32.1)"
 
     # Checkout as in build-windows.yml, at the runner's workspace path.
     Run git config --global core.autocrlf false
@@ -690,7 +690,7 @@ compare_artifacts() {
         fi
     done
     phase_done "compare"
-    local ctx="Built in a Windows Server 2022 VM (${WIN_IMAGE##*@}) with upstream build_windows.ps1 and package_windows.ps1 at tag ${APP_VERSION}, commit ${RESOLVED_COMMIT}, SOURCE_DATE_EPOCH ${SOURCE_EPOCH}; MSVC 14.44.35207 (cl ${REL_MSVC}), SDK 10.0.22621.0 (SDK 10.0.26100 also installed; D3D redist ${D3D_REDIST:-not logged}), VS ${VS_REL}; ImageOS/ImageVersion not set: build-info.json records GitHub's runner image (${REL_IMAGE_OS:-none}/${REL_IMAGE_VERSION:-none} in the release), which only GitHub can match (upstream leak)."
+    local ctx="Built in a Windows Server 2022 VM (${WIN_IMAGE##*@}) with upstream build_windows.ps1 and package_windows.ps1 at tag ${APP_VERSION}, commit ${RESOLVED_COMMIT}, SOURCE_DATE_EPOCH ${SOURCE_EPOCH}; MSVC 14.44.35207 (cl ${REL_MSVC}), SDK 10.0.22621.0 (SDKs 19041, 26100 also installed; D3D redist ${D3D_REDIST:-not logged}), VS ${VS_REL}; ImageOS/ImageVersion not set: build-info.json records GitHub's runner image (${REL_IMAGE_OS:-none}/${REL_IMAGE_VERSION:-none} in the release), which only GitHub can match (upstream leak)."
     local sums="" a2
     for a2 in "${ARTIFACTS[@]}"; do sums+="${OFF_NAME[$a2]}: official ${OFF_SHA[$a2]}, rebuilt ${BUILT_SHA[$a2]}${DIFF_NOTE[$a2]:+ (${DIFF_NOTE[$a2]})}; "; done
     if [[ "$all" == true ]]; then
