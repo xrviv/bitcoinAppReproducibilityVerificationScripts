@@ -1,38 +1,30 @@
 #!/usr/bin/env bash
-# mixinandroid_build.sh - Mixin Messenger (one.mixin.messenger) Android Verification
-# Version: v0.1.4
-# Organization: WalletScrutiny.com
-# Last modified by: Bob (WalletScrutiny agent), for Daniel Garcia
-# Date last modified: 2026-09-14
-# Project: https://github.com/MixinNetwork/android-app
-# Host deps: docker or podman; curl only when downloading the official APK.
-#
-# TECHNICAL DISCLAIMER:
-# This script is provided for technical analysis and reproducible build verification purposes
-# only. No warranty is provided regarding security, functionality, or fitness for any particular
-# purpose. Users assume all risks associated with running this script and analyzing the software.
-#
-# LEGAL DISCLAIMER:
-# This script is designed for legitimate security research and reproducible build verification.
-# Users are responsible for ensuring compliance with all applicable laws and regulations.
+# mixinandroid-v0.2.0_build.sh - Mixin Messenger (one.mixin.messenger) Android Verification
+# Version:          v0.2.0
+# Last modified by: Claude Code for Danny
+# Last modified on: 2026-11-24
+# Organization:     WalletScrutiny.com
+# Project:          https://github.com/MixinNetwork/android-app
+# Host deps: podman or docker, curl.
+# DISCLAIMER: for reproducible build verification and research only, without warranty; users
+# assume all risks and are responsible for complying with applicable laws.
 #
 # SCRIPT SUMMARY:
-# - Reads versionName, versionCode, signer and the Firebase/API-key values out of the official
-#   artifact (GitHub release APK or a Play split set) with aapt2/apksigner inside the pinned image.
-# - Clones the release tag inside the image, injects the recovered build inputs, builds
-#   :app:bundle<Flavor>Release with Gradle and renders it with bundletool in the same mode as the
-#   official artifact (universal or split set).
+# - Reads version, signer and Firebase/API-key values from the official GitHub APK or Play splits.
+# - Clones the tag, injects those inputs, builds :app:bundle<Flavor>Release and renders it with
+#   bundletool in the official artifact's mode (universal or split set).
 # - Unpacks both sides and diffs them; signing files and the Play SourceStamp are excluded,
 #   resources.arsc and AndroidManifest.xml are judged on their apktool-decoded form (WS #574).
-# - Prints the results block, writes COMPARISON_RESULTS.yaml next to the script.
+# - Library ws-rb-core (GitLab #1023) pinned below (offline: WS_LIB_FILE). The workspace is new per
+#   run in the caller's directory. After the build, ws-buildlock.sh (#1000, pinned) writes
+#   <workspace>/build-lock/build-lock.json; it never changes the verdict.
+# Exit: 0 reproducible; 1 not reproducible, ftbfs or no verdict; 2 invalid input or library unavailable.
 #
 # Five things to know:
-#  1. Upstream ships verify-mixin-apk.sh (needs adb + a phone). This script reuses
-#     its pins: the mingc/android-build-box image digest, bundletool 1.18.3 and the
-#     release tag, but compares files instead of a device.
-#  2. Every official artifact is a bundletool rendering of the release AAB: the
-#     GitHub asset is a universal APK, Play ships base + ABI splits. So the build
-#     target is :app:bundle<Flavor>Release and bundletool renders the same shape.
+#  1. Reuses the pins of upstream's verify-mixin-apk.sh (image digest, bundletool 1.18.3,
+#     tag) but compares files, not a phone.
+#  2. Official APKs are bundletool renderings of the release AAB (GitHub: universal;
+#     Play: base + ABI splits); bundletool renders the same shape from our AAB.
 #  3. Two flavors exist, googlePlay and otherChannel; they differ only in
 #     BuildConfig.IS_GOOGLE_PLAY. Default is googlePlay (the GitHub asset carries a
 #     Google SourceStamp, so it came out of Play). --flavor overrides.
@@ -41,11 +33,10 @@
 #     rebuilt from values the official APK itself carries (Firebase string resources,
 #     manifest meta-data). Values that only live in dex cannot be recovered that way
 #     and will show up as dex differences.
-#  5. Bugsnag mapping-upload tasks are chained onto every release bundle task and
-#     need an account; they are excluded (-x), which does not change the AAB.
+#  5. Bugsnag upload tasks need an account and are excluded (-x); the AAB is unchanged.
 
-SCRIPT_VERSION="v0.1.9"
-SCRIPT_NAME="mixinandroid_build.sh"
+SCRIPT_VERSION="v0.2.0"
+SCRIPT_NAME="mixinandroid-v0.2.0_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 if [[ -f "$SCRIPT_PATH" ]]; then
     SCRIPT_SHA256="$(sha256sum "$SCRIPT_PATH" | awk '{print $1}')"
@@ -54,9 +45,57 @@ else
 fi
 printf '%s %s sha256:%s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION" "$SCRIPT_SHA256"
 
-set -uo pipefail   # no -e: diff/cmp return 1 on differences
+set -uo pipefail   # no -e; the library's ERR trap turns any unguarded failure into no verdict
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# ---- WalletScrutiny library (GitLab #1023), pinned by sha256 ------------------
+# Goes in each build script right after its self-hash line, before anything else.
+# Source: WS_LIB_FILE (offline, must match), else the cache, else GitLab by
+# commit. Nothing else. A wrong hash is rejected whichever source sent it.
+# No matching copy, or a different version inside: no verdict, no YAML, exit 2.
+# First, before anything can fail: no earlier verdict may survive this run. A run
+# that holds this folder's lock is still writing its own; that one stays, and the
+# library refuses this run when it takes the lock.
+WS_LIB_DIR0="$(dirname "$(readlink -f "$0")")"
+if command -v flock >/dev/null 2>&1; then
+  flock -n "$WS_LIB_DIR0/.comparison_results.lock" true 2>/dev/null && rm -f -- "$WS_LIB_DIR0/COMPARISON_RESULTS.yaml"
+else
+  WS_LIB_P="$(cat "$WS_LIB_DIR0/.comparison_results.lock.d/pid" 2>/dev/null || true)"
+  case "$WS_LIB_P" in ''|*[!0-9]*) WS_LIB_P="";; esac
+  { [ -n "$WS_LIB_P" ] && kill -0 "$WS_LIB_P" 2>/dev/null; } || rm -f -- "$WS_LIB_DIR0/COMPARISON_RESULTS.yaml"
+fi
+WS_LIB=ws-rb-core WS_LIB_VERSION=1.1.0
+WS_LIB_REV=3bafe3b5961f11bcf1fa4fbbe3f4f206d53a61d0 WS_LIB_SHA256=4f0920dc8edb1e07aefbb4748d72fd3cc011eb769aaa40de8b5a6a9026312c7e
+ws_lib_load() {
+  local c f u t=""
+  ws_lib_ok() { [ "$(sha256sum "$1" 2>/dev/null | cut -d' ' -f1)" = "$WS_LIB_SHA256" ]; }
+  if [ -n "${WS_LIB_FILE:-}" ]; then
+    f="$WS_LIB_FILE"
+    ws_lib_ok "$f" || { echo "[FAIL] WS_LIB_FILE $f is not sha256 $WS_LIB_SHA256: no verdict" >&2; exit 2; }
+  else
+    # Cache in XDG_CACHE_HOME or HOME; with neither, or no way to create it, a
+    # temporary folder for this run only. Every copy is hash-checked either way.
+    c="${XDG_CACHE_HOME:-${HOME:+$HOME/.cache}}"
+    if [ -n "$c" ] && mkdir -p "$c/ws-rb-lib" 2>/dev/null; then c="$c/ws-rb-lib"
+    else t="$(mktemp -d 2>/dev/null)" || { echo "[FAIL] no folder to fetch $WS_LIB into: no verdict" >&2; exit 2; }; c="$t"; fi
+    f="$c/$WS_LIB_SHA256.sh"
+    if ! ws_lib_ok "$f"; then
+      u="https://gitlab.com/walletscrutiny/walletScrutinyCom/-/raw/$WS_LIB_REV/scripts/rb/lib/$WS_LIB-$WS_LIB_VERSION.sh"
+      curl -fsSL --max-time 60 -o "$f.$$" "$u" 2>/dev/null && ws_lib_ok "$f.$$" && mv -f "$f.$$" "$f"
+      rm -f "$f.$$"
+    fi
+  fi
+  ws_lib_ok "$f" || { [ -z "$t" ] || rm -rf -- "$t"; echo "[FAIL] $WS_LIB $WS_LIB_VERSION ($WS_LIB_SHA256) unavailable or altered: no verdict" >&2; exit 2; }
+  # 1.1.0 and later mount this file into the build container (WS_LIB_PATH)
+  # and remove a temporary folder on exit; for 1.0.0 it goes now.
+  WS_LIB_PATH="$f" WS_LIB_TMP="$t"
+  . "$f"
+  [ -z "$t" ] || [ -n "${WS_LIB_MOUNT:-}" ] || rm -rf -- "$t"
+  [ "${WS_LIB_LOADED_VERSION:-}" = "$WS_LIB_VERSION" ] || { echo "[FAIL] $f holds ${WS_LIB_LOADED_VERSION:-no version}, not $WS_LIB_VERSION: no verdict" >&2; exit 2; }
+  echo "Library: $WS_LIB $WS_LIB_VERSION sha256: $WS_LIB_SHA256"
+}
+ws_lib_load
+
+
 APP_ID="one.mixin.messenger"
 REPO_URL="https://github.com/MixinNetwork/android-app"
 # Pins copied from upstream verify-mixin-apk.sh at v6.2.2 (PR #6546 / #6610).
@@ -64,53 +103,26 @@ BUILD_IMAGE="docker.io/mingc/android-build-box@sha256:de4a27cbc13a22563f82e93fde
 BUNDLETOOL_VERSION="1.18.3"
 BUNDLETOOL_SHA256="a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29"
 APKTOOL_URL="https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar"
-HOST_UID="$(id -u)"
-HOST_GID="$(id -g)"
+APKTOOL_SHA256="dbf930b076c6b9be08d57c449cacefc3bdd6b71ebd59b3066fc0e1f5b14f9423"
+BUILDLOCK_REV="6eb3c49f860de9b6fbe152cb0c71dd9a4413a979"
+BUILDLOCK_SHA256="fc1d41a45cd1fb455edab9478078c827937761c85966272f4487930f718f8812"
 
-NC="\033[0m"; GREEN="\033[1;32m"; YELLOW="\033[1;33m"; RED="\033[1;31m"; BLUE="\033[1;34m"
-log_info()    { echo -e "${BLUE}[INFO]${NC} $*"; }
-log_success() { echo -e "${GREEN}[OK]${NC} $*"; }
-log_warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
-log_error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+log_info()    { ws_info "$@"; }
+log_success() { ws_ok "$@"; }
+log_warn()    { ws_warn "$@"; }
+log_error()   { ws_error "$@"; }
+banner()  { ws_section "$*"; }
+section() { echo ""; echo "--- $* ---"; }
+sha256of() { ws_sha256 "$1"; }
+nov() { ws_no_verdict "$1"; }   # runtime, network, tool or input-file problem: no YAML
+inv() { ws_invalid "$1"; }      # invalid parameters: exit 2, no YAML
+ftbfs() { ws_error "$1"; ws_write_yaml ftbfs "$2" ${YAML_HASHES[@]+"${YAML_HASHES[@]}"}; exit 1; }   # the source itself does not build this artifact
 
-banner() {
-    echo ""; echo ""
-    echo "############################################################"
-    echo "##"; printf "##  %s\n" "$*"; echo "##"
-    echo "############################################################"
-}
-section() {
-    echo ""; echo "------------------------------------------------------------"
-    printf "  %s\n" "$*"
-    echo "------------------------------------------------------------"
-}
-sha256of() { sha256sum "$1" | awk '{print $1}'; }
-
-execution_dir="$SCRIPT_DIR"
-write_yaml() {   # write_yaml <verdict> <notes>
-    cat > "${execution_dir}/COMPARISON_RESULTS.yaml" <<EOF
-script_version: ${SCRIPT_VERSION}
-verdict: ${1}
-notes: |
-  ${2}
-EOF
-    log_info "COMPARISON_RESULTS.yaml written with verdict: ${1}"
-}
-die() {   # die <exit-code> <log message> [yaml note; defaults to the log message]
-    log_error "$2"; write_yaml ftbfs "${3:-$2}"
-    echo ""; echo "Exit code: $1"; exit "$1"
-}
-
-[[ "$EUID" -eq 0 ]] && die 2 "Do not run this script as root." "Script was run as root; refusing to proceed"
+ws_refuse_root
+ws_install_traps
 
 version_arg=""; binary_arg=""; arch_arg=""; type_arg=""; flavor="googlePlay"
 
-require_arg() {
-    local flag="$1" val="${2:-}"
-    if [[ -z "$val" || "$val" == --* ]]; then
-        die 2 "${flag} requires a value (got: '${val:-<nothing>}')" "${flag} requires a value"
-    fi
-}
 usage() {
     cat <<USAGE
 Usage: $SCRIPT_NAME [--binary <apk | directory of Play splits>] [--version <x.y.z>] [--flavor googlePlay|otherChannel] [--arch a] [--type t]
@@ -121,77 +133,55 @@ Usage: $SCRIPT_NAME [--binary <apk | directory of Play splits>] [--version <x.y.
   --version  Release version without the v prefix (tag v<version>). Read from the
              artifact when omitted; when nothing is given the latest GitHub release is used.
   --flavor   Gradle product flavor to build; default googlePlay.
-  --arch/--type  accepted and ignored; the artifact decides which ABIs are compared.
+  --arch     ABI to check against the artifact (e.g. arm64-v8a); a mismatch is invalid input.
+  --type     accepted and ignored.
 USAGE
 }
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --version) require_arg --version "${2:-}"; version_arg="$2"; shift 2 ;;
-        --binary|--apk) require_arg "$1" "${2:-}"; binary_arg="$2"; shift 2 ;;
-        --flavor)  require_arg --flavor "${2:-}";  flavor="$2";      shift 2 ;;
-        --arch)    require_arg --arch "${2:-}";    arch_arg="$2";    shift 2 ;;
-        --type)    require_arg --type "${2:-}";    type_arg="$2";    shift 2 ;;
-        -h|--help) usage; echo "Exit code: 0"; exit 0 ;;
+        --version) ws_require_value --version "${2:-}"; version_arg="$2"; shift 2 ;;
+        --binary|--apk) ws_require_value "$1" "${2:-}"; binary_arg="$2"; shift 2 ;;
+        --flavor)  ws_require_value --flavor "${2:-}";  flavor="$2";      shift 2 ;;
+        --arch)    ws_require_value --arch "${2:-}";    arch_arg="$2";    shift 2 ;;
+        --type)    ws_require_value --type "${2:-}";    type_arg="$2";    shift 2 ;;
+        -h|--help) usage; exit 0 ;;
         *) log_warn "Unknown parameter ignored: $1"; shift ;;
     esac
 done
-[[ -n "$arch_arg" ]] && log_info "--arch ${arch_arg} accepted but not used (ABIs come from the artifact)"
 [[ -n "$type_arg" ]] && log_info "--type ${type_arg} accepted but not used"
-case "$flavor" in googlePlay|otherChannel) ;; *) die 2 "--flavor must be googlePlay or otherChannel (got ${flavor})" ;; esac
+[[ -z "$version_arg" || "$version_arg" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || inv "--version must be x.y.z (got ${version_arg})"
+case "$flavor" in googlePlay|otherChannel) ;; *) inv "--flavor must be googlePlay or otherChannel (got ${flavor})" ;; esac
 FLAVOR_CAP="${flavor^}"   # GooglePlay / OtherChannel
 
-if [[ -z "${CRUN:-}" ]]; then   # a docker CLI without daemon access must not win over a working podman
-    for c in docker podman; do
-        command -v "$c" &>/dev/null && "$c" info &>/dev/null && { CRUN="$c"; break; }
-    done
-    [[ -n "${CRUN:-}" ]] || die 2 "Neither docker nor podman is usable (installed and able to run 'info')" "No usable container runtime (docker or podman)"
-fi
-MEM_LIMIT="${MEM_LIMIT:-24g}"
-MEM_ARGS=(); [[ -n "$MEM_LIMIT" ]] && MEM_ARGS=(--memory="$MEM_LIMIT")
+ws_results_init
+ws_engine
+# Rootless podman with cgroupfs cannot set memory limits: --memory (MEM_LIMIT, default 24g) is docker only.
+MEM_ARGS=(); YAML_HASHES=()
+if [[ "$WS_ENGINE" == docker ]]; then MEM_LIMIT="${MEM_LIMIT-24g}"; [[ -z "$MEM_LIMIT" ]] || MEM_ARGS=(--memory="$MEM_LIMIT"); fi
 
 banner "PRE-FLIGHT: HOST TOOL CHECK"
-printf "  %-12s OK  (%s)\n" "$CRUN" "$(command -v "$CRUN")"
-if [[ -z "$binary_arg" ]]; then
-    command -v curl &>/dev/null || die 2 "curl not found in PATH and --binary was not supplied" "curl required to download the official APK; or pass --binary"
-    printf "  %-12s OK  (%s)\n" "curl" "$(command -v curl)"
-fi
+printf "  %-12s OK  (%s)\n" "$WS_ENGINE" "$(command -v "$WS_ENGINE")"
+command -v curl &>/dev/null || nov "curl not found in PATH"
+printf "  %-12s OK  (%s)\n" "curl" "$(command -v curl)"
 echo "  Host requirement satisfied."
 
-RUN_ID="mixinandroid-$(date +%s)-$$"
-CTR_BASE="ws-mixinandroid-${RUN_ID}"
-workspace="${execution_dir}/mixinandroid_verification_${RUN_ID}"
+CTR_BASE="ws-mixinandroid-${WS_RUN_ID}"
+for c in meta build lock render cmp; do ws_track_container "${CTR_BASE}-${c}"; done
+WS_CHOWN_IMAGE="$BUILD_IMAGE"   # docker hand-back uses the pinned image; it is never removed
+ws_workspace mixinandroid "${version_arg:-artifact}"
+workspace="$WS_WORKDIR"
 DL_DIR="${workspace}/official"; META_DIR="${workspace}/metadata"
 SRC_DIR="${workspace}/source"; BUILD_DIR="${workspace}/built"
 GRADLE_HOME="${workspace}/gradle-home"; CMP_DIR="${workspace}/comparison"
-TOOLS_DIR="${workspace}/tools"
-ctx=""
-
-ensure_user_ownership() {
-    [[ -e "$1" ]] || return 0
-    # Rootless podman maps container root to the invoking user, so nothing is foreign-owned and a
-    # chown to the numeric uid inside the container would land on a subordinate uid instead.
-    [[ -n "$(find "$1" ! -user "$HOST_UID" -print -quit 2>/dev/null)" ]] || return 0
-    $CRUN run --rm -v "${1}:/target" "$BUILD_IMAGE" \
-        sh -c "chown -R ${HOST_UID}:${HOST_GID} /target" >/dev/null 2>&1 || \
-        log_warn "Could not fix ownership for ${1}"
-}
-cleanup() {
-    log_info "Cleaning up containers..."
-    for c in meta build render cmp; do $CRUN rm -f "${CTR_BASE}-${c}" 2>/dev/null || true; done
-    ensure_user_ownership "$workspace"
-    [[ -n "$ctx" ]] && rm -rf "$ctx" 2>/dev/null || true
-    log_success "Cleanup complete."
-}
-trap cleanup EXIT
-mkdir -p "$DL_DIR" "$META_DIR" "$SRC_DIR" "$BUILD_DIR" "$GRADLE_HOME" "$CMP_DIR" "$TOOLS_DIR"
-ctx=$(mktemp -d)
+TOOLS_DIR="${workspace}/tools"; ctx="${workspace}/ctx"; BL_DIR="${workspace}/build-lock"
+mkdir -p "$DL_DIR" "$META_DIR" "$SRC_DIR" "$BUILD_DIR" "$GRADLE_HOME" "$CMP_DIR" "$TOOLS_DIR" "$ctx" "$BL_DIR"
 
 banner "MIXIN MESSENGER (ANDROID) REPRODUCIBLE BUILD VERIFICATION"
 echo "  Script:    ${SCRIPT_NAME} ${SCRIPT_VERSION}"
 echo "  App ID:    ${APP_ID}"
 echo "  Flavor:    ${flavor} (:app:bundle${FLAVOR_CAP}Release rendered with bundletool ${BUNDLETOOL_VERSION})"
 echo "  Image:     ${BUILD_IMAGE}"
-echo "  Runtime:   ${CRUN} ($($CRUN --version 2>&1 | head -1))"
+echo "  Runtime:   ${WS_ENGINE} ($(ws_ctr --version 2>&1 | head -1 || true))"
 echo "  Workspace: ${workspace}"
 echo "  Date:      $(date)"
 
@@ -199,31 +189,26 @@ echo "  Date:      $(date)"
 banner "OFFICIAL ARTIFACT"
 declare -a OFFICIAL=()      # absolute paths; OFFICIAL[0] is the base/universal APK
 mode=""                     # universal | splits
-gh_curl() {   # gh_curl <url> [curl args...]  -- GITHUB_TOKEN is optional
-    local url="$1"; shift
-    if [[ -n "${GITHUB_TOKEN:-}" ]]; then curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" "$@" "$url"
-    else curl -fsSL "$@" "$url"; fi
-}
 if [[ -n "$binary_arg" ]]; then
-    [[ -e "$binary_arg" ]] || die 2 "--binary path does not exist: ${binary_arg}"
+    [[ -e "$binary_arg" ]] || inv "--binary path does not exist: ${binary_arg}"
     binary_arg=$(realpath "$binary_arg")
     if [[ -d "$binary_arg" ]]; then
-        single=$(find "$binary_arg" -maxdepth 1 -type f -name '*.apk' | head -2)
+        single=$(find "$binary_arg" -maxdepth 1 -type f -name '*.apk' | head -2 || true)
         if [[ ! -f "${binary_arg}/base.apk" && -n "$single" && $(wc -l <<<"$single") -eq 1 ]]; then
             binary_arg="$single"   # a directory holding one APK is the single-artifact case
         fi
     fi
     if [[ -d "$binary_arg" ]]; then
         mode="splits"
-        [[ -f "${binary_arg}/base.apk" ]] || die 2 "--binary directory has no base.apk: ${binary_arg}" "Split directory without base.apk"
+        [[ -f "${binary_arg}/base.apk" ]] || inv "--binary directory has no base.apk: ${binary_arg}"
         OFFICIAL+=("${binary_arg}/base.apk")
         while IFS= read -r f; do OFFICIAL+=("$f"); done < <(find "$binary_arg" -maxdepth 1 -type f -name 'split_config.*.apk' | sort)
-        [[ ${#OFFICIAL[@]} -gt 1 ]] || die 2 "No split_config.*.apk next to base.apk; a single APK must be passed as a file" "Split directory without ABI splits"
+        [[ ${#OFFICIAL[@]} -gt 1 ]] || inv "No split_config.*.apk next to base.apk; a single APK must be passed as a file"
         # Only ABI splits exist for this app (language/density splits are disabled in the bundle config).
         for f in "${OFFICIAL[@]:1}"; do
             case "$(basename "$f")" in
                 split_config.arm64_v8a.apk|split_config.armeabi_v7a.apk|split_config.x86_64.apk) ;;
-                *) die 2 "Unsupported split $(basename "$f"); this app only ships ABI splits" ;;
+                *) inv "Unsupported split $(basename "$f"); this app only ships ABI splits" ;;
             esac
         done
         log_info "Play split set: ${#OFFICIAL[@]} APKs in ${binary_arg}"
@@ -235,24 +220,26 @@ else
     mode="universal"
     if [[ -n "$version_arg" ]]; then rel_tag="v${version_arg}"
     else
-        rel_tag=$(gh_curl "https://api.github.com/repos/MixinNetwork/android-app/releases/latest" 2>/dev/null \
-            | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' | head -1)
-        [[ -n "$rel_tag" ]] || die 2 "Could not resolve the latest GitHub release; pass --version or --binary"
+        ws_fetch "https://api.github.com/repos/MixinNetwork/android-app/releases/latest" "${DL_DIR}/latest.json"
+        rel_tag=$(grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' "${DL_DIR}/latest.json" | sed -E 's/.*"([^"]+)"$/\1/' | head -1 || true)
+        [[ -n "$rel_tag" ]] || nov "Could not resolve the latest GitHub release; pass --version or --binary"
         log_info "No --version given; latest GitHub release is ${rel_tag}"
     fi
     apk_url="${REPO_URL}/releases/download/${rel_tag}/mixin-android-${rel_tag#v}.apk"
     dl="${DL_DIR}/mixin-android-${rel_tag#v}.apk"
     log_info "Downloading ${apk_url}"
-    gh_curl "$apk_url" --retry 3 --retry-delay 5 -o "$dl" || die 2 "Download failed: ${apk_url}" "Failed to download official APK: ${apk_url}"
-    OFFICIAL+=("$dl")
+    ws_fetch "$apk_url" "$dl"
+    OFFICIAL+=("$dl"); downloaded=1
     log_success "Downloaded $(basename "$dl") ($(stat -c%s "$dl") bytes)"
 fi
 for f in "${OFFICIAL[@]}"; do printf '  %-28s %s  %s bytes\n' "$(basename "$f")" "$(sha256of "$f")" "$(stat -c%s "$f")"; done
 app_hash=$(sha256of "${OFFICIAL[0]}")
+[[ -z "${downloaded:-}" ]] || YAML_HASHES=("$app_hash")   # ABS publishes a --version run by this hash
 
 # Bind-mount the official APKs read-only under /official/<basename>.
 OFF_MOUNTS=(); for f in "${OFFICIAL[@]}"; do OFF_MOUNTS+=(-v "${f}:/official/$(basename "$f"):ro"); done
 BASE_NAME="$(basename "${OFFICIAL[0]}")"
+[[ "$BASE_NAME" =~ ^[A-Za-z0-9._+-]+\.apk$ ]] || inv "official APK file name may only use A-Z a-z 0-9 . _ + -: ${BASE_NAME}"
 
 # PHASE 0: METADATA -----------------------------------------------------------
 banner "PHASE 0: OFFICIAL APK METADATA + BUILD INPUTS"
@@ -271,10 +258,20 @@ abis=$(grep -oE "^native-code: .*" <<<"$badging" | tr -d "'" | sed 's/^native-co
 sig=$("$BT/apksigner" verify --verbose --print-certs "$apk" 2>&1) || { echo "ERROR: signature verification failed for ${BASE_NAME}"; printf '%s\n' "$sig"; exit 1; }
 signer=$(sed -nE 's/^Signer( #[0-9]+| \(minSdkVersion=[^)]*\))? certificate SHA-256 digest: //p' <<<"$sig" | sort -u | paste -sd, -)
 stamp=$(sed -nE 's/^Source Stamp Signer certificate DN: //p' <<<"$sig" | head -1)
+[[ -n "$signer" ]] || { echo "ERROR: no signer certificate read from ${BASE_NAME}"; exit 1; }
+: > /out/stamped; grep -q 'Verified for SourceStamp: true' <<<"$sig" && echo "${BASE_NAME}" >> /out/stamped
 for other in /official/*.apk; do
     [[ "$other" == "$apk" ]] && continue
-    s2=$("$BT/apksigner" verify --print-certs "$other" 2>&1 | sed -nE 's/^Signer( #[0-9]+)? certificate SHA-256 digest: //p' | sort -u | paste -sd, -)
-    [[ "$s2" == "$signer" ]] || { echo "ERROR: $(basename "$other") signed by ${s2:-nobody}, base by ${signer}"; exit 1; }
+    n2=$(basename "$other"); sig2=$("$BT/apksigner" verify --verbose --print-certs "$other" 2>&1) || { echo "ERROR: signature verification failed for ${n2}"; exit 1; }
+    s2=$(sed -nE 's/^Signer( #[0-9]+| \(minSdkVersion=[^)]*\))? certificate SHA-256 digest: //p' <<<"$sig2" | sort -u | paste -sd, -)
+    [[ "$s2" == "$signer" ]] || { echo "ERROR: ${n2} signed by ${s2:-nobody}, base by ${signer}"; exit 1; }
+    st2=$(sed -nE 's/^Source Stamp Signer certificate DN: //p' <<<"$sig2" | head -1)
+    [[ "$st2" == "$stamp" ]] || { echo "ERROR: ${n2} SourceStamp '${st2:-none}' differs from the base's '${stamp:-none}'"; exit 1; }
+    b2=$("$BT/aapt2" dump badging "$other" 2>/dev/null | head -1)
+    [[ "$b2" == *"name='${pkg}'"* && "$b2" == *"versionCode='${vcode}'"* ]] || { echo "ERROR: ${n2} is not ${pkg} versionCode ${vcode}: ${b2}"; exit 1; }
+    x="${n2#split_}"; [[ "$n2" != split_config.* || "$b2" == *"split='${x%.apk}'"* ]] || { echo "ERROR: ${n2} declares another split: ${b2}"; exit 1; }
+    grep -q 'Verified for SourceStamp: true' <<<"$sig2" && echo "$n2" >> /out/stamped
+    echo "[META] ${n2}: same package, versionCode, signer and SourceStamp"
 done
 printf '%s\n' "$pkg" > /out/pkg; printf '%s\n' "$vname" > /out/vname; printf '%s\n' "$vcode" > /out/vcode
 printf '%s\n' "$signer" > /out/signer; printf '%s\n' "$abis" > /out/abis; printf '%s\n' "$stamp" > /out/stamp
@@ -330,17 +327,24 @@ for pair in "com.google.android.geo.API_KEY:GOOGLE_MAP_KEY" "com.bugsnag.android
 done
 META
 sed -i "s/\${BASE_NAME}/${BASE_NAME}/g" "$ctx/meta.sh"
-$CRUN run --rm --name "${CTR_BASE}-meta" "${OFF_MOUNTS[@]}" -v "${META_DIR}:/out" -v "${ctx}/meta.sh:/meta.sh:ro" \
-    "$BUILD_IMAGE" bash /meta.sh || die 1 "Phase 0 metadata extraction failed" "APK metadata extraction failed"
+ws_ctr run --rm --name "${CTR_BASE}-meta" "${OFF_MOUNTS[@]}" -v "${META_DIR}:/out" -v "${ctx}/meta.sh:/meta.sh:ro" \
+    "$BUILD_IMAGE" bash /meta.sh || nov "Phase 0 metadata extraction failed"
 pkg_id=$(cat "$META_DIR/pkg"); wallet_version=$(cat "$META_DIR/vname"); version_code=$(cat "$META_DIR/vcode")
 signer=$(cat "$META_DIR/signer"); abis=$(cat "$META_DIR/abis"); stamp=$(cat "$META_DIR/stamp"); min_sdk=$(cat "$META_DIR/minsdk"); official_rev=$(cat "$META_DIR/vcs_rev")
-[[ "$pkg_id" == "$APP_ID" ]] || die 1 "APK app ID mismatch: expected ${APP_ID}, got ${pkg_id}"
-[[ -n "$wallet_version" ]] || die 1 "Could not derive versionName from the official APK"
+[[ "$pkg_id" == "$APP_ID" ]] || nov "APK app ID mismatch: expected ${APP_ID}, got ${pkg_id}"
+[[ -n "$wallet_version" ]] || nov "Could not derive versionName from the official APK"
 if [[ -n "$version_arg" && "$version_arg" != "$wallet_version" ]]; then
-    die 2 "Requested --version ${version_arg} but the official APK reports ${wallet_version}" "Requested version ${version_arg} but official APK is ${wallet_version}"
+    inv "Requested --version ${version_arg} but the official APK reports ${wallet_version}"
 fi
 if [[ "$mode" == "universal" && "$abis" != *arm64-v8a*armeabi-v7a*x86_64* ]]; then
     log_warn "Universal APK expected three ABIs, found: ${abis}"
+fi
+[[ "$wallet_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$version_code" =~ ^[0-9]+$ ]] || nov "Unexpected versionName '${wallet_version}' or versionCode '${version_code}' in the official APK"
+[[ -z "$official_rev" || "$official_rev" =~ ^[0-9a-f]{40}$ ]] || nov "Unexpected source revision '${official_rev}' in the official APK"
+if [[ -n "$arch_arg" ]]; then
+    if [[ "$mode" == "splits" ]]; then [[ -f "${binary_arg}/split_config.${arch_arg//-/_}.apk" ]] || inv "--arch ${arch_arg}: the split set has no split_config.${arch_arg//-/_}.apk"
+    else [[ " ${abis} " == *" ${arch_arg} "* ]] || inv "--arch ${arch_arg}: the APK ships ${abis}"; fi
+    log_success "--arch ${arch_arg} present in the artifact"
 fi
 log_success "APK metadata: v${wallet_version} (code ${version_code}), signer ${signer}"
 
@@ -364,7 +368,8 @@ fi
 cd /project || exit 7
 tag_commit=$(git rev-parse HEAD 2>/dev/null)
 [[ -n "$tag_commit" ]] || { echo "[BUILD] ERROR: git cannot read HEAD in /project"; git rev-parse HEAD; exit 9; }
-echo "[BUILD] ${tag} = ${tag_commit} ($(git cat-file -t "refs/tags/${tag}" 2>/dev/null || echo lightweight) tag object)"
+tag_type=$(git cat-file -t "refs/tags/${tag}" 2>/dev/null || echo unknown); printf '%s\n' "$tag_type" > /out/tag_type.txt
+echo "[BUILD] ${tag} = ${tag_commit} (${tag_type} object)"
 # The artifact may name the exact commit it was built from. When that commit is public it is the
 # honest thing to build; the tag is the fallback. Either way both commits are reported.
 offrev="__OFFREV__"; source_note="tag ${tag} (artifact names no revision)"
@@ -403,42 +408,61 @@ echo "[BUILD] gradle wrapper: $(sed -nE 's/^distributionUrl=.*gradle-([0-9.]+)-.
 ./gradlew --no-daemon --stacktrace ":app:bundle__FLAVOR__Release" \
     -x "bugsnagUpload__FLAVOR__ReleaseProguardMapping" -x "bugsnagCreate__FLAVOR__ReleaseBuild" 2>&1 | tee /out/gradle.log \
     | grep -E "^> Task :app:(bundle|package|minify|merge.*Native|externalNative)|BUILD |FAILURE|What went wrong|^> [A-Z]|^e: " | tail -60
-rc=${PIPESTATUS[0]}
+st=("${PIPESTATUS[@]}"); rc=${st[0]}
+[[ "${st[1]}" -eq 0 ]] || { echo "[BUILD] ERROR: tee exit ${st[1]}, Gradle log not written"; exit 90; }
 aab=$(ls app/build/outputs/bundle/*Release/*.aab 2>/dev/null | head -1)
 if [[ "$rc" -ne 0 || -z "$aab" ]]; then echo "[BUILD] gradle exit ${rc}, aab: ${aab:-none}"; tail -40 /out/gradle.log; exit 1; fi
 cp "$aab" /out/app.aab; sha256sum /out/app.aab
 BUILD
 sed -i -e "s/__FLAVOR__/${FLAVOR_CAP}/g" -e "s/__TAG__/${tag}/g" -e "s/__VERSION__/${wallet_version}/g" \
     -e "s/__VCODE__/${version_code}/g" -e "s|__REPO__|${REPO_URL}|g" -e "s/__OFFREV__/${official_rev}/g" "$ctx/build.sh"
-$CRUN run --rm --name "${CTR_BASE}-build" "${MEM_ARGS[@]}" \
+build_rc=0
+ws_ctr run --rm --name "${CTR_BASE}-build" ${MEM_ARGS[@]+"${MEM_ARGS[@]}"} \
     -v "${SRC_DIR}:/project" -v "${META_DIR}:/inputs:ro" -v "${GRADLE_HOME}:/gradle-home" -v "${BUILD_DIR}:/out" \
-    -v "${ctx}/build.sh:/build.sh:ro" "$BUILD_IMAGE" bash /build.sh
-build_rc=$?
+    -v "${ctx}/build.sh:/build.sh:ro" "$BUILD_IMAGE" bash /build.sh || build_rc=$?
 case "$build_rc" in
     0) ;;
-    7) die 2 "Clone of ${tag} failed (see output above)" "Tag ${tag} could not be cloned from ${REPO_URL}" ;;
-    9) die 1 "git cannot read the checkout in /project (ownership or permissions, see output above)" "git could not read the source checkout" ;;
-    8) die 1 "Source at ${tag} does not declare version ${wallet_version}" "Source version at ${tag} does not match the artifact version ${wallet_version}" ;;
-    *) die 1 "Gradle build failed (see built/gradle.log)" "Gradle :app:bundle${FLAVOR_CAP}Release failed" ;;
+    7) nov "Clone of ${tag} failed (see output above)" ;;
+    9) nov "git cannot read the checkout in /project (ownership or permissions, see output above)" ;;
+    8) nov "Source at ${tag} does not declare version ${wallet_version}; source and artifact identity unresolved" ;;
+    90) nov "Gradle log not written (tee failed)" ;;
+    1) kind=$(ws_gradle_failure_kind "$BUILD_DIR/gradle.log")
+       [[ "$kind" == source ]] || nov "Gradle build failed, cause ${kind} (exit ${build_rc}; see ${BUILD_DIR}/gradle.log)"
+       ftbfs "Gradle build failed with a source diagnostic (see ${BUILD_DIR}/gradle.log)" "Gradle :app:bundle${FLAVOR_CAP}Release failed with a compiler or resource error at ${tag}" ;;
+    *) nov "Build container failed (exit ${build_rc})" ;;
 esac
-[[ -f "$BUILD_DIR/app.aab" ]] || die 1 "Build finished without an AAB" "Gradle :app:bundle${FLAVOR_CAP}Release produced no AAB"
-commit=$(cat "$BUILD_DIR/commit.txt"); version_build_note=$(cat "$BUILD_DIR/version_build_note.txt")
+[[ -f "$BUILD_DIR/app.aab" ]] || nov "Build finished without an AAB"
+commit=$(cat "$BUILD_DIR/commit.txt"); version_build_note=$(cat "$BUILD_DIR/version_build_note.txt"); tag_type=$(cat "$BUILD_DIR/tag_type.txt" 2>/dev/null || echo unknown)
 source_note=$(paste -sd'|' "$BUILD_DIR/source_note.txt" | sed 's/|/; /g')
 [[ "$version_build_note" == *patched* ]] && log_warn "$version_build_note"
 [[ "$source_note" == *WARNING* || "$source_note" == *patched* ]] && log_warn "$source_note"
 log_success "Checked out ${tag} = ${commit}; AAB built: $(sha256of "$BUILD_DIR/app.aab")"
 
+section "BUILD RECORD (ws-buildlock, verdict unaffected)"
+BUILD_LOCK_FILE=""; BL_SH="${TOOLS_DIR}/ws-buildlock.sh"; bl_rc=0
+if curl -fsSL --max-time 60 -o "$BL_SH" "https://gitlab.com/walletscrutiny/walletScrutinyCom/-/raw/${BUILDLOCK_REV}/scripts/rb/ws-buildlock.sh" < /dev/null \
+   && [[ "$(ws_sha256 "$BL_SH")" == "$BUILDLOCK_SHA256" ]]; then
+    ws_ctr run --rm --name "${CTR_BASE}-lock" -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+        -v "${GRADLE_HOME}:/gradle-home:ro" -v "${SRC_DIR}:/project:ro" -v "${BL_DIR}:/build-lock" -v "${BL_SH}:/ws-buildlock.sh:ro" \
+        "$BUILD_IMAGE" bash /ws-buildlock.sh --out /build-lock --gradle-home /gradle-home --src /project --app-id "$APP_ID" \
+        --version "$wallet_version" --platform android --commit "$commit" > "${workspace}/build-lock.log" 2>&1 || bl_rc=$?
+    if [[ "$bl_rc" -eq 0 && -s "${BL_DIR}/build-lock.json" ]] && ! grep -q 'nothing recorded' "${workspace}/build-lock.log"; then
+        bl_n=$(grep -o '"ecosystem": *"gradle"' "${BL_DIR}/build-lock.json" | wc -l || true)
+        if [[ "${bl_n:-0}" -gt 0 ]]; then BUILD_LOCK_FILE="${BL_DIR}/build-lock.json"
+            log_success "build-lock.json: ${BUILD_LOCK_FILE} (${bl_n} Gradle artifacts, sha256 $(ws_sha256 "$BUILD_LOCK_FILE"))"
+        else log_warn "build-lock.json lists no Gradle artifacts; not offered for upload; verdict unaffected."; fi
+    else
+        log_warn "No build-lock.json (exit ${bl_rc}; see ${workspace}/build-lock.log); verdict unaffected."
+    fi
+else
+    log_warn "build-lock skipped: no ws-buildlock.sh with the expected sha256; verdict unaffected."
+fi
+
 section "Rendering APKs with bundletool ${BUNDLETOOL_VERSION} (${mode})"
 bt_jar="${TOOLS_DIR}/bundletool-all-${BUNDLETOOL_VERSION}.jar"
-if [[ ! -f "$bt_jar" ]]; then
-    $CRUN run --rm --name "${CTR_BASE}-render" -v "${TOOLS_DIR}:/tools" "$BUILD_IMAGE" \
-        curl -fsSL --retry 3 -o "/tools/$(basename "$bt_jar")" \
-        "https://github.com/google/bundletool/releases/download/${BUNDLETOOL_VERSION}/bundletool-all-${BUNDLETOOL_VERSION}.jar" \
-        || die 2 "bundletool download failed"
-fi
-[[ "$(sha256of "$bt_jar")" == "$BUNDLETOOL_SHA256" ]] || die 1 "bundletool checksum mismatch: $(sha256of "$bt_jar")" "bundletool jar checksum mismatch"
+ws_fetch "https://github.com/google/bundletool/releases/download/${BUNDLETOOL_VERSION}/bundletool-all-${BUNDLETOOL_VERSION}.jar" "$bt_jar" "$BUNDLETOOL_SHA256"
 if [[ "$mode" == "universal" ]]; then bt_mode="--mode=universal"; else bt_mode="--mode=default"; fi
-$CRUN run --rm --name "${CTR_BASE}-render" -v "${TOOLS_DIR}:/tools:ro" -v "${BUILD_DIR}:/out" "$BUILD_IMAGE" bash -c "
+ws_ctr run --rm --name "${CTR_BASE}-render" -v "${TOOLS_DIR}:/tools:ro" -v "${BUILD_DIR}:/out" "$BUILD_IMAGE" bash -c "
     set -e; cd /out; rm -rf rendered; mkdir rendered
     java -jar /tools/$(basename "$bt_jar") build-apks --bundle=/out/app.aab --output=/out/rendered.apks ${bt_mode} --overwrite
     cd rendered && unzip -q -o ../rendered.apks && find . -name '*.apk' | sort | sed 's|^\./||' > list.txt && cat list.txt
@@ -447,7 +471,7 @@ $CRUN run --rm --name "${CTR_BASE}-render" -v "${TOOLS_DIR}:/tools:ro" -v "${BUI
         m=\$(\"\$BT/aapt2\" dump xmltree --file AndroidManifest.xml \"\$a\" 2>/dev/null | grep -oE 'minSdkVersion\\([^)]*\\)=[0-9]+' | grep -oE '[0-9]+\$' | head -1)
         echo \"\$a \${m:-?}\" >> variants.txt
     done" \
-    || die 1 "bundletool build-apks failed"
+    || nov "bundletool build-apks failed"
 # Pair every official APK with its rendered counterpart.
 declare -a PAIRS=()   # "official-basename|rendered-relative-path"
 if [[ "$mode" == "universal" ]]; then
@@ -459,7 +483,7 @@ else
         case "$n" in base.apk) stem="base-master" ;; split_config.*.apk) stem="base-${n#split_config.}"; stem="${stem%.apk}" ;; esac
         r=$(awk -v s="splits/${stem}" -v m="$min_sdk" '($1 == s ".apk" || $1 ~ ("^" s "_[0-9]+\\.apk$")) && $2 == m { print $1; exit }' "$BUILD_DIR/rendered/variants.txt")
         [[ -n "$r" && -f "$BUILD_DIR/rendered/$r" ]] \
-            || die 1 "bundletool produced no ${stem} variant with minSdkVersion ${min_sdk} for ${n} (see built/rendered/variants.txt)" "Rendered split set lacks a minSdk ${min_sdk} variant for ${n}"
+            || nov "bundletool produced no ${stem} variant with minSdkVersion ${min_sdk} for ${n} (see built/rendered/variants.txt)"
         PAIRS+=("${n}|${r}")
     done
 fi
@@ -470,10 +494,7 @@ banner "PHASE 2: CONTENTS COMPARISON (${#PAIRS[@]} artifact(s))"
 echo "  Signing material and the Play SourceStamp are excluded; resources.arsc and"
 echo "  AndroidManifest.xml are judged on their decoded form (WS #574)."
 echo "  Started: $(date)"
-if [[ ! -f "${TOOLS_DIR}/apktool.jar" ]]; then
-    $CRUN run --rm --name "${CTR_BASE}-render" -v "${TOOLS_DIR}:/tools" "$BUILD_IMAGE" \
-        curl -fsSL --retry 3 -o /tools/apktool.jar "$APKTOOL_URL" || die 2 "apktool download failed"
-fi
+ws_fetch "$APKTOOL_URL" "${TOOLS_DIR}/apktool.jar" "$APKTOOL_SHA256"
 cat > "$ctx/compare.sh" <<'CMP'
 #!/bin/bash
 set -uo pipefail
@@ -486,12 +507,15 @@ while IFS='|' read -r off rel; do
     unzip -q -o "/official/${off}" -d "$o" || { echo "ERROR: cannot unpack ${off}"; exit 3; }
     unzip -q -o "/built/rendered/${rel}" -d "$b" || { echo "ERROR: cannot unpack ${rel}"; exit 3; }
     for d in "$o" "$b"; do [[ -n "$(find "$d" -type f | head -1)" ]] || { echo "ERROR: ${d} empty after unpack"; exit 3; }; done
-    # Signing material (upstream signs, we do not) and the Play SourceStamp file (written by
-    # Google Play, certificate CN=Android O=Google Inc.) can never come out of a rebuild.
-    find "$o" "$b" -maxdepth 2 -path '*/META-INF/*' \
-        \( -iname '*.RSA' -o -iname '*.DSA' -o -iname '*.EC' -o -iname '*.SF' -o -iname 'MANIFEST.MF' \) \
-        -print -delete | sed 's|^/tmp/[ob]-[^/]*/|  excluded (signing): |'
-    find "$o" "$b" -maxdepth 1 -name 'stamp-cert-sha256' -print -delete | sed 's|^/tmp/[ob]-[^/]*/|  excluded (Play SourceStamp): |'
+    # Official-only signing files, and the stamp file if it is one 32-byte root entry and apksigner verified
+    # the SourceStamp (phase 0), are excluded; each counts as raw + acceptable. A built file at the path stays.
+    ex=0; xl=""; sok=0; sg=0
+    grep -Fqx -- "$off" /stamped && [[ $(unzip -Z1 "/official/${off}" | grep -cx stamp-cert-sha256) -eq 1 ]] && sok=1
+    while IFS= read -r f; do r="${f#"$o"/}"; [[ -e "$b/$r" || ( "$r" == stamp-cert-sha256 && $sok -ne 1 ) ]] && continue
+        rm -f -- "$f" || exit 3; ex=$((ex+1)); [[ "$r" == META-INF/* ]] && sg=1; xl+="Only in $(dirname "$f"): $(basename "$f")"$'\n'
+        echo "  excluded (official-only): ${r}"; echo "${off}: official-only ${r} excluded" >> /out/acceptable.txt
+    done < <(find "$o" -maxdepth 2 -type f \( -path "$o/META-INF/*" \( -iname '*.RSA' -o -iname '*.DSA' -o -iname '*.EC' -o -iname '*.SF' -o -iname 'MANIFEST.MF' \) -o -path "$o/stamp-cert-sha256" -size 32c \))
+    [[ $sg -eq 0 || -d "$b/META-INF" ]] || rmdir "$o/META-INF" 2>/dev/null || true
     echo "  files: $(find "$o" -type f | wc -l) official, $(find "$b" -type f | wc -l) built"
     diff -rq "$o" "$b" > /tmp/raw.txt 2>&1; rc=$?
     if [[ $rc -ne 0 && $rc -ne 1 ]]; then echo "ERROR: diff exit ${rc}"; head -20 /tmp/raw.txt; exit 3; fi
@@ -500,12 +524,13 @@ while IFS='|' read -r off rel; do
     cnt=$(grep -E '^(Files|Only in)' /tmp/raw.txt || true)
     raw=$(printf '%s\n' "$cnt" | grep -c . || true); raw=${raw:-0}
     [[ $rc -eq 1 && $raw -eq 0 ]] && { echo "ERROR: diff reported differences but none were parsed"; exit 3; }
-    echo "  raw differences: ${raw}"
-    printf '%s\n' "$cnt" | sed "s|/tmp/o-${tag}/||;s|/tmp/b-${tag}/||" | head -5 | sed 's/^/    /'
+    raw=$((raw+ex)); echo "  raw differences: ${raw} (${ex} official-only signing/stamp file(s) excluded)"
+    all=$(printf '%s%s\n' "$xl" "$cnt" | grep . || true)
+    printf '%s\n' "$all" | sed "s|/tmp/o-${tag}/||;s|/tmp/b-${tag}/||" | head -5 | sed 's/^/    /'
     [[ $raw -gt 5 ]] && echo "    ... full list: comparison/diff_full.txt"
-    { echo "## ${off}"; printf '%s\n' "$cnt"; } >> /out/diff_full.txt
-    acc=0; mat=0; decoded=0
-    decode_both() {   # apktool failure is a tool error (exit 3 -> ftbfs), never a verdict on the artifact
+    { echo "## ${off}"; printf '%s\n' "$all"; } >> /out/diff_full.txt
+    acc=$ex; mat=0; decoded=0
+    decode_both() {   # apktool failure is a tool error: exit 3, no verdict
         [[ $decoded -eq 1 ]] && return 0; decoded=1
         rm -rf /tmp/do /tmp/db
         $APKTOOL d -f --no-src --no-debug-info -o /tmp/do "/official/${off}" > /tmp/apktool.log 2>&1 \
@@ -531,6 +556,7 @@ while IFS='|' read -r off rel; do
                     || { echo "ERROR: apktool output incomplete for ${off} (resources.arsc present but no decoded res/)"; exit 3; }
                 rf="/out/diff_res_${tag}.txt"
                 diff -r /tmp/do/res /tmp/db/res > "$rf" 2>&1; drc=$?
+                [[ $drc -le 1 ]] || { echo "ERROR: decoded res/ diff failed (exit ${drc})"; exit 3; }
                 # Everything that is not diff structure must be the Crashlytics mapping id, a per-build
                 # R8 UUID that WS #574 accepts; anything else in the decoded tree is material.
                 rest=$(grep -vE '^([0-9,]+[acd][0-9,]+|---|diff (-r )?/tmp/.*)$' "$rf" | grep -v 'crashlytics\.mapping_file_id' || true)
@@ -549,21 +575,24 @@ while IFS='|' read -r off rel; do
             AndroidManifest.xml)
                 decode_both; mf="/out/diff_manifest_${tag}.txt"
                 diff -u /tmp/do/AndroidManifest.xml /tmp/db/AndroidManifest.xml > "$mf" 2>&1; drc=$?
+                [[ $drc -le 1 ]] || { echo "ERROR: manifest diff failed (exit ${drc})"; exit 3; }
                 # Google Play stamps the manifest of everything it serves (stamp.source, stamp.type,
                 # vending.derived.apk.id); a rebuild cannot carry those. Any other changed line is material.
                 changed=$(grep -E '^[-+][^-+]' "$mf" || true)
-                # Judge on both manifests with the stamp lines removed and an element left childless
-                # collapsed to its self-closing form (that is how the stamp shows up in a config split).
-                norm() { grep -vE 'com\.android\.(stamp\.(source|type)|vending\.derived\.apk\.id)' "$1" | awk '
+                # Official side only: drop these exact Play lines. Both: collapse a childless element (config splits).
+                norm() { if [[ $2 == o ]]; then grep -vE '^[[:space:]]*<meta-data android:name="com\.android\.(stamp\.source" android:value="https://play\.google\.com/store|stamp\.type" android:value="STAMP_TYPE_(DISTRIBUTION|STANDALONE)_APK|vending\.derived\.apk\.id" android:value="[0-9]+)"/>$' "$1"; else cat "$1"; fi | awk '
                     { if (held != "") { if ($0 ~ ("^[ \t]*</" tag ">$")) { sub(/>$/, "/>", held); print held; held = ""; next }
                                         print held; held = "" }
                       if (match($0, /^[ \t]*<[A-Za-z][A-Za-z0-9_.:-]*( [^>]*[^\/?])?>$/)) { held = $0; tag = $0; sub(/^[ \t]*</, "", tag); sub(/[ \t>].*$/, "", tag); next }
                       print } END { if (held != "") print held }'; }
-                rest=$(diff <(norm /tmp/do/AndroidManifest.xml) <(norm /tmp/db/AndroidManifest.xml) | grep -E '^[<>]' || true)
+                norm /tmp/do/AndroidManifest.xml o > /tmp/no.txt && norm /tmp/db/AndroidManifest.xml b > /tmp/nb.txt || { echo "ERROR: manifest normalization failed"; exit 3; }
+                diff /tmp/no.txt /tmp/nb.txt > /tmp/mn.txt; nrc=$?
+                [[ $nrc -le 1 ]] || { echo "ERROR: normalized manifest diff failed (exit ${nrc})"; exit 3; }
+                rest=$(grep -E '^[<>]' /tmp/mn.txt || true)
                 if [[ $drc -eq 0 ]]; then
                     echo "  AndroidManifest.xml: binary differs, decoded XML IDENTICAL, acceptable"; acc=$((acc+1))
                     echo "${off}: AndroidManifest.xml binary differs, decoded XML identical" >> /out/acceptable.txt
-                elif [[ $drc -eq 1 && -z "$rest" ]]; then
+                elif [[ $drc -eq 1 && $nrc -eq 0 ]]; then
                     echo "  AndroidManifest.xml: decoded XML differs only in Play SourceStamp meta-data, acceptable"
                     printf '%s\n' "$changed" | head -3 | sed 's/^/    /'; acc=$((acc+1))
                     printf '%s\n' "$changed" | sed "s/^/${off}: manifest /" >> /out/acceptable.txt
@@ -588,12 +617,14 @@ printf 'raw_total=%s\nacceptable=%s\nmaterial=%s\n' "$total_raw" "$total_acc" "$
 CMP
 printf '%s\n' "${PAIRS[@]}" > "$ctx/pairs.txt"
 : > "$CMP_DIR/per_artifact.txt"
-$CRUN run --rm --name "${CTR_BASE}-cmp" "${OFF_MOUNTS[@]}" -v "${BUILD_DIR}:/built:ro" -v "${TOOLS_DIR}:/tools:ro" \
-    -v "${CMP_DIR}:/out" -v "${ctx}/compare.sh:/compare.sh:ro" -v "${ctx}/pairs.txt:/pairs.txt:ro" \
-    "$BUILD_IMAGE" bash /compare.sh 2>&1 | tee "$CMP_DIR/comparison.log"
-[[ ${PIPESTATUS[0]} -eq 0 ]] || die 1 "Comparison phase failed" "Comparison phase failed (tool error)"
+cmp_rc=0
+ws_ctr run --rm --name "${CTR_BASE}-cmp" "${OFF_MOUNTS[@]}" -v "${BUILD_DIR}:/built:ro" -v "${TOOLS_DIR}:/tools:ro" \
+    -v "${CMP_DIR}:/out" -v "${ctx}/compare.sh:/compare.sh:ro" -v "${ctx}/pairs.txt:/pairs.txt:ro" -v "${META_DIR}/stamped:/stamped:ro" \
+    "$BUILD_IMAGE" bash /compare.sh 2>&1 | tee "$CMP_DIR/comparison.log" || cmp_rc=$?
+[[ "$cmp_rc" -eq 0 && -s "$CMP_DIR/summary.txt" ]] || nov "Comparison phase failed (tool error, exit ${cmp_rc})"
 raw_total=$(sed -nE 's/^raw_total=([0-9]+)$/\1/p' "$CMP_DIR/summary.txt"); acc_count=$(sed -nE 's/^acceptable=([0-9]+)$/\1/p' "$CMP_DIR/summary.txt")
-mat_count=$(sed -nE 's/^material=([0-9]+)$/\1/p' "$CMP_DIR/summary.txt"); mat_count=${mat_count:-1}
+mat_count=$(sed -nE 's/^material=([0-9]+)$/\1/p' "$CMP_DIR/summary.txt")
+[[ "$raw_total" =~ ^[0-9]+$ && "$acc_count" =~ ^[0-9]+$ && "$mat_count" =~ ^[0-9]+$ ]] || nov "Comparison summary unreadable (${CMP_DIR}/summary.txt)"
 
 section "VERDICT (judged on non-signature diffs across all artifacts)"
 echo "  Raw differences:              ${raw_total:-?}"
@@ -604,31 +635,32 @@ if [[ "$mat_count" -eq 0 ]]; then VERDICT="reproducible"; log_success "Verdict: 
 else VERDICT="not_reproducible"; log_error "Verdict: NOT_REPRODUCIBLE (${mat_count} material diff(s))"; fi
 
 built_hash=$(sha256of "$BUILD_DIR/rendered/${PAIRS[0]##*|}")
+diff_lines="${CMP_DIR}/diff_lines.txt"
+awk '/^## /{a=substr($0,4); next} /^(Files|Only in)/{gsub(/\/tmp\/o-[^\/ :]+/,"o"); gsub(/\/tmp\/b-[^\/ :]+/,"b"); print a ": " $0}' \
+    "$CMP_DIR/diff_full.txt" > "$diff_lines" || nov "cannot read ${CMP_DIR}/diff_full.txt"
+diff_n=$(wc -l < "$diff_lines")
+diff_text="$(
+    if [[ "$diff_n" -eq 0 ]]; then echo "(no differing entries)"; else sed -n 1,5p "$diff_lines"
+        [[ "$diff_n" -le 5 ]] || echo "    ... $((diff_n - 5)) more line(s); full list: ${CMP_DIR}/diff_full.txt"; fi
+    echo ""
+    echo "Revision, tag (and its signature):"
+    echo "Tag: ${tag} ($(case "$tag_type" in tag) echo "annotated, signature not checked" ;; commit) echo "lightweight, no signature possible" ;; *) echo "$tag_type" ;; esac))"
+    echo "Built from: ${source_note}"
+)"
 echo ""
-cat <<RESULTS
-===== Begin Results =====
-appId:          ${APP_ID}
-signer:         ${signer}
-apkVersionName: ${wallet_version}
-apkVersionCode: ${version_code}
-verdict:        ${VERDICT}
-appHash:        ${app_hash}
-builtHash:      ${built_hash}
-commit:         ${commit}
-scriptVersion:  ${SCRIPT_VERSION}
-scriptHash:     ${SCRIPT_SHA256}
-variant:        ${flavor} flavor, :app:bundle${FLAVOR_CAP}Release, bundletool ${BUNDLETOOL_VERSION} ${mode}
-image:          ${BUILD_IMAGE}
-artifacts:      ${#PAIRS[@]} ($(paste -sd' ' "$CMP_DIR/per_artifact.txt"))
-rawDiffs:       ${raw_total}
-acceptableDiffs:${acc_count} (WS #574; each one listed in comparison/acceptable.txt)
-materialDiffs:  ${mat_count}
-excluded:       META-INF signing files, stamp-cert-sha256 and stamp meta-data (Play SourceStamp${stamp:+, signer $stamp})
-buildInputs:    google-services.json + manifest API keys rebuilt from the official APK
-versionBuild:   ${version_build_note}
-sourceRevision: ${source_note}
-===== End Results =====
-RESULTS
-write_yaml "${VERDICT}" "Source-built ${flavor} AAB rendered with bundletool ${BUNDLETOOL_VERSION} (${mode}) vs official: ${raw_total} raw difference(s) over ${#PAIRS[@]} artifact(s) after excluding signing material and the Play SourceStamp, of which ${acc_count} acceptable per WS #574 and ${mat_count} material. Official ${app_hash}; built ${built_hash}. google-services.json and manifest API keys were rebuilt from values found in the official APK; ${version_build_note}; source: ${source_note}."
-if [[ "$VERDICT" == "reproducible" ]]; then echo ""; echo "Exit code: 0"; exit 0
-else echo ""; echo "Exit code: 1"; exit 1; fi
+ws_results_block "$APP_ID" "$signer" "$wallet_version" "$version_code" "$VERDICT" "$app_hash" "$commit" "$diff_text"
+echo ""
+echo "builtHash:       ${built_hash}"
+echo "variant:         ${flavor} flavor, :app:bundle${FLAVOR_CAP}Release, bundletool ${BUNDLETOOL_VERSION} ${mode}"
+echo "image:           ${BUILD_IMAGE} (${WS_ENGINE})"
+echo "artifacts:       ${#PAIRS[@]} ($(paste -sd' ' "$CMP_DIR/per_artifact.txt"))"
+echo "diffs:           raw ${raw_total} (incl. official-only signing/stamp files), acceptable ${acc_count} (WS #574; listed in ${CMP_DIR}/acceptable.txt), material ${mat_count}"
+echo "excluded:        META-INF signing files, stamp-cert-sha256 and stamp meta-data (Play SourceStamp${stamp:+, signer $stamp})"
+echo "buildInputs:     google-services.json + manifest API keys rebuilt from the official APK"
+echo "versionBuild:    ${version_build_note}"
+echo "workspace:       ${workspace}"
+if [[ -n "$BUILD_LOCK_FILE" ]]; then echo "Upload with the verification: ${BUILD_LOCK_FILE} (sha256 $(ws_sha256 "$BUILD_LOCK_FILE"))"; fi
+echo ""
+ws_write_yaml "${VERDICT}" "Source-built ${flavor} AAB rendered with bundletool ${BUNDLETOOL_VERSION} (${mode}) vs official: ${raw_total} raw difference(s) over ${#PAIRS[@]} artifact(s), of which ${acc_count} acceptable per WS #574 and ${mat_count} material. Official ${app_hash}; built ${built_hash}. google-services.json and manifest API keys were rebuilt from values found in the official APK; ${version_build_note}; source: ${source_note}." ${YAML_HASHES[@]+"${YAML_HASHES[@]}"}
+[[ "$VERDICT" == "reproducible" ]] && exit 0
+exit 1
