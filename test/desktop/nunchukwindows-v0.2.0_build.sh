@@ -1,9 +1,9 @@
 #!/bin/bash
 #
 # nunchukwindows_build.sh - Nunchuk Desktop Windows Reproducible Build Verifier
-# Version: v0.1.9
+# Version: v0.2.0
 # Last modified by: Danny Garcia, Carol (Buzz), Claude Code
-# Last modified on: 2026-11-17
+# Last modified on: 2026-11-24
 # Organization: WalletScrutiny.com
 # Project: https://github.com/nunchuk-io/nunchuk-desktop
 # LICENSE: MIT License
@@ -19,27 +19,74 @@
 # image), and compares the selected file (--type) byte for byte with the release. Upstream marks Windows
 # verification "standby": expect differences.
 #
-# Usage: nunchukwindows_build.sh --version VERSION [--binary FILE|DIR] [--arch x86_64-windows] [--type setup|portable] [--golden DIR]
-# One verdict per run, for the file --type selects. Host needs podman (or docker), /dev/kvm, and read access to the golden image and VM key.
+# Shared steps come from ws-rb-core 1.1.0, pinned by sha256. One verdict per run, for --type. Usage: --help.
 #
 
 set -euo pipefail
 
-SCRIPT_VERSION="v0.1.9"
+SCRIPT_VERSION="v0.2.0"
+SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_SHA256="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | cut -d' ' -f1)" || true
+SCRIPT_SHA256="${SCRIPT_SHA256:-N/A}"
+printf '%s %s sha256:%s\n' "$(basename "$SCRIPT_PATH")" "$SCRIPT_VERSION" "$SCRIPT_SHA256"
+
+# ---- WalletScrutiny library (GitLab #1023), pinned by sha256 ------------------
+# Goes in each build script right after its self-hash line, before anything else.
+# Source: WS_LIB_FILE (offline, must match), else the cache, else GitLab by
+# commit. Nothing else. A wrong hash is rejected whichever source sent it.
+# No matching copy, or a different version inside: no verdict, no YAML, exit 2.
+# First, before anything can fail: no earlier verdict may survive this run. A run
+# that holds this folder's lock is still writing its own; that one stays, and the
+# library refuses this run when it takes the lock.
+WS_LIB_DIR0="$(dirname "$(readlink -f "$0")")"
+if command -v flock >/dev/null 2>&1; then
+  flock -n "$WS_LIB_DIR0/.comparison_results.lock" true 2>/dev/null && rm -f -- "$WS_LIB_DIR0/COMPARISON_RESULTS.yaml"
+else
+  WS_LIB_P="$(cat "$WS_LIB_DIR0/.comparison_results.lock.d/pid" 2>/dev/null || true)"
+  case "$WS_LIB_P" in ''|*[!0-9]*) WS_LIB_P="";; esac
+  { [ -n "$WS_LIB_P" ] && kill -0 "$WS_LIB_P" 2>/dev/null; } || rm -f -- "$WS_LIB_DIR0/COMPARISON_RESULTS.yaml"
+fi
+WS_LIB=ws-rb-core WS_LIB_VERSION=1.1.0
+WS_LIB_REV=3bafe3b5961f11bcf1fa4fbbe3f4f206d53a61d0 WS_LIB_SHA256=4f0920dc8edb1e07aefbb4748d72fd3cc011eb769aaa40de8b5a6a9026312c7e
+ws_lib_load() {
+  local c f u t=""
+  ws_lib_ok() { [ "$(sha256sum "$1" 2>/dev/null | cut -d' ' -f1)" = "$WS_LIB_SHA256" ]; }
+  if [ -n "${WS_LIB_FILE:-}" ]; then
+    f="$WS_LIB_FILE"
+    ws_lib_ok "$f" || { echo "[FAIL] WS_LIB_FILE $f is not sha256 $WS_LIB_SHA256: no verdict" >&2; exit 2; }
+  else
+    # Cache in XDG_CACHE_HOME or HOME; with neither, or no way to create it, a
+    # temporary folder for this run only. Every copy is hash-checked either way.
+    c="${XDG_CACHE_HOME:-${HOME:+$HOME/.cache}}"
+    if [ -n "$c" ] && mkdir -p "$c/ws-rb-lib" 2>/dev/null; then c="$c/ws-rb-lib"
+    else t="$(mktemp -d 2>/dev/null)" || { echo "[FAIL] no folder to fetch $WS_LIB into: no verdict" >&2; exit 2; }; c="$t"; fi
+    f="$c/$WS_LIB_SHA256.sh"
+    if ! ws_lib_ok "$f"; then
+      u="https://gitlab.com/walletscrutiny/walletScrutinyCom/-/raw/$WS_LIB_REV/scripts/rb/lib/$WS_LIB-$WS_LIB_VERSION.sh"
+      curl -fsSL --max-time 60 -o "$f.$$" "$u" 2>/dev/null && ws_lib_ok "$f.$$" && mv -f "$f.$$" "$f"
+      rm -f "$f.$$"
+    fi
+  fi
+  ws_lib_ok "$f" || { [ -z "$t" ] || rm -rf -- "$t"; echo "[FAIL] $WS_LIB $WS_LIB_VERSION ($WS_LIB_SHA256) unavailable or altered: no verdict" >&2; exit 2; }
+  # 1.1.0 and later mount this file into the build container (WS_LIB_PATH)
+  # and remove a temporary folder on exit; for 1.0.0 it goes now.
+  WS_LIB_PATH="$f" WS_LIB_TMP="$t"
+  . "$f"
+  [ -z "$t" ] || [ -n "${WS_LIB_MOUNT:-}" ] || rm -rf -- "$t"
+  [ "${WS_LIB_LOADED_VERSION:-}" = "$WS_LIB_VERSION" ] || { echo "[FAIL] $f holds ${WS_LIB_LOADED_VERSION:-no version}, not $WS_LIB_VERSION: no verdict" >&2; exit 2; }
+  echo "Library: $WS_LIB $WS_LIB_VERSION sha256: $WS_LIB_SHA256"
+}
+ws_lib_load
+
 APP_ID="nunchuk"
 APP_NAME="Nunchuk Desktop (Windows)"
 GH_REPO="nunchuk-io/nunchuk-desktop"
 MIN_VERSION="2.9.1"
 
-EXIT_OK=0
-EXIT_DIFF=1
-EXIT_INVALID=2
-
 APP_VERSION=""
 APP_ARCH="x86_64-windows"
 APP_TYPE="setup"
 BINARY_PATH=""
-CONTAINER_CMD=""
 GIT_IMAGE="${GIT_IMAGE:-docker.io/alpine/git@sha256:6f8eae2205a85c51106a9650e574a37fb1d5e4f645e5f6ea57cb57b9462cd4cf}"
 WIN_IMAGE="docker.io/dockurr/windows@sha256:16fd7c39a3e48bb946d29c59dc6015942e5b900a1fa5d7e5552053bfc48ee2ea"
 GOLDEN_DIR="${WS_WINDOWS_GOLDEN:-/var/lib/walletscrutiny-windows/golden-2022}"
@@ -50,22 +97,15 @@ VM_NAME=""
 VM_PORT=""
 SSH_HELPER=""
 TOOLS_USER=()
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-SCRIPT_PATH="$(readlink -f "$0")"
-SCRIPT_SHA256=""
-VERDICT_WRITTEN=false
-NO_VERDICT_BY_DESIGN=false
 RESOLVED_COMMIT="unknown"
 SOURCE_EPOCH=""
+D3D_REDIST=""
 PHASE_TIMES=""
 # Elapsed time of a phase, for the results block.
 phase_done() { PHASE_TIMES+="${1}: $(( (SECONDS - PHASE_T0) / 60 )) min $(( (SECONDS - PHASE_T0) % 60 )) s"$'\n'; PHASE_T0=$SECONDS; }
 PHASE_T0=0
 
-# Runner identity and compiler of the release, read from build-info.json in the official ZIP.
-# build-info.json ships in both artifacts and records $env:ImageOS/$env:ImageVersion verbatim.
-# Only GitHub's runner sets those two; this script does not fake them (Danny, 2026-10-21), so a
-# release that records them cannot match. The run says so under Warnings.
+# From build-info.json: runner image (only GitHub sets it; not faked, Danny 2026-10-21) and compiler.
 REL_IMAGE_OS=""
 REL_IMAGE_VERSION=""
 REL_MSVC=""
@@ -80,46 +120,14 @@ SIG_WARNINGS=""
 declare -A OFF_NAME OFF_SHA BUILT_SHA DIFF_NOTE
 ARTIFACTS=()
 
-NC="\033[0m"; GREEN="\033[1;32m"; YELLOW="\033[1;33m"; RED="\033[1;31m"; BLUE="\033[1;34m"
-log_info()  { echo -e "${BLUE}[INFO]${NC} $*"; }
-log_ok()    { echo -e "${GREEN}[OK]${NC}  $*"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
-
-die_invalid() { log_error "$1"; NO_VERDICT_BY_DESIGN=true; exit "${EXIT_INVALID}"; }
-die_build()   { log_error "$1"; write_yaml "ftbfs" "$1"; exit "${EXIT_DIFF}"; }
-# Not a source build failure (network, VM, toolchain): no YAML (ABS B5).
-die_env()     { log_error "$1"; NO_VERDICT_BY_DESIGN=true; exit "${EXIT_DIFF}"; }
-# Environment cannot run the build at all (no KVM, golden image missing/expired): no verdict.
-die_prereq() {
-    log_error "$1"
-    NO_VERDICT_BY_DESIGN=true
-    exit "${EXIT_INVALID}"
-}
-die_provenance() {
-    log_error "PROVENANCE FAILURE: $1"
-    log_error "No verdict is emitted: the artifact compared is not the file upstream signed."
-    NO_VERDICT_BY_DESIGN=true
-    rm -f "${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
-    exit "${EXIT_DIFF}"
-}
-
-write_yaml() {
-    local verdict="$1" notes="${2:-}" yaml_file="${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
-    notes="${notes//\"/\'}"
-    if [[ -n "$notes" ]]; then
-        printf 'script_version: %s\nverdict: %s\nnotes: "%s"\n' "$SCRIPT_VERSION" "$verdict" "$notes" > "$yaml_file"
-    else
-        printf 'script_version: %s\nverdict: %s\n' "$SCRIPT_VERSION" "$verdict" > "$yaml_file"
-    fi
-    VERDICT_WRITTEN=true
-    log_info "COMPARISON_RESULTS.yaml written to: $yaml_file"
-}
+# Upstream build failure: ftbfs.
+die_build() { ws_error "$1"; ws_write_yaml ftbfs "$1"; exit "$WS_EXIT_FAIL"; }
+die_provenance() { ws_no_verdict "PROVENANCE FAILURE: $1. The artifact compared is not the file upstream signed."; }
 
 # Tools (BusyBox wget/unzip/sha256sum, GnuPG, git, ssh) from the pinned git image, WORK_DIR at /w.
 tools_c() {
     local tool="$1"; shift
-    "$CONTAINER_CMD" run --rm "${TOOLS_USER[@]}" -e GITHUB_TOKEN -v "${WORK_DIR}:/w" -w /w \
+    ws_ctr run --rm "${TOOLS_USER[@]}" -e GITHUB_TOKEN -v "${WORK_DIR}:/w" -w /w \
         --entrypoint "$tool" "$GIT_IMAGE" "$@"
 }
 gpg_c() { tools_c gpg --homedir /w/gnupg --no-autostart "$@"; }
@@ -139,63 +147,51 @@ gh_wget() {
         wget -q -O "$1" "$2" 2>/dev/null' sh "$rel" "$url"
 }
 
-sha256_of() { [[ -f "$1" ]] && sha256sum "$1" | awk '{print $1}' || echo "N/A"; }
+ws_sha256() { [[ -f "$1" ]] && sha256sum "$1" | awk '{print $1}' || echo "N/A"; }
 
 is_rootless() {
     local r=""
-    case "$CONTAINER_CMD" in
-        podman) r="$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)" ;;
-        docker) docker info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless && r=true ;;
+    case "$WS_ENGINE" in
+        podman) r="$(ws_ctr info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)" ;;
+        docker) ws_ctr info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless && r=true ;;
     esac
     [[ "$r" == "true" ]]
-}
-
-detect_container_cmd() {
-    if command -v podman >/dev/null 2>&1; then CONTAINER_CMD="podman"
-    elif command -v docker >/dev/null 2>&1; then CONTAINER_CMD="docker"
-    else die_invalid "Neither podman nor docker found in PATH. Install one and retry."; fi
-    is_rootless || TOOLS_USER=(--user "$(id -u):$(id -g)")
-    log_info "Container runtime: ${CONTAINER_CMD}$(is_rootless && echo ' (rootless)')"
-}
-
-require_arg() {
-    if [[ -z "${2:-}" || "${2:-}" == --* ]]; then die_invalid "Missing value for parameter: $1"; fi
 }
 
 parse_args() {
     if [[ $# -eq 0 ]]; then
         echo "Usage: $0 --version VERSION [--binary FILE|DIR] [--arch ARCH] [--type setup|portable] [--golden DIR]"
-        exit "${EXIT_INVALID}"
+        exit "$WS_EXIT_INVALID"
     fi
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --version) require_arg "$1" "${2:-}"; APP_VERSION="$2"; shift 2 ;;
-            --binary)  require_arg "$1" "${2:-}"; BINARY_PATH="$2"; shift 2 ;;
-            --arch)    require_arg "$1" "${2:-}"; APP_ARCH="$2"; shift 2 ;;
-            --type)    require_arg "$1" "${2:-}"; APP_TYPE="$2"; shift 2 ;;
-            --golden)  require_arg "$1" "${2:-}"; GOLDEN_DIR="$2"; shift 2 ;;
+            --version) ws_require_value "$1" "${2:-}"; APP_VERSION="$2"; shift 2 ;;
+            --binary)  ws_require_value "$1" "${2:-}"; BINARY_PATH="$2"; shift 2 ;;
+            --arch)    ws_require_value "$1" "${2:-}"; APP_ARCH="$2"; shift 2 ;;
+            --type)    ws_require_value "$1" "${2:-}"; APP_TYPE="$2"; shift 2 ;;
+            --golden)  ws_require_value "$1" "${2:-}"; GOLDEN_DIR="$2"; shift 2 ;;
             --apk)
                 if [[ $# -ge 2 && "${2:-}" != --* ]]; then shift 2; else shift; fi
-                log_warn "--apk is not applicable for desktop builds (ignored)" ;;
+                ws_warn "--apk is not applicable for desktop builds (ignored)" ;;
             --help) show_help; exit 0 ;;
-            *) log_warn "Unknown argument: $1 (ignored)"; shift ;;
+            *) ws_unknown_arg "$@"; shift "$WS_SHIFT" ;;
         esac
     done
-    [[ -n "$APP_VERSION" ]] || die_invalid "--version is required"
+    [[ -n "$APP_VERSION" ]] || ws_invalid "--version is required"
     # package_windows.ps1 accepts exactly X.Y.Z.
     [[ "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-        || die_invalid "Invalid --version '${APP_VERSION}' (expected e.g. 2.9.1, no v prefix)"
+        || ws_invalid "Invalid --version '${APP_VERSION}' (expected e.g. 2.9.1, no v prefix)"
     [[ "$APP_ARCH" == "x86_64-windows" ]] \
-        || die_invalid "Unsupported --arch '${APP_ARCH}'; only x86_64-windows is implemented"
+        || ws_invalid "Unsupported --arch '${APP_ARCH}'; only x86_64-windows is implemented"
     case "$APP_TYPE" in
         setup|portable) ARTIFACTS=("$APP_TYPE") ;;
-        *) die_invalid "Unsupported --type '${APP_TYPE}'; use setup or portable" ;;
+        *) ws_invalid "Unsupported --type '${APP_TYPE}'; use setup or portable" ;;
     esac
     if [[ "$(printf '%s\n' "$MIN_VERSION" "$APP_VERSION" | sort -V | head -1)" != "$MIN_VERSION" ]]; then
-        die_invalid "Version ${APP_VERSION} predates ${MIN_VERSION}, the first release with build_windows.ps1"
+        ws_invalid "Version ${APP_VERSION} predates ${MIN_VERSION}, the first release with build_windows.ps1"
     fi
     if [[ -n "$BINARY_PATH" ]]; then
-        [[ -e "$BINARY_PATH" ]] || die_invalid "--binary path does not exist: $BINARY_PATH"
+        [[ -e "$BINARY_PATH" ]] || ws_invalid "--binary path does not exist: $BINARY_PATH"
         BINARY_PATH="$(realpath "$BINARY_PATH")"
         local pat m=() magic want
         [[ "$APP_TYPE" == setup ]] && { pat='*-x64-setup*.exe'; want=4d5a; } || { pat='*-x64-portable*.zip'; want=504b0304; }
@@ -205,12 +201,12 @@ parse_args() {
             # shellcheck disable=SC2206 # $pat is a glob on purpose
             m=("$BINARY_PATH"/$pat)
             shopt -u nullglob
-            [[ ${#m[@]} -eq 1 ]] || die_invalid "--binary directory needs exactly one ${pat} file (found ${#m[@]})"
+            [[ ${#m[@]} -eq 1 ]] || ws_invalid "--binary directory needs exactly one ${pat} file (found ${#m[@]})"
             BINARY_PATH="${m[0]}"
         fi
         # The installer is a PE file (MZ), the portable build a ZIP (PK\3\4).
         magic="$(head -c 4 "$BINARY_PATH" | od -An -tx1 | tr -d ' \n')"
-        [[ "$magic" == "$want"* ]] || die_invalid "--binary is not a ${APP_TYPE} file (starts with ${magic:-nothing})"
+        [[ "$magic" == "$want"* ]] || ws_invalid "--binary is not a ${APP_TYPE} file (starts with ${magic:-nothing})"
     fi
 }
 
@@ -228,8 +224,7 @@ OPTIONAL:
   --binary FILE|DIR    Official file of the selected --type, or a folder holding it (skip its download)
   --arch ARCH          x86_64-windows (default, only supported value)
   --type TYPE          setup (default, the Inno Setup installer) or portable (the ZIP)
-  --golden DIR         Golden image folder (default: $WS_WINDOWS_GOLDEN or
-                       /var/lib/walletscrutiny-windows/golden-2022)
+  --golden DIR         Golden image folder (default: $WS_WINDOWS_GOLDEN)
 
 OPTIONAL ENVIRONMENT:
   GITHUB_TOKEN         Used for GitHub downloads, to avoid rate limiting
@@ -245,8 +240,8 @@ REQUIREMENTS:
 
 EXIT CODES:
   0  Identical (the selected file is byte-for-byte equal)
-  1  Differences found, or build failed
-  2  Invalid parameters or missing prerequisites (no verdict for missing prerequisites)
+  1  Differences found, build failed, or a failure with no verdict (host, network, VM, prerequisites)
+  2  Invalid parameters, or ws-rb-core could not be loaded
   130  Interrupted (no verdict)
 
 OUTPUT:
@@ -256,57 +251,33 @@ EOF
 }
 
 setup_workdir() {
-    local suffix="${APP_VERSION}_${APP_ARCH}_${APP_TYPE}" base
-    base="$(pwd -P)"
-    for _ in 1 2 3; do
-        WORK_DIR="${base}/nunchukwin_verification_${suffix}_$(date +%s)-$$"
-        if mkdir "$WORK_DIR" 2>/dev/null; then
-            trap reclaim_workspace EXIT
-            trap 'NO_VERDICT_BY_DESIGN=true; exit 130' INT TERM
-            log_info "Work directory: $WORK_DIR"
-            mkdir -p "$WORK_DIR"/{official,built,vm}
-            return 0
-        fi
-        sleep 1
-    done
-    WORK_DIR=""
-    die_env "Could not create a per-run workspace under ${base}"
+    ws_workspace nunchukwin "$APP_VERSION" "${APP_ARCH}_${APP_TYPE}"
+    WORK_DIR="$WS_WORKDIR"
+    mkdir -p "$WORK_DIR"/{official,built,vm}
 }
 
-# EXIT trap: remove the VM container, hand the workspace back, delete vm/ (overlays, key copy).
-reclaim_workspace() {
-    set +e
-    if [[ "$VERDICT_WRITTEN" != true && "$NO_VERDICT_BY_DESIGN" != true ]]; then
-        log_error "Run ended before a verdict (internal error); no COMPARISON_RESULTS.yaml written"
-    fi
-    [[ -n "$VM_NAME" ]] && "$CONTAINER_CMD" rm -f "$VM_NAME" > /dev/null 2>&1
-    [[ -n "$SSH_HELPER" ]] && "$CONTAINER_CMD" rm -f "$SSH_HELPER" > /dev/null 2>&1
+# Run first by ws_on_exit: remove the VM, hand files back, delete vm/ (overlays, key copy).
+ws_cleanup_hook() {
+    [[ -z "$VM_NAME" ]] || ws_ctr rm -f "$VM_NAME" > /dev/null 2>&1 || true
+    [[ -z "$SSH_HELPER" ]] || ws_ctr rm -f "$SSH_HELPER" > /dev/null 2>&1 || true
     [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]] || return 0
-    if [[ -n "$(find "$WORK_DIR" ! -uid "$(id -u)" -print -quit 2>/dev/null)" ]]; then
-        local uid gid; uid="$(id -u)"; gid="$(id -g)"
-        is_rootless && { uid=0; gid=0; }
-        "$CONTAINER_CMD" run --rm -v "${WORK_DIR}:/w" --entrypoint chown "$GIT_IMAGE" -R "${uid}:${gid}" /w > /dev/null 2>&1 \
-            || log_warn "Could not restore ownership of ${WORK_DIR}; deleting it may need 'podman unshare rm -rf'"
-    fi
-    chmod -R u+rwX "$WORK_DIR" > /dev/null 2>&1
-    rm -rf "${WORK_DIR}/vm"
-    [[ -z "$(find "$WORK_DIR" ! -uid "$(id -u)" -print -quit 2>/dev/null)" ]] \
-        || log_warn "Workspace still has files not owned by uid $(id -u): ${WORK_DIR}"
-    return 0
+    ws_hand_back
+    chmod -R u+rwX "$WORK_DIR" > /dev/null 2>&1 || true
+    rm -rf "${WORK_DIR}/vm" || true
 }
 
 check_prereqs() {
     local f ends
-    [[ -r /dev/kvm && -w /dev/kvm ]] || die_prereq "/dev/kvm is not readable and writable for $(id -un) (needs the kvm group)"
-    [[ -e /dev/net/tun ]] || die_prereq "/dev/net/tun is missing"
+    [[ -r /dev/kvm && -w /dev/kvm ]] || ws_no_verdict "/dev/kvm is not readable and writable for $(id -un) (needs the kvm group)"
+    [[ -e /dev/net/tun ]] || ws_no_verdict "/dev/net/tun is missing"
     for f in storage/data.qcow2 storage2/data2.qcow2 storage/windows.boot GOLDEN-INFO.txt; do
-        [[ -r "${GOLDEN_DIR}/${f}" ]] || die_prereq "Golden image file not readable: ${GOLDEN_DIR}/${f} (needs the windows-images group)"
+        [[ -r "${GOLDEN_DIR}/${f}" ]] || ws_no_verdict "Golden image file not readable: ${GOLDEN_DIR}/${f} (needs the windows-images group)"
     done
-    [[ -r "$VM_KEY" ]] || die_prereq "VM SSH key not readable: ${VM_KEY}"
-    ends="$(grep -oE 'evaluation ends ~?[0-9]{4}-[0-9]{2}-[0-9]{2}' "${GOLDEN_DIR}/GOLDEN-INFO.txt" | grep -oE '[0-9-]{10}' | head -1)"
-    [[ -n "$ends" ]] || die_prereq "GOLDEN-INFO.txt has no 'evaluation ends YYYY-MM-DD' line"
-    [[ "$(date -u +%F)" < "$ends" ]] || die_prereq "The golden image's Windows evaluation ended on ${ends}; rebuild it (#984 runbook)"
-    log_ok "Prerequisites: /dev/kvm, golden image ${GOLDEN_DIR} (evaluation ends ${ends}), VM key"
+    [[ -r "$VM_KEY" ]] || ws_no_verdict "VM SSH key not readable: ${VM_KEY}"
+    ends="$(grep -oE 'evaluation ends ~?[0-9]{4}-[0-9]{2}-[0-9]{2}' "${GOLDEN_DIR}/GOLDEN-INFO.txt" | grep -oE '[0-9-]{10}' | head -1 || true)"
+    [[ -n "$ends" ]] || ws_no_verdict "GOLDEN-INFO.txt has no 'evaluation ends YYYY-MM-DD' line"
+    [[ "$(date -u +%F)" < "$ends" ]] || ws_no_verdict "The golden image's Windows evaluation ended on ${ends}; rebuild it (#984 runbook)"
+    ws_ok "Prerequisites: /dev/kvm, golden image ${GOLDEN_DIR} (evaluation ends ${ends}), VM key"
 }
 
 # Release names: 2.9.1 renamed CI's -unsigned files; from 2.9.2 the release keeps the CI names.
@@ -332,21 +303,21 @@ prepare_official() {
         dest="${WORK_DIR}/official/${OFF_NAME[$a]}"
         if [[ -n "$BINARY_PATH" && "$a" == "$APP_TYPE" ]]; then
             [[ "$(basename "$BINARY_PATH")" == "${OFF_NAME[$a]}" ]] \
-                || log_warn "--binary is named $(basename "$BINARY_PATH"), expected ${OFF_NAME[$a]}; compared as ${OFF_NAME[$a]}"
+                || ws_warn "--binary is named $(basename "$BINARY_PATH"), expected ${OFF_NAME[$a]}; compared as ${OFF_NAME[$a]}"
             cp "$BINARY_PATH" "$dest"
         elif [[ "$a" == portable || " ${ARTIFACTS[*]} " == *" $a "* ]]; then
             url="https://github.com/${GH_REPO}/releases/download/${APP_VERSION}/${OFF_NAME[$a]}"
-            log_info "Downloading official release: $url"
-            gh_wget "$dest" "$url" || die_env "Failed to download: $url"
+            ws_info "Downloading official release: $url"
+            gh_wget "$dest" "$url" || ws_no_verdict "Failed to download: $url"
         else
             continue
         fi
-        OFF_SHA[$a]="$(sha256_of "$dest")"
-        log_ok "Official ${OFF_NAME[$a]} ($(stat -c%s "$dest") bytes) sha256 ${OFF_SHA[$a]}"
+        OFF_SHA[$a]="$(ws_sha256 "$dest")"
+        ws_ok "Official ${OFF_NAME[$a]} ($(stat -c%s "$dest") bytes) sha256 ${OFF_SHA[$a]}"
     done
     # shellcheck disable=SC2016
     tools_c sh -c 'unzip -p "$1" build-info.json > official/build-info.json' sh "official/${OFF_NAME[portable]}" \
-        || die_env "The official portable ZIP has no build-info.json"
+        || ws_no_verdict "The official portable ZIP has no build-info.json"
     REL_IMAGE_OS="$(sed -nE 's/.*"runnerImage": *"([^"]*)".*/\1/p' "${WORK_DIR}/official/build-info.json")"
     REL_IMAGE_VERSION="$(sed -nE 's/.*"runnerImageVersion": *"([^"]*)".*/\1/p' "${WORK_DIR}/official/build-info.json")"
     REL_MSVC="$(sed -nE 's/.*"msvcFileVersion": *"([^"]*)".*/\1/p' "${WORK_DIR}/official/build-info.json")"
@@ -354,11 +325,11 @@ prepare_official() {
     case "$REL_MSVC" in
         19.44.35229.0) VS_REL=17.14.41 ;;
         19.44.35230.0) VS_REL=17.14.45 ;;
-        *) die_env "No VS Build Tools pinned for the release's cl.exe '${REL_MSVC}' (msvcFileVersion)" ;;
+        *) ws_no_verdict "No VS Build Tools pinned for the release's cl.exe '${REL_MSVC}' (msvcFileVersion)" ;;
     esac
-    log_info "Release built on runner ${REL_IMAGE_OS:-?} ${REL_IMAGE_VERSION:-?} with cl.exe ${REL_MSVC}"
+    ws_info "Release built on runner ${REL_IMAGE_OS:-?} ${REL_IMAGE_VERSION:-?} with cl.exe ${REL_MSVC}"
     if [[ -n "$REL_IMAGE_OS$REL_IMAGE_VERSION" ]]; then
-        log_warn "build-info.json records GitHub's runner image; this build cannot reproduce that (see Warnings)"
+        ws_warn "build-info.json records GitHub's runner image; this build cannot reproduce that (see Warnings)"
         SIG_WARNINGS+=$'\n'"- UPSTREAM LEAK: build-info.json, inside both Windows files, records GitHub's runner image (runnerImage ${REL_IMAGE_OS}, runnerImageVersion ${REL_IMAGE_VERSION}) from \$env:ImageOS/\$env:ImageVersion. Only GitHub's runner sets them and this script does not fake them, so no build elsewhere can match that file. Upstream should drop these fields or make them settable."
     fi
 }
@@ -366,7 +337,7 @@ prepare_official() {
 # SHA256SUMS signed by the pinned key; a signed manifest that disagrees is fatal (no verdict).
 verify_official_signature() {
     local base="https://github.com/${GH_REPO}/releases/download/${APP_VERSION}" out a listed signed=false
-    echo ""; log_info "Verifying release manifest signature (gpg in a container)..."
+    echo ""; ws_info "Verifying release manifest signature (gpg in a container)..."
     if ! gh_wget "${WORK_DIR}/SHA256SUMS" "${base}/SHA256SUMS" || ! gh_wget "${WORK_DIR}/SHA256SUMS.asc" "${base}/SHA256SUMS.asc"; then
         SIG_MANIFEST_STATUS="[WARNING] SHA256SUMS or SHA256SUMS.asc not published"
         SIG_WARNINGS+=$'\n- No signed manifest was retrievable; digests not cross-checked.'
@@ -381,7 +352,7 @@ verify_official_signature() {
                 && grep -qE "^\[GNUPG:\] VALIDSIG .*${NUNCHUK_RELEASE_KEY_FPR}\$" <<<"$out"; then
             signed=true
             SIG_MANIFEST_STATUS="[OK] Good signature on SHA256SUMS from pinned key ${NUNCHUK_RELEASE_KEY_FPR}"
-            log_ok "Good signature on SHA256SUMS from the pinned release key"
+            ws_ok "Good signature on SHA256SUMS from the pinned release key"
         else
             SIG_MANIFEST_STATUS="[WARNING] No valid signature from ${NUNCHUK_RELEASE_KEY_FPR} on SHA256SUMS"
             SIG_WARNINGS+=$'\n- gpg reported no valid signature from the pinned key over the release manifest.'
@@ -402,12 +373,12 @@ verify_official_signature() {
 
 resolve_commit() {
     local out
-    out="$("$CONTAINER_CMD" run --rm "$GIT_IMAGE" ls-remote "https://github.com/${GH_REPO}.git" \
+    out="$(ws_ctr run --rm "$GIT_IMAGE" ls-remote "https://github.com/${GH_REPO}.git" \
         "refs/tags/${APP_VERSION}^{}" "refs/tags/${APP_VERSION}" 2>/dev/null || true)"
     RESOLVED_COMMIT="$(printf '%s\n' "$out" | awk 'END{print $1}')"
     [[ "$RESOLVED_COMMIT" =~ ^[0-9a-f]{40}$ ]] \
-        || die_env "Could not resolve tag ${APP_VERSION} to a commit; refusing to attribute a build to it"
-    log_ok "Tag ${APP_VERSION} = commit ${RESOLVED_COMMIT}"
+        || ws_no_verdict "Could not resolve tag ${APP_VERSION} to a commit; refusing to attribute a build to it"
+    ws_ok "Tag ${APP_VERSION} = commit ${RESOLVED_COMMIT}"
 }
 
 # ssh/scp from a helper container on the host network; the VM port listens on 127.0.0.1 only.
@@ -417,23 +388,23 @@ SSH_OPTS=(-i /k -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o L
 # SSH_NAME (optional) names the helper container, so the EXIT trap can remove it.
 vm_ssh() {
     local n=(); [[ -n "${SSH_NAME:-}" ]] && n=(--name "$SSH_NAME")
-    "$CONTAINER_CMD" run --rm -i "${n[@]}" --network host -v "${WORK_DIR}/vm/key:/k:ro" --entrypoint ssh \
+    ws_ctr run --rm -i "${n[@]}" --network host -v "${WORK_DIR}/vm/key:/k:ro" --entrypoint ssh \
         "$GIT_IMAGE" "${SSH_OPTS[@]}" -p "$VM_PORT" Docker@127.0.0.1 "$@"
 }
 # A failed copy is an ftbfs, except while diffing a known mismatch (COPY_SOFT=true):
 # then it only warns, so the verdict stays not_reproducible.
 COPY_SOFT=false
-copy_fail() { [[ "$COPY_SOFT" == true ]] && { log_warn "$1"; return 1; }; die_env "$1"; }
+copy_fail() { [[ "$COPY_SOFT" == true ]] && { ws_warn "$1"; return 1; }; ws_no_verdict "$1"; }
 # Copy a host file into the VM, then check its sha256 inside Windows.
 vm_push() {
     local src="$1" dst="$2" got
-    "$CONTAINER_CMD" run --rm --network host -v "${WORK_DIR}/vm/key:/k:ro" -v "${src}:/f:ro" --entrypoint scp \
+    ws_ctr run --rm --network host -v "${WORK_DIR}/vm/key:/k:ro" -v "${src}:/f:ro" --entrypoint scp \
         "$GIT_IMAGE" "${SSH_OPTS[@]}" -P "$VM_PORT" /f "Docker@127.0.0.1:${dst//\\//}" > /dev/null 2>&1 \
-        || "$CONTAINER_CMD" run --rm --network host -v "${WORK_DIR}/vm/key:/k:ro" -v "${src}:/f:ro" --entrypoint scp \
+        || ws_ctr run --rm --network host -v "${WORK_DIR}/vm/key:/k:ro" -v "${src}:/f:ro" --entrypoint scp \
             "$GIT_IMAGE" -O "${SSH_OPTS[@]}" -P "$VM_PORT" /f "Docker@127.0.0.1:${dst//\\//}" > /dev/null \
         || { copy_fail "Could not copy $(basename "$src") into the VM"; return 1; }
     got="$(vm_ssh "powershell -NoProfile -Command (Get-FileHash '${dst}').Hash" | tr -d '\r\n' | tr 'A-F' 'a-f')"
-    [[ "$got" == "$(sha256_of "$src")" ]] || { copy_fail "Copy of $(basename "$src") into the VM is corrupt"; return 1; }
+    [[ "$got" == "$(ws_sha256 "$src")" ]] || { copy_fail "Copy of $(basename "$src") into the VM is corrupt"; return 1; }
 }
 # Stream a VM file out over SSH, then check it against Get-FileHash inside Windows.
 vm_pull() {
@@ -441,7 +412,7 @@ vm_pull() {
     vm_ssh "powershell -NoProfile -Command \"\$f=[IO.File]::OpenRead('${src}');\$f.CopyTo([Console]::OpenStandardOutput());\$f.Close()\"" > "$dst" \
         || { copy_fail "Could not copy ${src} out of the VM"; return 1; }
     want="$(vm_ssh "powershell -NoProfile -Command (Get-FileHash '${src}').Hash" | tr -d '\r\n' | tr 'A-F' 'a-f')"
-    [[ "$want" == "$(sha256_of "$dst")" ]] || { copy_fail "Copy of ${src} out of the VM is corrupt"; return 1; }
+    [[ "$want" == "$(ws_sha256 "$dst")" ]] || { copy_fail "Copy of ${src} out of the VM is corrupt"; return 1; }
 }
 
 start_vm() {
@@ -452,30 +423,30 @@ start_vm() {
     # dockur state files (windows.boot = already installed; windows.vars must be writable).
     cp "${GOLDEN_DIR}"/storage/windows.* "${WORK_DIR}/vm/storage/"
     chmod u+w "${WORK_DIR}"/vm/storage/windows.*
-    local extra=(); [[ "$CONTAINER_CMD" == podman ]] && extra=(--group-add keep-groups)
+    local extra=(); [[ "$WS_ENGINE" == podman ]] && extra=(--group-add keep-groups)
     # Copy-on-write overlays; the golden disks are only ever opened read-only.
     for s in "storage/data.qcow2:/golden" "storage2/data2.qcow2:/golden2"; do
         local disk="${s%%:*}" mnt="${s#*:}"
-        "$CONTAINER_CMD" run --rm "${extra[@]}" --entrypoint qemu-img \
+        ws_ctr run --rm "${extra[@]}" --entrypoint qemu-img \
             -v "${GOLDEN_DIR}/storage:/golden:ro" -v "${GOLDEN_DIR}/storage2:/golden2:ro" -v "${WORK_DIR}/vm:/vm" \
             "$WIN_IMAGE" create -q -f qcow2 -F qcow2 -b "${mnt}/${disk##*/}" "/vm/${disk}" \
-            || die_env "Could not create the qcow2 overlay for ${disk}"
+            || ws_no_verdict "Could not create the qcow2 overlay for ${disk}"
     done
-    log_info "Starting Windows VM ${VM_NAME} (RAM ${VM_RAM}, 4 cores)..."
-    "$CONTAINER_CMD" run -d --name "$VM_NAME" "${extra[@]}" \
+    ws_info "Starting Windows VM ${VM_NAME} (RAM ${VM_RAM}, 4 cores)..."
+    ws_ctr run -d --name "$VM_NAME" "${extra[@]}" \
         -e VERSION=2022 -e RAM_SIZE="$VM_RAM" -e CPU_CORES=4 -e DISK_SIZE=64G -e DISK2_SIZE=32G -e DISK_FMT=qcow2 \
         -v "${WORK_DIR}/vm/storage:/storage" -v "${WORK_DIR}/vm/storage2:/storage2" \
         -v "${GOLDEN_DIR}/storage:/golden:ro" -v "${GOLDEN_DIR}/storage2:/golden2:ro" \
         -p 127.0.0.1::22 --device /dev/kvm --device /dev/net/tun --cap-add NET_ADMIN --stop-timeout 120 \
-        "$WIN_IMAGE" > /dev/null || die_env "Could not start the Windows VM container"
-    VM_PORT="$("$CONTAINER_CMD" port "$VM_NAME" 22/tcp | head -1)"; VM_PORT="${VM_PORT##*:}"
-    [[ "$VM_PORT" =~ ^[0-9]+$ ]] || die_env "Could not read the VM's SSH port"
+        "$WIN_IMAGE" > /dev/null || ws_no_verdict "Could not start the Windows VM container"
+    VM_PORT="$(ws_ctr port "$VM_NAME" 22/tcp | head -1)"; VM_PORT="${VM_PORT##*:}"
+    [[ "$VM_PORT" =~ ^[0-9]+$ ]] || ws_no_verdict "Could not read the VM's SSH port"
     for _ in $(seq 1 90); do
-        vm_ssh "type C:\\OEM\\done.txt" > /dev/null 2>&1 && { log_ok "Windows is up (SSH on 127.0.0.1:${VM_PORT})"; phase_done "VM boot"; return 0; }
-        "$CONTAINER_CMD" ps -q --filter "name=${VM_NAME}" | grep -q . || die_env "The VM container exited during boot"
+        vm_ssh "type C:\\OEM\\done.txt" > /dev/null 2>&1 && { ws_ok "Windows is up (SSH on 127.0.0.1:${VM_PORT})"; phase_done "VM boot"; return 0; }
+        ws_ctr ps -q --filter "name=${VM_NAME}" | grep -q . || ws_no_verdict "The VM container exited during boot"
         sleep 10
     done
-    die_env "Windows did not answer over SSH within 15 min"
+    ws_no_verdict "Windows did not answer over SSH within 15 min"
 }
 
 # Runs inside Windows. Starts under PowerShell 5.1, installs pwsh 7 if needed, then re-runs itself
@@ -544,7 +515,8 @@ if ($Phase -eq 'build') {
             -ArgumentList '--quiet', '--wait', '--norestart', '--nocache', '--offline', $opc, '--add', 'Microsoft.VisualStudio.Workload.VCTools', `
             '--add', 'Microsoft.VisualStudio.Component.VC.CoreBuildTools', '--add', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', `
             '--add', 'Microsoft.VisualStudio.Component.VC.CMake.Project', `
-            '--add', 'Microsoft.VisualStudio.Component.VC.Redist.14.Latest', '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.22621'
+            '--add', 'Microsoft.VisualStudio.Component.VC.Redist.14.Latest', '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.22621', `
+            '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.26100'
         Need ($p.ExitCode -in 0, 3010) "VS Build Tools installer exit code $($p.ExitCode)"
         # Ports built with MSBuild (sqlite3) need the C++ build targets, not only cl.exe.
         Need (VsPath) "VS Build Tools installed without the VC.CoreBuildTools / VC.CMake.Project components"
@@ -573,8 +545,14 @@ if ($Phase -eq 'build') {
     Need ((& python --version) -eq 'Python 3.12.10') "python $(& python --version), want 3.12.10"
     Need ((& nasm -v) -match '^NASM version 3\.02 ') "nasm $(& nasm -v), want 3.02"
     Need ((& perl -e 'print $^V') -eq 'v5.32.1') "perl $(& perl -e 'print $^V'), want v5.32.1"
+    # windeployqt copies these from the folder the newest SDK fills: 10.0.26100 on the runner.
+    $d3d = "${env:ProgramFiles(x86)}\Windows Kits\10\Redist\D3D\x64"
+    $d3dv = foreach ($n in 'd3dcompiler_47.dll', 'dxcompiler.dll', 'dxil.dll') { if (Test-Path "$d3d\$n") { "$n $((Get-Item "$d3d\$n").VersionInfo.FileVersion)" } else { "$n missing" } }
+    Write-Host "D3D redist: $($d3dv -join ', ')"
+    Need (-not ($d3dv -like '* missing')) "D3D redist incomplete ($($d3dv -join ', '))"
+    Need ((Test-Path "$d3d\d3dcompiler_47.dll") -and (Get-Item "$d3d\d3dcompiler_47.dll").VersionInfo.FileVersion -like '10.0.26100.*') "d3dcompiler_47.dll is not from SDK 10.0.26100 ($($d3dv[0]))"
     Lap 'tool install'
-    Write-Host "Toolchain: PASS (cl $Arg3, VCTools 14.44.35207, SDK 10.0.22621.0, CRT 14.44.35211.0, pwsh 7.6.6, Python 3.12.10, NASM 3.02, Perl 5.32.1)"
+    Write-Host "Toolchain: PASS (cl $Arg3, VCTools 14.44.35207, SDK 10.0.22621.0, d3dcompiler_47 10.0.26100.*, CRT 14.44.35211.0, pwsh 7.6.6, Python 3.12.10, NASM 3.02, Perl 5.32.1)"
 
     # Checkout as in build-windows.yml, at the runner's workspace path.
     Run git config --global core.autocrlf false
@@ -622,29 +600,31 @@ PS1
 
 run_build() {
     local a n
-    log_info "Copying the build driver into the VM..."
+    ws_info "Copying the build driver into the VM..."
     vm_ssh "mkdir C:\\nw" > /dev/null 2>&1 || true
     vm_push "${WORK_DIR}/nw.ps1" 'C:\nw\nw.ps1'
-    log_info "Building inside Windows (toolchain, then upstream build_windows.ps1 + package_windows.ps1): about 2-3 h..."
+    ws_info "Building inside Windows (toolchain, then upstream build_windows.ps1 + package_windows.ps1): about 2-3 h..."
     # In the background so INT/TERM run the trap now (it removes the VM), not after the build.
-    set +e
     SSH_HELPER="nunchukwin-ssh-$(date +%s)-$$"
     { SSH_NAME="$SSH_HELPER" vm_ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\nw\\nw.ps1 -Phase build -Tag ${APP_VERSION} -Commit ${RESOLVED_COMMIT} -Arg3 ${REL_MSVC}" < /dev/null 2>&1 \
-        | tr -d '\r' | tee "${WORK_DIR}/build.log"; } &
-    wait $!
-    set -e
+        | tr -d '\r' | tee "${WORK_DIR}/build.log" || true; } &
+    # A failed SSH session is judged from build.log below, not by the ERR trap.
+    wait $! || true
     grep -q '^NW-BUILD-DONE' "${WORK_DIR}/build.log" || {
-        # Stopped before the toolchain passed: not an ftbfs. [^$] skips pwsh's echo of the throw line.
+        # Toolchain not passed: no verdict. [^$] skips pwsh's echo of the throw.
         grep -q '^Toolchain: PASS' "${WORK_DIR}/build.log" \
-            || die_env "Windows toolchain setup failed (build.log in the workspace): $(grep -m1 -oE '(Toolchain check failed|sha256 mismatch): [^$].*' "${WORK_DIR}/build.log" | cut -c1-200)"
+            || ws_no_verdict "Windows toolchain setup failed (build.log in the workspace): $(grep -m1 -oE '(Toolchain check failed|sha256 mismatch): [^$].*' "${WORK_DIR}/build.log" | cut -c1-200)"
+        # ftbfs only if an upstream step threw (NW-FAIL).
+        grep -q '^NW-FAIL' "${WORK_DIR}/build.log" || ws_no_verdict "Build stopped with no upstream failure logged (SSH, VM or clone; build.log in the workspace)"
         die_build "Upstream Windows build failed: $(grep -m1 -o 'NW-FAIL .*' "${WORK_DIR}/build.log" | cut -c1-200) (log with vcpkg/CMake tails: build.log in the workspace)"
     }
+    D3D_REDIST="$(sed -nE 's/^D3D redist: (.*)$/\1/p' "${WORK_DIR}/build.log" | head -1)"
     SOURCE_EPOCH="$(sed -nE 's/^NW-BUILD-DONE epoch=([0-9]+).*/\1/p' "${WORK_DIR}/build.log")"
     # A skipped upstream step can invalidate a verdict: surface such lines, don't judge them.
     grep -nE 'SKIP|Skipping' "${WORK_DIR}/build.log" > "${WORK_DIR}/skip_lines.txt" || true
     if [[ -s "${WORK_DIR}/skip_lines.txt" ]]; then
         n="$(wc -l < "${WORK_DIR}/skip_lines.txt")"
-        log_warn "${n} build log lines mention SKIP/Skipping (first 5; all in skip_lines.txt):"
+        ws_warn "${n} build log lines mention SKIP/Skipping (first 5; all in skip_lines.txt):"
         head -n 5 "${WORK_DIR}/skip_lines.txt"
         SIG_WARNINGS+=$'\n'"- ${n} build log lines mention SKIP/Skipping; review skip_lines.txt in the workspace."
     fi
@@ -652,15 +632,15 @@ run_build() {
     PHASE_TIMES+="$(sed -nE 's/^NW-TIME (.*)$/\1/p' "${WORK_DIR}/build.log")"$'\n'
     PHASE_T0=$SECONDS
     for a in "${ARTIFACTS[@]}"; do
-        log_info "Copying $(built_name "$a") out of the VM..."
+        ws_info "Copying $(built_name "$a") out of the VM..."
         vm_pull "C:\\nunchuk-repro\\artifacts\\$(built_name "$a")" "${WORK_DIR}/built/${OFF_NAME[$a]}"
-        BUILT_SHA[$a]="$(sha256_of "${WORK_DIR}/built/${OFF_NAME[$a]}")"
-        log_ok "Rebuilt ${OFF_NAME[$a]} sha256 ${BUILT_SHA[$a]}"
+        BUILT_SHA[$a]="$(ws_sha256 "${WORK_DIR}/built/${OFF_NAME[$a]}")"
+        ws_ok "Rebuilt ${OFF_NAME[$a]} sha256 ${BUILT_SHA[$a]}"
     done
     phase_done "copy-out"
 }
 
-# Differing entries between two "sha256  path" manifests (written by the caller as m-official / m-built).
+# Differing entries between the "sha256  path" manifests m-official and m-built.
 diff_manifests() {
     local d="$1" n
     # shellcheck disable=SC2016
@@ -670,7 +650,7 @@ diff_manifests() {
         || return 1
     n="$(wc -l < "${WORK_DIR}/${d}/differing.txt")"
     DIFF_NOTE[$2]="${n} of $(wc -l < "${WORK_DIR}/${d}/m-official") files differ (path, official sha256, rebuilt sha256 in ${d}/differing.txt)"
-    log_warn "${DIFF_NOTE[$2]}"; head -n 5 "${WORK_DIR}/${d}/differing.txt"
+    ws_warn "${DIFF_NOTE[$2]}"; head -n 5 "${WORK_DIR}/${d}/differing.txt"
 }
 
 compare_artifacts() {
@@ -680,10 +660,10 @@ compare_artifacts() {
     for a in "${ARTIFACTS[@]}"; do
         echo "${OFF_NAME[$a]}"; echo "  official ${OFF_SHA[$a]}"; echo "  rebuilt  ${BUILT_SHA[$a]}"
         if [[ "${OFF_SHA[$a]}" == "${BUILT_SHA[$a]}" ]]; then
-            log_ok "${OFF_NAME[$a]} is byte-for-byte IDENTICAL"; continue
+            ws_ok "${OFF_NAME[$a]} is byte-for-byte IDENTICAL"; continue
         fi
         all=false
-        log_warn "${OFF_NAME[$a]} differs; unpacking both to diff file by file..."
+        ws_warn "${OFF_NAME[$a]} differs; unpacking both to diff file by file..."
         mkdir -p "${WORK_DIR}/diff-${a}"
         if [[ "$a" == portable ]]; then
             # shellcheck disable=SC2016
@@ -710,72 +690,44 @@ compare_artifacts() {
         fi
     done
     phase_done "compare"
-    local ctx="Built in a Windows Server 2022 VM (${WIN_IMAGE##*@}) with upstream build_windows.ps1 and package_windows.ps1 at tag ${APP_VERSION}, commit ${RESOLVED_COMMIT}, SOURCE_DATE_EPOCH ${SOURCE_EPOCH}; MSVC 14.44.35207 (cl ${REL_MSVC}), SDK 10.0.22621.0, VS ${VS_REL}; ImageOS/ImageVersion not set: build-info.json records GitHub's runner image (${REL_IMAGE_OS:-none}/${REL_IMAGE_VERSION:-none} in the release), which only GitHub can match (upstream leak)."
+    local ctx="Built in a Windows Server 2022 VM (${WIN_IMAGE##*@}) with upstream build_windows.ps1 and package_windows.ps1 at tag ${APP_VERSION}, commit ${RESOLVED_COMMIT}, SOURCE_DATE_EPOCH ${SOURCE_EPOCH}; MSVC 14.44.35207 (cl ${REL_MSVC}), SDK 10.0.22621.0 (SDK 10.0.26100 also installed; D3D redist ${D3D_REDIST:-not logged}), VS ${VS_REL}; ImageOS/ImageVersion not set: build-info.json records GitHub's runner image (${REL_IMAGE_OS:-none}/${REL_IMAGE_VERSION:-none} in the release), which only GitHub can match (upstream leak)."
     local sums="" a2
     for a2 in "${ARTIFACTS[@]}"; do sums+="${OFF_NAME[$a2]}: official ${OFF_SHA[$a2]}, rebuilt ${BUILT_SHA[$a2]}${DIFF_NOTE[$a2]:+ (${DIFF_NOTE[$a2]})}; "; done
     if [[ "$all" == true ]]; then
-        write_yaml "reproducible" "Every compared file is byte-for-byte identical. ${sums}${ctx}"
+        ws_write_yaml "reproducible" "Every compared file is byte-for-byte identical. ${sums}${ctx}"
         return 0
     fi
-    write_yaml "not_reproducible" "Rebuilt files differ from the release. ${sums}${ctx}"
+    ws_write_yaml "not_reproducible" "Rebuilt files differ from the release. ${sums}${ctx}"
     return 1
 }
 
 emit_verification_summary() {
     local verdict a
-    verdict="$(awk '/^verdict:/{print $2}' "${SCRIPT_DIR}/COMPARISON_RESULTS.yaml" 2>/dev/null)"
+    verdict="$(awk '/^verdict:/{print $2}' "${WS_RESULTS_FILE}" 2>/dev/null)"
     echo ""
     echo "HASH LEGEND"
-    echo "  appHash          sha256 of the official file as distributed (first compared file; others below)."
-    echo "  builtAppHash     sha256 of our rebuilt file; equality with appHash is the verdict."
-    echo "  scriptHash       sha256 of this script."
+    echo "  appHash     sha256 of the official file as distributed (first compared file; Diff gives the rebuilt one)."
+    echo "  scriptHash  sha256 of this script; libHash of the ws-rb-core library it loaded."
     echo ""
-    echo "===== Begin Results ====="
-    echo "appId:          ${APP_ID}"
-    echo "signer:         N/A"
-    echo "apkVersionName: ${APP_VERSION}"
-    echo "apkVersionCode: N/A"
-    echo "verdict:        ${verdict}"
-    a="${ARTIFACTS[0]}"
-    echo "appHash:        ${OFF_SHA[$a]:-N/A}"
-    echo "officialFile:   ${OFF_NAME[$a]:-N/A}"
-    echo "builtAppHash:   ${BUILT_SHA[$a]:-N/A}"
-    echo "commit:         ${RESOLVED_COMMIT}"
-    echo "scriptVersion:  ${SCRIPT_VERSION}"
-    echo "scriptHash:     ${SCRIPT_SHA256:-N/A}"
-    echo ""
-    echo "Diff:"
+    local d=""
     for a in "${ARTIFACTS[@]}"; do
-        if [[ "${OFF_SHA[$a]}" == "${BUILT_SHA[$a]}" ]]; then
-            echo "${OFF_NAME[$a]}: identical (${OFF_SHA[$a]})"
-        else
-            echo "${OFF_NAME[$a]}: official ${OFF_SHA[$a]}, rebuilt ${BUILT_SHA[$a]:-N/A}"
-            echo "  ${DIFF_NOTE[$a]:-not diffed}"
-        fi
+        if [[ "${OFF_SHA[$a]}" == "${BUILT_SHA[$a]}" ]]; then d+="${OFF_NAME[$a]}: identical (${OFF_SHA[$a]})"$'\n'
+        else d+="${OFF_NAME[$a]}: official ${OFF_SHA[$a]}, rebuilt ${BUILT_SHA[$a]:-N/A}"$'\n'"  ${DIFF_NOTE[$a]:-not diffed}"$'\n'; fi
     done
-    echo ""
-    echo "Revision, tag (and its signature):"
-    echo "tag:            ${APP_VERSION}"
-    echo "commit:         ${RESOLVED_COMMIT}"
-    echo ""
-    echo "Signature Summary:"
-    echo "${SIG_MANIFEST_STATUS}"
-    echo "${SIG_DIGEST_STATUS}"
-    echo "[WARNING] Tag signature not checked by this script"
-    echo "[WARNING] Commit signature not checked by this script"
-    echo ""
-    echo "Keys used:"
-    if [[ "$SIG_MANIFEST_STATUS" == "[OK]"* ]]; then echo "Manifest signed with: ${NUNCHUK_RELEASE_KEY_FPR}"; else echo "None established"; fi
-    echo ""
-    printf 'Warnings:%s\n' "${SIG_WARNINGS:-}"
-    echo ""
-    echo "===== End Results ====="
+    d+=$'\n'"Revision, tag (and its signature):"$'\n'"tag:            ${APP_VERSION}"$'\n'"commit:         ${RESOLVED_COMMIT}"$'\n\n'
+    d+="Signature Summary:"$'\n'"${SIG_MANIFEST_STATUS}"$'\n'"${SIG_DIGEST_STATUS}"$'\n'
+    d+="[WARNING] Tag signature not checked by this script"$'\n'"[WARNING] Commit signature not checked by this script"$'\n\n'"Keys used:"$'\n'
+    if [[ "$SIG_MANIFEST_STATUS" == "[OK]"* ]]; then d+="Manifest signed with: ${NUNCHUK_RELEASE_KEY_FPR}"; else d+="None established"; fi
+    d+=$'\n\n'"Warnings:${SIG_WARNINGS:-}"
+    a="${ARTIFACTS[0]}"
+    ws_results_block "$APP_ID" N/A "$APP_VERSION" N/A "$verdict" "${OFF_SHA[$a]:-N/A}" "$RESOLVED_COMMIT" "$d"
     echo ""
     echo "Build environment:"
     echo "VM image:       ${WIN_IMAGE}"
     echo "golden image:   ${GOLDEN_DIR}"
     echo "release runner: ${REL_IMAGE_OS:-?} ${REL_IMAGE_VERSION:-?}, cl.exe ${REL_MSVC} (runner fields not reproduced, see Warnings)"
     echo "toolchain:      VS Build Tools ${VS_REL}, MSVC 14.44.35207, SDK 10.0.22621.0, pwsh 7.6.6, Python 3.12.10, NASM 3.02, Strawberry Perl 5.32.1.1"
+    echo "D3D redist:     ${D3D_REDIST:-not logged}"
     echo "                cl.exe is checked against build-info.json; Python, NASM and Perl against upstream's CI logs"
     echo "                (runs 38044363978, 40099229609, 41083969010, 43581994636 for 2.9.1 to 2.9.4) and runner toolsets."
     [[ "$APP_VERSION" == 2.9.[1-4] ]] || echo "[WARNING] Toolchain versions were confirmed for 2.9.1 to 2.9.4 only; check them against this release's CI run"
@@ -797,17 +749,17 @@ main() {
     echo ""; echo "======================================================"
     echo "${APP_NAME} Reproducible Build Verifier ${SCRIPT_VERSION}"
     echo "======================================================"; echo ""
-    SCRIPT_SHA256="$(sha256_of "$SCRIPT_PATH")"
-    log_info "Script:  $(basename "$SCRIPT_PATH") ${SCRIPT_VERSION}"
-    log_info "         sha256: ${SCRIPT_SHA256}"
-    rm -f "${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
-
+    ws_refuse_root
+    ws_install_traps
     parse_args "$@"
-    [[ "$(id -u)" -ne 0 ]] || die_invalid "Do not run as root: run as a normal user (rootless podman, or docker group)"
-    detect_container_cmd
+    ws_results_init
+    ws_engine
+    # Rootless: container root is the caller. Otherwise the tools run as the caller.
+    is_rootless || TOOLS_USER=(--user "$(id -u):$(id -g)")
+    WS_CHOWN_IMAGE="$GIT_IMAGE"
     check_prereqs
     setup_workdir
-    log_info "Version: ${APP_VERSION}  Arch: ${APP_ARCH}  Type: ${APP_TYPE}"
+    ws_info "Version: ${APP_VERSION}  Arch: ${APP_ARCH}  Type: ${APP_TYPE}"
 
     prepare_official
     verify_official_signature
@@ -819,15 +771,14 @@ main() {
 
     local verdict_exit=0
     compare_artifacts || verdict_exit=$?
-    "$CONTAINER_CMD" rm -f "$VM_NAME" > /dev/null 2>&1 || true
-    VM_NAME=""
+    ws_ctr rm -f "$VM_NAME" > /dev/null 2>&1 && VM_NAME=""
 
     emit_verification_summary
     echo ""
     echo "======================================================"
     echo "RESULTS (machine-readable verdict in COMPARISON_RESULTS.yaml)"
     echo "======================================================"
-    cat "${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"
+    cat "${WS_RESULTS_FILE}"
     echo ""
     echo "Work directory: ${WORK_DIR}"
     echo "Rebuilt artifacts: ${WORK_DIR}/built/"
