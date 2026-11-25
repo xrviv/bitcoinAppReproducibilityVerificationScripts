@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# coinspacewallet-v0.5.0_build.sh - Coin Wallet Android reproducible build verification
-# Version:          v0.5.0
+# coinspacewallet-v0.5.1_build.sh - Coin Wallet Android reproducible build verification
+# Version:          v0.5.1
 # Last modified by: Claude Opus 5.5 for Danny Garcia
 # Last modified on: 2026-11-25
 # Organization:     WalletScrutiny.com
@@ -15,8 +15,8 @@
 # Needs GITHUB_TOKEN (read:packages): the @coinspace/* npm packages exist only on npm.pkg.github.com.
 # Exit: 0 reproducible; 1 not reproducible, ftbfs or no verdict; 2 invalid input or no library.
 
-SCRIPT_NAME="coinspacewallet-v0.5.0_build.sh"
-SCRIPT_VERSION="v0.5.0"
+SCRIPT_NAME="coinspacewallet-v0.5.1_build.sh"
+SCRIPT_VERSION="v0.5.1"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
 SCRIPT_SHA256="${SCRIPT_SHA256:-N/A}"
@@ -89,6 +89,7 @@ NODE_VER="20.20.2"
 NODE_SHA="df770b2a6f130ed8627c9782c988fda9669fa23898329a61a871e32f965e007d"  # node-v20.20.2-linux-x64.tar.xz
 declare -A BUNDLETOOL_SHA256=(
   [1.17.2]=2d4ad908faea64047c1cc9cb747e6aa667c6ab192e09607bd16b67246a8cd6ae
+  [1.18.0]=78343764d2e79c8f55710378b04981fcb1e46daebfc3b5dc577778082e6a98fd
   [1.18.1]=675786493983787ffa11550bdb7c0715679a44e1643f3ff980a529e9c822595c
   [1.18.2]=378b5434cd1378bef6b2bc527b8c7f0ff2584b273830335bce54d6d0813c8584
   [1.18.3]=a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29
