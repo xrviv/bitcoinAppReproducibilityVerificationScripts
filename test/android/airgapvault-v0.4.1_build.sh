@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# airgapvault-v0.4.0_build.sh - AirGap Vault Android reproducible build verification
-# Version:          v0.4.0
+# airgapvault-v0.4.1_build.sh - AirGap Vault Android reproducible build verification
+# Version:          v0.4.1
 # Last modified by: Claude Opus 5.5 for Danny Garcia
 # Last modified on: 2026-11-25
 # Organization:     WalletScrutiny.com
@@ -15,8 +15,8 @@
 # Changelog: script-notes/android/it.airgap.vault/changelog.md
 # Exit: 0 reproducible; 1 not reproducible, ftbfs or no verdict; 2 invalid input or no library.
 
-SCRIPT_NAME="airgapvault-v0.4.0_build.sh"
-SCRIPT_VERSION="v0.4.0"
+SCRIPT_NAME="airgapvault-v0.4.1_build.sh"
+SCRIPT_VERSION="v0.4.1"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
 SCRIPT_SHA256="${SCRIPT_SHA256:-N/A}"
@@ -420,10 +420,15 @@ if [[ -n "$SV" ]]; then
     (cd src/packages/sapling-android/app/src/main/cpp/libs && sha256sum */*.a) > committed-a.txt || true
     cd src/packages/sapling-android
     chmod +x gradlew
-    JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 ./gradlew --no-daemon publishToMavenLocal
-    cp "/w/home/.m2/repository/it/airgap/sapling/$1/sapling-$1.aar" /w/built.aar
+    # Java takes user.home from the passwd entry (/root), not $HOME: name the Maven repo explicitly.
+    JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 ./gradlew --no-daemon -Dmaven.repo.local=/w/home/.m2/repository publishToMavenLocal
+    a="$(find /w/home/.m2/repository -type f -name "*-$1.aar")"
+    [ -n "$a" ] && [ "$(printf "%s\n" "$a" | wc -l)" -eq 1 ] || { echo "published AAR(s) for $1: ${a:-none}"; exit 30; }
+    echo "Published AAR: ${a#/w/home/.m2/repository/}"
+    cp "$a" /w/built.aar
   ' sh "$SV" "$SAPLING_URL" || rc=$?
   SAP_COMMIT="$(cat "${SAP}/commit.txt" 2>/dev/null || true)"
+  [[ "$rc" -ne 30 ]] || nov "airgap-sapling ${SV} built, but not exactly one published AAR was found (a script problem): no verdict. Log: ${SAP}/build.log"
   # The app itself built: a failed rebuild of its dependency gives no verdict for the app (Danny, 2026-11-25).
   if [[ "$rc" -ne 0 ]]; then
     nov "airgap-sapling ${SV} (commit ${SAP_COMMIT:-?}) did not build from its tag (exit ${rc}, $(failure_kind "${SAP}/build.log")). The app built, but its sapling AAR cannot be checked: no verdict. Log: ${SAP}/build.log"
