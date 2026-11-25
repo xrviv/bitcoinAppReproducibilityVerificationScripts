@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# airgapvault-v0.4.1_build.sh - AirGap Vault Android reproducible build verification
-# Version:          v0.4.1
+# airgapvault-v0.4.2_build.sh - AirGap Vault Android reproducible build verification
+# Version:          v0.4.2
 # Last modified by: Claude Opus 5.5 for Danny Garcia
 # Last modified on: 2026-11-25
 # Organization:     WalletScrutiny.com
@@ -10,13 +10,14 @@
 # Steps: read the official APK (GitHub release or Google Play: both are one universal APK), clone
 #   the release tag, build it with the tag's own
 #   build/android/Dockerfile (base image pinned by digest), rebuild the airgap-sapling AAR from its
-#   tag and compare it with the JitPack AAR the build used, compare every ZIP entry, write results.
+#   tag in JitPack's build paths and compare it with the JitPack AAR the build used, compare every
+#   ZIP entry, write results.
 #   Library ws-rb-core (#1023); build-lock.json from the Gradle cache (#1000) never changes the verdict.
 # Changelog: script-notes/android/it.airgap.vault/changelog.md
 # Exit: 0 reproducible; 1 not reproducible, ftbfs or no verdict; 2 invalid input or no library.
 
-SCRIPT_NAME="airgapvault-v0.4.1_build.sh"
-SCRIPT_VERSION="v0.4.1"
+SCRIPT_NAME="airgapvault-v0.4.2_build.sh"
+SCRIPT_VERSION="v0.4.2"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
 SCRIPT_SHA256="${SCRIPT_SHA256:-N/A}"
@@ -397,11 +398,11 @@ ws_section "TOOLS IMAGE (ubuntu 22.04 by digest, cmdline-tools and apktool 3.0.3
 fetch "$APKTOOL_URL" "${W}/tools/apktool.jar" "$APKTOOL_SHA256"
 cat > "${W}/tools/Containerfile" <<EOF
 FROM ${UBUNTU_PIN}
-ENV DEBIAN_FRONTEND=noninteractive ANDROID_SDK_ROOT=/opt/android-sdk ANDROID_HOME=/opt/android-sdk
+ENV DEBIAN_FRONTEND=noninteractive ANDROID_SDK_ROOT=/opt/android-sdk-linux ANDROID_HOME=/opt/android-sdk-linux
 RUN apt-get update && apt-get install -y ca-certificates curl git unzip zip openjdk-11-jdk openjdk-17-jdk binutils python3 && rm -rf /var/lib/apt/lists/*
-RUN mkdir -p /opt/android-sdk/cmdline-tools && curl -fsSL -o /tmp/ct.zip "${CT_URL}" && echo "${CT_SHA256}  /tmp/ct.zip" | sha256sum -c - \\
- && unzip -q /tmp/ct.zip -d /opt/android-sdk/cmdline-tools && mv /opt/android-sdk/cmdline-tools/cmdline-tools /opt/android-sdk/cmdline-tools/latest && rm -f /tmp/ct.zip
-ENV PATH=/opt/android-sdk/cmdline-tools/latest/bin:\${PATH}
+RUN mkdir -p /opt/android-sdk-linux/cmdline-tools && curl -fsSL -o /tmp/ct.zip "${CT_URL}" && echo "${CT_SHA256}  /tmp/ct.zip" | sha256sum -c - \\
+ && unzip -q /tmp/ct.zip -d /opt/android-sdk-linux/cmdline-tools && mv /opt/android-sdk-linux/cmdline-tools/cmdline-tools /opt/android-sdk-linux/cmdline-tools/latest && rm -f /tmp/ct.zip
+ENV PATH=/opt/android-sdk-linux/cmdline-tools/latest/bin:\${PATH}
 # sdkmanager checks each package against the checksum in Google's repository index.
 RUN yes | sdkmanager --licenses > /dev/null && sdkmanager "platform-tools" "platforms;android-29" "build-tools;29.0.3" "ndk;21.1.6352462" "cmake;3.10.2.4988404"
 COPY apktool.jar /opt/apktool.jar
@@ -413,19 +414,21 @@ bg_wait "${CTR[@]}" build "${targs[@]}" "${W}/tools" || nov "Tools image build f
 if [[ -n "$SV" ]]; then
   ws_section "SAPLING (airgap-sapling ${SV} from its tag, compared with the JitPack AAR)"
   rc=0
-  ctr sapling "${SAP}/build.log" /dev/null --platform "$PLATFORM" -e HOME=/w/home -v "${SAP}:/w" -w /w --entrypoint bash "$TOOLS_IMG" -c '
+  # Build in JitPack's own paths (its public build.log: repo at /home/jitpack/build, SDK at
+  # /opt/android-sdk-linux): the libsapling.so build IDs depend on them (Danny, 2026-11-25).
+  ctr sapling "${SAP}/build.log" /dev/null --platform "$PLATFORM" -e HOME=/home/jitpack -v "${SAP}:/home/jitpack" -w /home/jitpack --entrypoint bash "$TOOLS_IMG" -c '
     set -eu
-    git clone --quiet --depth 1 --branch "$1" "$2" src || exit 10
-    git -C src rev-parse HEAD > commit.txt
-    (cd src/packages/sapling-android/app/src/main/cpp/libs && sha256sum */*.a) > committed-a.txt || true
-    cd src/packages/sapling-android
+    git clone --quiet --depth 1 --branch "$1" "$2" build || exit 10
+    git -C build rev-parse HEAD > commit.txt
+    (cd build/packages/sapling-android/app/src/main/cpp/libs && sha256sum */*.a) > committed-a.txt || true
+    cd build/packages/sapling-android
     chmod +x gradlew
     # Java takes user.home from the passwd entry (/root), not $HOME: name the Maven repo explicitly.
-    JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 ./gradlew --no-daemon -Dmaven.repo.local=/w/home/.m2/repository publishToMavenLocal
-    a="$(find /w/home/.m2/repository -type f -name "*-$1.aar")"
+    JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 ./gradlew --no-daemon -Dmaven.repo.local=/home/jitpack/.m2/repository publishToMavenLocal
+    a="$(find /home/jitpack/.m2/repository -type f -name "*-$1.aar")"
     [ -n "$a" ] && [ "$(printf "%s\n" "$a" | wc -l)" -eq 1 ] || { echo "published AAR(s) for $1: ${a:-none}"; exit 30; }
-    echo "Published AAR: ${a#/w/home/.m2/repository/}"
-    cp "$a" /w/built.aar
+    echo "Published AAR: ${a#/home/jitpack/.m2/repository/}"
+    cp "$a" /home/jitpack/built.aar
   ' sh "$SV" "$SAPLING_URL" || rc=$?
   SAP_COMMIT="$(cat "${SAP}/commit.txt" 2>/dev/null || true)"
   [[ "$rc" -ne 30 ]] || nov "airgap-sapling ${SV} built, but not exactly one published AAR was found (a script problem): no verdict. Log: ${SAP}/build.log"
@@ -529,7 +532,7 @@ done <<< "$summary"
 if [[ -n "$SV" ]]; then
   n="${NCOUNT[1]}"
   if [[ "$n" -eq 0 ]]; then SAP_VERDICT=reproducible SAP_NOTES="airgap-sapling ${SV} (${SAP_COMMIT}): every AAR entry identical, .so files unmodified"
-  else SAP_VERDICT=not_reproducible SAP_NOTES="airgap-sapling ${SV} (${SAP_COMMIT}): ${n} AAR entries differ (counted); ELF notes: ${W}/cmp/sapling-diag.txt"; fi
+  else SAP_VERDICT=not_reproducible SAP_NOTES="airgap-sapling ${SV} (${SAP_COMMIT}): ${n} AAR entries differ (counted); ELF notes in the workspace: cmp/sapling-diag.txt"; fi
   ws_info "Sapling: ${SAP_VERDICT}"; ws_diff_preview "${W}/cmp/sapling-diag.txt"
 else
   SAP_NOTES="build.gradle names no airgap-sapling and the APK ships no libsapling.so"
@@ -541,7 +544,7 @@ else verdict=not_reproducible; ws_warn "VERDICT: NOT REPRODUCIBLE (${COUNTED} di
 n_acc="$(wc -l < "${W}/cmp/accepted.txt" || true)"
 results "$verdict"
 ws_write_yaml "$verdict" "AirGap Vault ${VERSION} (${VCODE}) ${SRC} vs tag ${TAG}, commit ${COMMIT}.
-Build: the tag's build/android/Dockerfile, BUILD_NR=${VCODE}, versionName set from the tag as AirGap's CI does; FROM pinned to ${IONIC_PIN#docker.io/}, base Gradle module cache emptied first.
+Build: the tag's build/android/Dockerfile, BUILD_NR=${VCODE}, versionName set from the tag as AirGap's CI does; FROM pinned to ${IONIC_PIN#docker.io/}, base Gradle module cache emptied first. airgap-sapling built from its tag in JitPack's paths (/home/jitpack/build, SDK /opt/android-sdk-linux), as its JitPack build.log shows.
 Compared: every ZIP entry by SHA-256 of its content. Differing entries: ${COUNTED} (APK ${NCOUNT[0]}$([[ -n "$SV" ]] && echo ", sapling AAR ${NCOUNT[1]}")). Accepted (WS #574): ${n_acc// /} (root META-INF signing files, official only; Google Play SourceStamp and manifest labels; resources.arsc when the apktool-decoded res/ trees match$([[ -n "$SV" ]] && echo "; nested jars whose every entry matches")).
 Sapling: ${SAP_VERDICT}; ${SAP_NOTES}. Zcash Sapling params checked against librustzcash's BLAKE2b hashes.
 Not rebuilt (prebuilt with public source): sapling's committed Rust .a libraries, libsqlc-ndk-native-driver.so (npm), libtool-checker.so (rootbeer-lib AAR), npm dist JS, other Maven artifacts." "${HASHES[@]}"
