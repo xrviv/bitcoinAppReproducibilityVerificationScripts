@@ -1,9 +1,9 @@
 #!/bin/bash
 # sparrowdesktop_build.sh — Sparrow Desktop (Linux tarball/deb/rpm) reproducible build verification
-# Version: v0.22.1
+# Version: v0.22.2
 # Organization: WalletScrutiny.com
-# Last modified by: Daniel Garcia
-# Last modified on: 2026-11-18
+# Last modified by: Claude Opus 5.5 for Danny Garcia
+# Last modified on: 2026-11-25
 # Project: https://github.com/sparrowwallet/sparrow
 # Disclaimer: for reproducible-build verification and research only. No warranty; users assume all risk and are responsible for legal compliance; the developers assume no liability for misuse.
 # Steps: clone the tag in a container, build with upstream's JDK (./gradlew jpackage, plus packageTarDistribution or the deb repack), take the official artifact (--binary or GitHub release), compare extracted contents file by file, write COMPARISON_RESULTS.yaml next to this script.
@@ -12,7 +12,7 @@
 # Exit codes: 0 = reproducible, 1 = not_reproducible, ftbfs or a failure with no verdict, 2 = invalid parameters or library unavailable, 130 = stopped.
 set -euo pipefail
 
-SCRIPT_VERSION="v0.22.1"
+SCRIPT_VERSION="v0.22.2"
 SCRIPT_SHA256=$(sha256sum "$0" 2>/dev/null | cut -d' ' -f1) || true
 SCRIPT_SHA256="${SCRIPT_SHA256:-N/A}"
 echo "$(basename "$0") ${SCRIPT_VERSION} sha256: ${SCRIPT_SHA256}"
@@ -66,9 +66,12 @@ ws_lib_load
 
 APP_ID="sparrow"
 
-# Upstream's JDK for 2.5.6 (.github/workflows/package.yaml java-version); the build refuses a tag that asks for another.
-JDK_VERSION="25.0.5+8"
-JDK_SHA256="68982529869257d0ee6b824ec5aa270ff8b118bb438670da0b97ebdab178d7fb"
+# Upstream's JDK for 2.5.7 (docs/reproducible.md, .sdkmanrc): Temurin 25.0.5.1+2, sha256 from Adoptium's release.
+# JDK_UPSTREAM is the java-version string .github/workflows/package.yaml gives setup-java for it; the build
+# refuses a tag that asks for another.
+JDK_VERSION="25.0.5.1+2"
+JDK_SHA256="760f91b22c3efc9bd1b64ff950598231be82928cc807e30691a0e7a2995a62c0"
+JDK_UPSTREAM="25.0.5+100000002.0.LTS"
 
 APP_VERSION=""
 APP_ARCH=""
@@ -176,6 +179,7 @@ build_and_verify() {
         --build-arg JDK_FILE="$jdk_file" \
         --build-arg JDK_URL="https://github.com/adoptium/temurin25-binaries/releases/download/jdk-${JDK_VERSION/+/%2B}/${jdk_file}" \
         --build-arg JDK_SHA256="$JDK_SHA256" \
+        --build-arg JDK_UPSTREAM="$JDK_UPSTREAM" \
         -t "$IMAGE_NAME" . 2>&1 | tee build.log; then
         echo ""
         # ftbfs only when the source itself failed to build; any other failure writes no YAML.
@@ -563,6 +567,7 @@ ENV PATH=${JAVA_HOME}/bin:${PATH}
 # Clone the requested tag directly, so a cached clone can never miss a newer tag.
 ARG SPARROW_VERSION
 ENV SPARROW_VERSION=${SPARROW_VERSION}
+ARG JDK_UPSTREAM
 WORKDIR /build
 RUN git clone --recursive --branch "${SPARROW_VERSION}" https://github.com/sparrowwallet/sparrow.git
 
@@ -572,7 +577,7 @@ RUN git submodule update --init --recursive && \
     echo "Resolved commit: $(cat /commit)" && git submodule status && \
     UPSTREAM_JDK=$(sed -n "s/.*java-version: *'\([^']*\)'.*/\1/p" .github/workflows/package.yaml | head -1) && \
     echo "Upstream workflow JDK: ${UPSTREAM_JDK:-unknown}; this script: ${JDK_VERSION}" && \
-    if [ -n "${UPSTREAM_JDK}" ] && [ "${UPSTREAM_JDK}" != "${JDK_VERSION%%+*}" ]; then \
+    if [ -n "${UPSTREAM_JDK}" ] && [ "${UPSTREAM_JDK}" != "${JDK_UPSTREAM}" ]; then \
         echo "JDK_MISMATCH: tag ${SPARROW_VERSION} is built upstream with JDK ${UPSTREAM_JDK}; update this script"; exit 1; \
     fi
 
