@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
 # unstoppablefdroid_build.sh - Unstoppable Wallet (F-Droid variant) Verification
-# Version: v0.1.4 | WalletScrutiny.com | Danny Garcia | 2026-10-16
-# Project: https://github.com/horizontalsystems/unstoppable-wallet-android
-# Host deps: docker or podman; curl only when downloading the official APK.
-# Sibling of unstoppablewallet_build.sh (Play/split-only). Four things to know:
-#  1. F-Droid ships ONE fat APK per version via assembleFdroidRelease. No AAB, no
-#     bundletool. See ws-notes/review-notes/android-apk-forms-fat-universal-splits.md
-#  2. F-Droid signs with ITS OWN key. A signer differing from the Play/GitHub
-#     artifacts is expected, not a finding.
-#  3. F-Droid does not build the pristine tag. fdroiddata declares
-#     `rm: subscriptions-google-play` and a prebuild sed stripping marketKit.sendStats;
-#     both are reproduced and asserted below. Without them no match is possible.
-#  4. The horizontalsystems kits (xrp from wallet 0.52.0) are rebuilt from source; any horizontalsystems
-#     JitPack fetch aborts. F-Droid's own build consumes JitPack artifacts instead.
+# Version:       v0.1.5
+# Organization:  WalletScrutiny.com
+# License:       MIT
+# Last modified by: Claude (WalletScrutiny agent)
+# Last modified on: 2026-11-26
+# Project:       https://github.com/horizontalsystems/unstoppable-wallet-android
+# Host deps:     docker or podman only (the APK download runs in the container)
+# Disclaimer:    Provided as-is, without warranty. It checks whether the published APK matches a build
+#                of the tagged source; it does not audit the code. Use at your own risk.
+# Steps:         1 build the container image; 2 take --binary or download the F-Droid APK; 3 read
+#                version/signer/app ID; 4 build HS kits + wallet (assembleFdroidRelease) from source;
+#                5 compare contents; 6 results block + COMPARISON_RESULTS.yaml (real verdicts only).
+# Notes:         sibling of unstoppablewallet_build.sh. F-Droid ships ONE fat APK (assembleFdroidRelease),
+#                signed with F-Droid's own key (a different signer is expected). fdroiddata's
+#                `rm: subscriptions-google-play` + marketKit.sendStats strip are reproduced and asserted.
+#                All horizontalsystems kits are rebuilt from source; any HS JitPack fetch stops the run.
 
-SCRIPT_VERSION="v0.1.4"
+SCRIPT_VERSION="v0.1.5"
 SCRIPT_NAME="unstoppablefdroid_build.sh"
 SCRIPT_PATH="$(readlink -f "$0")"
 if [[ -f "$SCRIPT_PATH" ]]; then
@@ -27,6 +30,8 @@ printf '%s %s sha256:%s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION" "$SCRIPT_SHA256"
 set -uo pipefail   # no -e: diff/cmp return 1 on differences
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+CALLER_DIR="$(pwd -P)"
+rm -f "${SCRIPT_DIR}/COMPARISON_RESULTS.yaml"   # never leave a previous run's verdict for ABS
 APP_ID="io.horizontalsystems.bankwallet"
 FDROID_REPO="https://f-droid.org/repo"
 FDROID_API="https://f-droid.org/api/v1/packages/${APP_ID}"
@@ -71,14 +76,23 @@ verdict: ${1}
 notes: |
   ${2}
 EOF
-    log_info "COMPARISON_RESULTS.yaml written with verdict: ${1}"
+    YAML_OWN=1; log_info "COMPARISON_RESULTS.yaml written with verdict: ${1}"
 }
-die() {   # die <exit-code> <log message> [yaml note; defaults to the log message]
+YAML_OWN=0
+drop_yaml() { [[ "$YAML_OWN" -eq 1 ]] && rm -f "${execution_dir}/COMPARISON_RESULTS.yaml"; YAML_OWN=0; }
+# ftbfs <code> <msg> [note]: only when the tagged source fails to build.
+ftbfs() {
     log_error "$2"; write_yaml ftbfs "${3:-$2}"
     echo ""; echo "Exit code: $1"; exit "$1"
 }
+# no_verdict <code> <msg>: input, runtime, network or policy stop; no YAML.
+no_verdict() {
+    drop_yaml; log_error "$2"
+    log_error "No verdict: COMPARISON_RESULTS.yaml not written."
+    echo ""; echo "Exit code: $1"; exit "$1"
+}
 
-[[ "$EUID" -eq 0 ]] && die 2 "Do not run this script as root." "Script was run as root; refusing to proceed"
+[[ "$EUID" -eq 0 ]] && no_verdict 2 "Do not run this script as root."
 
 version_arg=""
 apk_file=""
@@ -89,7 +103,7 @@ version_code_arg=""
 require_arg() {
     local flag="$1" val="${2:-}"
     if [[ -z "$val" || "$val" == --* ]]; then
-        die 2 "${flag} requires a value (got: '${val:-<nothing>}')" "${flag} requires a value"
+        no_verdict 2 "${flag} requires a value (got: '${val:-<nothing>}')"
     fi
 }
 
@@ -123,13 +137,18 @@ done
 [[ -n "$arch_arg" ]] && log_info "--arch ${arch_arg} accepted but not used (F-Droid ships one fat APK)"
 [[ -n "$type_arg" ]] && log_info "--type ${type_arg} accepted but not used"
 
+if [[ -n "$apk_file" ]]; then
+    [[ -f "$apk_file" ]] || no_verdict 2 "--binary path is not a file: ${apk_file}"
+    apk_file=$(realpath "$apk_file")
+fi
+
 if [[ -z "${CRUN:-}" ]]; then
     if command -v docker &>/dev/null; then
         CRUN=docker
     elif command -v podman &>/dev/null; then
         CRUN=podman
     else
-        die 2 "Neither docker nor podman found in PATH"
+        no_verdict 1 "Neither docker nor podman found in PATH"
     fi
 fi
 
@@ -139,19 +158,18 @@ MEM_ARGS=()
 
 banner "PRE-FLIGHT: HOST TOOL CHECK"
 printf "  %-12s OK  (%s)\n" "$CRUN" "$(command -v "$CRUN")"
-if [[ -z "$apk_file" ]]; then
-    command -v curl &>/dev/null || die 2 "curl not found in PATH and --binary was not supplied" "curl required to download the official F-Droid APK; or pass --binary"
-    printf "  %-12s OK  (%s)\n" "curl" "$(command -v curl)"
-fi
-echo "  Host requirement satisfied."
+echo "  Host requirement satisfied (container runtime only)."
 
-RUN_ID="unstoppablefdroid-$(date +%s)-$$"
+RUN_TAG="$(date +%s)-$$"
+RUN_ID="unstoppablefdroid-${RUN_TAG}"
 IMG_P3="ws-unstoppablefdroid-source-${RUN_ID}"
 CTR_P0="ws-unstoppablefdroid-p0-${RUN_ID}"
 CTR_P3="ws-unstoppablefdroid-source-ctr-${RUN_ID}"
 CTR_P5="ws-unstoppablefdroid-cmp-${RUN_ID}"
+CTR_DL="ws-unstoppablefdroid-dl-${RUN_ID}"
 
-workspace="${execution_dir}/unstoppablefdroid_verification_${RUN_ID}"
+# Per-run workspace in the caller's dir, exclusive mkdir.
+workspace="${CALLER_DIR}/unstoppablefdroid_verification_${version_arg:-apk}_${RUN_TAG}"
 DL_DIR="${workspace}/official"
 P0_DIR="${workspace}/metadata"
 P3_DIR="${workspace}/source-build"
@@ -160,35 +178,46 @@ P5_DIR="${workspace}/comparison"
 p3_ctx=""
 p0_ctx=""
 p5_ctx=""
+WS_CREATED=0
 
+# Container root = caller under rootless podman (unshare chown 0:0); docker: chown uid:gid.
 ensure_user_ownership() {
     local path="$1" image="$2"
     [[ -e "$path" ]] || return 0
+    if [[ "$CRUN" == podman ]]; then
+        podman unshare chown -R 0:0 "$path" >/dev/null 2>&1 || log_warn "Could not fix ownership for ${path}"
+        return 0
+    fi
     [[ -n "$image" ]] || return 0
-    $CRUN run --rm \
-        -v "${path}:/target" \
-        "$image" \
+    $CRUN run --rm -v "${path}:/target" "$image" \
         sh -c "chown -R ${HOST_UID}:${HOST_GID} /target" >/dev/null 2>&1 || \
         log_warn "Could not fix ownership for ${path}"
 }
 
 cleanup() {
     log_info "Cleaning up containers and images..."
-    $CRUN rm -f "$CTR_P3" 2>/dev/null || true
-    $CRUN rm -f "$CTR_P5" 2>/dev/null || true
+    $CRUN rm -f "$CTR_P0" "$CTR_P3" "$CTR_P5" "$CTR_DL" >/dev/null 2>&1 || true
     local own_image=""
     if $CRUN image inspect "$IMG_P3" >/dev/null 2>&1; then
         own_image="$IMG_P3"
     fi
-    ensure_user_ownership "$workspace" "$own_image"
-    $CRUN rmi -f "$IMG_P3" 2>/dev/null || true
+    [[ "$WS_CREATED" -eq 1 ]] && ensure_user_ownership "$workspace" "$own_image"
+    $CRUN rmi -f "$IMG_P3" >/dev/null 2>&1 || true
     [[ -n "$p3_ctx" ]] && rm -rf "$p3_ctx" 2>/dev/null || true
     [[ -n "$p0_ctx" ]] && rm -rf "$p0_ctx" 2>/dev/null || true
     [[ -n "$p5_ctx" ]] && rm -rf "$p5_ctx" 2>/dev/null || true
+    if [[ "$WS_CREATED" -eq 1 ]]; then
+        local foreign
+        foreign=$(find "$workspace" ! -uid "$HOST_UID" -print -quit 2>/dev/null || true)
+        [[ -z "$foreign" ]] || log_warn "Workspace still holds a file not owned by you: ${foreign}"
+    fi
     log_success "Cleanup complete."
 }
 trap cleanup EXIT
+trap 'drop_yaml; echo ""; log_error "Stopped by signal; no verdict written."; echo "Exit code: 130"; exit 130' INT TERM
 
+mkdir "$workspace" 2>/dev/null || no_verdict 2 "Could not create a new workspace: ${workspace}"
+WS_CREATED=1
 mkdir -p "$DL_DIR" "$P0_DIR" "$P3_DIR" "$P5_DIR"
 
 banner "UNSTOPPABLE WALLET (F-DROID) REPRODUCIBLE BUILD VERIFICATION"
@@ -199,65 +228,14 @@ echo "  Runtime:   ${CRUN} ($($CRUN --version 2>&1 | head -1))"
 echo "  Workspace: ${workspace}"
 echo "  Date:      $(date)"
 
-# OFFICIAL ARTIFACT: download from F-Droid unless --binary was supplied.
-banner "OFFICIAL ARTIFACT"
-
-if [[ -n "$apk_file" ]]; then
-    [[ -f "$apk_file" ]] || die 2 "--binary path is not a file: ${apk_file}"
-    apk_file=$(realpath "$apk_file")
-    log_info "Using supplied official APK: ${apk_file}"
-else
-    fdroid_version_code="$version_code_arg"
-    if [[ -z "$fdroid_version_code" ]]; then
-        log_info "Querying ${FDROID_API}"
-        api_json=$(curl -fsSL "$FDROID_API" 2>/dev/null || true)
-        [[ -n "$api_json" ]] || die 2 "Could not reach the F-Droid package API" "F-Droid package API unreachable; pass --version-code or --binary"
-        api_lines=$(printf '%s' "$api_json" | tr '{' '\n')
-        if [[ -n "$version_arg" ]]; then
-            esc_ver=$(printf '%s' "$version_arg" | sed 's/[][\.*^$/]/\\&/g')
-            fdroid_version_code=$(printf '%s\n' "$api_lines" \
-                | grep -E "\"versionName\"[[:space:]]*:[[:space:]]*\"${esc_ver}\"" \
-                | grep -oE '"versionCode"[[:space:]]*:[[:space:]]*[0-9]+' \
-                | grep -oE '[0-9]+' | head -1 || true)
-            if [[ -z "$fdroid_version_code" ]]; then
-                log_error "Version ${version_arg} is not published in the F-Droid repo"
-                log_warn  "Versions currently available:"
-                printf '%s\n' "$api_lines" \
-                    | grep -oE '"versionName"[[:space:]]*:[[:space:]]*"[^"]+"' \
-                    | sed -E 's/.*"([^"]+)"$/    \1/' | sort -u >&2 || true
-                write_yaml ftbfs "Version ${version_arg} not published in the F-Droid repo"
-                echo ""; echo "Exit code: 2"; exit 2
-            fi
-            log_info "--version ${version_arg} resolves to F-Droid versionCode ${fdroid_version_code}"
-        else
-            fdroid_version_code=$(printf '%s' "$api_json" \
-                | grep -oE '"suggestedVersionCode"[[:space:]]*:[[:space:]]*[0-9]+' \
-                | grep -oE '[0-9]+' | head -1 || true)
-            log_info "No --version given; using suggested versionCode ${fdroid_version_code}"
-        fi
-    fi
-    [[ "$fdroid_version_code" =~ ^[0-9]+$ ]] || die 2 "Could not determine an F-Droid versionCode" "Could not determine F-Droid versionCode; pass --version-code or --binary"
-    apk_url="${FDROID_REPO}/${APP_ID}_${fdroid_version_code}.apk"
-    apk_file="${DL_DIR}/${APP_ID}_${fdroid_version_code}.apk"
-    log_info "Downloading ${apk_url}"
-    curl -fsSL --retry 3 --retry-delay 5 -o "$apk_file" "$apk_url" || die 2 "Download failed: ${apk_url}" "Failed to download official F-Droid APK: ${apk_url}"
-    log_success "Downloaded $(basename "$apk_file") ($(stat -c%s "$apk_file") bytes)"
-    echo "  URL: ${apk_url}"
-fi
-
-official_size=$(stat -c%s "$apk_file")
-app_hash=$(sha256of "$apk_file")
-log_info "Official APK SHA-256: ${app_hash}"
-log_info "Official APK size:    ${official_size} bytes"
-
 # CONTAINER IMAGE: shared by metadata extraction, source build and comparison.
 banner "SETUP: BUILD SHARED CONTAINER IMAGE"
 echo "  Started: $(date)"
 
-p3_ctx=$(mktemp -d)
+p3_ctx=$(mktemp -d -p "$workspace" ctx-image.XXXXXX)
 
 cat > "$p3_ctx/Dockerfile" <<'DOCKERFILE_P3'
-FROM ubuntu:24.04
+FROM docker.io/library/ubuntu:24.04
 ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -291,14 +269,67 @@ WORKDIR /build
 DOCKERFILE_P3
 
 section "Building source-build image: ${IMG_P3}"
-$CRUN build -t "$IMG_P3" -f "$p3_ctx/Dockerfile" "$p3_ctx" || die 1 "Source-build image failed" "Source-build container image failed"
+$CRUN build -t "$IMG_P3" -f "$p3_ctx/Dockerfile" "$p3_ctx" || no_verdict 1 "Source-build container image failed to build (environment/network)"
 log_success "Source-build image built: ${IMG_P3}"
+
+# OFFICIAL ARTIFACT: --binary, or F-Droid download inside the container.
+banner "OFFICIAL ARTIFACT"
+
+in_ctr() { $CRUN run --rm --name "$CTR_DL" "$@"; }
+
+if [[ -n "$apk_file" ]]; then
+    log_info "Using supplied official APK: ${apk_file}"
+else
+    fdroid_version_code="$version_code_arg"
+    if [[ -z "$fdroid_version_code" ]]; then
+        log_info "Querying ${FDROID_API}"
+        api_json=$(in_ctr "$IMG_P3" wget -qO- "$FDROID_API" 2>/dev/null || true)
+        [[ -n "$api_json" ]] || no_verdict 1 "Could not reach the F-Droid package API; pass --version-code or --binary"
+        api_lines=$(printf '%s' "$api_json" | tr '{' '\n')
+        if [[ -n "$version_arg" ]]; then
+            esc_ver=$(printf '%s' "$version_arg" | sed 's/[][\.*^$/]/\\&/g')
+            fdroid_version_code=$(printf '%s\n' "$api_lines" \
+                | grep -E "\"versionName\"[[:space:]]*:[[:space:]]*\"${esc_ver}\"" \
+                | grep -oE '"versionCode"[[:space:]]*:[[:space:]]*[0-9]+' \
+                | grep -oE '[0-9]+' | head -1 || true)
+            if [[ -z "$fdroid_version_code" ]]; then
+                log_warn "Versions currently available:"
+                printf '%s\n' "$api_lines" \
+                    | grep -oE '"versionName"[[:space:]]*:[[:space:]]*"[^"]+"' \
+                    | sed -E 's/.*"([^"]+)"$/    \1/' | sort -u >&2 || true
+                no_verdict 2 "Version ${version_arg} is not published in the F-Droid repo"
+            fi
+            log_info "--version ${version_arg} resolves to F-Droid versionCode ${fdroid_version_code}"
+        else
+            fdroid_version_code=$(printf '%s' "$api_json" \
+                | grep -oE '"suggestedVersionCode"[[:space:]]*:[[:space:]]*[0-9]+' \
+                | grep -oE '[0-9]+' | head -1 || true)
+            log_info "No --version given; using suggested versionCode ${fdroid_version_code}"
+        fi
+    fi
+    [[ "$fdroid_version_code" =~ ^[0-9]+$ ]] || no_verdict 2 "Could not determine an F-Droid versionCode; pass --version-code or --binary"
+    apk_name="${APP_ID}_${fdroid_version_code}.apk"
+    apk_url="${FDROID_REPO}/${apk_name}"
+    apk_file="${DL_DIR}/${apk_name}"
+    log_info "Downloading ${apk_url}"
+    in_ctr -v "${DL_DIR}:/dl" "$IMG_P3" wget -q --tries=3 --waitretry=5 -O "/dl/${apk_name}" "$apk_url" \
+        || no_verdict 1 "Download failed: ${apk_url}"
+    [[ -s "$apk_file" ]] || no_verdict 1 "Downloaded APK is empty: ${apk_url}"
+    log_success "Downloaded ${apk_name} ($(stat -c%s "$apk_file") bytes)"
+    echo "  URL: ${apk_url}"
+fi
+
+official_size=$(stat -c%s "$apk_file")
+app_hash=$(sha256of "$apk_file")
+log_info "Official APK SHA-256: ${app_hash}"
+log_info "Official APK size:    ${official_size} bytes"
+
 
 banner "PHASE 0: APK METADATA EXTRACTION"
 echo "  Extracting versionName, versionCode, signer from the official F-Droid APK..."
 echo "  Started: $(date)"
 
-p0_ctx=$(mktemp -d)
+p0_ctx=$(mktemp -d -p "$workspace" ctx-meta.XXXXXX)
 
 cat > "$p0_ctx/extract_meta.sh" <<'META_SCRIPT'
 #!/bin/bash
@@ -342,7 +373,7 @@ if ! $CRUN run \
     -v "${p0_ctx}/extract_meta.sh:/extract_meta.sh:ro" \
     "$IMG_P3" \
     bash /extract_meta.sh; then
-    die 1 "Phase 0 metadata extraction failed" "APK metadata extraction failed"
+    no_verdict 1 "Phase 0: could not read the official APK (metadata or signature check failed)"
 fi
 
 wallet_version=$(cat "${P0_DIR}/version_name.txt" 2>/dev/null || echo "unknown")
@@ -350,14 +381,14 @@ version_code=$(cat   "${P0_DIR}/version_code.txt"  2>/dev/null || echo "unknown"
 signer=$(cat          "${P0_DIR}/signer.txt"        2>/dev/null || echo "unknown")
 
 pkg_id=$(cat "${P0_DIR}/pkg_name.txt" 2>/dev/null || echo "unknown")
-[[ "$pkg_id" == "$APP_ID" ]] || die 1 "APK app ID mismatch: expected $APP_ID, got ${pkg_id}"
+[[ "$pkg_id" == "$APP_ID" ]] || no_verdict 2 "APK app ID mismatch: expected $APP_ID, got ${pkg_id}"
 log_success "APK app ID verified: ${pkg_id}"
 
 if [[ -n "$version_arg" && "$version_arg" != "$wallet_version" ]]; then
-    die 2 "Requested --version ${version_arg} but the official APK reports versionName ${wallet_version}" "Requested version ${version_arg} but official APK is ${wallet_version}"
+    no_verdict 2 "Requested --version ${version_arg} but the official APK reports versionName ${wallet_version}"
 fi
 if [[ "$wallet_version" == "unknown" || -z "$wallet_version" ]]; then
-    die 1 "Could not derive versionName from the official APK"
+    no_verdict 2 "Could not derive versionName from the official APK"
 fi
 
 log_success "APK metadata: v${wallet_version} (code ${version_code})"
@@ -379,9 +410,9 @@ ORIG_PATH="$PATH"
 
 clone_at_commit() {
     local url="$1" commit="$2" dir="$3"
-    git clone "$url" "$dir"
-    git -C "$dir" checkout "$commit"
-    git -C "$dir" submodule update --init --recursive
+    git clone "$url" "$dir" || exit 44
+    git -C "$dir" checkout "$commit" || exit 44
+    git -C "$dir" submodule update --init --recursive || exit 44
 }
 
 extract_wallet_hs_version() {
@@ -412,7 +443,7 @@ require_nonempty() {
     local name="$1" value="$2"
     if [[ -z "$value" ]]; then
         echo "ERROR: Could not derive ${name} from wallet dependencies"
-        exit 1
+        exit 45
     fi
 }
 
@@ -453,15 +484,14 @@ create_root_pom() {
     echo "Created root POM stub: ${group}:${artifact}:${version}"
 }
 
-# publish_kit <repo> <module> <artifact> <version> <agp-optin 0|1>: add maven-publish, set the
-# publication coordinates (patching an existing release(MavenPublication) or appending one),
+# publish_kit <repo> <module> <artifact> <version> <agp-optin 0|1>: set publication coordinates,
 # assert the version landed, then publishToMavenLocal.
 publish_kit() {
     local g="$2/build.gradle"
     cd "/build/deps/$1"
     grep -qF "maven-publish" "$g" || sed -i "/plugins {/a\\    id 'maven-publish'" "$g"
     if [[ "$5" == 1 ]]; then
-        # AGP 8.11.1: components.release does not exist without the release-variant publishing opt-in.
+        # AGP 8: release-variant opt-in
         grep -qF "singleVariant('release')" "$g" || sed -i "/^android {/a\\    publishing { singleVariant('release') }" "$g"
     fi
     if grep -qF "release(MavenPublication)" "$g"; then
@@ -483,16 +513,16 @@ afterEvaluate {
 }
 PUB
     fi
-    grep -qF "version = '$4'" "$g" || { echo "ERROR: $3 publication version not set to $4"; exit 1; }
+    grep -qF "version = '$4'" "$g" || { echo "ERROR: $3 publication version not set to $4"; exit 45; }
     ./gradlew ":$2:publishToMavenLocal" --no-daemon
 }
 
-# inject_coords <build.gradle> <artifactId> <version>: add coordinates after `from components.release`.
+# inject_coords <gradle> <artifactId> <version>
 inject_coords() {
     sed -i "s/from components.release/from components.release\\n                groupId = \\\"com.github.horizontalsystems\\\"\\n                artifactId = \\\"$2\\\"\\n                version = \\\"$3\\\"/" "$1"
 }
 
-# publish_multi <dir> <artifact> <version> <modules...>: multi-module kits (bitcoin, ethereum).
+# publish_multi <dir> <artifact> <version> <modules...>
 publish_multi() {
     local dir="$1" art="$2" ver="$3" module; shift 3
     cd "$dir"
@@ -507,7 +537,7 @@ publish_multi() {
 
 echo ""; echo "=== Step 1: Clone all repos === $(date)"
 
-git clone --depth 1 --branch __WALLET_VERSION__ "$GH/unstoppable-wallet-android.git" /build/wallet
+git clone --depth 1 --branch __WALLET_VERSION__ "$GH/unstoppable-wallet-android.git" /build/wallet || exit 44
 
 compile_sdk=$(sed -nE 's/^[[:space:]]*compileSdk[[:space:]]*=[[:space:]]*"([0-9]+)".*/\1/p' \
     /build/wallet/gradle/libs.versions.toml | head -1)
@@ -517,7 +547,7 @@ platform_dir=$(find "$ANDROID_HOME/platforms" -maxdepth 1 -type d \
 if [[ -z "$platform_dir" ]]; then
     echo "ERROR: compileSdk ${compile_sdk} is not installed under $ANDROID_HOME/platforms"
     echo "       Refusing to build dependencies before this environment defect is fixed."
-    exit 1
+    exit 45
 fi
 echo "Compile SDK ${compile_sdk} present: ${platform_dir}"
 
@@ -527,7 +557,7 @@ elif [[ -f "/build/wallet/app/build.gradle" ]]; then
     wallet_gradle="/build/wallet/app/build.gradle"
 else
     echo "ERROR: wallet app/build.gradle(.kts) not found under /build/wallet/app/"
-    exit 1
+    exit 45
 fi
 
 # VAR:kit-name pairs; every one is a hard requirement (an empty version aborts).
@@ -542,11 +572,13 @@ for spec in $KITS; do
 done
 HD_WALLET_VER=$(extract_wallet_hs_version "hd-wallet-kit-android" "$wallet_gradle" || true)
 THORCHAIN_VER=$(extract_wallet_hs_version "thorchain-kit-android" "$wallet_gradle" || true)
-# xrp-kit-android (wallet >= 0.52.0) publishes under the old repo name: com.github.horizontalsystems:xrp-android
+# xrp-kit (wallet >= 0.52.0) publishes as xrp-android
 XRP_VER=$(extract_wallet_hs_version "xrp-android" "$wallet_gradle" || true)
+NEAR_VER=$(extract_wallet_hs_version "near-android-kit" "$wallet_gradle" || true)   # wallet >= 0.53.0
 [[ -n "$HD_WALLET_VER" ]] && echo "  hd-wallet-kit-android:            $HD_WALLET_VER"
 [[ -n "$THORCHAIN_VER" ]] && echo "  thorchain-kit-android:             $THORCHAIN_VER"
 [[ -n "$XRP_VER" ]] && echo "  xrp-kit-android (xrp-android):     $XRP_VER"
+[[ -n "$NEAR_VER" ]] && echo "  near-android-kit:                  $NEAR_VER"
 
 # bitcoin-kit is cloned to /home/jitpack/build: its build.gradle hardcodes that path.
 for spec in $KITS; do
@@ -560,6 +592,7 @@ fi
 if [[ -n "$XRP_VER" ]]; then
     clone_at_commit "$GH/xrp-kit-android.git"                  "$XRP_VER"       /build/deps/xrp-kit-android
 fi
+[[ -z "$NEAR_VER" ]] || clone_at_commit "$GH/near-android-kit.git" "$NEAR_VER" /build/deps/near-android-kit
 
 if [[ -z "$HD_WALLET_VER" ]]; then
     HD_WALLET_VER=$(grep -Eo "com\\.github\\.horizontalsystems:hd-wallet-kit-android:[^\"']+" \
@@ -573,7 +606,7 @@ if [[ -z "$HD_WALLET_VER" ]]; then
 fi
 if [[ -z "$HD_WALLET_VER" ]]; then
     echo "ERROR: Could not derive hd-wallet-kit-android version from dependent repos"
-    exit 1
+    exit 45
 fi
 echo "  hd-wallet-kit-android (resolved direct or dependency pin): $HD_WALLET_VER"
 clone_at_commit "$GH/hd-wallet-kit-android.git" "$HD_WALLET_VER" /build/deps/hd-wallet-kit-android
@@ -641,13 +674,21 @@ echo "  [BLOB CAVEAT] zano links prebuilt .a (Zano engine/Boost/OpenSSL) — not
 publish_kit zano-kit-android zanokit zano-kit-android "$ZANO_VER" 1
 
 if [[ -n "$XRP_VER" ]]; then
-    # Its publication version is 'local' and its hd-wallet pin (a74b51f) differs from the
-    # wallet's; both are rewritten so neither xrp nor hd-wallet is fetched from JitPack.
+    # Rewrite version 'local' and the hd-wallet pin so neither comes from JitPack.
     echo ""; echo "=== Step 4h: xrp-kit-android === $(date)"
     cd /build/deps/xrp-kit-android
     sed -i '/maven.*jitpack/i\        mavenLocal()' settings.gradle
     sed -i -E "s/(com\\.github\\.horizontalsystems:hd-wallet-kit-android:)[^\"']+/\\1$HD_WALLET_VER/g" xrpkit/build.gradle
     publish_kit xrp-kit-android xrpkit xrp-android "$XRP_VER" 0
+fi
+
+if [[ -n "$NEAR_VER" ]]; then
+    # As unstoppablewallet v0.6.6: mavenLocal first, wallet's hd-wallet pin.
+    echo ""; echo "=== Step 4i: near-android-kit === $(date)"
+    cd /build/deps/near-android-kit
+    sed -i '/maven.*jitpack/i\        mavenLocal()' settings.gradle
+    sed -i -E "s/(com\\.github\\.horizontalsystems:hd-wallet-kit-android:)[^\"']+/\\1$HD_WALLET_VER/g" nearkit/build.gradle
+    publish_kit near-android-kit nearkit near-android-kit "$NEAR_VER" 0
 fi
 
 echo ""; echo "=== Step 5a: bitcoin-kit-android === $(date)"
@@ -681,7 +722,7 @@ if [[ -d subscriptions-google-play ]]; then
     echo "[fdroiddata] removed subscriptions-google-play/"
 else
     echo "ERROR: subscriptions-google-play/ not present; fdroiddata 'rm' no longer applies"
-    exit 1
+    exit 45
 fi
 settings_file=""
 for f in settings.gradle.kts settings.gradle; do
@@ -689,7 +730,7 @@ for f in settings.gradle.kts settings.gradle; do
 done
 if [[ -z "$settings_file" ]]; then
     echo "ERROR: no settings.gradle(.kts) found"
-    exit 1
+    exit 45
 fi
 # Upstream guards the include with file(...).exists(), so the rm suffices. A blanket sed
 # would kill the `if` line too and leave a dangling brace. Assert the guard instead.
@@ -701,14 +742,14 @@ elif grep -qE '^[[:space:]]*include\(":subscriptions-google-play"\)' "$settings_
 else
     echo "ERROR: ${settings_file} references subscriptions-google-play in an unrecognised form"
     grep -n 'subscriptions-google-play' "$settings_file" || true
-    exit 1
+    exit 45
 fi
 
 # (b) strip the stats call; upstream moved this file, so search rather than hardcode.
 stats_files=$(grep -rl 'marketKit\.sendStats' --include='StatsManager.kt' . || true)
 if [[ -z "$stats_files" ]]; then
     echo "ERROR: no StatsManager.kt containing marketKit.sendStats; fdroiddata prebuild no longer applies"
-    exit 1
+    exit 45
 fi
 for sf in $stats_files; do
     sed -i -e '/marketKit.sendStats/d' "$sf"
@@ -716,7 +757,7 @@ for sf in $stats_files; do
 done
 if grep -rq 'marketKit\.sendStats' --include='StatsManager.kt' .; then
     echo "ERROR: marketKit.sendStats still present after prebuild patch"
-    exit 1
+    exit 45
 fi
 
 # Record what changed relative to the tag, for the report.
@@ -734,7 +775,7 @@ BUILT_APK=$(find app/build/outputs/apk/fdroid/release -name "*.apk" -type f 2>/d
 if [[ -z "$BUILT_APK" ]]; then
     echo "ERROR: build succeeded but no APK found under app/build/outputs/apk/fdroid/release"
     find app/build/outputs -type f -name "*.apk" || true
-    exit 1
+    exit 45
 fi
 echo "Built APK: ${BUILT_APK}"
 mkdir -p /output/built
@@ -773,7 +814,7 @@ if [[ "$HS_LOCAL" -eq 0 || "$HS_JITPACK" -gt 0 ]]; then
     fi
     echo "ERROR: dependency source check failed (mavenLocal=$HS_LOCAL, JitPack=$HS_JITPACK)"
     echo "       The APK verdict would not prove a full source build. Aborting."
-    exit 1
+    exit 42
 fi
 
 echo ""; echo "=== All builds complete at $(date) ==="
@@ -795,11 +836,30 @@ $CRUN run \
     bash /build/build.sh 2>&1 | tee "$P3_DIR/container-build.log"
 P3_EXIT=${PIPESTATUS[0]}
 
-[[ $P3_EXIT -eq 0 ]] || die 1 "Source-build container exited with code $P3_EXIT" "From-source build failed (exit ${P3_EXIT})"
+# 42 JitPack, 44 clone, 45 recipe, runtime or env errors: no verdict. ftbfs needs a Gradle error.
+if [[ $P3_EXIT -ne 0 ]]; then
+    case "$P3_EXIT" in
+        42) no_verdict 1 "Dependency-source check failed: a horizontalsystems package came from JitPack" ;;
+        44) no_verdict 1 "git clone failed (network or missing ref)" ;;
+        45) no_verdict 1 "fdroiddata build recipe no longer applies; the script needs an update" ;;
+    esac
+    [[ "$P3_EXIT" -ge 125 ]] && no_verdict 1 "Container runtime error or killed (exit ${P3_EXIT})"
+    WL="$P3_DIR/wallet-build.log"; [[ -s "$WL" ]] || WL="$P3_DIR/container-build.log"
+    tl=$(awk '/What went wrong:/{b=""} {b=b $0 "\n"} END{printf "%s",b}' "$WL" 2>/dev/null | tail -n 80)
+    INF='Could not (GET|HEAD|download)|Could not resolve all|timed out|Connection (refused|reset)|UnknownHost|name resolution|No route to host|status code 5[0-9][0-9]|SSL|handshake|No space left|OutOfMemoryError|heap space|Killed|Daemon disappeared|[Vv]erification failed|checksum|Unsupported class file|Could not (create|initialize|find) |not installed'
+    hit=$(printf '%s' "$tl" | grep -Eo "$INF" | head -1 || true)
+    [[ -z "$hit" ]] || no_verdict 1 "Source build stopped on an environment error (${hit})"
+    # ftbfs only with a real compiler/resource diagnostic (kotlinc, javac, aapt2, C/C++) near the end.
+    CMP_RE='^e: |\.java:[0-9]+: error:|AAPT: error:|\.(c|cc|cpp|h|hpp):[0-9]+:[0-9]+: (fatal )?error:'
+    diag=$(tail -n 400 "$WL" 2>/dev/null | grep -Em1 "$CMP_RE" || true)
+    printf '%s' "$tl" | grep -qE 'BUILD FAILED|FAILURE: Build failed' && [[ -n "$diag" ]] \
+        || no_verdict 1 "Source build failed without a compiler error (exit ${P3_EXIT}); no verdict"
+    ftbfs 1 "Source build failed (exit ${P3_EXIT}): ${diag:0:160}" "From-source build failed (exit ${P3_EXIT}): ${diag:0:160}"
+fi
 $CRUN rm -f "$CTR_P3" 2>/dev/null || true
 
 BUILT_APK="$P3_DIR/built/built.apk"
-[[ -f "$BUILT_APK" ]] || die 1 "Source build produced no APK at $BUILT_APK" "Source build produced no APK"
+[[ -f "$BUILT_APK" ]] || no_verdict 1 "Source build left no APK at $BUILT_APK"
 built_hash=$(sha256of "$BUILT_APK")
 built_size=$(stat -c%s "$BUILT_APK")
 
@@ -818,7 +878,7 @@ banner "PHASE 2: CONTENTS COMPARISON (single APK)"
 echo "  Official vs source-built APK; contents-only (signing ignored)."
 echo "  Started: $(date)"
 
-p5_ctx=$(mktemp -d)
+p5_ctx=$(mktemp -d -p "$workspace" ctx-compare.XXXXXX)
 
 cat > "$p5_ctx/compare.sh" <<'CMP_SCRIPT_END'
 #!/bin/bash
@@ -845,10 +905,15 @@ for d in /tmp/o /tmp/b; do
     fi
 done
 
-# Signing material is never comparable (F-Droid signs; we do not). Drop it both sides.
-find /tmp/o /tmp/b -maxdepth 2 -path '*/META-INF/*' \
+# Exclude root META-INF signing files only when official-only (our build is unsigned).
+while IFS= read -r -d '' sig; do
+    rel="META-INF/$(basename "$sig")"
+    if [[ ! -e "/tmp/b/${rel}" ]]; then
+        rm -f "$sig"; echo "  excluded (official-only signing file): ${rel}"
+    fi
+done < <(find /tmp/o/META-INF -maxdepth 1 -type f \
     \( -iname '*.RSA' -o -iname '*.DSA' -o -iname '*.EC' -o -iname '*.SF' -o -iname 'MANIFEST.MF' \) \
-    -print -delete | sed 's/^/  excluded (signing): /'
+    -print0 2>/dev/null)
 
 OFF_N=$(find /tmp/o -type f | wc -l)
 BLT_N=$(find /tmp/b -type f | wc -l)
@@ -859,7 +924,7 @@ diff_rc=$?
 # diff exits 0 (same) or 1 (differs); anything else is a tool error, not "no differences".
 if [[ "$diff_rc" -ne 0 && "$diff_rc" -ne 1 ]]; then
     echo "ERROR: diff -rq failed with exit ${diff_rc}; refusing to emit a verdict"
-    sed 's/^/    /' /tmp/rawdiff.txt | head -20
+    sed 's/^/    /' /tmp/rawdiff.txt | head -5
     exit 3
 fi
 cnt=$(grep -E '^(Files|Only in)' /tmp/rawdiff.txt || true)
@@ -867,7 +932,7 @@ cnt=$(grep -E '^(Files|Only in)' /tmp/rawdiff.txt || true)
 unparsed=$(grep -vE '^(Files|Only in)' /tmp/rawdiff.txt | grep -v '^$' || true)
 if [[ -n "$unparsed" ]]; then
     echo "ERROR: unrecognised diff output; refusing to emit a verdict"
-    printf '%s\n' "$unparsed" | sed 's/^/    /' | head -20
+    printf '%s\n' "$unparsed" | sed 's/^/    /' | head -5
     exit 3
 fi
 raw_total=$(printf '%s\n' "$cnt" | grep -c . || true); raw_total=${raw_total:-0}
@@ -877,7 +942,7 @@ if [[ "$diff_rc" -eq 1 && "$raw_total" -eq 0 ]]; then
 fi
 echo "  raw differences: ${raw_total}"
 printf '%s\n' "$cnt" | head -5 | sed 's/^/    /'
-[[ "$raw_total" -gt 5 ]] && echo "    ... full list: diff_full.txt"
+[[ "$raw_total" -gt 5 ]] && echo "    ... (first 5 shown; full list in diff_full.txt)"
 printf '%s\n' "$cnt" > /out/diff_full.txt
 
 acc=0; mat=0
@@ -903,7 +968,6 @@ while IFS= read -r line; do
                     acc=$((acc + 1))
                 else
                     echo "  resources.arsc: decoded res/ DIFFERS — material (see diff_res.txt)"
-                    head -5 /out/diff_res.txt | sed 's/^/    /'
                     MATERIAL+=("resources.arsc (decoded res/ differs)"); mat=$((mat + 1))
                 fi
             else
@@ -920,7 +984,6 @@ while IFS= read -r line; do
                     acc=$((acc + 1))
                 else
                     echo "  AndroidManifest.xml: decoded XML DIFFERS — material (see diff_manifest.txt)"
-                    head -5 /out/diff_manifest.txt | sed 's/^/    /'
                     MATERIAL+=("AndroidManifest.xml (decoded XML differs)"); mat=$((mat + 1))
                 fi
             else
@@ -937,10 +1000,8 @@ done < <(printf '%s\n' "$cnt")
 echo ""
 echo "  acceptable: ${acc}"
 echo "  material:   ${mat}"
-if [[ "$mat" -gt 0 ]]; then
-    echo "  material entries:"
-    printf '    %s\n' "${MATERIAL[@]}" | head -20
-fi
+printf '%s\n' "${MATERIAL[@]:-}" | grep -v '^$' > /out/material_entries.txt || true
+[[ "$mat" -gt 0 ]] && echo "  material entries listed in material_entries.txt"
 
 {
     echo "raw_total=${raw_total}"
@@ -962,8 +1023,12 @@ $CRUN run --rm \
     bash /compare.sh 2>&1 | tee "$P5_DIR/comparison.log"
 P5_EXIT=${PIPESTATUS[0]}
 
-[[ $P5_EXIT -eq 0 ]] || die 1 "Comparison phase failed (exit ${P5_EXIT})"
+[[ $P5_EXIT -eq 0 ]] || no_verdict 1 "Comparison tooling failed (exit ${P5_EXIT}); no verdict"
 
+echo "  Full diff files (workspace):"
+for f in diff_full.txt material_entries.txt diff_res.txt diff_manifest.txt; do
+    [[ -f "$P5_DIR/$f" ]] && echo "    $P5_DIR/$f"
+done
 raw_total=$(sed -nE 's/^raw_total=([0-9]+)$/\1/p' "$P5_DIR/summary.txt" | head -1)
 acc_count=$(sed -nE 's/^acceptable=([0-9]+)$/\1/p' "$P5_DIR/summary.txt" | head -1)
 mat_count=$(sed -nE 's/^material=([0-9]+)$/\1/p'   "$P5_DIR/summary.txt" | head -1)
@@ -1008,7 +1073,7 @@ RESULTS
 [[ -n "$git_tag_info" ]] && echo "$git_tag_info"
 echo "===== End Results ====="
 
-write_yaml "${VERDICT}" "Source-built F-Droid fat APK vs official F-Droid APK: ${raw_total} raw difference(s) after excluding root META-INF signing material, of which ${acc_count} acceptable per WS #574 and ${mat_count} material. Official ${app_hash}; built ${built_hash}. All horizontalsystems dependencies rebuilt from source, JitPack fallback prohibited (F-Droid's own build uses JitPack). fdroiddata modifications reproduced: rm subscriptions-google-play; strip marketKit.sendStats."
+write_yaml "${VERDICT}" "Source-built F-Droid fat APK vs official F-Droid APK: ${raw_total} raw difference(s) after excluding official-only root META-INF signing files, of which ${acc_count} acceptable per WS #574 and ${mat_count} material. Official ${app_hash}; built ${built_hash}. All horizontalsystems dependencies rebuilt from source, JitPack fallback prohibited (F-Droid's own build uses JitPack). fdroiddata modifications reproduced: rm subscriptions-google-play; strip marketKit.sendStats."
 
 if [[ "$VERDICT" == "reproducible" ]]; then
     echo ""; echo "Exit code: 0"; exit 0
