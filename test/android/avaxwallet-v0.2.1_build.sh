@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# avaxwallet-v0.2.0_build.sh - Avax (Core Wallet by Ava Labs) Android reproducible build verification
-# Version:          v0.2.0
+# avaxwallet-v0.2.1_build.sh - Avax (Core Wallet by Ava Labs) Android reproducible build verification
+# Version:          v0.2.1
 # Last modified by: Claude Opus 5.5 for Danny Garcia
-# Last modified on: 2026-11-26
+# Last modified on: 2026-11-27
 # Organization:     WalletScrutiny.com
 # App ID:           com.avaxwallet
 # Project:          https://github.com/ava-labs/core-mobile (packages/core-mobile)
-# License: MIT. Changelog: ~/work/ws-notes/script-notes/android/com.avaxwallet/changelog.md (none in this header)
+# License: MIT. Changelog: ~/work/ws-notes/script-notes/android/com.avaxwallet/changelog.md
 # Disclaimer: provided as-is, without warranty, for reproducible-build verification only. Review before
 #   running. This is not a security audit; you are responsible for lawful use.
 # Steps: Core ships Android through Google Play only, so --binary (Play split dir or one APK) is required.
@@ -18,12 +18,12 @@
 #   check. Library ws-rb-core (#1023); build-lock.json from the Gradle cache (#1000) never changes the verdict.
 # Exit: 0 reproducible; 1 not reproducible, ftbfs or no verdict; 2 invalid input or no library; 130 stopped.
 
-SCRIPT_VERSION="v0.2.0"
+SCRIPT_VERSION="v0.2.1"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"; SCRIPT_SHA256="${SCRIPT_SHA256:-N/A}"
 echo "$(basename "$SCRIPT_PATH") $SCRIPT_VERSION sha256:${SCRIPT_SHA256}"
 
-# No -e: diff and cmp return 1 on legitimate differences; the library's ERR trap makes any unguarded failure no verdict.
+# No -e: diff/cmp return 1 on differences; the library's ERR trap makes unguarded failures no verdict.
 set -uo pipefail
 
 # ---- WalletScrutiny library (GitLab #1023), pinned by sha256: standard loader ----
@@ -150,9 +150,9 @@ if [[ -n "$arch_arg" ]]; then
   fi
 fi
 
-ws_results_init   # one run per script folder; a stale COMPARISON_RESULTS.yaml is removed here, after --help
+ws_results_init   # one run per folder; a stale YAML is removed here, after --help
 ws_engine
-# Rootless podman with cgroupfs cannot set memory limits: --memory (MEM_LIMIT, default 24g) is docker only.
+# Rootless podman + cgroupfs can't set memory limits: --memory (MEM_LIMIT, default 24g) is docker only.
 MEM_ARGS=(); if [[ "$WS_ENGINE" == docker ]]; then MEM_LIMIT="${MEM_LIMIT-24g}"; [[ -z "$MEM_LIMIT" ]] || MEM_ARGS=(--memory="$MEM_LIMIT"); fi
 # Every container is named and tracked, so the exit trap stops it if the run ends early.
 CN="avaxwallet-${WS_RUN_ID}"
@@ -204,7 +204,7 @@ RUN cd /opt && curl -fsSL -o apktool.jar https://github.com/iBotPeaches/Apktool/
   && echo "${APKTOOL_SHA256}  apktool.jar" | sha256sum -c - \\
   && curl -fsSL -o bundletool.jar https://github.com/google/bundletool/releases/download/${BUNDLETOOL_VERSION}/bundletool-all-${BUNDLETOOL_VERSION}.jar \\
   && echo "${BUNDLETOOL_SHA256}  bundletool.jar" | sha256sum -c - && chmod 0644 apktool.jar bundletool.jar
-# ccache 4.13.2 = the version bitrise-build-cache-cli installs for activate-build-cache-for-react-native.
+# ccache 4.13.2 = what bitrise-build-cache-cli installs for activate-build-cache-for-react-native.
 RUN cd /tmp && curl -fsSL -o cc.tgz https://github.com/ccache/ccache/releases/download/v4.13.2/ccache-4.13.2-linux-x86_64-glibc.tar.gz \\
   && echo "e531303ffded7ddf0f275674d866f6ac1ad89148c235346e7b12c3c915d15f56  cc.tgz" | sha256sum -c - \\
   && tar -xzf cc.tgz && install -m 0755 ccache-4.13.2-linux-x86_64-glibc/ccache /usr/local/bin/ccache && rm -rf cc.tgz ccache-4.13.2-*
@@ -228,7 +228,9 @@ for A in "$@"; do
   signer="$(printf '%s\n' "$sv" | awk '/Signer #1 certificate SHA-256/{print $NF; exit}')"
   stamp="$(printf '%s\n' "$sv" | grep -c 'Verified for SourceStamp: true')"
   sreq="$("$BT/aapt2" dump xmltree --file AndroidManifest.xml "$A" 2>/dev/null | grep -cE 'isSplitRequired|requiredSplitTypes')"
-  "$BT/aapt2" dump resources "$A" > /tmp/r.txt 2>/dev/null || { echo "[META] aapt2 dump resources failed"; exit 7; }
+  unzip -l "$A" resources.arsc >/dev/null 2>&1; z=$?
+  if [[ $z == 11 && -n "$(g split)" ]]; then : > /tmp/r.txt
+  else [[ $z == 0 ]] && "$BT/aapt2" dump resources "$A" > /tmp/r.txt 2>/dev/null || { echo "[META] resource dump failed (unzip $z)"; exit 7; }; fi
   devip="$(grep -A1 'string/react_native_dev_server_ip$' /tmp/r.txt | sed -n 's/.*"\(.*\)".*/\1/p' | head -1)"
   echo "$(basename "$A")|${pkg}|$(g versionName)|$(g versionCode)|$(g split)|${abis}|${minsdk}|${signer}|${stamp}|${devip}|${sreq}" >> /m/apks.txt
   echo "[META] $(basename "$A"): ${pkg} $(g versionName) ($(g versionCode)) split '$(g split)' abis ${abis:-none} minSdk ${minsdk} SourceStamp ${stamp} devIP ${devip:-none}"
@@ -464,19 +466,19 @@ else
   prc=0
   crun pair -v "${OFFICIAL_DIR}:/official:ro" -v "${BLD}:/out" "$IMG" bash -c '
     BT=$ANDROID_HOME/build-tools/36.0.0
-    cfg() { s=$("$BT/aapt2" dump badging "$1" 2>/dev/null | grep "^package:" | sed -n "s/.*split=.\([^\x27]*\).*/\1/p"); echo "${s#config.}"; }
-    for o in /official/base.apk /official/split_config.*.apk; do co=$(cfg "$o"); m=""
-      for b in /out/rendered/splits/*.apk; do [[ "$(cfg "$b")" == "$co" ]] && { m="$b"; break; }; done
+    cfg() { s=$("$BT/aapt2" dump badging "$1" 2>/dev/null) || exit 9; s=$(printf "%s\n" "$s" | grep "^package:" | sed -n "s/.*split=.\([^\x27]*\).*/\1/p"); echo "${s#config.}"; }
+    for o in /official/base.apk /official/split_config.*.apk; do co=$(cfg "$o") || exit 9; m=""
+      for b in /out/rendered/splits/*.apk; do cb=$(cfg "$b") || exit 9; [[ "$cb" == "$co" ]] && { m="$b"; break; }; done
       echo "$(basename "$o")|${co:-base}|${m:+rendered/splits/$(basename "$m")}"; done' > "${BLD}/pairs.txt" 2>/dev/null || prc=$?
   [[ $prc -eq 0 && "$(grep -c . "${BLD}/pairs.txt" || true)" -eq ${#OFFICIAL[@]} ]] || nov "Pairing official and rendered splits failed (exit ${prc})."
   while IFS='|' read -r o c b; do
     if [[ -n "$b" ]]; then PAIRS+=("${OFFICIAL_DIR}/${o}|${BLD}/${b}"); echo "  ${o} (split '${c}') <-> ${b}"
     else ws_warn "No rendered counterpart for ${o} (split '${c}') -> counted as a difference"; PAIRS+=("${OFFICIAL_DIR}/${o}|"); fi
   done < "${BLD}/pairs.txt"
-    n_rend="$(find "${BLD}/rendered/splits" -name '*.apk' | wc -l)"; n_used="$(cut -d'|' -f3 "${BLD}/pairs.txt" | grep -c . || true)"
+  n_rend="$(find "${BLD}/rendered/splits" -name '*.apk' | wc -l)"; n_used="$(cut -d'|' -f3 "${BLD}/pairs.txt" | grep -c . || true)"
   extra=$((n_rend - n_used)); [[ $extra -gt 0 ]] && ws_warn "${extra} rendered split(s) have no official counterpart (counted as differences)"
 fi
-# Every official APK must enter the comparison; an empty or short pair list never reads as reproducible.
+# Every official APK must enter the comparison; a short pair list never reads as reproducible.
 [[ ${#PAIRS[@]} -eq ${#OFFICIAL[@]} && ${#PAIRS[@]} -gt 0 ]] || nov "Only ${#PAIRS[@]} of ${#OFFICIAL[@]} official APK(s) paired."
 
 phase "PHASE 2: COMPARISON"
