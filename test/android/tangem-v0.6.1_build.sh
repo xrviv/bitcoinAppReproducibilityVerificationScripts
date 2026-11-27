@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# tangem-v0.6.0_build.sh - Tangem Wallet Android reproducible build verification
-# Version:          v0.6.0
+# tangem-v0.6.1_build.sh - Tangem Wallet Android reproducible build verification
+# Version:          v0.6.1
 # Last modified by: Claude Opus 5.5 for Danny Garcia
 # Last modified on: 2026-11-27
 # Organization:     WalletScrutiny.com
@@ -12,14 +12,16 @@
 #   build in an Ubuntu 22.04 + OpenJDK 17 image: Play = bundleGoogleRelease + bundletool splits,
 #   GitHub = assembleGoogleRelease. Version name/code come from the official APK (Gradle properties);
 #   google-services.json is the repo's stub plus com.tangem.wallet. Compare every ZIP entry.
-#   GITHUB_TOKEN (read:packages) is needed: Tangem's SDKs come from GitHub Packages. This script reads it
-#   from the environment and passes it by name only; Gradle and its plugins can read it in the build
-#   container. Workspace files are scanned for it after the build. Library ws-rb-core (#1023); build-lock.json from the
-#   Gradle cache (#1000) never changes the verdict.
+#   GITHUB_TOKEN (read:packages) is needed for the build only: Tangem's SDKs come from GitHub Packages,
+#   which refuses anonymous reads (A10 exception; the release lookup works without it). The script reads
+#   it from the environment and passes it by name only; Gradle and its plugins can read it in the build
+#   container. Clone/build output is masked (***) before the terminal and logs; workspace files are
+#   scanned for it at every exit, after the containers stop (count only). Gradle heap: GRADLE_XMX (default 16g; Tangem's 8g ran out of memory on 6.9).
+#   Library ws-rb-core (#1023); build-lock.json from the Gradle cache (#1000) never changes the verdict.
 # Exit: 0 reproducible; 1 not reproducible, ftbfs or no verdict; 2 invalid input or no library; 130 stopped.
 
-SCRIPT_NAME="tangem-v0.6.0_build.sh"
-SCRIPT_VERSION="v0.6.0"
+SCRIPT_NAME="tangem-v0.6.1_build.sh"
+SCRIPT_VERSION="v0.6.1"
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_SHA256="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')"
 SCRIPT_SHA256="${SCRIPT_SHA256:-N/A}"
@@ -67,7 +69,7 @@ ws_lib_load
 APP_ID="com.tangem.wallet"
 REPO_URL="https://github.com/tangem/tangem-app-android.git"
 API_URL="https://api.github.com/repos/tangem/tangem-app-android/releases/tags"
-# Probe, tag lookup, clone and download image (aapt/apksigner in build-tools 29.0.3, git, curl), by digest.
+# Probe, tag lookup and download image (aapt/apksigner in build-tools 29.0.3, git, wget; no curl), by digest.
 WS_IMG="docker.io/walletscrutiny/android@sha256:eabd60543f19831feef6db22e9a1ada0ef469eef723119f1c96bd836198614c3"
 BASE_IMG="docker.io/library/ubuntu:22.04@sha256:b000e69a50ff940390233025e7a337fb8469b509e2334fa4d018ac30f3e18cdb"
 CMDLINE_SHA256="2d2d50857e4eb553af5a6dc3ad507a17adf43d115264b1afc116f95c92e5e258"
@@ -78,7 +80,7 @@ BUILDLOCK_REV="6eb3c49f860de9b6fbe152cb0c71dd9a4413a979"
 BUILDLOCK_SHA256="fc1d41a45cd1fb455edab9478078c827937761c85966272f4487930f718f8812"
 
 VERSION="" ARCH="" BINARY="" DEVICE_SDK="" MODE="" TAG="" REQ_TAG="" COMMIT="" SIGNER="" VNAME="" VCODE="" APP_HASH=""
-COUNTED=0 BG_PID="" BASE_NATIVE="" W="" HASHES=() BUILD_LOCK_FILE="" FTBFS_NOTE=""
+COUNTED=0 BG_PID="" BASE_NATIVE="" W="" HASHES=() BUILD_LOCK_FILE="" FTBFS_NOTE="" LEAK_DONE=0
 declare -a OFFICIAL=() LABELS=() NCOUNT=() NACC=() OFF_HASH=() BUILT_HASH=()
 
 nov() { ws_no_verdict "$1"; }   # runtime, network, tool or input problem: no YAML
@@ -98,7 +100,8 @@ Usage: ${SCRIPT_NAME} [--binary <apk|split dir>] [--version <v>] [--arch <abi>] 
   --tag            git tag to build (default v<version>)
   --device-sdk     device API level for bundletool (default 36)
   --help
-Env: GITHUB_TOKEN (required, read:packages); GITHUB_USER (default walletscrutiny); MEM_LIMIT (docker only).
+Env: GITHUB_TOKEN (read:packages, needed to build); GITHUB_USER (default walletscrutiny);
+     GRADLE_XMX (Gradle heap, default 16g); MEM_LIMIT (docker only).
 Exit codes: 0 reproducible, 1 not_reproducible/ftbfs/no verdict, 2 invalid parameters
 EOF
 }
@@ -126,27 +129,54 @@ case "$ARCH" in ""|arm64-v8a|armeabi-v7a|x86_64|x86) ;; *) inv "Unsupported --ar
 
 ws_results_init
 ws_engine
-# Tangem's Gradle settings read the Tangem SDKs from GitHub Packages, which refuses anonymous reads.
-[[ -n "${GITHUB_TOKEN:-}" ]] || nov "GITHUB_TOKEN is not set: Tangem's SDKs come from GitHub Packages (token with read:packages). Nothing was built."
-export GITHUB_TOKEN
+GRADLE_XMX="${GRADLE_XMX:-16g}"
+[[ "$GRADLE_XMX" =~ ^[1-9][0-9]*[gm]$ ]] || inv "GRADLE_XMX must look like 16g or 12000m."
 GH_ACTOR="${GITHUB_USER:-walletscrutiny}"
 [[ "$GH_ACTOR" =~ ^[A-Za-z0-9-]+$ ]] || inv "GITHUB_USER must be a GitHub user name."
 CTR=(docker); [[ "$WS_ENGINE" != podman ]] || CTR=(podman --cgroup-manager=cgroupfs)
-# Rootless podman with cgroupfs can't set memory limits: --memory (MEM_LIMIT, default 20g) is docker only.
-MEM_ARGS=(); if [[ "$WS_ENGINE" == docker ]]; then MEM_LIMIT="${MEM_LIMIT-20g}"; [[ -z "$MEM_LIMIT" ]] || MEM_ARGS=(--memory="$MEM_LIMIT"); fi
+# Rootless podman with cgroupfs can't set memory limits: --memory (MEM_LIMIT, default 28g) is docker only.
+MEM_ARGS=(); if [[ "$WS_ENGINE" == docker ]]; then MEM_LIMIT="${MEM_LIMIT-28g}"; [[ -z "$MEM_LIMIT" ]] || MEM_ARGS=(--memory="$MEM_LIMIT"); fi
 IMG="localhost/ws-tangem:${WS_RUN_ID}"
 
 # Background + wait: a signal acts at once; the exit hook stops and reaps it.
 bg_wait() { local rc=0; "$@" & BG_PID=$!; wait "$BG_PID" || rc=$?; BG_PID=""; return $rc; }
-ws_cleanup_hook() { [[ -z "$BG_PID" ]] || { kill "$BG_PID"; wait "$BG_PID"; } 2>/dev/null || true; }
-# ctr STAGE LOG ARGS...: run a named container (removed at exit), output to the terminal and LOG;
-# returns the container's exit code, or 90 if LOG was not written.
+# At exit: stop the wrapper and every tracked container first, so nothing writes after the token scan.
+ws_cleanup_hook() {
+  local x
+  [[ -z "$BG_PID" ]] || { kill "$BG_PID"; wait "$BG_PID"; } 2>/dev/null || true
+  [[ -z "${WS_ENGINE:-}" || "${WS_KEEP:-}" == 1 ]] || for x in "${WS_CONTAINERS[@]}"; do ws_ctr rm -f "$x" &>/dev/null || true; done
+  leak_scan
+}
+# Replaces GITHUB_TOKEN (read from the environment, never an argument) with *** in each output line.
+read -r -d '' MASK_AWK <<'EOF' || true
+BEGIN { t = ENVIRON["GITHUB_TOKEN"] }
+{ s = $0; o = ""; if (t != "") while ((i = index(s, t)) > 0) { o = o substr(s, 1, i - 1) "***"; s = substr(s, i + length(t)) }
+  print o s; fflush() }
+EOF
+# ctr STAGE LOG ARGS...: run a named container (removed at exit), masked output to the terminal and LOG;
+# returns the container's exit code, or 90 if the mask or LOG failed.
 ctr() {
   local n="tangem-${WS_RUN_ID}-$1" l="$2" rc=0; shift 2
   ws_track_container "$n"
-  bg_wait bash -c 'l="$1"; shift; "$@" < /dev/null 2>&1 | tee "$l"; s=("${PIPESTATUS[@]}"); [[ ${s[1]} == 0 ]] || exit 90; exit "${s[0]}"' \
-    _ "$l" "${CTR[@]}" run --rm --name "$n" "$@" || rc=$?
+  bg_wait bash -c 'l="$1" m="$2"; shift 2; "$@" < /dev/null 2>&1 | awk "$m" | tee "$l"; s=("${PIPESTATUS[@]}"); [[ ${s[1]} == 0 && ${s[2]} == 0 ]] || exit 90; exit "${s[0]}"' \
+    _ "$l" "$MASK_AWK" "${CTR[@]}" run --rm --name "$n" "$@" || rc=$?
   return $rc
+}
+# grep_tok PATH...: grep -rlsF for the token, given on a file descriptor (never an argument); grep's status.
+grep_tok() { grep -rlsF -f <(printf '%s\n' "$GITHUB_TOKEN") "$@"; }
+# Final workspace scan, once, at exit. Prints a count and our own top-level folder names only (a file name
+# could hold the token). The whole list is read; grep's status is kept (1 = none, 2+ = incomplete).
+leak_scan() {
+  local rc x d=""; local -a hits=()
+  [[ "$LEAK_DONE" -eq 0 && -n "${GITHUB_TOKEN:-}" && -n "$W" && -d "$W" ]] || return 0
+  mapfile -t hits < <(grep_tok "$W"; echo "rc=$?")
+  rc="${hits[-1]#rc=}"; unset 'hits[-1]'; LEAK_DONE=1
+  for x in "${hits[@]}"; do x="${x#"$W"/}"; x="${x%%/*}"
+    case "$x" in official|built|cmp|ctx|gradle-home|build-lock|src|*.log|*.json|*.txt|*.py) [[ " $d " == *" $x "* ]] || d+="${d:+ }$x" ;; esac
+  done
+  if [[ "${#hits[@]}" -gt 0 ]]; then ws_warn "GITHUB_TOKEN found in ${#hits[@]} workspace file(s) (in: ${d:-?}); do not share them."
+  elif [[ "$rc" -eq 1 ]]; then ws_ok "Token scan: GITHUB_TOKEN is in no workspace file."; fi
+  [[ "$rc" -le 1 ]] || ws_warn "Token scan of ${W} incomplete (grep exit ${rc}): check files before sharing them."
 }
 
 read -r -d '' PROBE_SH <<'EOF' || true
@@ -260,8 +290,11 @@ tags="$(wsi tag -c 'git ls-remote --tags --exit-code "$1" "refs/tags/$2"' sh "$R
 
 if [[ -z "$BINARY" ]]; then
   ws_info "Reading release ${TAG} (GitHub API, in a container)..."
-  # The token (if set) reaches curl on stdin (printf is a shell builtin), never on a command line.
-  wsi api -e GITHUB_TOKEN -c 'h=""; [ -z "$GITHUB_TOKEN" ] || h="Authorization: Bearer $GITHUB_TOKEN"; printf "%s\n" "$h" | curl -fsSL --retry 3 --max-time 60 -H @- "$1"' \
+  # The token (if set) goes into a private wgetrc in the container's /tmp (printf is a builtin), never on a
+  # command line; no redirects, so the header goes to api.github.com only.
+  wsi api -e GITHUB_TOKEN -c 'umask 077; c="$(mktemp)" || exit 9
+    if [ -n "$GITHUB_TOKEN" ]; then printf "header = Authorization: Bearer %s\n" "$GITHUB_TOKEN" > "$c" || exit 9; fi
+    wget --config="$c" --max-redirect=0 -q -O - --tries=3 --timeout=60 "$1"; r=$?; rm -f "$c"; exit $r' \
     sh "${API_URL}/${TAG}" > "${W}/release.json" || nov "GitHub API request for release ${TAG} failed."
   # One asset per line, then the release APK of this version with its published digest.
   line="$(tr -d '\n' < "${W}/release.json" | sed 's/"url": *"https:\/\/api\.github\.com\/repos\/[^"]*\/releases\/assets\//\n/g' \
@@ -273,7 +306,7 @@ if [[ -z "$BINARY" ]]; then
   [[ -n "$want" && -n "$url" ]] || nov "Asset ${asset} has no published sha256 or download URL."
   ws_info "Downloading ${asset} (published sha256 ${want})..."
   # shellcheck disable=SC2046
-  wsi dl $(ws_user_flags) -v "${W}/official:/o" -c 'curl -fsSL --retry 3 --max-time 1800 -o /o/app.apk "$1"' sh "$url" \
+  wsi dl $(ws_user_flags) -v "${W}/official:/o" -c 'wget -q -O /o/app.apk --tries=3 --timeout=300 "$1"' sh "$url" \
     || nov "Download of ${asset} failed."
   got="$(ws_sha256 "${W}/official/app.apk")"
   [[ "$got" == "$want" ]] || { rm -f "${W}/official/app.apk"; nov "sha256 mismatch for ${asset}: expected ${want}, got ${got}."; }
@@ -287,6 +320,9 @@ for e in "${OFFICIAL[@]}"; do
   [[ "${e%%|*}" -ef "${W}/official/${e##*|}" ]] || cp "${e%%|*}" "${W}/official/${e##*|}" || nov "Cannot copy ${e%%|*}."
 done
 
+# The build reads Tangem's SDKs from GitHub Packages, which refuses anonymous reads.
+[[ -n "${GITHUB_TOKEN:-}" ]] || nov "GITHUB_TOKEN is not set: Tangem's SDKs come from GitHub Packages (token with read:packages). Nothing was built."
+export GITHUB_TOKEN
 ws_section "BUILD IMAGE (Ubuntu 22.04 by digest, OpenJDK 17, SDK, pinned tools)"
 cat > "${W}/ctx/Dockerfile" <<EOF
 FROM ${BASE_IMG}
@@ -374,7 +410,7 @@ results() {
 
 TASK=assembleGoogleRelease; [[ "$MODE" == split ]] && TASK=bundleGoogleRelease
 ws_section "BUILD (gradlew ${TASK}, versionCode ${VCODE}, versionName ${VNAME})"
-ws_info "Typically 20-40 min; GITHUB_TOKEN is passed by name (-e), never by value."
+ws_info "Typically 30-60 min; GITHUB_TOKEN is passed by name (-e), never by value. Gradle heap ${GRADLE_XMX} (upstream 8g)."
 rc=0
 # shellcheck disable=SC2046
 ctr build "${W}/build.log" $(ws_user_flags) "${MEM_ARGS[@]}" -e HOME=/tmp/h -e GRADLE_USER_HOME=/gh -e GITHUB_TOKEN \
@@ -382,7 +418,8 @@ ctr build "${W}/build.log" $(ws_user_flags) "${MEM_ARGS[@]}" -e HOME=/tmp/h -e G
   -e "KOTLIN_DAEMON_JVM_OPTIONS=-Xmx4g -XX:MaxMetaspaceSize=512m" \
   -v "${W}/src:/src" -v "${W}/gradle-home:/gh" -w /src "$IMG" bash -c \
   'chmod +x gradlew && exec ./gradlew "$@" -x :core:ui:verifyDesignTokens --no-daemon --no-build-cache --stacktrace --max-workers=4' \
-  sh "$TASK" "-PversionCode=${VCODE}" "-PversionName=${VNAME}" || rc=$?
+  sh "$TASK" "-PversionCode=${VCODE}" "-PversionName=${VNAME}" \
+  "-Dorg.gradle.jvmargs=-Xmx${GRADLE_XMX} -XX:MaxMetaspaceSize=1g -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -Dfile.encoding=UTF-8" || rc=$?
 if [[ "$rc" -ne 0 ]]; then
   # 90: log not written; 126+: not run, killed or stopped. Only exit 1 (Gradle failed) is classified.
   [[ "$rc" -eq 1 ]] || nov "Build container exited ${rc} (log not written, not run or killed); no verdict. Log: ${W}/build.log"
@@ -405,10 +442,6 @@ else
   cp "${arts[0]}" "${W}/built/app.apk" || nov "Cannot copy the APK."
 fi
 ws_ok "Built: ${arts[0]#"${W}/"}"
-# The token is passed to grep on a file descriptor, never as an argument.
-if leak="$(grep -rlF -f <(printf '%s\n' "$GITHUB_TOKEN") "$W" 2>/dev/null | head -n5)" && [[ -n "$leak" ]]; then
-  ws_warn "GITHUB_TOKEN found in workspace file(s); do not share them: $(printf '%s ' $leak)"
-fi
 
 ws_section "BUILD RECORD (ws-buildlock, verdict unaffected)"
 BL_SH="${W}/ctx/ws-buildlock.sh"; bl_rc=0
@@ -421,6 +454,11 @@ if bx lock-get curl -fsSL --max-time 60 -o /w/ctx/ws-buildlock.sh "https://gitla
     ws_ok "build-lock.json: ${BUILD_LOCK_FILE} (${bl_n} Gradle artifacts, sha256 $(ws_sha256 "$BUILD_LOCK_FILE"))"
   else ws_warn "No usable build-lock.json (exit ${bl_rc}; see ${W}/build-lock.log)."; fi
 else ws_warn "build-lock skipped: no ws-buildlock.sh with the expected sha256."; fi
+# Offer build-lock.json only if a complete scan finds no token in it (0 = found, 2+ = scan failed).
+if [[ -n "$BUILD_LOCK_FILE" && -n "${GITHUB_TOKEN:-}" ]]; then
+  bl_t=0; grep_tok "$BUILD_LOCK_FILE" >/dev/null || bl_t=$?
+  [[ "$bl_t" -eq 1 ]] || { BUILD_LOCK_FILE=""; ws_warn "build-lock.json holds the token or could not be scanned: not offered."; }
+fi
 
 if [[ "$MODE" == split ]]; then
   ws_section "RENDER SPLITS (bundletool ${BUNDLETOOL_VERSION})"
@@ -499,7 +537,7 @@ def res_why(do, db):
     if not (os.path.isdir(do + '/res') and os.path.isdir(db + '/res')): raise Undecided('apktool produced no res/')
     a, b = tree(do + '/res'), tree(db + '/res')
     if a == b: return 'binary-only; decoded res/ identical'
-    if [k for k in set(a) | set(b) if a.get(k) != b.get(k)] != ['values/strings.xml']: return None
+    if [k for k in set(a) | set(b) if a.get(k) != b.get(k)] != ['values/strings.xml'] or 'values/strings.xml' not in a or 'values/strings.xml' not in b: return None
     x, y = no_cl(do), no_cl(db)
     return 'decoded res/ differs only in the one Crashlytics mapping_file_id string' if x is not None and x == y else None
 cnt, acc = open('cmp/counted.txt', 'w'), open('cmp/accepted.txt', 'w')
@@ -515,7 +553,7 @@ for name in names:
         try:
             if mode == 'split' and k == 'stamp-cert-sha256' and k not in b and a[k][1] == 32 and stamp_ok(off):
                 why = 'Play SourceStamp, 32 bytes, official only, apksigner SourceStamp verified'
-            elif k in a and k in b and k in ('AndroidManifest.xml', 'resources.arsc'):
+            elif k in a and k in b and (k == 'resources.arsc' or (k == 'AndroidManifest.xml' and mode == 'split')):
                 do, db = decode(off, f'cmp/dec_{lab}_off'), decode(bui, f'cmp/dec_{lab}_bui')
                 if k == 'resources.arsc': why = res_why(do, db)
                 elif mode == 'split' and manifest(do, True) == manifest(db, False):
@@ -538,10 +576,12 @@ names=()
 for e in "${OFFICIAL[@]}"; do names+=("${e##*|}"); done
 summary="$(bx cmp python3 cmp.py "$MODE" "${names[@]}")" || nov "Comparison failed."
 # One record per official APK (official hash set) plus built-only extras (official hash "-"); labels unique.
-n_off=0; seen=" "
+n_off=0; seen=" " want=" "
+for x in "${names[@]}"; do x="${x%.apk}"; want+="${x#split_config.} "; done
 while IFS='|' read -r lab nc na oh bh; do
   [[ -n "$lab" ]] || continue
   [[ "$seen" != *" ${lab} "* && "$nc" =~ ^[0-9]+$ && "$na" =~ ^[0-9]+$ ]] || nov "Malformed or duplicate comparison record: ${lab}"
+  [[ "$oh" == - || "$want" == *" ${lab} "* ]] || nov "Comparison record ${lab} is not one of the official APKs."
   seen+="${lab} "; [[ "$oh" == - ]] || n_off=$((n_off + 1))
   LABELS+=("$lab") NCOUNT+=("$nc") NACC+=("$na") OFF_HASH+=("$oh") BUILT_HASH+=("$bh")
   COUNTED=$((COUNTED + nc))
