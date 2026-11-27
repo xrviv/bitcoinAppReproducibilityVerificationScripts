@@ -2,12 +2,12 @@
 # ==============================================================================
 # keystone3pro_build.sh - Keystone 3 Pro Reproducible Build Verification
 # ==============================================================================
-# Version: v0.2.0
+# Version: v0.2.1
 # Organization: WalletScrutiny.com
 # Project: https://github.com/KeystoneHQ/keystone3-firmware
 # License: MIT
-# Last modified by: Bob (WalletScrutiny)
-# Last modified on: 2026-10-12
+# Last modified by: Carol (WalletScrutiny)
+# Last modified on: 2026-11-27
 # ==============================================================================
 #
 # TECHNICAL DISCLAIMER:
@@ -31,7 +31,7 @@
 
 set -eEuo pipefail
 
-SCRIPT_VERSION="v0.2.0"
+SCRIPT_VERSION="v0.2.1"
 APP_ID="keystone3.pro"
 REPO_URL="https://github.com/KeystoneHQ/keystone3-firmware"
 SCRIPT_PATH="$(readlink -f "$0")"
@@ -47,6 +47,11 @@ VERSION=""
 ARCH="arm"
 TYPE="multi"
 BINARY_PATH=""
+# keyst.one's CloudFront blocks the build server's main address (walletScrutinyCom
+# issue 1032), so the official firmware is fetched from this alternative address
+# when the host has it. Empty, or an address the host lacks, uses the default route.
+SOURCE_IP="${KEYSTONE_SOURCE_IP-66.29.128.153}"
+DOWNLOAD_ARGS=()
 NO_CACHE=false
 JOBS=""
 RUN_ID=""
@@ -190,6 +195,8 @@ Parameters:
   --binary PATH       Optional official keystone3.bin (or a directory holding one).
                       If omitted, downloads from
                       https://keyst.one/contents/KeystoneFirmwareG3/
+                      from KEYSTONE_SOURCE_IP (default 66.29.128.153) when the
+                      host has that address; set it empty to use the default route.
   --apk PATH          Android-only parameter; accepted as an alias for --binary.
   --jobs N            Parallel compile jobs for make and cargo (default: nproc).
   --no-cache          Build container images without cache.
@@ -218,6 +225,34 @@ detect_container_cmd() {
     die_ftbfs "Neither podman nor docker found. Host requirement is podman or docker."
   fi
   log_info "Container engine: ${CONTAINER_CMD}"
+}
+
+# Bind the keyst.one downloads to SOURCE_IP. Host networking lets wget bind an
+# address of the host, which works the same in rootless podman and docker.
+setup_download_source() {
+  local addrs
+  if [[ -z "${SOURCE_IP}" ]]; then
+    log_info "Official firmware download uses the default route (KEYSTONE_SOURCE_IP is empty)."
+    return
+  fi
+  if command -v ip >/dev/null 2>&1; then
+    addrs="$(ip -o addr show 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4}')"
+  else
+    addrs="$(hostname -I 2>/dev/null | tr ' ' '\n')"
+  fi
+  if printf '%s\n' "${addrs}" | grep -qxF "${SOURCE_IP}"; then
+    DOWNLOAD_ARGS=(--network host)
+    log_info "Official firmware download binds to ${SOURCE_IP}."
+  else
+    log_info "Host has no address ${SOURCE_IP}; official firmware download uses the default route."
+  fi
+}
+
+# wget options matching DOWNLOAD_ARGS.
+wget_bind_args() {
+  if [[ ${#DOWNLOAD_ARGS[@]} -gt 0 ]]; then
+    printf '%s\n' "--bind-address=${SOURCE_IP}"
+  fi
 }
 
 container_user_args() {
@@ -350,15 +385,16 @@ DOCKERFILE
 }
 
 preflight_official_firmware() {
-  local url probe status
+  local url probe status bind_args=()
   if [[ -n "${BINARY_PATH}" ]]; then
     log_info "Official firmware supplied locally; skipping availability check."
     return
   fi
   url="$(official_url)"
   log_info "Checking official firmware availability: ${url}"
-  probe="$("${CONTAINER_CMD}" run --rm "${GIT_IMAGE_TAG}" \
-    wget --server-response --spider --user-agent='Mozilla/5.0' --tries=2 --timeout=20 "${url}" 2>&1 || true)"
+  mapfile -t bind_args < <(wget_bind_args)
+  probe="$("${CONTAINER_CMD}" run --rm "${DOWNLOAD_ARGS[@]}" "${GIT_IMAGE_TAG}" \
+    wget "${bind_args[@]}" --server-response --spider --user-agent='Mozilla/5.0' --tries=2 --timeout=20 "${url}" 2>&1 || true)"
   status="$(printf '%s\n' "${probe}" | awk '/^[[:space:]]*HTTP\// {code=$2} END {print code}')"
   case "${status}" in
     404|410)
@@ -475,8 +511,9 @@ build_firmware_checker() {
 }
 
 stage_official_firmware() {
-  local url user_args=()
+  local url user_args=() bind_args=()
   mapfile -t user_args < <(container_user_args)
+  mapfile -t bind_args < <(wget_bind_args)
   if [[ -n "${BINARY_PATH}" ]]; then
     log_info "Using provided official firmware: ${BINARY_PATH}"
     cp "${BINARY_PATH}" "${WORK_DIR}/official-keystone3.bin"
@@ -486,9 +523,10 @@ stage_official_firmware() {
   log_info "Downloading official firmware: ${url}"
   run_ctr "download" \
     "${user_args[@]}" \
+    "${DOWNLOAD_ARGS[@]}" \
     -v "${WORK_DIR}:/work" \
     "${GIT_IMAGE_TAG}" \
-    wget -O /work/official-keystone3.bin --user-agent='Mozilla/5.0' --tries=3 --timeout=30 "${url}"
+    wget "${bind_args[@]}" -O /work/official-keystone3.bin --user-agent='Mozilla/5.0' --tries=3 --timeout=30 "${url}"
 }
 
 sha256_file() {
@@ -593,6 +631,7 @@ main() {
   parse_args "$@"
   validate_inputs
   detect_container_cmd
+  setup_download_source
   setup_workdir
 
   echo -e "${YELLOW}"
