@@ -1,9 +1,9 @@
 #!/bin/bash
-# bitkit-v0.3.8_build.sh - Bitkit (to.bitkit) Android reproducible build verification
-# Version:       v0.3.8
+# bitkit-v0.3.9_build.sh - Bitkit (to.bitkit) Android reproducible build verification
+# Version:       v0.3.9
 # Organization:  WalletScrutiny.com
 # Last modified by: Claude Code for Danny
-# Last modified on: 2026-11-13
+# Last modified on: 2026-11-28
 # Project:       https://github.com/synonymdev/bitkit-android
 # DISCLAIMER: examine this script before running it. It is provided as-is, without warranty,
 # and may contain bugs. It runs containers, downloads source and builds (CPU, RAM, disk heavy).
@@ -13,14 +13,14 @@
 # official Play splits given by --binary; writes COMPARISON_RESULTS.yaml next to the script.
 set -euo pipefail
 SCRIPT_HASH="$(sha256sum "$(readlink -f "$0")" 2>/dev/null | cut -d' ' -f1)" || true
-echo "[INFO] Script: ${0##*/} v0.3.8 sha256: ${SCRIPT_HASH:=N/A}"
+echo "[INFO] Script: ${0##*/} v0.3.9 sha256: ${SCRIPT_HASH:=N/A}"
 EXEC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly EXEC_DIR
 readonly WORK_DIR_PREFIX="bitkit_verification"
 readonly RUN_ID="$(date +%s)-$$"
 readonly CALLER_DIR="$(pwd -P)"
-readonly SCRIPT_VERSION="v0.3.8"
-readonly SCRIPT_NAME="bitkit-v0.3.8_build.sh"
+readonly SCRIPT_VERSION="v0.3.9"
+readonly SCRIPT_NAME="bitkit-v0.3.9_build.sh"
 readonly APP_ID="to.bitkit"
 readonly REPO_URL="https://github.com/synonymdev/bitkit-android.git"
 readonly BUILD_IMAGE="bitkitwallet_build_env:5"
@@ -315,7 +315,7 @@ compare_apks() {
     built_rel="${built_unzip#"${WORK_DIR}/"}"
     diff_rel="${diff_file#"${WORK_DIR}/"}"
     container_exec "diff -r '${official_rel}' '${built_rel}' \
-        > '${diff_rel}' 2>&1 || true"
+        > '${diff_rel}' 2>&1 || [ \$? -eq 1 ]"  # diff error (2): no verdict
     chmod -R a+rwX "${results_dir}" 2>/dev/null || true
     local total_lines=0
     local non_meta_count=0
@@ -553,7 +553,8 @@ print_results_block() {
 usage() {
     cat <<EOF
 Usage: ${SCRIPT_NAME} --binary <split APK|dir|.zip|.tar.gz> (alias --apk) [--version V]
-  [--arch arm64-v8a] [--type (unused)] [--github-token PAT, or GITHUB_TOKEN] [--cleanup]
+  [--arch arm64-v8a] [--type (unused)] [--cleanup]
+  Env GITHUB_TOKEN (read:packages), required. --github-token PAT also works, but ps shows it.
 Exit: 0 reproducible, 1 not_reproducible/ftbfs/failure, 2 invalid input
 EOF
 }
@@ -636,6 +637,7 @@ parse_arguments() {
         echo "Exit code: ${EXIT_INVALID}"
         exit "${EXIT_INVALID}"
     fi
+    export GITHUB_TOKEN="${github_token}"  # podman gets it by name (-e GITHUB_TOKEN), never by value
     ARCH_SAFE="${ARCH//-/_}"
     VERSION_SAFE="${VERSION:-provided}"
     WORK_DIR="$(work_dir_path "${VERSION_SAFE}" "${ARCH_SAFE}")"
@@ -891,7 +893,7 @@ build() {
         -e "JAVA_HOME=/usr/lib/jvm/zulu17-ca-amd64" \
         -e "GITHUB_ACTOR=walletscrutiny" \
         -e "NDK_VERSION=${NDK_VERSION}" \
-        -e "GITHUB_TOKEN=${github_token}" \
+        -e GITHUB_TOKEN \
         "${BUILD_IMAGE}" \
         bash -c "set -euo pipefail
             echo '[INFO] Cloning ${REPO_URL} at tag ${GIT_TAG}...'
@@ -916,10 +918,6 @@ build() {
 {\"project_info\": {\"project_number\": \"783092706332\",\"project_id\": \"bitkit-prod\",\"storage_bucket\": \"bitkit-prod.firebasestorage.app\"},\"client\": [{\"client_info\": {\"mobilesdk_app_id\": \"1:783092706332:android:1bc9125e3a0db5d3b703d9\",\"android_client_info\": {\"package_name\": \"to.bitkit\"}},\"api_key\": [{\"current_key\": \"AIzaSyDIdnCadyHRiBAwYaJHTcXh5gaK0kJbKLc\"}],\"services\": {\"appinvite_service\": {\"other_platform_oauth_client\": []}}}],\"configuration_version\": \"1\"}
 GSEOF
             echo '[INFO] google-services.json written for mainnetRelease flavor.'
-            mkdir -p /workspace/.gradle
-            printf 'gpr.user=walletscrutiny\ngpr.key=%s\n' \"\${GITHUB_TOKEN}\" \
-                >> /workspace/.gradle/gradle.properties
-            echo '[INFO] GitHub Packages credentials written to ~/.gradle/gradle.properties.'
             cd /workspace/app
             keytool -genkeypair \
                 -keystore /workspace/debug.keystore \
@@ -946,8 +944,9 @@ GSEOF
             chmod -R a+rwX /workspace 2>/dev/null || true
         " 2>&1 | tee "${WORK_DIR}/build.log" || rc=$?
     if [[ "${rc}" -ne 0 ]]; then
-        if grep -qiE 'unable to access|Could not resolve host|Could not (GET|HEAD) |Connection (refused|reset|timed out)|Read timed out|Network is unreachable|name resolution|status code (401|403|429|5[0-9]{2})' "${WORK_DIR}/build.log"; then
-            log_fail "Clone/build stopped on a network or access error (exit ${rc}); no verdict written."
+        # >=125: podman/runtime error, git clone failure (128) or a kill (137 OOM): not ftbfs
+        if [[ "${rc}" -ge 125 ]] || grep -qiE 'unable to access|Could not resolve host|Could not (GET|HEAD) |Connection (refused|reset|timed out)|Read timed out|Network is unreachable|name resolution|status code (401|403|429|5[0-9]{2})' "${WORK_DIR}/build.log"; then
+            log_fail "Clone/build stopped on a network, access or runtime error (exit ${rc}); no verdict written."
             echo "Exit code: ${EXIT_FAILED}"
             exit "${EXIT_FAILED}"
         fi
